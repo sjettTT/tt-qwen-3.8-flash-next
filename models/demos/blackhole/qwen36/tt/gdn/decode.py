@@ -112,6 +112,27 @@ def recurrent_forward(gdn, x, mode="recurrent", chunk_size=None, valid_len=None)
             ttnn.deallocate(new_fused_conv)
         return output
 
+    state_mc = gdn.decode_state_memory_config if mode == "recurrent" else None
+    if state_mc is not None and new_state.memory_config() != state_mc:
+        placed_state = ttnn.to_memory_config(new_state, state_mc)
+        ttnn.deallocate(new_state)
+        new_state = placed_state
+
+    if state_mc is not None and isinstance(new_fused_conv, list):
+        placed_conv = []
+        for state in new_fused_conv:
+            if state.memory_config() == state_mc:
+                placed_conv.append(state)
+            else:
+                placed = ttnn.to_memory_config(state, state_mc)
+                ttnn.deallocate(state)
+                placed_conv.append(placed)
+        new_fused_conv = placed_conv
+    elif state_mc is not None and new_fused_conv is not None and new_fused_conv.memory_config() != state_mc:
+        placed_conv = ttnn.to_memory_config(new_fused_conv, state_mc)
+        ttnn.deallocate(new_fused_conv)
+        new_fused_conv = placed_conv
+
     gdn.recurrent_state = new_state
     if isinstance(new_fused_conv, list):
         gdn.split_conv_state = new_fused_conv

@@ -1413,6 +1413,7 @@ def generate_reports(
     outputFolder: Optional[Path],
     date: bool,
     nameAppend: Optional[str],
+    report_mode: Optional[str] = None,
 ) -> None:
     """Emit the final CSV report plus supporting artifacts."""
 
@@ -1540,6 +1541,8 @@ def generate_reports(
 
         for row in timeline_keys:
             csv_row = {}
+            if report_mode is not None:
+                csv_row["REPORT MODE"] = report_mode
             if type(row) is str and "sp" in row:
                 headerAndMessage = signposts[row]["data"].split(": ")[-1].split("\n")
                 csv_row["OP CODE"] = headerAndMessage[0]
@@ -1888,7 +1891,8 @@ def generate_reports(
             anchor = tail_part.index("PROGRAM CACHE HIT") + 1
             tail_part[anchor:anchor] = kernel_size_headers
         allHeaders = (
-            head_part
+            (["REPORT MODE"] if report_mode is not None else [])
+            + head_part
             + tensorCSVData["INPUT"]["headers"]
             + tensorCSVData["OUTPUT"]["headers"]
             + tail_part
@@ -1935,16 +1939,86 @@ def process_ops(
     analyze_noc_traces: bool = False,
     device_analysis_types: Tuple[str, ...] | List[str] = (),
     force_legacy_device_logs: bool = False,
+    host_only: bool = False,
 ) -> None:
     """Top-level entry point used by both CLI and importers."""
+
+    if host_only and device_only:
+        raise ValueError("host-only and device-only report modes are mutually exclusive")
+    if host_only and (analyze_noc_traces or device_analysis_types or force_legacy_device_logs):
+        raise ValueError("host-only reports cannot request device or NoC analysis")
+    if host_only and (date or name_append):
+        raise ValueError("host-only reports require the flat undated unnamed evidence layout")
 
     if not output_folder:
         output_folder = PROFILER_ARTIFACTS_DIR
     logFolder = generate_logs_folder(output_folder)
     reportFolder = generate_reports_folder(output_folder)
 
-    ops, signposts, traceReplays = import_tracy_op_logs(logFolder)
+    if host_only:
+        allowed_host_log_names = {
+            TRACY_FILE_NAME,
+            TRACY_OPS_TIMES_FILE_NAME,
+            TRACY_OPS_DATA_FILE_NAME,
+        }
+        if not logFolder.is_dir() or logFolder.is_symlink():
+            raise RuntimeError(f"host-only report requires one regular profiler log directory: {logFolder}")
+        log_artifacts = tuple(sorted(logFolder.iterdir(), key=lambda path: path.name))
+        actual_names = {path.name for path in log_artifacts}
+        if actual_names != allowed_host_log_names:
+            unexpected = sorted(actual_names - allowed_host_log_names)
+            missing = sorted(allowed_host_log_names - actual_names)
+            raise RuntimeError(
+                f"host-only report refuses unexpected profiler artifacts: unexpected={unexpected} missing={missing}"
+            )
+        invalid = [
+            path
+            for path in log_artifacts
+            if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0
+        ]
+        if invalid:
+            raise RuntimeError(f"host-only report refuses nonregular or empty profiler artifacts: {invalid}")
+        trace_mtime_ns = (logFolder / TRACY_FILE_NAME).stat().st_mtime_ns
+        stale_exports = [
+            path
+            for path in log_artifacts
+            if path.name != TRACY_FILE_NAME and path.stat().st_mtime_ns < trace_mtime_ns
+        ]
+        if stale_exports:
+            raise RuntimeError(f"host-only report refuses stale profiler exports: {stale_exports}")
+        if reportFolder.is_symlink() or (reportFolder.exists() and not reportFolder.is_dir()):
+            raise RuntimeError(f"host-only report refuses a non-directory report path: {reportFolder}")
+        if reportFolder.exists() and any(reportFolder.iterdir()):
+            raise RuntimeError(f"host-only report refuses a nonempty pre-existing report directory: {reportFolder}")
+        ops, signposts, traceReplays = import_tracy_op_logs(logFolder)
+        if not ops:
+            raise RuntimeError("host-only report contains no TTNN operation records")
+        generate_reports(
+            ops,
+            {},
+            {},
+            signposts,
+            logFolder,
+            reportFolder,
+            date,
+            name_append,
+            report_mode="host_only_no_device_join",
+        )
+        manifest = {
+            "schema": "ttnn-host-only-ops-report/v1",
+            "report_mode": "host_only_no_device_join",
+            "device_data_joined": False,
+            "stale_device_artifacts_rejected": True,
+            "unexpected_profiler_artifacts_rejected": True,
+            "allowed_log_artifacts": sorted(allowed_host_log_names),
+            "operation_count": len(ops),
+            "signpost_count": len(signposts),
+        }
+        reportFolder.mkdir(parents=True, exist_ok=True)
+        (reportFolder / "host_only_report.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        return
 
+    ops, signposts, traceReplays = import_tracy_op_logs(logFolder)
     if ops and not device_only:
         deviceOps, traceOps = append_device_data(
             ops,
@@ -1967,6 +2041,12 @@ def process_ops(
 @click.option("--date", default=False, is_flag=True, help="Append date to output files")
 @click.option("--device-only", default=False, is_flag=True, help="Only generate a device data report")
 @click.option(
+    "--host-only",
+    default=False,
+    is_flag=True,
+    help="Generate a TTNN host-operation report and reject all device-profiler artifacts",
+)
+@click.option(
     "--analyze-noc-traces", is_flag=True, help="Use tt-npe to analyze profiler noc event trace files (if available)"
 )
 @click.option("-a", "--device-analysis-types", multiple=True, help="Subset of analysis types to be performed on device")
@@ -1976,7 +2056,14 @@ def process_ops(
     help="Force use of legacy device log parsing instead of cpp_device_perf_report.csv.",
 )
 def main(
-    output_folder, name_append, date, device_only, analyze_noc_traces, device_analysis_types, force_legacy_device_logs
+    output_folder,
+    name_append,
+    date,
+    device_only,
+    host_only,
+    analyze_noc_traces,
+    device_analysis_types,
+    force_legacy_device_logs,
 ):
     if output_folder:
         output_folder = Path(output_folder)
@@ -1988,6 +2075,7 @@ def main(
         analyze_noc_traces,
         device_analysis_types,
         force_legacy_device_logs=force_legacy_device_logs,
+        host_only=host_only,
     )
 
 

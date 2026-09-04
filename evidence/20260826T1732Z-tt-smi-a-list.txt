@@ -1,0 +1,24 @@
+job=tt-smi-a-list
+start_utc=2026-08-26T17:32Z
+postcheck_utc=2026-08-26T17:34:33Z
+command=env PYTHONDONTWRITEBYTECODE=1 TT_VISIBLE_DEVICES=0,1,2,3 TT_LOGGER_LEVEL=error timeout --signal=TERM --kill-after=10s 60s tt-smi --offline -ls --snapshot_no_tty
+tt_smi=6.2.0
+exit_status=0
+duration_seconds=0.205
+visibility=0,1,2,3
+visible_board_count=4
+visible_arch=Blackhole
+visible_series=p150b
+postcheck_unexpected_handles=none
+postcheck_inherited_locks=present_on_launcher_codex_and_code_mode_host
+runtime_log=/home/sjett/qwen38-flash-next-data/20260826T1732Z-tt-smi-a-list.log
+runtime_log_sha256=4e8b5383a764325e12badfe203d79c3f04d15e14a415c9830dd5bc235763ae38
+
+UMD logical order shown by the command (BDF-sorted):
+0 0000:01:00.0 /dev/tenstorrent/2 AF4F213752F4D208
+1 0000:21:00.0 /dev/tenstorrent/3 8FD48C3DF1CF1C85
+2 0000:41:00.0 /dev/tenstorrent/1 9D5052CD17DFF36F
+3 0000:61:00.0 /dev/tenstorrent/0 360E5028754A871F
+
+No partition-B BDF or device node appeared. This proves visibility and logical
+mapping only; it is not yet a passing fabric-adjacency or TTNN mesh test.

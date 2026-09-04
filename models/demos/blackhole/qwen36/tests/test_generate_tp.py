@@ -16,7 +16,9 @@ Run:
     MESH_DEVICE=P150x4 HF_MODEL=Qwen/Qwen3.6-27B \
       pytest models/demos/blackhole/qwen36/tests/test_generate_tp.py -v -s
 """
+
 import os
+import re
 
 from models.demos.blackhole.qwen36.tests.test_factory import model_path, parametrize_mesh_tp
 from models.demos.blackhole.qwen36.tt.model import Qwen36Model
@@ -38,6 +40,7 @@ def test_generate_tp_stateful(mesh_device, ensure_gc):
 
     new_ids = model.generate_tp(ids, max_new_tokens=8)
     text = tok.decode(ids + new_ids)
+    logger.info(f"generated token ids: {new_ids}")
     logger.info(f"GENERATED (bespoke generate_tp): {text!r}")
 
     assert len(set(new_ids)) > 1, f"degenerate: {new_ids}"
@@ -45,4 +48,16 @@ def test_generate_tp_stateful(mesh_device, ensure_gc):
     first = tok.decode([new_ids[0]]).strip()
     logger.info(f"first generated token: {first!r}")
     assert first == "Paris", f"expected 'Paris', got {first!r} (stateful decode continuation may be wrong)"
+
+    # Qwen3.8-27B has a recorded eager Transformers reference for this exact prompt.
+    # Keep the older Qwen3.5/3.6 checkpoint contract at its established first-token
+    # assertion because their later greedy tokens are allowed to differ.
+    names = (os.getenv("HF_MODEL", ""), str(model.args.CKPT_DIR), getattr(model.args.hf_config, "_name_or_path", ""))
+    is_qwen38 = any("qwen38" in re.sub(r"[^a-z0-9]", "", name.lower()) for name in names) or (
+        getattr(model.args.hf_config, "transformers_version", None) == "5.8.0.dev0"
+    )
+    if is_qwen38:
+        expected_ids = [11751, 13, 198, 760, 6511, 314, 9564, 369]
+        assert new_ids == expected_ids, f"Qwen3.8 greedy tokens differ from Transformers: {new_ids} != {expected_ids}"
+        assert text == "The capital of France is Paris.\nThe capital of Germany is"
     logger.info("PASSED: bespoke generate_tp produces the correct continuation")

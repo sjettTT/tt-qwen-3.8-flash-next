@@ -10,7 +10,6 @@
     defined(COMPILE_FOR_IDLE_ERISC) || defined(COMPILE_FOR_AERISC) || defined(COMPILE_FOR_DM)
 #include "risc_common.h"
 #include "internal/dataflow/dataflow_api_addrgen.h"
-#include "api/tensor/tensor_accessor.h"
 #else
 #include "ckernel.h"
 #endif
@@ -141,9 +140,11 @@ __attribute__((noinline)) void init_profiler(
     wIndex = CUSTOM_MARKERS;
     stackSize = 0;
 
-    for (int i = 0; i < SUM_COUNT; i++) {
-        sumIDs[i] = 0;
-        sums[i] = 0;
+    if constexpr (DO_SUM) {
+        for (int i = 0; i < SUM_COUNT; i++) {
+            sumIDs[i] = 0;
+            sums[i] = 0;
+        }
     }
 
 #if defined(COMPILE_FOR_IDLE_ERISC) || (defined(COMPILE_FOR_AERISC) && (COMPILE_FOR_AERISC == 0)) || \
@@ -291,14 +292,17 @@ inline __attribute__((always_inline)) bool get_profiler_zone_invalid() {
 }
 
 inline __attribute__((always_inline)) void risc_finished_profiling() {
-    for (int i = 0; i < SUM_COUNT; i++) {
-        if (sums[i] > 0) {
-            if (wIndex < PROFILER_L1_VECTOR_SIZE) {
-                profiler_data_buffer[myRiscID].data[wIndex] =
-                    PROFILER_MARKER_VALID |
-                    ((get_id(sumIDs[i], ZONE_TOTAL) & PROFILER_MARKER_TIMER_ID_MASK) << PROFILER_MARKER_TIMER_ID_SHIFT);
-                profiler_data_buffer[myRiscID].data[wIndex + 1] = sums[i];
-                wIndex += PROFILER_L1_MARKER_UINT32_SIZE;
+    if constexpr (DO_SUM) {
+        for (int i = 0; i < SUM_COUNT; i++) {
+            if (sums[i] > 0) {
+                if (wIndex < PROFILER_L1_VECTOR_SIZE) {
+                    profiler_data_buffer[myRiscID].data[wIndex] =
+                        PROFILER_MARKER_VALID |
+                        ((get_id(sumIDs[i], ZONE_TOTAL) & PROFILER_MARKER_TIMER_ID_MASK)
+                         << PROFILER_MARKER_TIMER_ID_SHIFT);
+                    profiler_data_buffer[myRiscID].data[wIndex + 1] = sums[i];
+                    wIndex += PROFILER_L1_MARKER_UINT32_SIZE;
+                }
             }
         }
     }
@@ -334,7 +338,12 @@ inline void __attribute__((always_inline)) profiler_noc_async_write_posted(
     constexpr uint8_t noc_mode = DM_DEDICATED_NOC;
 #endif
     DEBUG_SANITIZE_NOC_WRITE_TRANSACTION(noc, dst_noc_addr, src_local_l1_addr, size);
-    ncrisc_noc_fast_write_any_len<noc_mode>(
+    ncrisc_noc_fast_write_any_len<
+        noc_mode,
+        /*use_trid=*/false,
+        /*one_packet=*/
+        PROFILER_L1_BUFFER_SIZE + QUICK_PUSH_MARKER_COUNT * PROFILER_L1_MARKER_UINT32_SIZE * sizeof(uint32_t) <=
+            NOC_MAX_BURST_SIZE>(
         noc, write_cmd_buf, src_local_l1_addr, dst_noc_addr, size, NOC_UNICAST_WRITE_VC, false, false, 1, true, true);
     WAYPOINT("NAWD");
 }
@@ -397,9 +406,6 @@ __attribute__((noinline)) void finish_profiler(bool do_accumulate = DO_ACCUMULAT
             uint32_t profiler_core_count_per_dram = profiler_control_buffer[CORE_COUNT_PER_DRAM];
             bool is_dram_set = profiler_control_buffer[DRAM_PROFILER_ADDRESS] != 0;
             int dramProfilerAddressIndex = DRAM_PROFILER_ADDRESS;
-            uint32_t pageSize =
-                PROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC * MaxProcessorsPerCoreType * profiler_core_count_per_dram;
-
             // Guaranteed-marker slots are free in accumulate mode, so time the push (slots 1/2) and nested NOC flush
             // (slots 3/4) there.
             volatile tt_reg_ptr uint32_t* push_clk =
@@ -453,12 +459,12 @@ __attribute__((noinline)) void finish_profiler(bool do_accumulate = DO_ACCUMULAT
                     }
 
                     if (do_noc && is_dram_set) {
-                        const auto s = TensorAccessor(
-                            tensor_accessor::make_interleaved_dspec</*is_dram=*/true>(),
-                            profiler_control_buffer[dramProfilerAddressIndex],
-                            pageSize);
-                        uint64_t dram_bank_dst_noc_addr =
-                            s.get_noc_addr(core_flat_id / profiler_core_count_per_dram, dram_offset);
+                        // The profiler assigns each core to one DRAM bank, so the interleaved page id is always a
+                        // bank id and its page-within-bank offset is zero. Compute the same address directly without
+                        // carrying the general TensorAccessor mapping into size-constrained firmware.
+                        uint64_t dram_bank_dst_noc_addr = get_noc_addr_from_bank_id</*DRAM=*/true>(
+                            core_flat_id / profiler_core_count_per_dram,
+                            profiler_control_buffer[dramProfilerAddressIndex] + dram_offset);
                         profiler_noc_async_write_posted(
                             reinterpret_cast<uint32_t>(profiler_data_buffer[riscID].data),
                             dram_bank_dst_noc_addr,
@@ -527,9 +533,6 @@ __attribute__((noinline)) void finish_profiler(bool do_accumulate = DO_ACCUMULAT
     bool is_dram_set = profiler_control_buffer[DRAM_PROFILER_ADDRESS] != 0;
     int dramProfilerAddressIndex = DRAM_PROFILER_ADDRESS;
 
-    uint32_t pageSize =
-        PROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC * MaxProcessorsPerCoreType * profiler_core_count_per_dram;
-
     NocRegisterStateSave noc_state;
     for (uint32_t riscID = 0; riscID < PROCESSOR_COUNT; riscID++) {
         bool do_noc = true;
@@ -588,13 +591,9 @@ __attribute__((noinline)) void finish_profiler(bool do_accumulate = DO_ACCUMULAT
             }
 
             if (do_noc && is_dram_set) {
-                const auto s = TensorAccessor(
-                    tensor_accessor::make_interleaved_dspec</*is_dram=*/true>(),
-                    profiler_control_buffer[dramProfilerAddressIndex],
-                    pageSize);
-
-                uint64_t dram_bank_dst_noc_addr =
-                    s.get_noc_addr(core_flat_id / profiler_core_count_per_dram, dram_offset);
+                uint64_t dram_bank_dst_noc_addr = get_noc_addr_from_bank_id</*DRAM=*/true>(
+                    core_flat_id / profiler_core_count_per_dram,
+                    profiler_control_buffer[dramProfilerAddressIndex] + dram_offset);
 
                 profiler_noc_async_write_posted(
                     reinterpret_cast<uint32_t>(profiler_data_buffer[hostIndex].data),
@@ -659,12 +658,9 @@ __attribute__((noinline)) void quick_push() {
                            HOST_BUFFER_END_INDEX * PROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC +
                            profiler_control_buffer[HOST_BUFFER_END_INDEX] * sizeof(uint32_t);
 
-    const auto s = TensorAccessor(
-        tensor_accessor::make_interleaved_dspec</*is_dram=*/true>(),
-        profiler_control_buffer[DRAM_PROFILER_ADDRESS],
-        PROFILER_FULL_HOST_BUFFER_SIZE_PER_RISC * MaxProcessorsPerCoreType * profiler_core_count_per_dram);
-
-    uint64_t dram_bank_dst_noc_addr = s.get_noc_addr(core_flat_id / profiler_core_count_per_dram, dram_offset);
+    uint64_t dram_bank_dst_noc_addr = get_noc_addr_from_bank_id</*DRAM=*/true>(
+        core_flat_id / profiler_core_count_per_dram,
+        profiler_control_buffer[DRAM_PROFILER_ADDRESS] + dram_offset);
 
     for (uint32_t i = 0; i < (wIndex % NOC_ALIGNMENT_FACTOR); i++) {
         mark_padding();

@@ -123,7 +123,13 @@ def run_report_setup(verbose, outputFolder, binFolder, port):
 
 
 def generate_report(
-    outputFolder, binFolder, nameAppend, childCalls, collect_noc_traces=False, device_analysis_types=[]
+    outputFolder,
+    binFolder,
+    nameAppend,
+    childCalls,
+    collect_noc_traces=False,
+    device_analysis_types=[],
+    host_only=False,
 ):
     logsFolder = generate_logs_folder(outputFolder)
     tracyOutFile = logsFolder / TRACY_FILE_NAME
@@ -140,11 +146,26 @@ def generate_report(
             sys.exit(1)
         timeCount += 1
         time.sleep(1)
+    if host_only:
+        if logsFolder.is_symlink() or not logsFolder.is_dir():
+            raise RuntimeError(f"host-only report requires one regular profiler log directory: {logsFolder}")
+        artifacts = tuple(logsFolder.iterdir())
+        if (
+            len(artifacts) != 1
+            or artifacts[0].name != TRACY_FILE_NAME
+            or artifacts[0].is_symlink()
+            or not artifacts[0].is_file()
+            or artifacts[0].stat().st_size <= 0
+        ):
+            raise RuntimeError(
+                "host-only report preflight requires exactly one nonempty regular nonsymlink Tracy capture"
+            )
     csvexport_exe = resolve_tracy_tool_path(binFolder, TRACY_CSVEXPROT_TOOL)
     if csvexport_exe is None:
         logger.error(f"tracy-csvexport was not found under {binFolder}")
         sys.exit(1)
-    with open(logsFolder / TRACY_OPS_TIMES_FILE_NAME, "w") as csvFile:
+    export_mode = "x" if host_only else "w"
+    with open(logsFolder / TRACY_OPS_TIMES_FILE_NAME, export_mode) as csvFile:
         childCallStr = ""
         childCallsList = DEFAULT_CHILD_CALLS
         if childCalls:
@@ -161,7 +182,7 @@ def generate_report(
 
     logger.info(f"Host side ops time report generated at {logsFolder / TRACY_OPS_TIMES_FILE_NAME}")
 
-    with open(logsFolder / TRACY_OPS_DATA_FILE_NAME, "w") as csvFile:
+    with open(logsFolder / TRACY_OPS_DATA_FILE_NAME, export_mode) as csvFile:
         subprocess.run(
             f'{csvexport_exe} -m -s ";" {logsFolder / TRACY_FILE_NAME}',
             shell=True,
@@ -175,11 +196,12 @@ def generate_report(
     process_ops(
         outputFolder,
         nameAppend,
-        True,
+        not host_only,
         device_only=False,
         analyze_noc_traces=collect_noc_traces,
         device_analysis_types=device_analysis_types,
         force_legacy_device_logs=False,
+        host_only=host_only,
     )
 
 

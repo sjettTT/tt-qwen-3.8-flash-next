@@ -222,9 +222,11 @@ void kernel_main() {
     }
 #else
     fabric_connection.open();
-
-    auto* fabric_direction_connection =
-        direction ? &fabric_connection.get_backward_connection() : &fabric_connection.get_forward_connection();
+    tt::tt_fabric::WorkerToFabricEdmSender* fabric_direction_connection = nullptr;
+    if (direction ? fabric_connection.has_backward_connection() : fabric_connection.has_forward_connection()) {
+        fabric_direction_connection =
+            direction ? &fabric_connection.get_backward_connection() : &fabric_connection.get_forward_connection();
+    }
 #endif
     // pre-populate packet headers
     auto pkt_scatter_hdr = PacketHeaderPool::allocate_header();

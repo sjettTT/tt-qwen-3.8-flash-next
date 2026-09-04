@@ -195,6 +195,7 @@ class Qwen36Model:
         self._vis_buf = None  # [1, chunk_size, dim] bf16, image rows placed at their positions
         self._vis_mask_buf = None  # [1, chunk_size, 1] bf16, 1 at image positions else 0
         self._vis_zero_mask_host = None  # cached host zero mask for the clear (text/tail) path
+        self.mtp = None
 
     def init_vision_model(self, reference_visual=None, vision_args=None, dtype=ttnn.bfloat8_b, debug=False):
         """Build and attach the TT vision tower (DropInVisionTransformer).
@@ -532,6 +533,7 @@ class Qwen36Model:
         n_layers=None,
         layer_indices=None,
         hf_model=None,
+        enable_mtp=False,
     ):
         # HF_MODEL env var (hub or local path) is canonical; hf_model sets it for back-compat.
         if hf_model is not None:
@@ -571,6 +573,23 @@ class Qwen36Model:
         state_dict = args.load_state_dict()
 
         model = cls(device, args, state_dict, tensor_cache_path=cache_path)
+        if enable_mtp:
+            from models.demos.blackhole.qwen36.tt.mtp import Qwen36MTP
+            from models.demos.blackhole.qwen36.tt.weight_mapping import load_qwen36_mtp_state_dict
+
+            logger.info("Loading the checkpoint's dedicated MTP layer...")
+            mtp_state_dict = load_qwen36_mtp_state_dict(args.CKPT_DIR)
+            model.mtp = Qwen36MTP(model, mtp_state_dict, tensor_cache_path=cache_path)
+            # The 5120-wide eager residual is too large to coexist in L1 with
+            # the FFN RMSNorm circular buffers on one P150.  MTP requires this
+            # eager path to return raw target hidden states; keep the standard
+            # traced/preallocated decoder untouched when MTP is disabled.
+            for layer in model.layers:
+                layer.decode_residual_memory_config = ttnn.DRAM_MEMORY_CONFIG
+                if layer.is_full_attention:
+                    layer.attention.decode_memory_config = ttnn.DRAM_MEMORY_CONFIG
+                else:
+                    layer.attention.decode_state_memory_config = ttnn.DRAM_MEMORY_CONFIG
         return model
 
     def prefill_tp(self, token_ids, valid_len=None, vision_tokens=None):
@@ -779,7 +798,7 @@ class Qwen36Model:
         ttnn.deallocate(mask_tt)
         return ttnn.reshape(out, orig_shape)
 
-    def prefill(self, token_ids, vision_tokens=None):
+    def prefill(self, token_ids, vision_tokens=None, return_hidden_states=False):
         B, T = token_ids.shape
 
         # Stage the per-request RoPE (M-RoPE for multimodal, 1D for text) before any cos/sin seam.
@@ -800,11 +819,14 @@ class Qwen36Model:
         for layer in self.layers:
             x = layer.forward(x, cos=cos, sin=sin, mode="prefill")
 
-        x = self.norm(x, mode=Mode.PREFILL)
+        hidden_states = x
+        x = self.norm(hidden_states, mode=Mode.PREFILL)
 
         x_last = x[:, -1:, :]
         logits = self._lm_head(x_last)
 
+        if return_hidden_states:
+            return logits, hidden_states
         return logits
 
     def prefill_layer_chunked(self, token_ids, chunk_size=2048, page_table=None, vision_tokens=None):
@@ -901,7 +923,7 @@ class Qwen36Model:
 
         return logits
 
-    def decode(self, token_ids, current_pos):
+    def decode(self, token_ids, current_pos, return_hidden_states=False):
         B = token_ids.shape[0]
 
         token_ids_ttnn = ttnn.from_torch(token_ids, dtype=ttnn.uint32, device=self.device)
@@ -923,9 +945,13 @@ class Qwen36Model:
         )
 
         for i, layer in enumerate(self.layers):
-            x = layer.forward(x, cos=cos, sin=sin, mode="decode", position_tensor=cur_pos_tensor)
+            try:
+                x = layer.forward(x, cos=cos, sin=sin, mode="decode", position_tensor=cur_pos_tensor)
+            except RuntimeError as exc:
+                raise RuntimeError(f"Qwen eager decode failed at checkpoint layer {layer.layer_num}") from exc
 
-        x = self._final_norm_decode(x)
+        hidden_states = x
+        x = self._final_norm_decode(hidden_states)
         if self._ondev_argmax:
             # Pre-gather vocab-sharded logits; caller argmaxes shards, skips all-gather + readback.
             logits = ttnn.linear(x, self.lm_head_weight)
@@ -933,6 +959,8 @@ class Qwen36Model:
             logits = self._lm_head(x)
         ttnn.deallocate(x)
 
+        if return_hidden_states:
+            return logits, hidden_states
         return logits
 
     def _forward_decode(self, token_ids_buf, cos, sin, cur_pos_tensor, page_table, sharded_lm_head=False):

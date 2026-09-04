@@ -5,10 +5,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import csv
+import json
+import sys
 from pathlib import Path
 
 import pytest
 
+import tracy
+from tracy import __main__ as tracy_cli
 from tracy import process_ops_logs
 
 
@@ -200,3 +204,160 @@ def test_generate_reports_writes_multicast_noc_util_column(tmp_path):
         row = next(reader)
         assert "MULTICAST NOC UTIL (%)" in reader.fieldnames
         assert row["MULTICAST NOC UTIL (%)"] == "25.0"
+
+
+def _host_only_log_directory(tmp_path):
+    log_folder = tmp_path / ".logs"
+    log_folder.mkdir()
+    for name in (
+        process_ops_logs.TRACY_FILE_NAME,
+        process_ops_logs.TRACY_OPS_TIMES_FILE_NAME,
+        process_ops_logs.TRACY_OPS_DATA_FILE_NAME,
+    ):
+        (log_folder / name).write_text(f"fresh {name}\n")
+    return log_folder
+
+
+def _host_only_op():
+    return {
+        7: {
+            "op_code": "ttnn::multiply",
+            "op_type": "tt_dnn_device",
+            "global_call_count": 7,
+            "device_id": 0,
+            "host_time": {"ns_since_start": 100, "exec_time_ns": 25},
+            "metal_trace_id": None,
+            "input_tensors": [],
+            "output_tensors": [],
+            "op_hash": 1234,
+            "program_cache_hit": True,
+        }
+    }
+
+
+def test_process_ops_host_only_emits_flat_labeled_report_without_device_join(monkeypatch, tmp_path):
+    _host_only_log_directory(tmp_path)
+    monkeypatch.setattr(
+        process_ops_logs,
+        "import_tracy_op_logs",
+        lambda _log_folder: (_host_only_op(), {}, {}),
+    )
+
+    process_ops_logs.process_ops(tmp_path, None, False, host_only=True)
+
+    report_folder = tmp_path / "reports"
+    assert sorted(path.name for path in report_folder.iterdir()) == [
+        "host_only_report.json",
+        "ops_perf_results.csv",
+        process_ops_logs.TRACY_FILE_NAME,
+    ]
+    with (report_folder / "ops_perf_results.csv").open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        row = next(reader)
+        assert row["REPORT MODE"] == "host_only_no_device_join"
+        assert row["DEVICE ID"] == "0"
+        for field in reader.fieldnames:
+            if field.startswith("DEVICE ") and field not in {"DEVICE ID", "DEVICE ARCH"}:
+                assert row[field] == ""
+        assert row["OP TO OP LATENCY [ns]"] == ""
+    manifest = json.loads((report_folder / "host_only_report.json").read_text())
+    assert manifest == {
+        "schema": "ttnn-host-only-ops-report/v1",
+        "report_mode": "host_only_no_device_join",
+        "device_data_joined": False,
+        "stale_device_artifacts_rejected": True,
+        "unexpected_profiler_artifacts_rejected": True,
+        "allowed_log_artifacts": sorted(
+            {
+                process_ops_logs.TRACY_FILE_NAME,
+                process_ops_logs.TRACY_OPS_TIMES_FILE_NAME,
+                process_ops_logs.TRACY_OPS_DATA_FILE_NAME,
+            }
+        ),
+        "operation_count": 1,
+        "signpost_count": 0,
+    }
+
+
+@pytest.mark.parametrize("unexpected_name", ["profile_log_device.csv", "cpp_device_perf_report.csv", "other.log"])
+def test_process_ops_host_only_rejects_every_unexpected_log_artifact(monkeypatch, tmp_path, unexpected_name):
+    log_folder = _host_only_log_directory(tmp_path)
+    (log_folder / unexpected_name).write_text("stale device or unrelated data\n")
+    monkeypatch.setattr(
+        process_ops_logs,
+        "import_tracy_op_logs",
+        lambda _log_folder: (_host_only_op(), {}, {}),
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected profiler artifacts"):
+        process_ops_logs.process_ops(tmp_path, None, False, host_only=True)
+
+
+def test_process_ops_host_only_rejects_nonempty_report_directory(monkeypatch, tmp_path):
+    _host_only_log_directory(tmp_path)
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "stale.csv").write_text("stale\n")
+    monkeypatch.setattr(
+        process_ops_logs,
+        "import_tracy_op_logs",
+        lambda _log_folder: (_host_only_op(), {}, {}),
+    )
+
+    with pytest.raises(RuntimeError, match="nonempty pre-existing report"):
+        process_ops_logs.process_ops(tmp_path, None, False, host_only=True)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"device_only": True},
+        {"analyze_noc_traces": True},
+        {"device_analysis_types": ("device_kernel_duration",)},
+        {"force_legacy_device_logs": True},
+    ],
+)
+def test_process_ops_host_only_rejects_device_and_noc_modes(tmp_path, kwargs):
+    with pytest.raises(ValueError, match="host-only"):
+        process_ops_logs.process_ops(tmp_path, None, False, host_only=True, **kwargs)
+
+
+@pytest.mark.parametrize(("name_append", "date"), [("named", False), (None, True)])
+def test_process_ops_host_only_rejects_nonflat_output_layout(tmp_path, name_append, date):
+    with pytest.raises(ValueError, match="flat undated unnamed"):
+        process_ops_logs.process_ops(tmp_path, name_append, date, host_only=True)
+
+
+def test_generate_report_host_only_refuses_preexisting_export_symlink(tmp_path):
+    log_folder = tmp_path / ".logs"
+    log_folder.mkdir()
+    (log_folder / process_ops_logs.TRACY_FILE_NAME).write_text("fresh trace\n")
+    stale = tmp_path / "stale.csv"
+    stale.write_text("stale\n")
+    (log_folder / process_ops_logs.TRACY_OPS_TIMES_FILE_NAME).symlink_to(stale)
+
+    with pytest.raises(RuntimeError, match="exactly one nonempty regular nonsymlink Tracy capture"):
+        tracy.generate_report(tmp_path, tmp_path / "bin", None, None, host_only=True)
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        "--collect-noc-traces",
+        "--profile-dispatch-cores",
+        "--dump-device-data-mid-run",
+        "--disable-device-data-dump-to-files",
+    ],
+)
+def test_process_logs_only_host_only_rejects_capture_conflicts_before_generate_report(
+    monkeypatch, conflict
+):
+    generated = []
+    monkeypatch.setattr(sys, "argv", ["python", "--process-logs-only", "--no-device", conflict])
+    monkeypatch.setattr(tracy_cli, "generate_report", lambda *_args, **_kwargs: generated.append(True))
+
+    with pytest.raises(SystemExit) as raised:
+        tracy_cli.main()
+
+    assert raised.value.code == 2
+    assert generated == []

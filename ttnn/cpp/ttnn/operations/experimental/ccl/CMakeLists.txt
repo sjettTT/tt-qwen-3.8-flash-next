@@ -45,6 +45,8 @@ file(
     strided_reduce_scatter_async/device/kernels/*.hpp
     deepseek_moe_reduce_scatter/device/kernels/*.cpp
     deepseek_b1_reduce_to_one/device/kernels/*.cpp
+    moe_gpt/device/kernels/swiglu_sfpu.h
+    moe_compute/device/hostdevcommon/*.hpp
     moe_compute/device/kernels/*.cpp
     moe_compute/device/kernels/*.h
     moe/selective_reduce_combine/device/kernels/*.cpp

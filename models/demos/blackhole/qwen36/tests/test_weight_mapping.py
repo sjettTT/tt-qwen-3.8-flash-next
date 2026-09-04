@@ -7,7 +7,11 @@ import torch
 
 from models.demos.blackhole.qwen36.tt.model_config import Qwen36ModelArgs
 from models.demos.blackhole.qwen36.tt.tp_common import replicate_kv_weight
-from models.demos.blackhole.qwen36.tt.weight_mapping import remap_qwen36_state_dict
+from models.demos.blackhole.qwen36.tt.weight_mapping import (
+    MTP_REQUIRED_KEYS,
+    remap_qwen36_mtp_layer_state_dict,
+    remap_qwen36_state_dict,
+)
 
 HIDDEN_SIZE = 4096
 NUM_LAYERS = 32
@@ -54,6 +58,25 @@ class TestPrefixStripping:
     def test_no_mtp_keys(self, remapped):
         for key in remapped:
             assert "mtp" not in key.split(".")[0], f"MTP key not filtered: {key}"
+
+
+def test_mtp_layer_remap_uses_dedicated_weights():
+    mtp_state = {key: torch.empty(1) for key in MTP_REQUIRED_KEYS}
+    remapped = remap_qwen36_mtp_layer_state_dict(mtp_state, layer_idx=3)
+
+    assert set(remapped) == {
+        "layers.3.input_layernorm.weight",
+        "layers.3.mlp.down_proj.weight",
+        "layers.3.mlp.gate_proj.weight",
+        "layers.3.mlp.up_proj.weight",
+        "layers.3.post_attention_layernorm.weight",
+        "layers.3.self_attn.k_norm.weight",
+        "layers.3.self_attn.k_proj.weight",
+        "layers.3.self_attn.o_proj.weight",
+        "layers.3.self_attn.q_norm.weight",
+        "layers.3.self_attn.q_proj.weight",
+        "layers.3.self_attn.v_proj.weight",
+    }
 
 
 class TestTopLevelWeights:

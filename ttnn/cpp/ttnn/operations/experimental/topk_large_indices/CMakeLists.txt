@@ -17,6 +17,15 @@ set_target_properties(
             api
 )
 
+# These sources are compiled at runtime by Metalium and must be present in the
+# runtime package. Globbing non-build files is acceptable because developers do
+# not generate packages from an incrementally modified kernel tree.
+file(
+    GLOB_RECURSE kernels
+    device/kernels/*.cpp
+    device/kernels/*.hpp
+)
+
 target_sources(
     ttnn_op_experimental_topk_large_indices
     PUBLIC
@@ -24,11 +33,24 @@ target_sources(
         TYPE HEADERS
         BASE_DIRS ${FixmeOpAPIDir}
         FILES ${TTNN_OP_EXPERIMENTAL_TOPK_LARGE_INDICES_API_HEADERS}
+        FILE_SET kernels
+        TYPE HEADERS
+        BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
+        FILES ${kernels}
     PRIVATE
         ${TTNN_OP_EXPERIMENTAL_TOPK_LARGE_INDICES_SRCS}
 )
 
 target_link_libraries(ttnn_op_experimental_topk_large_indices PRIVATE TT::Metalium PUBLIC TTNN::Core)
+
+install(
+    TARGETS
+        ttnn_op_experimental_topk_large_indices
+    FILE_SET
+    kernels
+        DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/tt-metalium/ttnn/cpp/ttnn/operations/experimental/topk_large_indices
+        COMPONENT ttnn-runtime
+)
 
 install(TARGETS ttnn_op_experimental_topk_large_indices FILE_SET api COMPONENT ttnn-dev LIBRARY COMPONENT tar)
 

@@ -59,6 +59,7 @@ set(HW_JIT_API_HEADERS
     inc/api/compute/eltwise_unary/cbrt.h
     inc/api/compute/eltwise_unary/clamp.h
     inc/api/compute/eltwise_unary/comp.h
+    inc/api/compute/eltwise_unary/digamma.h
     inc/api/compute/eltwise_unary/dropout.h
     inc/api/compute/eltwise_unary/eltwise_unary.h
     inc/api/compute/eltwise_unary/elu.h
@@ -74,9 +75,14 @@ set(HW_JIT_API_HEADERS
     inc/api/compute/eltwise_unary/i1.h
     inc/api/compute/eltwise_unary/identity.h
     inc/api/compute/eltwise_unary/isinf_isnan.h
+    inc/api/compute/eltwise_unary/lerp.h
+    inc/api/compute/eltwise_unary/lgamma.h
     inc/api/compute/eltwise_unary/log1p.h
     inc/api/compute/eltwise_unary/logical_not.h
+    inc/api/compute/eltwise_unary/mac.h
+    inc/api/compute/eltwise_unary/mish.h
     inc/api/compute/eltwise_unary/negative.h
+    inc/api/compute/eltwise_unary/polygamma.h
     inc/api/compute/eltwise_unary/prelu.h
     inc/api/compute/eltwise_unary/rand.h
     inc/api/compute/eltwise_unary/rdiv.h
@@ -92,14 +98,17 @@ set(HW_JIT_API_HEADERS
     inc/api/compute/eltwise_unary/sfpu_int_sum.h
     inc/api/compute/eltwise_unary/sfpu_split_includes.h
     inc/api/compute/eltwise_unary/shift.h
+    inc/api/compute/eltwise_unary/snake_beta.h
     inc/api/compute/eltwise_unary/softcap.h
     inc/api/compute/eltwise_unary/softplus.h
     inc/api/compute/eltwise_unary/sqrt.h
     inc/api/compute/eltwise_unary/tanh_derivative.h
+    inc/api/compute/eltwise_unary/tanhshrink.h
     inc/api/compute/eltwise_unary/threshold.h
     inc/api/compute/eltwise_unary/trigonometry.h
     inc/api/compute/eltwise_unary/typecast.h
     inc/api/compute/eltwise_unary/where.h
+    inc/api/compute/eltwise_unary/xielu.h
     inc/api/compute/ema.h
     inc/api/compute/experimental/add_rsqrt.h
     inc/api/compute/experimental/compressed_custom_mm.h
@@ -108,15 +117,19 @@ set(HW_JIT_API_HEADERS
     inc/api/compute/experimental/custom_mm_reuse_dest_srcb.h
     inc/api/compute/experimental/eltwise_mul_scalar.h
     inc/api/compute/experimental/fast_untilize.h
+    inc/api/compute/experimental/indexer_mul_custom.h
+    inc/api/compute/experimental/matmul_custom.h
     inc/api/compute/experimental/mul_reduce_scalar.h
     inc/api/compute/experimental/rmsnorm.h
     inc/api/compute/experimental/rope_sfpu.h
     inc/api/compute/experimental/sdpa.h
     inc/api/compute/experimental/sdpa_custom_mm.h
     inc/api/compute/experimental/sdpa_custom_mm_reuse_dest_srcb.h
+    inc/api/compute/experimental/sdpa_sub_custom.h
     inc/api/compute/experimental/semaphore.h
     inc/api/compute/experimental/sinkhorn.h
     inc/api/compute/experimental/sum_reduce_scalar.h
+    inc/api/compute/experimental/topk_xl.h
     inc/api/compute/binary_fmod.h
     inc/api/compute/gcd.h
     inc/api/compute/isclose.h

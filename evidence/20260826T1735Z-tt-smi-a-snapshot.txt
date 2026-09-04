@@ -1,0 +1,42 @@
+job=tt-smi-a-snapshot
+snapshot_utc=2026-08-26T17:35:07Z
+postcheck_utc=2026-08-26T17:35:23Z
+command=env COLUMNS=240 PYTHONDONTWRITEBYTECODE=1 TT_VISIBLE_DEVICES=0,1,2,3 TT_LOGGER_LEVEL=error timeout --signal=TERM --kill-after=10s 60s tt-smi --offline -s --snapshot_no_tty
+exit_status=0
+duration_seconds=0.192
+visible_board_count=4
+json_length_assertion=true
+tt_smi=6.2.0
+tt_umd=0.9.8
+pyluwen=0.8.5
+kmd=2.7.0
+runtime_log=/home/sjett/qwen38-flash-next-data/20260826T1735Z-tt-smi-a-snapshot.json
+runtime_log_sha256=ae62f892f638799e9fd1160a9490fd0a825990e82b90f988bc44a82074477535
+postcheck_unexpected_handles=none
+
+All four cards:
+board_type=p150b
+dram_status=true
+dram_speed=16G
+pcie_speed=Gen5
+pcie_width=16
+gddr_uncorrectable_errors=0
+fw_bundle=19.8.1.0
+eth_fw=1.10.1
+cm_fw=0.30.1.0
+dm_app_fw=0.24.1.0
+gddr_fw=2.15
+enabled_eth_raw=0x3edf
+eth_live_status_raw=0x0
+
+Per logical device in UMD order:
+logical=0 node=2 bdf=0000:01:00.0 asic_id=AF4F213752F4D208 temp_c=49.6 max_gddr_temp_raw=0x34
+logical=1 node=3 bdf=0000:21:00.0 asic_id=8FD48C3DF1CF1C85 temp_c=52.1 max_gddr_temp_raw=0x38
+logical=2 node=1 bdf=0000:41:00.0 asic_id=9D5052CD17DFF36F temp_c=49.4 max_gddr_temp_raw=0x38
+logical=3 node=0 bdf=0000:61:00.0 asic_id=360E5028754A871F temp_c=49.1 max_gddr_temp_raw=0x36
+
+The snapshot process list identifies the expected root telemetry service on all
+eight nodes and the task-owned TT-SMI process on A only. Because
+ETH_LIVE_STATUS is zero, this result does not qualify partition A for collectives
+or A+B concurrency; a bounded current-revision physical descriptor/fabric test
+is still required.

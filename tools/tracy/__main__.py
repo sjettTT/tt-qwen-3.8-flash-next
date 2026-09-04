@@ -188,6 +188,32 @@ def main():
     originalArgs = sys.argv.copy()
 
     (options, args) = parser.parse_args()
+    if options.processLogsOnly and not options.device:
+        conflicts = []
+        if options.name_append:
+            conflicts.append("--name-append")
+        if options.collect_noc_traces:
+            conflicts.append("--collect-noc-traces")
+        if options.device_analysis_types:
+            conflicts.append("--device-analysis-types")
+        for active, name in (
+            (options.profile_dispatch_cores, "--profile-dispatch-cores"),
+            (options.do_sum, "--enable-sum-profiling"),
+            (options.do_accumulate, "--enable-accumulate-profiling"),
+            (options.sync_host_device, "--sync-host-device"),
+            (options.device_trace_profiler, "--device-trace-profiler"),
+            (options.device_memory_profiler, "--device-memory-profiler"),
+            (options.mid_run_device_data, "--dump-device-data-mid-run"),
+            (options.disable_device_data_dump_to_files, "--disable-device-data-dump-to-files"),
+            (options.disable_device_data_push_to_tracy, "--disable-device-data-push-to-tracy"),
+            (options.perf_counter_groups, "--profiler-capture-perf-counters"),
+        ):
+            if active:
+                conflicts.append(name)
+        if conflicts:
+            parser.error(
+                "--process-logs-only --no-device rejects capture/device options: " + ", ".join(conflicts)
+            )
     sys.argv[:] = args
 
     # Accumulate mode stores no per-op IDs, so an ops report is meaningless: disallow -r with --enable-accumulate-profiling.
@@ -214,7 +240,15 @@ def main():
             sys.exit(1)
 
     if options.processLogsOnly:
-        generate_report(outputFolder, binaryFolder, "", None, options.collect_noc_traces)
+        generate_report(
+            outputFolder,
+            binaryFolder,
+            "",
+            None,
+            options.collect_noc_traces,
+            options.device_analysis_types,
+            host_only=not options.device,
+        )
         sys.exit(0)
 
     if options.port:
@@ -491,6 +525,7 @@ def main():
                         options.child_functions,
                         options.collect_noc_traces,
                         options.device_analysis_types,
+                        host_only=not options.device,
                     )
             except subprocess.TimeoutExpired as e:
                 captureProcess.terminate()

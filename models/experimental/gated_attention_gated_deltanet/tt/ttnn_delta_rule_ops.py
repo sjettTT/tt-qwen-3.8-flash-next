@@ -390,24 +390,35 @@ def recurrent_gated_delta_rule_decode_ttnn(
     initial_state=None,
     device=None,
     high_precision=False,
+    normalize_qk_in_input_dtype=False,
 ):
-    """T=1 decode path: no loop/slice overhead. Returns o [B,1,H,V], state [B,H,K,V]."""
+    """T=1 decode path: no loop/slice overhead. Returns o [B,1,H,V], state [B,H,K,V].
+
+    ``normalize_qk_in_input_dtype`` preserves models whose reference normalizes
+    BF16 Q/K before promoting the recurrent step to FP32.  The default retains
+    the legacy order: promote first, then normalize.
+    """
     B = q.shape[0]
     H = q.shape[2]
     K = q.shape[3]
     V = v.shape[3]
+
+    if normalize_qk_in_input_dtype:
+        q = l2_norm_ttnn(q, dim=-1)
+        k = l2_norm_ttnn(k, dim=-1)
 
     # high_precision: fp32 step avoids bf16 decay quantization error over long decode.
     if high_precision:
         q = ttnn.typecast(q, ttnn.float32)
         k = ttnn.typecast(k, ttnn.float32)
         v = ttnn.typecast(v, ttnn.float32)
-        beta = ttnn.typecast(beta, ttnn.float32)
+        if beta.dtype != ttnn.float32:
+            beta = ttnn.typecast(beta, ttnn.float32)
         g = ttnn.typecast(g, ttnn.float32)
 
-    # L2 norm
-    q = l2_norm_ttnn(q, dim=-1)
-    k = l2_norm_ttnn(k, dim=-1)
+    if not normalize_qk_in_input_dtype:
+        q = l2_norm_ttnn(q, dim=-1)
+        k = l2_norm_ttnn(k, dim=-1)
 
     if scale is None:
         scale = K**-0.5

@@ -22,6 +22,21 @@ struct SelectiveReduceCombineWorkerLayout {
     uint32_t num_worker_cores = 0;
 };
 
+struct FusedSourceBufferLayout {
+    uint32_t rows_per_buffer = 0;
+    uint32_t buffer_block_size_bytes = 0;
+    uint32_t circular_buffer_size_bytes = 0;
+};
+
+// The fused MoE producer and combine consumer alias the same height-sharded
+// L1 tensor as a two-entry circular buffer. Derive both sides' buffer stride
+// from the physical shard height so double buffering is counted exactly once.
+FusedSourceBufferLayout compute_fused_source_buffer_layout(
+    uint32_t source_shard_height,
+    uint32_t source_buffer_size_bytes,
+    uint32_t token_segment_size_bytes,
+    uint32_t num_buffers);
+
 SelectiveReduceCombineWorkerLayout compute_worker_layout(
     const Tensor& input_tensor,
     uint32_t hidden_size,

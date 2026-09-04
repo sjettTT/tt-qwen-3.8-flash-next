@@ -1,0 +1,45 @@
+first_sample_utc=2026-08-26T17:29:01Z
+second_sample_utc=2026-08-26T17:29:53Z
+host=f07cs02
+kmd=2.7.0
+kmd_srcversion=6F5DF618C14D0C708A55788
+telemetry_service_pid=843856
+unexpected_device_handles_first_sample=none
+unexpected_device_handles_second_sample=none
+python_or_tt_workloads_first_sample=none
+python_or_tt_workloads_second_sample=none
+
+inherited_lock_holders:
+3875276 fd 200 -> /run/lock/tt-device-node-0.lock
+3875276 fd 201 -> /run/lock/tt-device-node-1.lock
+3875276 fd 202 -> /run/lock/tt-device-node-2.lock
+3875276 fd 203 -> /run/lock/tt-device-node-3.lock
+3875356 fd 200 -> /run/lock/tt-device-node-0.lock
+3875356 fd 201 -> /run/lock/tt-device-node-1.lock
+3875356 fd 202 -> /run/lock/tt-device-node-2.lock
+3875356 fd 203 -> /run/lock/tt-device-node-3.lock
+3875837 fd 200 -> /run/lock/tt-device-node-0.lock
+3875837 fd 201 -> /run/lock/tt-device-node-1.lock
+3875837 fd 202 -> /run/lock/tt-device-node-2.lock
+3875837 fd 203 -> /run/lock/tt-device-node-3.lock
+
+node_bdf_numa_iommu_link_board:
+0 0000:61:00.0 0 10 Gen5x16 360E5028754A871F leased_A
+1 0000:41:00.0 0 21 Gen5x16 9D5052CD17DFF36F leased_A
+2 0000:01:00.0 0 34 Gen5x16 AF4F213752F4D208 leased_A
+3 0000:21:00.0 0 49 Gen5x16 8FD48C3DF1CF1C85 leased_A
+4 0000:e1:00.0 1 60 Gen5x16 4E3FC21149A3FEF0 unleased_B_idle
+5 0000:c1:00.0 1 70 Gen5x16 B411631997534A40 unleased_B_idle
+6 0000:81:00.0 1 81 Gen5x16 BB82CB05ED639CCF unleased_B_idle
+7 0000:a1:00.0 1 90 Gen5x16 670987CC04D2A001 unleased_B_idle
+
+ownership_commands:
+fuser -v /dev/tenstorrent/{0,1,2,3,4,5,6,7}
+lsof /dev/tenstorrent/{0,1,2,3,4,5,6,7}
+ps -eo user,pid,ppid,stat,lstart,args
+readlink /proc/{launcher,codex,code-mode-host}/fd/{200,201,202,203}
+
+allocator_discovery:
+No host device broker, allocator service, or lease executable was found.
+The launcher-provided per-node flock lease is the only observed task-scoped
+host mechanism. Partition B was not locked or opened.

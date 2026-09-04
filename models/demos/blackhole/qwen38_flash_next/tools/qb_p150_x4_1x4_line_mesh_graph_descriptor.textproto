@@ -1,0 +1,13 @@
+# QuietBox 4x p150b: one 1x4 LINE mesh (three of the four ring links), the
+# logical shape the campaign's Linear collectives assume (lab boxes auto-discover
+# a 4x1 line; the QuietBox auto-discovers a 2x2 from its ring).  Set through
+# TT_MESH_GRAPH_DESC_PATH by run_qb_mesh_smoke.sh --mesh-graph-desc.
+mesh_descriptors {
+  name: "M0"
+  arch: BLACKHOLE
+  device_topology { dims: [ 1, 4 ] dim_types: [ LINE, LINE ] }
+  host_topology   { dims: [ 1, 1 ] }
+  channels { count: 4 policy: RELAXED }
+}
+
+top_level_instance { mesh { mesh_descriptor: "M0" mesh_id: 0 } }
