@@ -12,7 +12,8 @@ thinking and tool calls in the Qwen chat template.
 
 Every number below was measured on 4x p150.
 
-### IMPORTANT NOTE: This was implemented with the intention of the n-gram model residing in system memory. I have not tested performance with disk. Please make sure you have room to fit the 51.2B parameters (they take up >100GB at BF16).
+#### IMPORTANT NOTE: 
+This was implemented with the intention of the n-gram model residing in system memory. I have not tested performance with disk. If you are not using a QB, please make sure you have room to fit the 51.2B parameters (they take up >100GB at BF16).
 
 ## Performance (4x p150, measured 2026-09-04)
 
