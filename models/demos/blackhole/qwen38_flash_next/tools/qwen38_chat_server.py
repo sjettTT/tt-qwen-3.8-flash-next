@@ -12,10 +12,10 @@ request without ``temperature`` takes the model card's profile for its thinking
 mode; ``temperature 0`` or ``greedy`` is the bitwise greedy loop.  Without
 ``--sampling`` (the default, ``--no-sampling`` the explicit form) TAIL captures
 no candidate row, the loop is the greedy one at its measured period and explicit
-sampling fields are refused.  Runs only under a lane launcher (a lab partition:
-its six locks; the QuietBox: its one lock) that holds the profile's locks and
-sets the sealed-runtime environment; the server proves both before the mesh
-opens, replays the CPU acceptance records after the captures
+sampling fields are refused.  Runs under a launcher (``run_qwen38_chat_server.sh``)
+that selects the hardware profile and sets the runtime environment; the server
+checks the profile's locks (if it requires any) and the runtime identity before
+the mesh opens, replays the CPU acceptance records after the captures
 (``--sampling-discriminator`` then runs the sampling chain arms and stops),
 writes READY, serves until SIGTERM, then releases the chain and the mesh in the
 timing runner's order.  ``--host`` is loopback unless the profile serves the
@@ -896,7 +896,8 @@ PATH_ARGUMENTS = (
     "phase-log",
 ) + runtime_admission.PATH_ARGUMENTS
 TEXT_ARGUMENTS = ("tt-metal-sha", "source-head", "source-tree") + runtime_admission.TEXT_ARGUMENTS
-# The archive seal (the rest of the runtime arguments) is the lab launchers'; a checkout build passes the extension only.
+# The rest of the runtime arguments (the archive seal) belong to pinned-archive launchers; a checkout build passes the
+# extension only.
 REQUIRED_ARGUMENTS = frozenset(PATH_ARGUMENTS[:5] + TEXT_ARGUMENTS[:3] + ("runtime-extension", "runtime-sha256"))
 
 
@@ -909,7 +910,7 @@ def _parser() -> argparse.ArgumentParser:
     runtime_admission.add_seal_arguments(parser)
     parser.add_argument("--evidence", type=Path, default=None, help="run directory (READY, STOPPED, ledgers)")
     parser.add_argument("--host", default="127.0.0.1", help="loopback unless the profile serves the LAN or --allow-lan")
-    parser.add_argument("--allow-lan", action="store_true", help="accept a non-loopback --host on a lab profile")
+    parser.add_argument("--allow-lan", action="store_true", help="accept a non-loopback --host on a profile that does not serve the LAN")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--acceptance-prompts", type=Path, default=None, help="the CPU study's prompt-*-greedy.json")
     parser.add_argument("--require-json-96", action="store_true", help="refuse to serve unless json matches 96/96")
@@ -936,7 +937,7 @@ def _parser() -> argparse.ArgumentParser:
         "--hardware-profile",
         choices=tuple(hardware_profiles.hardware_profile_table()),
         default=None,
-        help="the lane: <host> is the host's partition B (the default), <host>-a its partition A",
+        help="the mesh to open (default: this host's profile, selected by TT_VISIBLE_DEVICES)",
     )
     parser.add_argument("--validate-only", action="store_true", help="provenance and CPU preparation, no mesh")
     parser.add_argument(

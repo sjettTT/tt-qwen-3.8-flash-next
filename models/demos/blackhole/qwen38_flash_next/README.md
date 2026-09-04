@@ -84,7 +84,7 @@ against the CPU records, then the server listens.  The run directory (`<cache-ro
 
 Options: `--allocated-context 32768|65536|131072|262144` selects the resident build (KV caches, RoPE tables and the
 context limit; the limit is the context minus 64 for the consumed EOS step), `--port`, `--host` (the QuietBox
-profiles serve the LAN; a lab profile needs `--allow-lan`), `--acceptance-prompts DIR --require-json-96` to refuse
+profiles serve the LAN; other profiles need `--allow-lan`), `--acceptance-prompts DIR --require-json-96` to refuse
 serving unless the startup replay matches the CPU records, `--serve-seconds N` to stop after N seconds,
 `--validate-only` to run the checks and the CPU preparation without opening the mesh.
 
@@ -96,11 +96,11 @@ ethernet ring opened as one 1x4 line), the device set, the cache and log roots, 
 ### Runtime admission (pending)
 
 The server's startup admission (`tools/runtime_admission.py`, `tools/live_decode_diagnostic.py`, `diagnostic_bf4.py`)
-still checks the runtime against the identities of the campaign's pinned build and binds the BF4 expert corpus by
+still checks the runtime against the identities of the build this port was developed on and binds the BF4 expert corpus by
 the paths it was produced under.  Until that admission is rewritten to accept a runtime built from a tt-metal
 checkout and a corpus produced by `tools/stage_full_bf4_cpu.py` on the same machine, a checkout build is refused at
-`prepare_live_decode_diagnostic` with the differing identity printed.  `tools/release/manifest.json` lists these three
-files as pending; everything else in the public tree is free of the campaign's hosts, paths and seals.
+`prepare_live_decode_diagnostic` with the differing identity printed.  The export manifest lists these three files as
+pending; everything else in the public tree is free of internal hosts, paths and seals.
 
 ## 4. Talk to it
 
@@ -132,10 +132,10 @@ The command-line client:
   through the chunk trace at about 3.2-3.5 ms per token (a 40k prompt: 125 s to the first token; 200k: 671 s), decode
   stays at 17-19 tokens/s to 256k.  Each context has its own cache set under `--cache-root`; 256k leaves about
   750 MB per device free.
-- MTP drafting (`--mtp 3|4`, 31-37 tokens/s on the lab mesh) lives on the `q38-serve-mtp` branch and is merged into
+- MTP drafting (`--mtp 3|4`, 31-37 tokens/s on 4x p150) lives on the `q38-serve-mtp` branch and is merged into
   this server separately; `--mtp` on a server without the path is refused by the launcher.
 
-## 6. QuietBox 2 and p300 hosts (untested)
+## 6. QuietBox 2 (untested)
 
 A p300 card is two Blackhole dies joined on the card; a QuietBox 2 (2x p300c) has four dies in one ring (the two
 on-card links and the two Warp400 links), so it is one 1x4 instance:
@@ -146,9 +146,7 @@ The profile exports `tools/qb2_p300_1x4_line_mesh_graph_descriptor.textproto` (a
 links, two channels per link as in tt-metal's `p300_x2` descriptor); tt-metal classifies a p300 cluster that is not
 exactly two or four dies as CUSTOM and refuses to open without a descriptor, so the launcher always exports one.  The
 route is unpinned: the first start derives the ring-walk order from the cluster descriptor, prints it and stops; pin
-it in `tools/hardware_profiles.py` (`route`, `route_nodes`) and start again.  On a host with four p300 cards (eight
-dies, the `p150_x8` [2,4] mesh) `--instance 0` uses nodes 0-3 and `--instance 1` nodes 4-7, each with its own caches
-and run directory; the two servers need different ports.  Nothing here has run on p300 hardware.
+it in `tools/hardware_profiles.py` (`route`, `route_nodes`) and start again.  Nothing here has run on p300 hardware.
 
 ## 7. Layout
 
@@ -164,19 +162,8 @@ and run directory; the two servers need different ports.  Nothing here has run o
                                                    the BF4 expert corpus (produce, verify, bind, probe)
     tools/prewarm_ple_table.py verify_checkpoint_files.py checkpoint_budget.py safetensors_metadata.py
     tools/qb_mesh_smoke.py                         open the mesh and check the route without the model
-    tools/release/                                 the public-tree manifest and exporter (section 8)
     tests/                                         no-device tests (set QWEN38_CHECKPOINT for the checkpoint-reading ones)
-    tools/dev/ tests/dev/                          the lab tooling: launchers, micro-tests, discriminators, profilers, gates
 
 Run the tests from the repository root with a python that imports `ttnn`:
 
     QWEN38_CHECKPOINT=/data/Qwen3.8-Flash-Next python -m pytest models/demos/blackhole/qwen38_flash_next/tests
-
-## 8. The public tree
-
-`tools/release/manifest.json` lists every public file, the three pending files and the forbidden token patterns
-(lab host names, user paths, lab addresses, staging roots, device locks, runtime seals, board identities).
-`tools/release/export_public_tree.py --check` scans the tree; `--out DIR` copies the public files; `--git-tree`
-writes a git tree object of the repository with only the public files under this directory (no branch); `--with-dev`
-adds `tools/dev` and `tests/dev`.  A forbidden token in a public file fails the export with every hit listed; nothing
-is rewritten.  `tests/test_release_export_static.py` runs the scan.

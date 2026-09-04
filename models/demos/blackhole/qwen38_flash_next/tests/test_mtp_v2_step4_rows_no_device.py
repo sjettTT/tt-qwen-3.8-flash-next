@@ -1076,7 +1076,7 @@ def test_fake_view_is_the_device_tile_order_and_folds_head_major_rows_for_free()
     expected = head_major.permute(0, 2, 1, 3).reshape(1, 1, 32, HEADS * HEAD_DIM)
     assert _bits_equal(viewed.torch_shards()[0], expected)
     assert not torch.equal(viewed.torch_shards()[0].float(), head_major.reshape(1, 1, 32, -1).float())
-    # The GR shapes the campaign already runs through the view on device, and a plain row-count view.
+    # The GR shapes the model already runs through the view on device, and a plain row-count view.
     branch_major = torch.randn(1, 4, 1, 640).to(torch.bfloat16)
     assert torch.equal(
         _view(FakeTensor([branch_major] * TP, BF16), (1, 1, 1, 2560)).torch_shards()[0],
@@ -1341,7 +1341,7 @@ def test_layer_rows_entry_points_are_thin_and_typed() -> None:
 # --------------------------------------------------------------------------- prefill chunk: R = 32
 # The chunk step of the C = 32 prefill is forward_rows at the full tile plus commit_rows with every row
 # accepted (a = 31; a = r - 1 for the padded last chunk).  These pins hold the same properties as the
-# R = 5 tests above at the chunk's row count, under the campaign tolerance model (output <= 2e-4 + 4 bf16
+# R = 5 tests above at the chunk's row count, under the tolerance model (output <= 2e-4 + 4 bf16
 # ulp of the output scale, state <= 3e-3 + 2^-7 of the state scale).
 
 CHUNK_ROWS = 32

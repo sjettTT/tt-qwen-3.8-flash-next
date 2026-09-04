@@ -1,6 +1,6 @@
 # QuietBox 4x p150b: one 1x4 RING mesh (all four ring links) for the ring A/B
 # against the 1x4 LINE descriptor.  Set through TT_MESH_GRAPH_DESC_PATH by
-# run_qb_mesh_smoke.sh --mesh-graph-desc.
+# the launcher that opens the ring (run_qwen38_chat_server.sh exports the LINE descriptor).
 mesh_descriptors {
   name: "M0"
   arch: BLACKHOLE

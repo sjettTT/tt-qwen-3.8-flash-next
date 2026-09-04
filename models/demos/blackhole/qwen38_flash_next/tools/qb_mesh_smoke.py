@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
-"""QuietBox 1x4 mesh smoke with the pinned runtime, the way the campaign launchers open the mesh.
+"""QuietBox 1x4 mesh smoke with the pinned runtime, the way the launchers open the mesh.
 
 Steps, each recorded as actual vs expected in the result JSON (nothing is
 flashed or reset; the mesh is opened once and closed):
@@ -12,8 +12,8 @@ flashed or reset; the mesh is opened once and closed):
      expected device nodes; the ethernet graph classified as line or ring; the
      route derived with ``physical_route.derive_canonical_line_route`` when the
      graph is a line, else a recorded ring walk from the lowest chip ID;
-  4. SystemMeshDescriptor local shape (lab: one local 4x1 line, all_local);
-  5. fabric FABRIC_1D / STRICT_INIT, ``open_mesh_device`` with the lab
+  4. SystemMeshDescriptor local shape (one local 4x1 line, all_local);
+  5. fabric FABRIC_1D / STRICT_INIT, ``open_mesh_device`` with the server's
      arguments (l1_small_size 24576, trace_region_size 0), reshape to 1x4,
      per-coordinate mapping (ttnn id, device node, BDF, board link, fabric ids);
   6. one eager op (add) on a dim-0 sharded tensor, exact compare;
@@ -234,7 +234,7 @@ def main() -> int:
         "graph_kind_lab": "line",
     }
     print(
-        f"[info] ethernet graph kind actual={graph_kind} lab=line adjacency={report['topology']['ethernet_adjacency']}",
+        f"[info] ethernet graph kind actual={graph_kind} expected=line adjacency={report['topology']['ethernet_adjacency']}",
         flush=True,
     )
     try:
@@ -261,7 +261,7 @@ def main() -> int:
     all_local = bool(descriptor.all_local())
     report["topology"]["system_mesh_local_shape"] = list(physical_shape)
     report["topology"]["system_mesh_all_local"] = all_local
-    # The lab auto-discovers (4, 1); a 1x4 descriptor reports (1, 4).  Either is one 1D four-device mesh.
+    # Auto-discovery on an eight-chip host reports (4, 1); a 1x4 descriptor reports (1, 4).  Either is one 1D four-device mesh.
     checks.expect(
         "SystemMeshDescriptor.local_shape is one 1D four-device mesh (sorted)", sorted(physical_shape), [1, 4]
     )
@@ -300,7 +300,7 @@ def main() -> int:
         checks.expect("mesh.get_num_devices", int(mesh.get_num_devices()), 4)
         opened_ids = [int(v) for v in mesh.get_device_ids()]
         checks.expect("mesh.get_device_ids (1x4 order) == requested route", opened_ids, list(route))
-        # The campaign's Linear collectives hop between neighbouring 1x4 coordinates:
+        # The model's Linear collectives hop between neighbouring 1x4 coordinates:
         # every consecutive pair in the opened order must be one ethernet link.
         missing_links = [[a, b] for a, b in zip(opened_ids, opened_ids[1:]) if b not in adjacency.get(a, set())]
         order_is_path = checks.expect("opened 1x4 order is an ethernet path (missing links)", missing_links, [])

@@ -5,7 +5,7 @@
 
 No device.  For r in {0, 1, 2, 8, 9, 31} and N in {r, 32 + r, 64 + r} a GDN layer and the PLE layer run the driver's
 sequence (the seed from the decode buffers, N // 32 full chunks at accept 31, the padded tail at accept r - 1, the
-hand-off) against N 1-row steps: the GDN recurrent state within the campaign tolerance, the ring slots and phase
+hand-off) against N 1-row steps: the GDN recurrent state within the tolerance model, the ring slots and phase
 bitwise, the PLE slots and n-gram context bitwise, then one more 1-row step on both sides.  ``decoded`` steps before
 the prefill cover the reverse seed (decode -> chunk).  The QSA hand-off is checked on position-encoded kept rows:
 the staging rows and the ring rows are the positions the generic body expects.  Source pins hold the hand-off

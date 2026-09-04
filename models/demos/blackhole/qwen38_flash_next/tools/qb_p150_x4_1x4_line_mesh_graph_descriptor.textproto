@@ -1,7 +1,7 @@
 # QuietBox 4x p150b: one 1x4 LINE mesh (three of the four ring links), the
-# logical shape the campaign's Linear collectives assume (lab boxes auto-discover
-# a 4x1 line; the QuietBox auto-discovers a 2x2 from its ring).  Set through
-# TT_MESH_GRAPH_DESC_PATH by run_qb_mesh_smoke.sh --mesh-graph-desc.
+# logical shape the model's Linear collectives assume (eight-chip hosts auto-discover
+# a 4x1 line; the QuietBox auto-discovers a 2x2 from its ring).  Exported as
+# TT_MESH_GRAPH_DESC_PATH by run_qwen38_chat_server.sh.
 mesh_descriptors {
   name: "M0"
   arch: BLACKHOLE

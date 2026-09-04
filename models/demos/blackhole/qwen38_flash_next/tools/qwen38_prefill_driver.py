@@ -13,7 +13,7 @@ The host work of chunk i + 1 (the 32 n-gram lookups from the running context, th
 queued behind chunk i's replay and an event every ``event_interval`` chunks bounds the run-ahead; the eager seed and
 hand-off run only after a device synchronize (their transients must not land in a running trace's addresses).
 
-Timing (the campaign rule): ``verify_before_replay`` once, outside the window; the raw ``ttnn._ttnn_execute_trace``
+Timing (the rule every measurement here follows): ``verify_before_replay`` once, outside the window; the raw ``ttnn._ttnn_execute_trace``
 per chunk is timed only with ``time_each_chunk`` (blocking replays, no host overlap); the end-to-end wall (forced
 steps, host writes, replays, hand-off) is reported separately.
 
