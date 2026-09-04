@@ -919,7 +919,7 @@ def emulate_qsa_position_inputs(position: int, *, allocated_compressed_blocks: i
     negative scalar returns ``+0.0`` (binary_ng, calculate_sfpu_binary_mul in
     ckernel_sfpu_binary.h forces ``result = 0.0f`` whenever an input is zero,
     matching the FPU), where torch would give ``-0.0``; observed bitwise on
-    silicon (the lab host, 2026-09-02). Visible blocks are therefore ``+0.0``.
+    silicon (the 4x p150 host, 2026-09-02). Visible blocks are therefore ``+0.0``.
     """
 
     if isinstance(position, bool) or not isinstance(position, int) or not 0 <= position < MAX_CONTEXT:

@@ -215,7 +215,7 @@ def _ttnn_embedding_output_shape(indices_shape: tuple[int, ...], weight_shape: t
     (``indices[-1]``); lines 70-74 reshape the device op's
     ``[batch, 1, sentence, hidden]`` result to ``[sentence, hidden]`` for rank-1
     indices and ``[batch, sentence, hidden]`` otherwise.  The pinned
-    runtime carries the same lines; the lab micro-test measured [1, 32, 2560]
+    runtime carries the same lines; 4x p150 micro-test measured [1, 32, 2560]
     for [1, 1, 32] indices.
     """
 

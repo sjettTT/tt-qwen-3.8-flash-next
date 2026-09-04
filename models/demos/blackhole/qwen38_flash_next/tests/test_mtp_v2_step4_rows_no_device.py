@@ -440,7 +440,7 @@ class FakeChunk:
 def torch_chunk_kernel(q, k, v, g, beta, scale, state):
     """The kernel's algorithm in torch: bf16 q scaled in bf16 (the composite's ``multiply(q, scale)``), GQA
     expand of the 4 key heads to the 12 value heads, fp32 WY chunk of 32 rows from ``state``; fp32 output
-    (the kernel's output dtype on the pinned runtime, measured in the lab)."""
+    (the kernel's output dtype on the pinned runtime, measured on 4x p150)."""
 
     q_scaled = (q.float() * scale).to(torch.bfloat16).float().repeat_interleave(HEADS // q.shape[2], dim=2)
     k_full = k.float().repeat_interleave(HEADS // k.shape[2], dim=2)

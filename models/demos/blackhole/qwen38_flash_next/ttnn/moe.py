@@ -57,8 +57,8 @@ SUPPORTED_ROWS = (1, TARGET_VERIFIER_ROWS, PREFILL_CHUNK_ROWS)
 # Both multi-row counts have run moe_compute on this model's silicon and matched the rows-1 path
 # bitwise (the rows-1 path is the production decode; 5 = the MTP verifier, 32 = the prefill chunk share
 # one code path past rows == 1): rows 32 vs 32 one-row calls on all 48 real layers, 1536/1536 rows
-# (lab, 2026-09-03, prefill stage-1 chunk discriminator); rows 5 vs one-row in the MTP-v2 step-1
-# discriminator and 245/245 rows in the MTP-v2 numerics gates (lab, 2026-09-03/04).
+# (2026-09-03, prefill stage-1 chunk discriminator); rows 5 vs one-row in the MTP-v2 step-1
+# discriminator and 245/245 rows in the MTP-v2 numerics gates (2026-09-03/04).
 ROWS5_HARDWARE_PROVEN = True
 ROWS32_HARDWARE_PROVEN = True
 BLACKHOLE_MOE_NUMERIC_ISSUE = "https://github.com/tenstorrent/tt-metal/issues/50038"

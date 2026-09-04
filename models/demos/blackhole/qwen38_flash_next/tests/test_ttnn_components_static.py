@@ -895,7 +895,7 @@ def test_rope_table_rows_are_four_embedding_lookups_viewed_as_tile_rows(monkeypa
             "dtype": ttnn.bfloat16,
             "memory_config": ttnn.DRAM_MEMORY_CONFIG,
         }
-    # The op hands back [1, 32, 64] (the lab failure of 39ca9542); every lookup
+    # The op hands back [1, 32, 64] (4x p150 failure of 39ca9542); every lookup
     # unsqueezes it once and views the 32-row tile as one row.
     unsqueezes = [call for call in calls if call[0] == "unsqueeze_to_4D"]
     assert len(unsqueezes) == 4

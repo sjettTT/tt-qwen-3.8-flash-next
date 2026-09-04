@@ -46,7 +46,7 @@ REAL_SPEC = build_ngram_hash_spec(
     seed=1234,
     divisible_by=128,
 )
-# The 33-token chain the per-position sequential mode produced in the lab at aef39cde.
+# The 33-token chain the per-position sequential mode produced on 4x p150 at aef39cde.
 CHAIN_33 = (
     17,
     15,

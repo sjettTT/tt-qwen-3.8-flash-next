@@ -125,7 +125,7 @@ class _FakeOps:
     def gather(self, tensor, dim, index, *, memory_config=None):
         assert index.dtype == ttnn.uint32 and index.layout == tensor.layout
         # gather_device_operation.cpp:24-33 routes ROW_MAJOR index rows wider than 60 tiles to
-        # RmSingleRowMultiCore, which the 2026-09-02 op repro in the lab showed wrong for every
+        # RmSingleRowMultiCore, which the 2026-09-02 op repro on 4x p150 showed wrong for every
         # dtype (76% of the elements misplaced); the single-core factory below that width is exact.
         if tensor.layout == ttnn.ROW_MAJOR_LAYOUT and index.shape[-1] > RM_GATHER_EXACT_WIDTH:
             raise AssertionError(f"ROW_MAJOR gather with a {index.shape[-1]}-wide index takes the wrong factory")

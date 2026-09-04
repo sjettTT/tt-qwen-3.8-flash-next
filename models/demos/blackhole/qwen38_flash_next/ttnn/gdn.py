@@ -1475,7 +1475,7 @@ class Qwen38TTNNGDN:
         self.mesh_contract.validate_tensor(hidden_rows, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         # Zero rows up to one tile on device: the projection of a zero row is exactly zero.  The padding
         # stays inside the input's own tile, so ``ttnn.pad`` returns a view of the input on this runtime
-        # (measured in the lab: deallocating it freed the caller's rows); it is never deallocated here.
+        # (measured on 4x p150: deallocating it freed the caller's rows); it is never deallocated here.
         if _shape(hidden_rows)[2] < CHUNK_SIZE:
             padded = ttnn.pad(
                 hidden_rows,
@@ -1658,7 +1658,7 @@ class Qwen38TTNNGDN:
         """One full-chunk run of the kernel from ``initial_state`` (read only).
 
         Returns the head-major output ``[VALUE_HEADS_PER_DEVICE, CHUNK_SIZE, HEAD_DIM]`` (TILE, the kernel's
-        own layout and output dtype: FP32 on the pinned runtime, measured in the lab; ``output_head_major``
+        own layout and output dtype: FP32 on the pinned runtime, measured on 4x p150; ``output_head_major``
         skips the composite's untilize / row-major permute) and the FP32 final state
         ``[1, VALUE_HEADS_PER_DEVICE, HEAD_DIM, HEAD_DIM]`` in a new buffer.  With ``committed_mask`` beta
         and g of the rows past the committed prefix are zeroed first (the catch-up), which makes those

@@ -129,7 +129,7 @@ def test_pinned_runtime_routes_uint32_last_dim_repeat_interleave_to_eight_ops_an
     assert "const bool input_tensor_is_dim_last_idx = (normalized_dim == input_tensor_rank - 1);" in router
     nanobind = _cpp("ttnn/cpp/ttnn/operations/data_movement/gather/gather_nanobind.cpp")
     assert 'nb::arg("input").noconvert(),\n        nb::arg("dim"),\n        nb::arg("index"),' in nanobind
-    # The full 2048-wide row would take RmSingleRowMultiCore, which the 2026-09-02 op repro in the lab
+    # The full 2048-wide row would take RmSingleRowMultiCore, which the 2026-09-02 op repro on 4x p150
     # showed wrong for every dtype (76% of the elements); each half stays on the exact single-core factory
     # and its 4 KiB stick keeps the joining concat on the aligned path.
     assert EXPANSION_GATHER_WIDTH <= 60 * ttnn.TILE_SIZE < TOKEN_BUDGET
@@ -477,7 +477,7 @@ def test_natural_row_regime_selects_the_oracle_set_up_to_the_budget_and_scores_p
 def test_regime_split_is_off_by_default_and_a_constructor_flag() -> None:
     # Off on numerics, not on the selected set: the natural-order row hands
     # sparse_sdpa the same keys in another order, its online-softmax
-    # accumulation order changes, and the lab micro-test (2026-09-02, positions
+    # accumulation order changes, and 4x p150 micro-test (2026-09-02, positions
     # 127-2050) saw only 20-38% of the bf16 attention output within one ulp of
     # the scored path.  The path and the constructor flag stay for an A/B on a
     # later runtime.

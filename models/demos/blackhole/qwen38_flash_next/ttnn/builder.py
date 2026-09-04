@@ -100,7 +100,7 @@ EXPERTS_PER_DEVICE = 128
 TOP_K = 10
 BUILDER_FORMAT_VERSION = 1
 # The resident build allocates one of four contexts: 32,768 (the default; every timing and bitwise pin is at this
-# allocation), 65,536, 131,072 or 262,144 (every QSA op admitted at each by the long-context micro-test, the lab host
+# allocation), 65,536, 131,072 or 262,144 (every QSA op admitted at each by the long-context micro-test, the 4x p150 host
 # 2026-09-03; the state grows by 1,088 bytes per token per QSA layer: 1.71 GB per device at 131,072, 3.43 GB at
 # 262,144, which leaves about 2.7 GB and about 1 GB of the measured 4.4 GB headroom, so 262,144 is a single-user
 # configuration).  RESIDENT_MAX_QSA_CACHE_CAPACITY keeps the default's historical name: demo/production.py and the

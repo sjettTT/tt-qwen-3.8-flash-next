@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The chat protocol module without a device: request normalisation, reply assembly, prefix splice (fake tokenizer),
-and, with the pinned checkpoint (lab), the template-equality matrix: the server's prompt ids must equal
+and, with the pinned checkpoint (4x p150), the template-equality matrix: the server's prompt ids must equal
 ``tokenizer.apply_chat_template`` on the raw request bitwise for every message shape x tools x thinking case."""
 
 from __future__ import annotations
@@ -533,7 +533,7 @@ def test_splice_closes_a_partial_reply_with_the_template_terminator() -> None:
     assert EOS_TOKEN_IDS == (248_046, 248_044)
 
 
-# -- checkpoint: template equality against transformers (lab) --------------------------------------
+# -- checkpoint: template equality against transformers (4x p150) --------------------------------------
 
 MATRIX_TOOLS = {
     "none": [],

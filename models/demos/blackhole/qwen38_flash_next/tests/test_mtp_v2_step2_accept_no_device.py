@@ -26,7 +26,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import GREEDY_TIE_B
 # Ids seen on the pinned prefixes and at the vocabulary edge: below and above the 2048 TF32 limit.
 SMALL_IDS = (17, 15, 16, 21, 12, 20, 11, 0, 2047)
 LARGE_IDS = (2048, 95859, 62086, 248044, 248319)
-R6_HISTOGRAM = [74, 75, 55, 38, 92]  # accepted drafts 0..4 over 334 rounds (r6 arm, lab, 2026-09-02)
+R6_HISTOGRAM = [74, 75, 55, 38, 92]  # accepted drafts 0..4 over 334 rounds (r6 arm, 2026-09-02)
 
 
 def _rows(pattern: tuple[int, ...], ids: tuple[int, ...]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
