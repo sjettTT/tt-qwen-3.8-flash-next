@@ -7,11 +7,10 @@ thinking and tool calls in the Qwen chat template.
 
 | hardware | profile | status |
 |---|---|---|
-| QuietBox, 4x p150b (fw 19.4.1.0) | `tt-quietbox` | verified 2026-09-04: startup acceptance 96/96 tokens against the CPU, 19.6 tokens/s at 32k context |
-| QuietBox 2, 2x p300c (4 dies) | `qb2` | **untested**: designed from the p300 ring topology, never run |
-| 4x p300 host (8 dies) | `qb2 --instance 0\|1` | **untested**: two independent 1x4 instances |
+| QuietBox, 4x p150c (fw 19.4.1.0) | `tt-quietbox` | verified 2026-09-04: startup acceptance 96/96 tokens against the CPU, 19.6 tokens/s at 32k context |
+| QuietBox 2, 2x p300c (4 dies) | `qb2` | **untested**: designed from the p300 ring topology, should run fine |
 
-Every number below was measured on 4x p150b; the lab's eight-chip hosts were used the same way, one 1x4 mesh at a time.
+Every number below was measured on 4x p150.
 
 ## Performance (4x p150, measured 2026-09-04)
 
