@@ -104,7 +104,7 @@ LOUDBOX = ResidentHardwareProfile(
     ethernet_graph="line",
     route=None,
     route_nodes=None,
-    system_mesh_local_shape=(1, 4),
+    system_mesh_local_shape=(4, 1),
     lan_serving=True,
 )
 
