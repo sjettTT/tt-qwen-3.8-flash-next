@@ -977,7 +977,8 @@ class Qwen38TTNNGDNRowsState:
 @dataclass(frozen=True)
 class Qwen38TTNNGDNRowsResult:
     """``hidden_rows`` is ``rows_state.output`` (``[1,1,rows,640]``, persistent: read it before the next pass,
-    never deallocate it); ``final_state`` is the chunk kernel's state after all ``rows`` rows in a new FP32
+    never deallocate it) or, for ``forward_rows(full_tile=True)``, the whole ``[1,1,32,640]`` output tile in a new
+    buffer the caller deallocates; ``final_state`` is the chunk kernel's state after all ``rows`` rows in a new FP32
     buffer (the committed state is untouched until ``commit_rows``); the caller owns and deallocates it."""
 
     hidden_rows: Any
@@ -1708,8 +1709,13 @@ class Qwen38TTNNGDN:
             )
         return output, final_state
 
-    def _gate_and_project_rows(self, recurrent_output, z, full_hidden, rows_state: Qwen38TTNNGDNRowsState):
-        """``_gate_and_project`` on CHUNK_SIZE rows; the first ``rows`` rows of the reduce-scatter land in ``rows_state.output``."""
+    def _gate_and_project_rows(
+        self, recurrent_output, z, full_hidden, rows_state: Qwen38TTNNGDNRowsState, *, full_tile: bool = False
+    ):
+        """``_gate_and_project`` on CHUNK_SIZE rows; the first ``rows`` rows of the reduce-scatter land in
+        ``rows_state.output``, or with ``full_tile`` the whole 32-row reduce-scatter output is returned (a new buffer
+        the caller owns; its rows past ``rows`` are exact zeros: the zero q rows give a zero recurrent output, whose
+        norm, gate and projection stay zero)."""
 
         rows = rows_state.constants.rows
 
@@ -1777,6 +1783,10 @@ class Qwen38TTNNGDN:
             expected_local_shape=(1, 1, CHUNK_SIZE, HIDDEN_SIZE_PER_DEVICE),
         )
         _deallocate(full_hidden)
+        if full_tile:
+            _require_shape(output, (1, 1, CHUNK_SIZE, HIDDEN_SIZE_PER_DEVICE), label="GDN rows output tile")
+            self.mesh_contract.validate_tensor(output, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+            return output
         # The row slice of the first tile may alias its input on this runtime; writing it into the persistent
         # output buffer (the 1-row path's slice form) keeps a fixed address and lets the 32-row tensor go.
         landed = ttnn.slice(output, (0, 0, 0, 0), (1, 1, rows, HIDDEN_SIZE_PER_DEVICE), output_tensor=rows_state.output)
@@ -1787,13 +1797,16 @@ class Qwen38TTNNGDN:
         return rows_state.output
 
     def forward_rows(
-        self, hidden_rows, state: Qwen38TTNNGDNState, rows_state: Qwen38TTNNGDNRowsState
+        self, hidden_rows, state: Qwen38TTNNGDNState, rows_state: Qwen38TTNNGDNRowsState, *, full_tile: bool = False
     ) -> Qwen38TTNNGDNRowsResult:
         """Run ``rows`` consecutive positions from the committed state without committing anything.
 
         ``hidden_rows`` has local shape ``[1,1,rows,640]`` (hidden sharded).  ``state.recurrent`` is read
         only; the ring and its phase are not touched (the rows path keeps its own ``history``).  The
-        result's ``final_state`` is the state after all rows in a new buffer.
+        result's ``final_state`` is the state after all rows in a new buffer.  With ``full_tile`` the result's
+        ``hidden_rows`` is the whole 32-row output tile in a new buffer the caller deallocates (rows past ``rows``
+        exact zeros), not the persistent ``rows_state.output`` slice: the caller that pads the rows back to the
+        tile saves the slice and the pad.
         """
 
         self._validate_state(state)
@@ -1803,7 +1816,7 @@ class Qwen38TTNNGDN:
         conv = self._causal_conv_rows(rows_state)
         self._make_chunk_inputs(conv, a, b, rows_state)
         recurrent_output, final_state = self._chunk_rows(rows_state, initial_state=state.recurrent)
-        output = self._gate_and_project_rows(recurrent_output, z, full_hidden, rows_state)
+        output = self._gate_and_project_rows(recurrent_output, z, full_hidden, rows_state, full_tile=full_tile)
         return Qwen38TTNNGDNRowsResult(output, final_state, state, rows_state)
 
     def _advance_history_rows(self, rows_state: Qwen38TTNNGDNRowsState, selectors: Qwen38TTNNRowsSelectors) -> None:

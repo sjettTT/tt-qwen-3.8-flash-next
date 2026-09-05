@@ -16,6 +16,7 @@ import jinja2
 import pytest
 
 from models.demos.blackhole.qwen38_flash_next.chat import (
+    END_OF_TEXT_ID,
     EOS_TOKEN_IDS,
     IM_END_ID,
     IM_START_ID,
@@ -266,18 +267,18 @@ def test_stop_effort_and_thinking_budget_rules() -> None:
     assert protocol.THINKING_TOKEN_CAPS == {"low": 4096, "medium": 16_384, "xhigh": None}
     assert protocol.ANSWER_RESERVE_TOKENS == 256
     assert protocol.thinking_budget("low", 32_704) == 4096 and protocol.thinking_budget("medium", 32_704) == 16_384
-    assert protocol.thinking_budget("xhigh", 32_704) == 32_448
+    assert protocol.thinking_budget("xhigh", 32_704) == 32_447
     # A 12k prompt at 32k leaves 20,704: medium takes its cap, xhigh the room less the reserve.
     assert protocol.thinking_budget("medium", 32_704 - 12_000) == min(16_384, 32_704 - 12_000 - 256) == 16_384
-    assert protocol.thinking_budget("xhigh", 32_704 - 12_000) == 20_448
-    # Below the caps the reserve bounds every level.
-    assert protocol.thinking_budget("low", 4096) == 3840
-    assert protocol.thinking_budget("medium", 4096) == 3840 and protocol.thinking_budget("xhigh", 4096) == 3840
-    assert protocol.thinking_budget("medium", 2048) == 1792  # Hermes' max_tokens
+    assert protocol.thinking_budget("xhigh", 32_704 - 12_000) == 20_447
+    # Below the caps the reserve bounds every level: budget + the forced </think> + 256 answer tokens = max_tokens.
+    assert protocol.thinking_budget("low", 4096) == 3839 == 4096 - 1 - protocol.ANSWER_RESERVE_TOKENS
+    assert protocol.thinking_budget("medium", 4096) == 3839 and protocol.thinking_budget("xhigh", 4096) == 3839
+    assert protocol.thinking_budget("medium", 2048) == 1791  # Hermes' max_tokens
     assert protocol.thinking_budget("xhigh", 300) == 150 and protocol.thinking_budget("low", 32) == 16
     assert protocol.thinking_budget("xhigh", 4096, requested=100) == 100
     assert protocol.thinking_budget("low", 4096, requested=0) == 0
-    assert protocol.thinking_budget("low", 4096, requested=10_000) == 3840
+    assert protocol.thinking_budget("low", 4096, requested=10_000) == 3839
 
 
 def test_render_prompt_normalises_validates_and_encodes_with_the_generation_prompt() -> None:
@@ -331,13 +332,43 @@ def test_assembler_splits_reasoning_from_content_at_the_think_end_token() -> Non
     assert assembler.reasoning_tokens == 3  # the reasoning tokens before </think>, whitespace included
     assert assembler.message() == {"role": "assistant", "content": "Answer", "reasoning_content": "Let me think."}
     assert assembler.echo_reply() == {"role": "assistant", "content": "Answer", "reasoning_content": "Let me think."}
-    # Non-thinking mode: a stray <think> opens reasoning anyway; a stray </think> outside is dropped.
+    # Non-thinking mode: the think tags are the answer's text (a quoted tag never opens a reasoning phase).
     assembler = Qwen38ReplyAssembler(decode, thinking_open=False)
-    assert _run(assembler, [THINK_END_ID, 4, THINK_START_ID, 1, THINK_END_ID, 4]) == [
-        {"content": "Answer"},
-        {"reasoning_content": "Let me"},
-        {"content": "Answer"},
-    ]
+    deltas = _run(assembler, [THINK_END_ID, 4, THINK_START_ID, 1, THINK_END_ID, 4])
+    assert "".join(delta["content"] for delta in deltas) == "</think>Answer<think>Let me</think>Answer"
+    assert assembler.reasoning == [] and assembler.reasoning_tokens == 0
+
+
+def test_assembler_tag_ids_act_only_in_the_phase_that_expects_them() -> None:
+    decode = _decoder({**TOOL_BLOCK, 30: "The tags are ", 31: " and ", 32: "; the reasoning ends here.", 33: " ok"})
+    # (a) An answer that quotes the tags: no phase change, the literals stay in the content.
+    assembler = Qwen38ReplyAssembler(decode, thinking_open=True)
+    _run(assembler, [30, THINK_END_ID, 30, THINK_START_ID, 31, THINK_END_ID, 33])
+    assert assembler.message() == {
+        "role": "assistant",
+        "content": "The tags are <think> and </think> ok",
+        "reasoning_content": "The tags are",
+    }
+    # (b) Think tags inside a tool block are the argument's text; the call is parsed whole.
+    assembler = Qwen38ReplyAssembler(decode, thinking_open=False, tools=[ADD_TOOL])
+    _run(assembler, [TOOL_CALL_START_ID, 16, THINK_START_ID, THINK_END_ID, 19, TOOL_CALL_END_ID])
+    assert assembler.parse_errors == [] and len(assembler.calls) == 1
+    assert json.loads(assembler.calls[0]["function"]["arguments"]) == {"query": "<think></think>"}
+    # (c) A tool block drafted inside the reasoning is reasoning: no call, nothing to execute, the answer follows.
+    assembler = Qwen38ReplyAssembler(decode, thinking_open=True)
+    deltas = _run(assembler, [14, TOOL_CALL_START_ID, 10, 11, 12, 13, TOOL_CALL_END_ID, 32, THINK_END_ID, 14])
+    assert assembler.calls == [] and all("tool_calls" not in delta for delta in deltas)
+    reasoning = "".join(assembler.reasoning)
+    assert reasoning.startswith("I'll add them.<tool_call>\n<function=add_integers>") and reasoning.endswith(
+        "</function>\n</tool_call>; the reasoning ends here."
+    )
+    assert assembler.message()["content"] == "I'll add them."
+    # A <tool_call> opened inside a tool block is that block's text: the block fails to parse as one call and is
+    # returned raw rather than restarted.
+    assembler = Qwen38ReplyAssembler(decode, thinking_open=False)
+    deltas = _run(assembler, [TOOL_CALL_START_ID, 10, TOOL_CALL_START_ID, 10, 11, 12, 13, TOOL_CALL_END_ID])
+    assert assembler.calls == [] and len(assembler.parse_errors) == 1
+    assert deltas[0]["content"].count("<tool_call>") == 2
 
 
 TOOL_BLOCK = {
@@ -422,6 +453,70 @@ def test_assembler_falls_back_to_raw_content_for_malformed_and_truncated_tool_ca
     assert assembler.truncated_tool_call is True and assembler.calls == []
 
 
+READ_FILE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "Read a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "note": {"type": ["string", "null"]},
+                "lines": {"type": "integer"},
+                "range": {"type": "object"},
+                "flags": {"type": "array"},
+                "exact": {"type": "boolean"},
+            },
+        },
+    },
+}
+ARGUMENT_PIECES = {
+    40: "\n<function=read_file>\n",
+    41: "<parameter=path>\n123\n</parameter>\n",
+    42: "<parameter=lines>\n7\n</parameter>\n",
+    43: '<parameter=range>\n{"start": 1}\n</parameter>\n',
+    44: "<parameter=flags>\n[true, null]\n</parameter>\n",
+    45: "<parameter=exact>\nfalse\n</parameter>\n",
+    46: "<parameter=extra>\n[1]\n</parameter>\n",
+    47: "<parameter=note>\nnull\n</parameter>\n",
+    48: '<parameter=path>\n"quoted"\n</parameter>\n',
+    49: "<parameter=lines>\nNaN\n</parameter>\n",
+    50: "<parameter=lines>\nseven\n</parameter>\n",
+    51: "<parameter=note>\ntrue\n</parameter>\n",
+}
+
+
+def _arguments(*parameter_ids: int, tools=(READ_FILE_TOOL,)) -> str:
+    """The arguments string of one read_file call assembled from ``parameter_ids`` under ``tools``."""
+
+    assembler = Qwen38ReplyAssembler(_decoder({**TOOL_BLOCK, **ARGUMENT_PIECES}), thinking_open=False, tools=tools)
+    _run(assembler, [TOOL_CALL_START_ID, 40, *parameter_ids, 13, TOOL_CALL_END_ID])
+    assert assembler.parse_errors == [] and len(assembler.calls) == 1
+    return assembler.calls[0]["function"]["arguments"]
+
+
+def test_assembler_types_tool_arguments_by_the_schema() -> None:
+    # A string parameter is verbatim whatever it looks like; the JSON-typed ones are parsed; an undeclared one is
+    # parsed when it is JSON.
+    assert json.loads(_arguments(41, 42, 43, 44, 45, 46)) == {
+        "path": "123",
+        "lines": 7,
+        "range": {"start": 1},
+        "flags": [True, None],
+        "exact": False,
+        "extra": [1],
+    }
+    assert json.loads(_arguments(48)) == {"path": '"quoted"'}
+    # ["string", "null"]: null is null, anything else is the text.
+    assert json.loads(_arguments(47)) == {"note": None} and json.loads(_arguments(51)) == {"note": "true"}
+    # NaN is not JSON: it stays text (the wire stays valid JSON); a non-JSON body for a typed parameter stays text.
+    assert _arguments(49) == '{"lines": "NaN"}' and json.loads(_arguments(50)) == {"lines": "seven"}
+    # Without the schema (a tool the request did not offer) every JSON-looking value is parsed, as before.
+    assert json.loads(_arguments(41, tools=())) == {"path": 123}
+    assert json.loads(_arguments(41, tools=(ADD_TOOL,))) == {"path": 123}
+
+
 def test_assembler_stop_strings_hold_back_the_tail_and_exclude_the_match() -> None:
     assembler = Qwen38ReplyAssembler(_decoder(TOOL_BLOCK), thinking_open=False, stop_strings=("STOP",))
     first = assembler.push(21)
@@ -450,6 +545,20 @@ def test_assembler_holds_a_split_utf8_sequence() -> None:
     assert (
         assembler.push(1) == [] and assembler.push(2) == [{"content": "é"}] and assembler.push(3) == [{"content": "x"}]
     )
+
+
+def test_assembler_flush_scans_the_held_and_pending_text_for_stop_strings() -> None:
+    # The budget ends the reply while a split UTF-8 token is pending: its text completes the stop string.
+    pieces = {(1,): "The E", (2,): "ND�"}
+    assembler = Qwen38ReplyAssembler(lambda ids: pieces[tuple(ids)], thinking_open=False, stop_strings=("END",))
+    assert assembler.push(1) == [{"content": "The"}] and assembler.held_text == " E" and assembler.push(2) == []
+    assert assembler.finish() == [] and assembler.stop_hit is True and "".join(assembler.content) == "The"
+    # A phase change flushes the same way.
+    assembler = Qwen38ReplyAssembler(lambda ids: pieces[tuple(ids)], thinking_open=False, stop_strings=("END",))
+    assembler.push(1)
+    assembler.push(2)
+    assert assembler.push(TOOL_CALL_START_ID) == [] and assembler.stop_hit is True
+    assert "".join(assembler.content) == "The"
 
 
 # -- prefix side ----------------------------------------------------------------------------------
@@ -513,6 +622,24 @@ def test_splice_continues_the_served_turn_from_the_committed_ids() -> None:
     assert protocol.splice_prompt(tokenizer, served, other, [ADD_TOOL], **FLAGS) is None
 
 
+def test_splice_accepts_an_echo_whose_content_is_text_parts() -> None:
+    tokenizer = FakeTokenizer()
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+    served = _served(tokenizer, messages, {"role": "assistant", "content": "two words", "reasoning_content": "r"})
+    as_string = protocol.normalize_messages(
+        [*messages, {"role": "assistant", "content": "two words"}, {"role": "user", "content": "go on"}]
+    )
+    as_parts = protocol.normalize_messages(
+        [
+            *messages,
+            {"role": "assistant", "content": [{"type": "text", "text": "two "}, {"type": "text", "text": "words"}]},
+            {"role": "user", "content": "go on"},
+        ]
+    )
+    spliced = protocol.splice_prompt(tokenizer, served, as_string, [], **FLAGS)
+    assert spliced is not None and protocol.splice_prompt(tokenizer, served, as_parts, [], **FLAGS) == spliced
+
+
 def test_splice_closes_a_partial_reply_with_the_template_terminator() -> None:
     tokenizer = FakeTokenizer()
     messages = [{"role": "user", "content": "hi"}]
@@ -530,7 +657,10 @@ def test_splice_closes_a_partial_reply_with_the_template_terminator() -> None:
         spliced = protocol.splice_prompt(tokenizer, served, history, [], **FLAGS)
         assert spliced is not None and spliced[: len(served.committed)] == served.committed
         assert tokenizer.decode(spliced[len(served.committed) :]).startswith(expected_head), eos
-    assert EOS_TOKEN_IDS == (248_046, 248_044)
+    # <|endoftext|> closed the reply where the template puts <|im_end|>: the reference render, not a splice.
+    served = _served(tokenizer, [{"role": "system", "content": "s"}, *messages], reply, eos=END_OF_TEXT_ID)
+    assert protocol.splice_prompt(tokenizer, served, history, [], **FLAGS) is None
+    assert EOS_TOKEN_IDS == (248_046, 248_044) and END_OF_TEXT_ID == 248_044
 
 
 # -- checkpoint: template equality against transformers (4x p150) --------------------------------------

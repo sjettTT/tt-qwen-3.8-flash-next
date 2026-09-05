@@ -56,7 +56,7 @@ class _FakeModel:
     def finish_prefill(self, state, chunk_state, prefilled: int) -> None:
         self.calls.append(("finish_prefill", prefilled))
 
-    def forward_prefill_chunk_generic(self, chunk_state, state, *, gdn_step_anchor: bool = False) -> None:
+    def forward_prefill_chunk_generic(self, chunk_state, state, *, gdn_step_anchor: bool = False, mtp=None) -> None:
         self.calls.append(("eager_chunk", gdn_step_anchor))
 
 
@@ -252,7 +252,8 @@ def test_driver_source_pins() -> None:
     chunk = inspect.getsource(Qwen38ChunkPrefill._run_chunk)
     assert "ttnn._ttnn_execute_trace(self.mesh, self.chunk_trace_id, cq_id=0, blocking=blocking)" in chunk
     assert (
-        "self.model.forward_prefill_chunk_generic(self.chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor)"
-        in chunk
+        "self.model.forward_prefill_chunk_generic(\n"
+        "            self.chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor, mtp=self.mtp\n"
+        "        )" in chunk
     )
     assert CHUNK_PAD_TOKEN_ID == 0 and driver_module.CHUNK_EVENT_INTERVAL == 4

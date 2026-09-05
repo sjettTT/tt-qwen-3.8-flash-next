@@ -115,13 +115,24 @@ def _ignore_phase(_phase: str) -> None:
 
 @dataclass(frozen=True)
 class Qwen38TTNNMoERowContract:
-    """Exact logical shapes for ordinary decode (1 row), target verification (5) or a prefill chunk (32)."""
+    """Exact logical shapes for ordinary decode (1 row), target verification (5) or a prefill chunk (32).
+
+    ``admitted_rows`` is ``SUPPORTED_ROWS`` unless the caller admits another row count for this instance alone
+    (an explicit diagnostic override, e.g. the k = 5 verifier's 6 rows); the module's admission and proof flags
+    are untouched by it.
+    """
 
     rows: int = 1
+    admitted_rows: tuple[int, ...] = SUPPORTED_ROWS
 
     def __post_init__(self) -> None:
-        if type(self.rows) is not int or self.rows not in SUPPORTED_ROWS:
-            raise ValueError(f"MoE rows must be exactly one of {SUPPORTED_ROWS}, got {self.rows!r}")
+        if not isinstance(self.admitted_rows, tuple) or not self.admitted_rows:
+            raise ValueError(f"MoE admitted rows must be a non-empty tuple, got {self.admitted_rows!r}")
+        for count in self.admitted_rows:
+            if isinstance(count, bool) or type(count) is not int or not 1 <= count <= CHUNK_ROWS:
+                raise ValueError(f"MoE admitted rows must be ints in [1, {CHUNK_ROWS}], got {self.admitted_rows!r}")
+        if type(self.rows) is not int or self.rows not in self.admitted_rows:
+            raise ValueError(f"MoE rows must be exactly one of {self.admitted_rows}, got {self.rows!r}")
 
     @property
     def hidden_sharded(self) -> tuple[int, int, int, int]:
@@ -331,13 +342,14 @@ class Qwen38TTNNMoE:
         collective_topology=None,
         rows: int = 1,
         synchronization_policy: Qwen38TTNNMoESyncPolicy = Qwen38TTNNMoESyncPolicy.CORRECTNESS_FENCED,
+        admitted_rows: tuple[int, ...] = SUPPORTED_ROWS,
     ) -> None:
         if type(synchronization_policy) is not Qwen38TTNNMoESyncPolicy:
             raise TypeError(
                 "MoE synchronization_policy must be an exact Qwen38TTNNMoESyncPolicy, "
                 f"got {synchronization_policy!r}"
             )
-        row_contract = Qwen38TTNNMoERowContract(rows)
+        row_contract = Qwen38TTNNMoERowContract(rows, admitted_rows)
         mesh_contract.validate_mesh(mesh_device)
         self.mesh_device = mesh_device
         self.mesh_contract = mesh_contract

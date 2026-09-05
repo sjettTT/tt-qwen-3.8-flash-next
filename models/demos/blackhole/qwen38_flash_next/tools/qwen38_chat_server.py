@@ -12,14 +12,15 @@ request without ``temperature`` takes the model card's profile for its thinking
 mode; ``temperature 0`` or ``greedy`` is the bitwise greedy loop.  Without
 ``--sampling`` (the default, ``--no-sampling`` the explicit form) TAIL captures
 no candidate row, the loop is the greedy one at its measured period and explicit
-sampling fields are refused.  Runs under a launcher (``run_qwen38_chat_server.sh``)
-that selects the hardware profile and sets the runtime environment; the server
-checks the profile's locks (if it requires any) and the runtime identity before
-the mesh opens, replays the CPU acceptance records after the captures
+sampling fields are refused.  Runs under ``tools/run_qwen38_chat_server.sh``
+(or a lab launcher holding its lane's locks): the server admits the runtime it
+imports (the ttnn built from this checkout, ``runtime_admission``), prepares the
+model inputs on the CPU, opens the mesh, converts the routed experts on the
+first start, replays the CPU acceptance records after the captures
 (``--sampling-discriminator`` then runs the sampling chain arms and stops),
 writes READY, serves until SIGTERM, then releases the chain and the mesh in the
 timing runner's order.  ``--host`` is loopback unless the profile serves the
-LAN (the QuietBox) or ``--allow-lan`` is given.
+LAN (the QuietBox, the LoudBox) or ``--allow-lan`` is given.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 import ttnn
@@ -59,15 +60,23 @@ from models.demos.blackhole.qwen38_flash_next.tools.evidence_records import (
     write_result,
 )
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import Qwen38ChatRequestRejected
+from models.demos.blackhole.qwen38_flash_next.tools.live_decode_diagnostic import (
+    construct_live_decode_diagnostic,
+    missing_bf4_layers,
+)
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     DEFAULT_PREFILL_MODE,
     MAX_TOKENS_BOUND,
+    MTP_DRAFTS,
+    MTP_GDN_ANCHORS,
     PREFILL_MODES,
     Qwen38ChatChainError,
     Qwen38ChatRequestError,
     Qwen38ChatSession,
     construct_chain,
+    mtp_capacity_admission,
     open_partition_b_mesh,
+    resolve_route,
     template_decoder,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
@@ -79,6 +88,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
 MODEL_ID = "Qwen/Qwen3.8-Flash-Next"
 ACCEPTANCE_CONTINUATION = 96
 ACCEPTANCE_GATE_PROMPT = "json"
+ACCEPTANCE_HANDOFF_SPLIT = 40  # MTP chains: the gate record replayed as 40 tokens in one mode then 56 in the other
 DISCRIMINATOR_PROMPT = "story"
 MAX_REQUEST_BYTES = 16 << 20
 # Decision 6 (2026-09-03): thinking ON for Hermes, medium when the client sends no effort.
@@ -90,7 +100,33 @@ MAX_TOKENS_RULE = {"default_max_tokens": "remaining context", "max_tokens_limit"
 QUEUE_LIMIT = 4
 RETRY_AFTER_SECONDS = 5
 HEARTBEAT_SECONDS = 30.0
-IGNORED_REQUEST_FIELDS = ("logit_bias", "response_format", "parallel_tool_calls", "stream_options", "user")
+# The template flags a client may send under chat_template_kwargs (the vLLM/SGLang convention the model card uses).
+TEMPLATE_KWARGS = ("enable_thinking", "reasoning_effort", "preserve_thinking")
+# Every field parse_chat_request reads; any other top-level key is logged as ignored.
+KNOWN_REQUEST_FIELDS = frozenset(
+    (
+        "model",
+        "messages",
+        "tools",
+        "tool_choice",
+        "stream",
+        "stream_options",
+        "max_tokens",
+        "max_completion_tokens",
+        "stop",
+        "response_format",
+        "parallel_tool_calls",
+        "logit_bias",
+        "user",
+        "chat_template_kwargs",
+        "enable_thinking",
+        "reasoning_effort",
+        "thinking_budget",
+        "ignore_eos",
+        "prefill_mode",
+    )
+    + sampling_step.SAMPLING_REQUEST_FIELDS
+)
 # A request's seed when it sends none: 63 random bits, echoed in the response.
 SEED_BITS = 63
 PROFILER_VARIABLES = ("TT_METAL_DEVICE_PROFILER", "TT_METAL_PROFILER_CPP_POST_PROCESS", "TTNN_OP_PROFILER")
@@ -113,10 +149,11 @@ def _log(event: str, **fields: Any) -> None:
 
 def parse_chat_request(document: Any, *, seed: int | None = None, sampling_available: bool = True) -> dict[str, Any]:
     """The fields the server honours, validated with actual-vs-expected messages (one completion; the sampling
-    fields per ``qwen38_sampling_step``, ``extra_body`` merged under the top level).  ``seed`` is the server's
-    draw for a request that sends none.  A greedy-only server (``sampling_available`` false) refuses explicit
-    sampling fields and runs a request without them greedily.  Raises ``ValueError`` subclasses carrying
-    ``param`` and ``code``."""
+    fields per ``qwen38_sampling_step``, ``extra_body`` merged under the top level, JSON null an absent field,
+    ``chat_template_kwargs`` the thinking flags' other spelling).  ``seed`` is the server's draw for a request that
+    sends none.  A greedy-only server (``sampling_available`` false) refuses explicit sampling fields and runs a
+    request without them greedily.  A field the server cannot honour (structured output, logit_bias, serial tool
+    calls) is refused, never dropped.  Raises ``ValueError`` subclasses carrying ``param`` and ``code``."""
 
     if not isinstance(document, Mapping):
         raise Qwen38ChatRequestRejected(f"request body must be a JSON object, got {type(document).__name__}")
@@ -127,6 +164,30 @@ def parse_chat_request(document: Any, *, seed: int | None = None, sampling_avail
                 f"extra_body must be an object, got {type(extra).__name__}", param="extra_body"
             )
         document = {**extra, **{key: value for key, value in document.items() if key != "extra_body"}}
+    document = {key: value for key, value in document.items() if value is not None}
+    template_kwargs = document.get("chat_template_kwargs", {})
+    if not isinstance(template_kwargs, Mapping):
+        raise Qwen38ChatRequestRejected(
+            f"chat_template_kwargs must be an object, got {type(template_kwargs).__name__}",
+            param="chat_template_kwargs",
+        )
+    for key, value in template_kwargs.items():
+        if key not in TEMPLATE_KWARGS:
+            raise Qwen38ChatRequestRejected(
+                f"chat_template_kwargs.{key} is not a template flag of this server (the flags are {TEMPLATE_KWARGS})",
+                param=f"chat_template_kwargs.{key}",
+            )
+        if key == "preserve_thinking" and value is not True:
+            raise Qwen38ChatRequestRejected(
+                f"chat_template_kwargs.preserve_thinking must be true (the server keeps the reasoning), got {value!r}",
+                param="chat_template_kwargs.preserve_thinking",
+            )
+        if key in document and document[key] != value:
+            raise Qwen38ChatRequestRejected(
+                f"chat_template_kwargs.{key} {value!r} contradicts {key} {document[key]!r}",
+                param=f"chat_template_kwargs.{key}",
+            )
+    document = {**{key: template_kwargs[key] for key in TEMPLATE_KWARGS[:2] if key in template_kwargs}, **document}
     messages = protocol.normalize_messages(document.get("messages"))
     tool_choice = document.get("tool_choice", "auto")
     if tool_choice not in protocol.TOOL_CHOICES:
@@ -138,6 +199,31 @@ def parse_chat_request(document: Any, *, seed: int | None = None, sampling_avail
     stream = document.get("stream", False)
     if type(stream) is not bool:
         raise Qwen38ChatRequestRejected(f"stream must be a boolean, got {stream!r}", param="stream")
+    stream_options = document.get("stream_options", {})
+    if not isinstance(stream_options, Mapping) or set(stream_options) - {"include_usage"}:
+        raise Qwen38ChatRequestRejected(
+            f"stream_options may only hold include_usage (usage rides on the final chunk), got {stream_options!r}",
+            param="stream_options",
+        )
+    response_format = document.get("response_format", {"type": "text"})
+    kind = response_format.get("type") if isinstance(response_format, Mapping) else response_format
+    if kind != "text":
+        raise Qwen38ChatRequestRejected(
+            f"response_format.type must be 'text' (this server has no constrained decoding), got {kind!r}",
+            param="response_format",
+        )
+    if document.get("logit_bias", {}) != {}:
+        raise Qwen38ChatRequestRejected(
+            f"logit_bias is not applied by this server: drop it, got {document.get('logit_bias')!r}", param="logit_bias"
+        )
+    if document.get("parallel_tool_calls", True) is not True:
+        raise Qwen38ChatRequestRejected(
+            f"parallel_tool_calls must be true (every call the model emits is returned), "
+            f"got {document.get('parallel_tool_calls')!r}",
+            param="parallel_tool_calls",
+        )
+    if not isinstance(document.get("user", ""), str):
+        raise Qwen38ChatRequestRejected(f"user must be a string, got {document.get('user')!r}", param="user")
     if document.get("n", 1) != 1:
         raise Qwen38ChatRequestRejected(f"n must be 1 (one greedy completion), got {document.get('n')!r}", param="n")
     # None (neither name sent) stays None: the session resolves the remaining context once the prompt is known.
@@ -204,7 +290,7 @@ def parse_chat_request(document: Any, *, seed: int | None = None, sampling_avail
         "sampling": sampling,
         "logprobs": logprobs,
         "top_logprobs": top_logprobs,
-        "ignored": sorted(name for name in IGNORED_REQUEST_FIELDS if name in document),
+        "ignored": sorted(set(document) - KNOWN_REQUEST_FIELDS),
     }
 
 
@@ -306,6 +392,7 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
         # The mesh allocator read after the traces were captured (hardware_profiles.symmetric_mesh_dram_memory: one observation
         # that applies to every card): free_bytes_per_bank is the build's headroom, reported as read, never updated.
         self.dram_after_captures = dram_after_captures
+        self.created = int(time.time())  # /v1/models created: when this server came up
         self.turnstile = threading.Condition()
         self.waiting: collections.deque[int] = collections.deque()
         self.tickets = itertools.count()
@@ -382,6 +469,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                         {
                             "id": MODEL_ID,
                             "object": "model",
+                            "created": self.server.created,
                             "owned_by": "tenstorrent",
                             "context_length": session.context_limit,
                             "max_model_len": session.context_limit,
@@ -427,6 +515,9 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                     "supports": ["tools", "streaming", "reasoning_content", "stop", "thinking_budget", "ignore_eos"]
                     + (["sampling", "seed", "logprobs"] if session.sampling is not None else []),
                     "sampling": "greedy" if session.sampling is None else "candidate_row_host_sampler",
+                    # logprobs are relative to the read candidates (above the vocabulary's by -log of the row's mass).
+                    "logprobs_normalizer": None if session.sampling is None else "candidate_row",
+                    "mtp": None if session.mtp is None else session.mtp.summary(),
                     "sampling_defaults": {
                         "thinking": sampling_step.parameters_as_dict(
                             sampling_step.Qwen38SamplingParameters.official_thinking(seed=0)
@@ -480,6 +571,12 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 400, str(error), "invalid_request_error", code=code, param=getattr(error, "param", None)
             )
             return
+        except Exception as error:  # noqa: BLE001  a validation defect: answered, not a dropped connection
+            _log(
+                "request_validation_failed", error=f"{type(error).__name__}: {error}", traceback=traceback.format_exc()
+            )
+            self._send_error_json(500, f"{type(error).__name__}: {error}", "server_error")
+            return
         if request["ignored"]:
             _log("ignored_request_fields", fields=request["ignored"])
         received_utc = utc_now()
@@ -490,7 +587,10 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             return
         request_id = _completion_id()
         assembler = protocol.Qwen38ReplyAssembler(
-            template_decoder(session.template), thinking_open=request["enable_thinking"], stop_strings=request["stop"]
+            template_decoder(session.template),
+            thinking_open=request["enable_thinking"],
+            stop_strings=request["stop"],
+            tools=request["tools"],
         )
         try:
             prompt_ids = protocol.splice_prompt(
@@ -634,17 +734,27 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             heartbeat_stop.set()
             self.server.release_device()
         finish_reason = _finish_reason(completion.finish_reason, assembler)
+        # The next request continues this turn from the committed ids only when they are the reply the client will
+        # echo: the prompt fully prefilled, no stop-string tail (the match's tokens are committed), the think block
+        # closed, no tool block cut open.  A length finish leaves the reply's last token unconsumed in the row.
+        continuable = (
+            completion.finish_reason != "error"
+            and len(session.committed) >= len(prompt_ids)
+            and not assembler.stop_hit
+            and assembler.phase == "content"
+            and not assembler.truncated_tool_call
+        )
         self.server.served = (
-            None
-            if completion.finish_reason == "error" or not session.committed
-            else protocol.Qwen38ServedTurn(
+            protocol.Qwen38ServedTurn(
                 messages=request["messages"],
                 tools=request["tools"],
                 enable_thinking=request["enable_thinking"],
                 reasoning_effort=request["reasoning_effort"],
                 reply=assembler.echo_reply(),
-                committed=list(session.committed),
+                committed=list(session.committed) + ([] if session.row_token is None else [session.row_token]),
             )
+            if continuable
+            else None
         )
         if completion.prefill_tokens:
             self.server.last_prefill_ms_per_token = round(
@@ -828,17 +938,30 @@ def load_acceptance_records(directory: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _divergence(actual: Sequence[int], expected: Sequence[int]) -> int | None:
+    divergence = next((index for index, (a, b) in enumerate(zip(actual, expected)) if a != b), None)
+    if divergence is None and len(actual) != len(expected):
+        divergence = min(len(actual), len(expected))
+    return divergence
+
+
 def replay_acceptance(
     session: Qwen38ChatSession,
     records: list[dict[str, Any]],
     *,
     continuation: int = ACCEPTANCE_CONTINUATION,
     require_gate: bool,
+    handoff_gate: bool = False,
+    handoff_split: int = ACCEPTANCE_HANDOFF_SPLIT,
 ) -> dict[str, Any]:
     """Prefill each record's prompt ids, generate greedily, report the first index where the device differs.
 
     Stops are disabled so an early EOS record is compared over its whole CPU
     stream; the gate is the ``json`` record's full ``continuation`` match.
+    ``handoff_gate`` (MTP chains) replays the gate record twice more, split at
+    ``handoff_split`` tokens: the pass loop then the 1-row loop, and the 1-row
+    loop then the pass loop, each half continuing the other's device state, so
+    both mode switches must reproduce the CPU stream to count as exact.
     """
 
     results = []
@@ -847,9 +970,7 @@ def replay_acceptance(
         session.reset()
         completion = session.complete(record["prompt_token_ids"], len(expected), stop_ids=())
         actual = completion.token_ids
-        divergence = next((index for index, (a, b) in enumerate(zip(actual, expected)) if a != b), None)
-        if divergence is None and len(actual) != len(expected):
-            divergence = min(len(actual), len(expected))
+        divergence = _divergence(actual, expected)
         result = {
             "prompt": record["prompt"],
             "prompt_tokens": len(record["prompt_token_ids"]),
@@ -866,6 +987,7 @@ def replay_acceptance(
             "prefill_forced_tokens": completion.prefill_forced_tokens,
             "prefill_handoff_ms": completion.prefill_handoff_ms,
             "tokens_per_second": completion.tokens_per_second,
+            "mtp": completion.mtp,
         }
         results.append(result)
         _log("acceptance_prompt", **{key: value for key, value in result.items() if not key.endswith("_ids")})
@@ -876,41 +998,111 @@ def replay_acceptance(
             f"acceptance gate: {ACCEPTANCE_GATE_PROMPT} matched "
             f"{None if gate is None else gate['matched_tokens']} of {continuation} CPU greedy tokens"
         )
+    handoff = None
+    if handoff_gate and gate is not None:
+        record = next(record for record in records if record["prompt"] == ACCEPTANCE_GATE_PROMPT)
+        expected = record["generated_token_ids"][:continuation]
+        handoff = {"split": handoff_split, "orders": {}}
+        for name, first_speculative in (("mtp_then_one_row", True), ("one_row_then_mtp", False)):
+            session.reset()
+            prompt = list(record["prompt_token_ids"])
+            first = session.complete(prompt, handoff_split, stop_ids=(), speculative=first_speculative)
+            # The second half extends the exact repeat: the first half's last token sits unconsumed in the row.
+            second = session.complete(
+                prompt + first.token_ids[:-1],
+                len(expected) - handoff_split + 1,
+                stop_ids=(),
+                speculative=not first_speculative,
+            )
+            actual = first.token_ids[:-1] + second.token_ids
+            handoff["orders"][name] = {
+                "divergence_index": _divergence(actual, expected),
+                "compared_tokens": len(expected),
+                "second_half_prefix_reused": second.prefix_reused,
+                "second_half_reset": second.reset,
+                "first_half_mtp": first.mtp,
+                "second_half_mtp": second.mtp,
+                "device_token_ids": actual,
+            }
+            _log(
+                "acceptance_handoff",
+                order=name,
+                **{k: v for k, v in handoff["orders"][name].items() if k != "device_token_ids"},
+            )
+        handoff["pass"] = all(order["divergence_index"] is None for order in handoff["orders"].values())
+        if require_gate and not handoff["pass"]:
+            raise Qwen38ChatChainError(
+                f"acceptance hand-off gate: {ACCEPTANCE_GATE_PROMPT} split at {handoff_split} diverged: "
+                f"{ {name: order['divergence_index'] for name, order in handoff['orders'].items()} }"
+            )
+    # The replays are not client requests: /health and result.json count clients from zero.
+    session.requests_served = 0
+    session.last_tokens_per_second = None
     return {
         "schema": "qwen38-chat-server-acceptance/v1",
         "continuation": continuation,
         "gate_prompt": ACCEPTANCE_GATE_PROMPT,
         "gate_pass": gate_pass,
         "prompts": results,
+        "handoff": handoff,
     }
 
 
 # -- main --------------------------------------------------------------------------------------
 
-# The launcher's ``common`` block: the model inputs and caches here, the runtime admission's in ``runtime_admission``.
+# The launcher's ``common`` block: the model inputs and caches; the runtime identity's arguments are ``runtime_admission``'s.
 PATH_ARGUMENTS = (
     "checkpoint",
     "component-cache-root",
     "routed-bf4-scratch-root",
     "model-io-cache-root",
     "phase-log",
-) + runtime_admission.PATH_ARGUMENTS
-TEXT_ARGUMENTS = ("tt-metal-sha", "source-head", "source-tree") + runtime_admission.TEXT_ARGUMENTS
-# The rest of the runtime arguments (the archive seal) belong to pinned-archive launchers; a checkout build passes the
-# extension only.
-REQUIRED_ARGUMENTS = frozenset(PATH_ARGUMENTS[:5] + TEXT_ARGUMENTS[:3] + ("runtime-extension", "runtime-sha256"))
+)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in PATH_ARGUMENTS:
-        parser.add_argument(f"--{name}", type=Path, required=name in REQUIRED_ARGUMENTS, default=None)
-    for name in TEXT_ARGUMENTS:
-        parser.add_argument(f"--{name}", required=name in REQUIRED_ARGUMENTS, default=None)
-    runtime_admission.add_seal_arguments(parser)
+        parser.add_argument(f"--{name}", type=Path, required=True)
+    runtime_admission.add_arguments(parser)
+    parser.add_argument(
+        "--bf4-corpus",
+        type=Path,
+        default=None,
+        help="a CPU-staged BF4 expert corpus root (tools/stage_full_bf4_cpu.py); without it the production cache "
+        "under --routed-bf4-scratch-root is used and the missing layers are converted on the first start",
+    )
+    parser.add_argument("--bf4-corpus-verification", type=Path, default=None, help="the corpus's verification.json")
+    parser.add_argument(
+        "--bf4-producer-identity",
+        type=Path,
+        default=None,
+        help="JSON with the corpus's expected source_head, runtime and checkpoint (pins what the record claims)",
+    )
+    parser.add_argument(
+        "--bf4-stage-limit",
+        type=int,
+        default=None,
+        help="convert at most N missing BF4 layers this run (a host that bounds a job's wall time; resumable)",
+    )
+    parser.add_argument(
+        "--cpu-oracle", type=Path, default=None, help="the two-step CPU oracle (default: the shipped one)"
+    )
+    parser.add_argument(
+        "--device-nodes",
+        default=None,
+        help="four KMD device nodes for a profile on other chips of an eight-chip host, e.g. 4,5,6,7",
+    )
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="open the mesh, convert the missing BF4 layers into the cache, close: no traces, no serving",
+    )
     parser.add_argument("--evidence", type=Path, default=None, help="run directory (READY, STOPPED, ledgers)")
     parser.add_argument("--host", default="127.0.0.1", help="loopback unless the profile serves the LAN or --allow-lan")
-    parser.add_argument("--allow-lan", action="store_true", help="accept a non-loopback --host on a profile that does not serve the LAN")
+    parser.add_argument(
+        "--allow-lan", action="store_true", help="accept a non-loopback --host on a profile that does not serve the LAN"
+    )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--acceptance-prompts", type=Path, default=None, help="the CPU study's prompt-*-greedy.json")
     parser.add_argument("--require-json-96", action="store_true", help="refuse to serve unless json matches 96/96")
@@ -937,7 +1129,7 @@ def _parser() -> argparse.ArgumentParser:
         "--hardware-profile",
         choices=tuple(hardware_profiles.hardware_profile_table()),
         default=None,
-        help="the mesh to open (default: this host's profile, selected by TT_VISIBLE_DEVICES)",
+        help="tt-quietbox | bh-loudbox | tt-quietbox-2[-instance-1] (a private table adds the lab lanes)",
     )
     parser.add_argument("--validate-only", action="store_true", help="provenance and CPU preparation, no mesh")
     parser.add_argument(
@@ -959,6 +1151,20 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="after the acceptance replay run the sampling chain arms on the gate prompt, write "
         "sampling-discriminator.json and stop without serving",
+    )
+    parser.add_argument(
+        "--mtp",
+        type=int,
+        choices=MTP_DRAFTS,
+        default=None,
+        help="draft K tokens per pass with the MTP layer (verify / draft / commit traces; greedy chunked-mode "
+        "requests generate through the pass loop); default off",
+    )
+    parser.add_argument(
+        "--mtp-gdn-anchor",
+        choices=MTP_GDN_ANCHORS,
+        default="off",
+        help="MTP: the GDN state re-anchor (layer0 = layer 0's commits run the 1-row fp32 step recurrence)",
     )
     return parser
 
@@ -983,7 +1189,20 @@ def main() -> int:
         raise SystemExit(f"--request-deadline-seconds must be positive, got {args.request_deadline_seconds}")
     if args.sampling_discriminator and (not args.sampling or args.acceptance_prompts is None):
         raise SystemExit("--sampling-discriminator needs --sampling and the acceptance prompt records")
-    marker = lambda phase: append_marker(args.phase_log, phase)  # noqa: E731
+    if args.bf4_stage_limit is not None and args.bf4_stage_limit <= 0:
+        raise SystemExit(f"--bf4-stage-limit must be positive, got {args.bf4_stage_limit}")
+    if args.device_nodes is not None:
+        try:
+            hardware_profile = hardware_profile.with_device_nodes(
+                tuple(int(node) for node in args.device_nodes.split(","))
+            )
+        except (ValueError, hardware_profiles.HardwareProfileError) as error:
+            raise SystemExit(f"--device-nodes {args.device_nodes!r}: {error}") from error
+
+    def marker(phase: str) -> None:
+        append_marker(args.phase_log, phase)
+        _log("phase", phase=phase)
+
     for name, expected in (
         ("TT_VISIBLE_DEVICES", hardware_profile.visible_devices),
         ("QWEN38_HARDWARE_MODE", "diagnostic_non_promoting"),
@@ -994,24 +1213,51 @@ def main() -> int:
     profiler = tuple(name for name in PROFILER_VARIABLES if os.environ.get(name) is not None)
     if profiler:
         raise SystemExit(f"profiler instrumentation is set: {profiler}")
-    source = runtime_admission.source_proof(args.source_head, args.source_tree)
+    runtime = runtime_admission.admit_runtime(args)
+    _log("runtime", **{key: value for key, value in runtime.items() if key != "bundle"})
     lock_proof = hardware_profiles.verify_inherited_locks(hardware_profile)
-    runtime = runtime_admission.runtime_proof(args.runtime_extension, args.runtime_sha256)
-    runtime_bundle = runtime_admission.runtime_bundle_identity(args)
-    prepared, _oracle = runtime_admission.prepare_cpu(args, marker=marker, hardware_profile=hardware_profile)
+    # The route: pinned by the profile, or (the LoudBox) derived from the cluster descriptor now and recorded.
+    hardware_profile, route_derivation = resolve_route(hardware_profile)
+    _log(
+        "route",
+        lane=hardware_profile.lane,
+        route=list(hardware_profile.route),
+        nodes=list(hardware_profile.route_nodes),
+    )
+    prepared, _oracle = runtime_admission.prepare_cpu(
+        args, marker=marker, hardware_profile=hardware_profile, identity=runtime
+    )
     template = Qwen38OfficialChatTemplate(prepared.checkpoint.root)
     records = load_acceptance_records(args.acceptance_prompts) if args.acceptance_prompts is not None else []
     resident_context = Qwen38ResidentContext(args.allocated_context)
+    # MTP is refused where the resident build's admission table says its pair, state and chain do not fit.
+    mtp_admission = None if args.mtp is None else mtp_capacity_admission(resident_context.allocated_context)
+    if mtp_admission is not None and not mtp_admission["fits"]:
+        raise SystemExit(
+            f"--mtp {args.mtp} does not fit at --allocated-context {resident_context.allocated_context}: the resident "
+            f"build leaves {mtp_admission['free_bytes_per_bank_after_captures']} free bytes per DRAM bank "
+            f"({mtp_admission['largest_contiguous_bytes_free_per_bank_after_captures']} contiguous) after its captures, "
+            f"the MTP chain needs {mtp_admission['required_free_bytes_per_bank']} "
+            f"({mtp_admission['required_largest_contiguous_bytes_per_bank']} contiguous): {mtp_admission}"
+        )
     summary = {
         "mode": "chat_server_single_trace_chain",
         "model": MODEL_ID,
         "hardware_profile": hardware_profile.host,
         "hardware_partition": hardware_profile.partition,
+        "device_nodes": list(hardware_profile.device_nodes),
+        "route": list(hardware_profile.route),
+        "route_nodes": list(hardware_profile.route_nodes),
+        "route_derivation": route_derivation["route_derivation"],
         "allocated_context": resident_context.allocated_context,
         "context_limit": resident_context.context_limit,
-        "source": source,
+        "source": {
+            "worktree": runtime["repo"],
+            "head": runtime["head"],
+            "tree": runtime["tree"],
+            "clean": not runtime["dirty"],
+        },
         "runtime": runtime,
-        "runtime_bundle": runtime_bundle,
         "prepared": prepared.summary(),
         "template_sha256": PINNED_TOKENIZER_ARTIFACTS["chat_template.jinja"],
         "acceptance_records": [record["prompt"] for record in records],
@@ -1025,7 +1271,12 @@ def main() -> int:
         "defaults": {"enable_thinking": ENABLE_THINKING_DEFAULT, "reasoning_effort": REASONING_EFFORT_DEFAULT},
         "sampling": "candidate_row_host_sampler" if args.sampling else "greedy",
         "sampling_discriminator": bool(args.sampling_discriminator),
-        "system_fingerprint": f"{args.source_head[:12]}-{args.runtime_sha256[:12]}",
+        "mtp": {
+            "k": args.mtp,
+            "anchor": args.mtp_gdn_anchor if args.mtp is not None else None,
+            "admission": mtp_admission,
+        },
+        "system_fingerprint": f"{runtime['head'][:12]}-{runtime['extension_sha256'][:12]}",
     }
     if args.validate_only:
         print(json.dumps({"status": "pass", "mesh_open_requested": False, **summary}, sort_keys=True))
@@ -1057,12 +1308,36 @@ def main() -> int:
     try:
         mesh, report["topology"] = open_partition_b_mesh(marker, hardware_profile)
         fabric_enabled = True
+        if args.prepare_only:
+            # The caches only: the builder converts the missing BF4 layers (bounded by --bf4-stage-limit) and the
+            # run stops; a later start finds them.  The component and model-I/O caches fill at the first target build.
+            construction = construct_live_decode_diagnostic(
+                prepared,
+                mesh_device=mesh,
+                collective_topology=ttnn.Topology.Linear,
+                marker=marker,
+                bf4_stage_limit=args.bf4_stage_limit,
+                require_complete=False,
+            )
+            missing = missing_bf4_layers(construction.builder)
+            report["prepare"] = {
+                "bf4_cache_root": str(construction.production_cache.root),
+                "staged_bf4_layers": [list(slot) for slot in construction.staged_bf4_layers],
+                "missing_bf4_layers": [list(slot) for slot in missing],
+            }
+            _log("prepared", staged=len(construction.staged_bf4_layers), missing=len(missing))
+            ttnn.synchronize_device(mesh)
+            report["status"] = "stopped"
+            raise Qwen38ChatServerStop("prepare-only run complete")
         chain = construct_chain(
             prepared,
             mesh,
             marker=marker,
             chunked_prefill=args.prefill_mode == "chunked",
             sampling=bool(args.sampling),
+            bf4_stage_limit=args.bf4_stage_limit,
+            mtp=args.mtp,
+            mtp_gdn_anchor=args.mtp_gdn_anchor,
         )
         if chain.allocated_context != resident_context.allocated_context:
             raise Qwen38ChatChainError(
@@ -1073,6 +1348,8 @@ def main() -> int:
             raise Qwen38ChatChainError(f"session prefill mode {session.prefill_mode} vs requested {args.prefill_mode}")
         if (session.sampling is not None) != bool(args.sampling):
             raise Qwen38ChatChainError(f"session sampling {session.sampling is not None} vs requested {args.sampling}")
+        if (session.mtp is not None) != (args.mtp is not None):
+            raise Qwen38ChatChainError(f"session mtp {session.mtp is not None} vs requested {args.mtp}")
         if session.context_limit != resident_context.context_limit:
             raise Qwen38ChatChainError(
                 f"session context limit {session.context_limit} vs the build's {resident_context.context_limit}"
@@ -1089,6 +1366,19 @@ def main() -> int:
             "chunk_capture_ms": chain.chunk_capture_ms,
             "prefill_mode": session.prefill_mode,
             "sampling": chain.sampling is not None,
+            "mtp": (
+                None
+                if chain.mtp is None
+                else {
+                    "k": chain.mtp.drafts,
+                    "anchor": chain.mtp.anchor,
+                    "traces": len(chain.mtp.captured_trace_ids()),
+                    "capture_ms": chain.mtp.capture_ms,
+                    "trace_dram_bytes_per_bank": chain.mtp.trace_dram_bytes_per_bank,
+                    "dram_bytes_per_bank": chain.mtp.dram_bytes_per_bank,
+                    "admission": chain.mtp.admission,
+                }
+            ),
         }
         # The allocator after every capture (the traces bake their addresses in; nothing is allocated after this
         # point on the serving path): the build's per-device headroom, in the report, READY and /health.
@@ -1099,7 +1389,9 @@ def main() -> int:
         _log("dram_after_captures", allocated_context=chain.allocated_context, **report["chain"]["dram_after_captures"])
         if records:
             marker("before-chat-acceptance-replay")
-            report["acceptance"] = replay_acceptance(session, records, require_gate=args.require_json_96)
+            report["acceptance"] = replay_acceptance(
+                session, records, require_gate=args.require_json_96, handoff_gate=session.mtp is not None
+            )
             (evidence / "acceptance.json").write_text(
                 json.dumps(report["acceptance"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
@@ -1151,6 +1443,7 @@ def main() -> int:
                 "allocated_context": chain.allocated_context,
                 "free_bytes_per_bank": report["chain"]["dram_after_captures"]["free_bytes_per_bank"],
                 "acceptance_gate_pass": None if not records else report["acceptance"]["gate_pass"],
+                "mtp": report["chain"]["mtp"],
             }
             ready_marker.write_text(json.dumps(ready, sort_keys=True) + "\n", encoding="utf-8")
             marker("chat-server-ready")
@@ -1160,6 +1453,10 @@ def main() -> int:
             except Qwen38ChatServerStop:
                 uncertain = server.busy or session.poisoned
                 report["status"] = "stopped" if not uncertain else "stopped_mid_request"
+    except Qwen38ChatServerStop as stop:
+        if report["status"] != "stopped":
+            report["error"] = f"{type(stop).__name__}: {stop}"
+            _log("failed", error=report["error"])
     except BaseException as error:
         uncertain = uncertain or (server is not None and (server.busy or server.session.poisoned))
         report["error"] = f"{type(error).__name__}: {error}"

@@ -636,16 +636,30 @@ class Qwen38TTNNTextModelChunkState:
 
 @dataclass
 class Qwen38TTNNGenericDecodeOutput:
-    """Logits of one position-generic step; every other tensor is in-place state or released."""
+    """Logits of one position-generic step; every other tensor is in-place state or released.
+
+    ``retain_mtp_inputs`` (the MTP-drafting chat server) keeps the layer-47 residual (the MTP alignment root at
+    this position) and the step's RoPE rows and QSA position inputs alive for the epilogue's MTP-layer row;
+    they are released with the output.
+    """
 
     logits: Qwen38ShardedLogits | None
     active: bool = True
+    residual: Any = None
+    rope: Any = None
+    qsa_position: Any = None
 
     def release_tensors(self) -> None:
         if not self.active:
             raise RuntimeError("generic decode output tensors were already released")
         if self.logits is not None:
             ttnn.deallocate(self.logits.tensor)
+        if self.residual is not None:
+            ttnn.deallocate(self.residual)
+        if self.rope is not None:
+            self.rope.deallocate()
+        if self.qsa_position is not None:
+            self.qsa_position.deallocate()
         self.active = False
 
 
@@ -2037,6 +2051,7 @@ class Qwen38TTNNTextModel:
         *,
         return_logits: bool = True,
         release_head: bool = True,
+        retain_mtp_inputs: bool = False,
     ) -> Qwen38TTNNGenericDecodeOutput:
         """TAIL of one position-generic step: position derivation, layers[GENERIC_HEAD_LAYERS:], mixer, LM head, advance.
 
@@ -2045,12 +2060,17 @@ class Qwen38TTNNTextModel:
         first one consumes the PLE row), applies the final mixer and LM head,
         then advances the device position as the last op.  ``release_head=False``
         leaves the head residual allocated: the HEAD/TAIL traces bake its fixed
-        address in, so the capture retains it for the life of the traces.  Any
+        address in, so the capture retains it for the life of the traces.
+        ``retain_mtp_inputs`` returns the layer-47 residual, the RoPE rows and
+        the QSA position inputs in the output instead of releasing them (the
+        MTP-drafting server's epilogue runs the MTP layer's row on them).  Any
         failure poisons this owner: the in-place state cannot be rolled back.
         """
 
         self._require_generic_decode_inputs(prepared, state)
         self._validate_generic_head(head)
+        if not isinstance(retain_mtp_inputs, bool):
+            raise TypeError(f"retain_mtp_inputs must be a bool, got {retain_mtp_inputs!r}")
         processed_layers = GENERIC_HEAD_LAYERS
         try:
             index_row = state.position.index_row()
@@ -2074,15 +2094,20 @@ class Qwen38TTNNTextModel:
                     head.active = False
                 processed_layers += 1
                 self._validate_residual(residual, label=f"generic target layer {layer_index} output")
-            qsa_position.deallocate()
-            rope.deallocate()
+            if not retain_mtp_inputs:
+                qsa_position.deallocate()
+                rope.deallocate()
             hidden = self.final_mixer(residual)
-            _deallocate_unique(residual)
+            if not retain_mtp_inputs:
+                _deallocate_unique(residual)
             self._validate_hidden(hidden, label="terminal hyper-connection output")
             logits = self.model_io.lm_head(hidden) if return_logits else None
             _deallocate_unique(hidden)
+            retained = (residual, rope, qsa_position) if retain_mtp_inputs else (None, None, None)
             state.position.advance()
-            return Qwen38TTNNGenericDecodeOutput(logits)
+            return Qwen38TTNNGenericDecodeOutput(
+                logits, residual=retained[0], rope=retained[1], qsa_position=retained[2]
+            )
         except BaseException as error:
             self._mark_poisoned("forward_decode_generic_tail", processed_layers, error)
 
@@ -2117,6 +2142,7 @@ class Qwen38TTNNTextModel:
         regime: int = 0,
         cq_id: int = 0,
         clock_ns: Callable[[], int] = time.monotonic_ns,
+        retain_mtp_inputs: bool = False,
     ) -> Qwen38TTNNGenericDecodeCapture:
         """Capture one residue class of the generic body: one single-body trace, or a HEAD and a TAIL trace.
 
@@ -2125,9 +2151,11 @@ class Qwen38TTNNTextModel:
         yields is collected into ``guard_attempts``).  ``epilogue(output)`` runs
         inside the last part's capture after the model (the caller's greedy
         candidates, device resolve and token-row copy) and its result is
-        returned.  Capture records commands without executing them, so the
-        device state is unchanged while the host ring-phase bookkeeping advances
-        as if the body ran; ``phase_observer`` sees ``before-<part>-capture`` and
+        returned.  ``retain_mtp_inputs`` (the split form only) hands the epilogue
+        the TAIL's retained residual, RoPE rows and QSA position inputs.  Capture
+        records commands without executing them, so the device state is unchanged
+        while the host ring-phase bookkeeping advances as if the body ran;
+        ``phase_observer`` sees ``before-<part>-capture`` and
         ``after-<part>-capture`` for the caller's phase checks.  A body failure
         poisons this owner and leaves the capture open; the process must exit.
         """
@@ -2136,6 +2164,8 @@ class Qwen38TTNNTextModel:
             raise TypeError("capture phase observer must be callable")
         if not isinstance(residue, int) or not isinstance(regime, int) or residue < 0 or regime < 0:
             raise ValueError(f"trace residue/regime must be non-negative ints, got {residue!r}/{regime!r}")
+        if retain_mtp_inputs and not split:
+            raise ValueError("retain_mtp_inputs needs the split (HEAD / TAIL) capture")
         parts = GENERIC_TRACE_PARTS_SPLIT if split else GENERIC_TRACE_PARTS_SINGLE
         head: Qwen38TTNNGenericHead | None = None
         output: Qwen38TTNNGenericDecodeOutput | None = None
@@ -2154,7 +2184,9 @@ class Qwen38TTNNTextModel:
                         head = self.forward_decode_generic_head(prepared, state)
                     else:
                         output = (
-                            self.forward_decode_generic_tail(head, prepared, state, release_head=False)
+                            self.forward_decode_generic_tail(
+                                head, prepared, state, release_head=False, retain_mtp_inputs=retain_mtp_inputs
+                            )
                             if part == "tail"
                             else self.forward_decode_generic(prepared, state)
                         )
@@ -2351,11 +2383,14 @@ class Qwen38TTNNTextModel:
         state: Qwen38TTNNTextModelGenericState,
         *,
         gdn_step_anchor: bool = False,
+        mtp=None,
     ) -> None:
         """One chunk: selectors, RoPE rows and QSA chunk inputs from the device position, the 32-lane
         embedding, 48 layers in place, ``P += 32``.  No final mixer or LM head: the first decode replay after
         the prefill consumes the last prompt token.  ``gdn_step_anchor`` is every GDN layer's state re-anchor (the
-        layer commits through ``commit_rows(step_committed_rows=True)``).  Any failure poisons this owner."""
+        layer commits through ``commit_rows(step_committed_rows=True)``).  ``mtp`` (the MTP-drafting server's chunk
+        extension) runs the MTP layer's rows on the layer-47 residual rows before they are released.  Any failure
+        poisons this owner."""
 
         self._validate_generic_state(state)
         self._validate_chunk_state(chunk_state)
@@ -2389,6 +2424,15 @@ class Qwen38TTNNTextModel:
                     gdn_step_anchor=gdn_step_anchor,
                 )
                 processed_layers += 1
+            if mtp is not None:
+                mtp.forward_chunk_rows(
+                    self,
+                    residual,
+                    rope_rows=rope,
+                    qsa_chunk=qsa_chunk,
+                    qsa_chunk_constants=chunk_state.qsa_chunk_constants,
+                    selectors=selectors,
+                )
             _deallocate_unique(residual)
             qsa_chunk.deallocate()
             rope.deallocate()
@@ -2405,6 +2449,7 @@ class Qwen38TTNNTextModel:
         guard: Callable[[str], AbstractContextManager[Any]],
         cq_id: int = 0,
         gdn_step_anchor: bool = False,
+        mtp=None,
     ) -> int:
         """Capture the chunk body once (after the decode captures, on the same generic state); returns the trace id.
 
@@ -2416,7 +2461,7 @@ class Qwen38TTNNTextModel:
         with ttnn.corruptible_allocation_scope(self.mesh_device):
             trace_id = ttnn.begin_trace_capture(self.mesh_device, cq_id=cq_id)
             with guard("prefill chunk capture"):
-                self.forward_prefill_chunk_generic(chunk_state, state, gdn_step_anchor=gdn_step_anchor)
+                self.forward_prefill_chunk_generic(chunk_state, state, gdn_step_anchor=gdn_step_anchor, mtp=mtp)
             ttnn.end_trace_capture(self.mesh_device, trace_id, cq_id=cq_id)
         return trace_id
 

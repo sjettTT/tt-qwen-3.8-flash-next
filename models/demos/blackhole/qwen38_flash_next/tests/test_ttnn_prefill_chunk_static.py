@@ -134,7 +134,7 @@ def test_model_chunk_state_is_allocated_before_capture_with_host_written_inputs(
     capture = inspect.getsource(Qwen38TTNNTextModel.capture_prefill_chunk)
     assert "ttnn.corruptible_allocation_scope(self.mesh_device)" in capture
     assert "ttnn.begin_trace_capture(self.mesh_device, cq_id=cq_id)" in capture
-    assert "self.forward_prefill_chunk_generic(chunk_state, state, gdn_step_anchor=gdn_step_anchor)" in capture
+    assert "self.forward_prefill_chunk_generic(chunk_state, state, gdn_step_anchor=gdn_step_anchor, mtp=mtp)" in capture
     assert "ttnn.end_trace_capture(self.mesh_device, trace_id, cq_id=cq_id)" in capture
 
 
@@ -168,7 +168,7 @@ def test_gdn_step_anchor_is_a_keyword_off_by_default_from_the_chain_to_the_gdn_c
     assert body.count("gdn_step_anchor") == 4  # the signature, the docstring, the call's keyword and its value
     assert body.count("gdn_step_anchor=gdn_step_anchor,") == 1
     opened = inspect.getsource(session_module.Qwen38TracedChain.open)
-    assert "model.forward_prefill_chunk_generic(chunk_state, state, gdn_step_anchor=chunk_gdn_step_anchor)" in opened
+    assert "chunk_state, state, gdn_step_anchor=chunk_gdn_step_anchor, mtp=chunk_extension" in opened
     assert "gdn_step_anchor=chunk_gdn_step_anchor,\n            )" in opened  # the capture
     assert "chunk_gdn_step_anchor=chunk_gdn_step_anchor," in opened  # the chain records what its trace carries
     assert "gdn_step_anchor=self.chunk_gdn_step_anchor," in inspect.getsource(

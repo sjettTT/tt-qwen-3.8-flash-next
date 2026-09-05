@@ -144,6 +144,31 @@ def test_duplicate_parameters_and_tool_suffix_fail_closed() -> None:
         parse_assistant_completion(suffix, enable_thinking=True)
 
 
+def test_tool_arguments_follow_the_schema_types() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "d",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}, "count": {"type": "integer"}, "tags": {"type": "array"}},
+                },
+            },
+        }
+    ]
+    generated = (
+        "<tool_call><function=lookup><parameter=id>42</parameter><parameter=count>3</parameter>"
+        "<parameter=tags>[1]</parameter><parameter=other>true</parameter><parameter=weight>NaN</parameter>"
+        "</function></tool_call>"
+    )
+    typed = parse_assistant_completion(generated, enable_thinking=False, tools=tools).tool_calls[0].arguments
+    assert typed == {"id": "42", "count": 3, "tags": [1], "other": True, "weight": "NaN"}
+    guessed = parse_assistant_completion(generated, enable_thinking=False).tool_calls[0].arguments
+    assert guessed == {"id": 42, "count": 3, "tags": [1], "other": True, "weight": "NaN"}
+
+
 def test_nonthinking_parser_has_no_reasoning() -> None:
     completion = parse_assistant_completion("visible answer<|im_end|>", enable_thinking=False)
     assert completion == Qwen38AssistantCompletion("", "visible answer", ())

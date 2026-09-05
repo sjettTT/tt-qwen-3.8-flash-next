@@ -347,6 +347,8 @@ class Qwen38SamplingRequest:
             **parameters_as_dict(self.parameters),
             "fallbacks": self.clocks.fallbacks,
             "candidate_misses": self.clocks.candidate_misses,
+            # The reported logprobs are normalised over the read candidates, not the vocabulary (the row's mass).
+            "logprobs_normalizer": "candidate_row",
         }
 
 
@@ -447,6 +449,7 @@ def generate_sampled(
             sample = choose_token(session, row, request, tail_residue=tail_residue, prompt_tokens=prompt_tokens)
             request.samples.append(sample)
             chain.write_token_row(sample.token_id)  # the row holds the token the client saw, as after the greedy loop
+            session.row_token = sample.token_id
             yield sample.token_id, "length"
             return
         residue = len(session.committed) % RESIDUE_CLASSES

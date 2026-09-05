@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import inspect
 import itertools
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,7 @@ from models.demos.blackhole.qwen38_flash_next.tt.gdn import (
 from models.demos.blackhole.qwen38_flash_next.tt.ple import Qwen38PLEWeights
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import layer as layer_module
+from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2
 from models.demos.blackhole.qwen38_flash_next.ttnn import ple as ple_module
 from models.experimental.gated_attention_gated_deltanet.torch_functional.delta_rule_ops import chunk_gated_delta_rule
 
@@ -709,6 +711,34 @@ def _rows_run(module, state, hidden: torch.Tensor, constants):
     module.sync_rows_history_from_state(state, rows_state)
     result = module.forward_rows(_hidden_sharded(hidden), state, rows_state)
     return result, rows_state
+
+
+def test_forward_rows_full_tile_is_the_row_slice_with_exact_zero_padding_rows(fake, gdn_weights) -> None:
+    """``full_tile=True`` returns the whole 32-row output (a fresh buffer): rows below R are the persistent slice's,
+    rows past R are exact zeros (zero q rows -> zero recurrent output -> zero norm, gate and projection)."""
+
+    fake.chunk.impl = step_chunk_kernel
+    _, weights = gdn_weights
+    module = _gdn_module(weights)
+    torch.manual_seed(17)
+    rows = 5
+    hidden = torch.randn(1, rows, 2560).to(torch.bfloat16)
+    state_slice = _seed_state(module, 13)
+    state_tile = _clone_state(module, state_slice)
+    constants = module.allocate_rows_constants(rows)
+    sliced, _ = _rows_run(module, state_slice, hidden, constants)
+    rows_state = module.allocate_rows_state(constants)
+    module.sync_rows_history_from_state(state_tile, rows_state)
+    tile = module.forward_rows(_hidden_sharded(hidden), state_tile, rows_state, full_tile=True)
+    output = _cat(tile.hidden_rows, 3)
+    assert output.shape == (1, 1, CHUNK_ROWS, 2560) and tile.hidden_rows is not rows_state.output
+    assert torch.equal(output[:, :, :rows], _cat(sliced.hidden_rows, 3))
+    assert torch.count_nonzero(output[:, :, rows:]) == 0
+    assert torch.equal(_cat(tile.final_state, 1), _cat(sliced.final_state, 1))
+    # The verify layer body takes the tile (no slice landing, no pad) and owns it.
+    source = inspect.getsource(mtp_v2._forward_layer_verify)
+    assert "full_tile=True" in source and 'label="GDN verify output rows"' not in source
+    assert "attention_owner = attention_hidden" in source
 
 
 def test_forward_rows_at_one_row_is_bitwise_the_one_row_path_around_the_recurrence(fake, gdn_weights) -> None:

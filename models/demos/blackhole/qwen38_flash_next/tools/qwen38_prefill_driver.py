@@ -90,6 +90,7 @@ class Qwen38ChunkPrefill:
         event_interval: int = CHUNK_EVENT_INTERVAL,
         verify_allocations: bool = True,
         gdn_step_anchor: bool = False,
+        mtp: Any = None,
     ) -> None:
         if isinstance(event_interval, bool) or type(event_interval) is not int or event_interval <= 0:
             raise ValueError(f"event interval must be a positive int, got {event_interval!r}")
@@ -107,15 +108,22 @@ class Qwen38ChunkPrefill:
         self.event_interval = event_interval
         self.verify_allocations = verify_allocations
         self.gdn_step_anchor = gdn_step_anchor
+        # The MTP-drafting chain's chunk extension (mtp_v2.Qwen38TTNNMTPChunkExtension): the chunk trace was captured
+        # with it, so every chunk also takes its 32 MTP tokens (the tokens one position ahead) and the hand-off
+        # includes the MTP layer.
+        self.mtp = mtp
 
     def _run_chunk(self, *, blocking: bool) -> None:
         """One chunk at the device position: the captured trace's replay, or the eager chunk body with the
-        re-anchor flag passed per chunk (a blocking eager chunk synchronizes so its wall is the chunk's)."""
+        re-anchor flag and the MTP extension passed per chunk (a blocking eager chunk synchronizes so its wall is
+        the chunk's)."""
 
         if self.chunk_trace_id is not None:
             ttnn._ttnn_execute_trace(self.mesh, self.chunk_trace_id, cq_id=0, blocking=blocking)
             return
-        self.model.forward_prefill_chunk_generic(self.chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor)
+        self.model.forward_prefill_chunk_generic(
+            self.chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor, mtp=self.mtp
+        )
         if blocking:
             ttnn.synchronize_device(self.mesh)
 
@@ -126,13 +134,17 @@ class Qwen38ChunkPrefill:
         start_position: int,
         ple_context: tuple[int, int] | None,
         time_each_chunk: bool = False,
+        following_token: int | None = None,
     ) -> Qwen38PrefillResult:
         """Prefill ``token_ids`` at positions ``start_position ..``; the caller's first decode replay consumes the
-        token after them.  Returns the position after the prefill and the committed stream's n-gram context."""
+        token after them (``following_token``, the MTP token of the last prefilled position when the chain drafts).
+        Returns the position after the prefill and the committed stream's n-gram context."""
 
         tokens = [int(token) for token in token_ids]
         if isinstance(start_position, bool) or type(start_position) is not int or start_position < 0:
             raise ValueError(f"start position must be a non-negative int, got {start_position!r}")
+        if self.mtp is not None and following_token is None:
+            raise ValueError("an MTP-drafting chain's chunked prefill needs the token following the prefilled ones")
         if start_position + len(tokens) > self.model.allocated_context:
             raise ValueError(
                 f"prefill of {len(tokens)} tokens from position {start_position} exceeds the allocated context "
@@ -159,10 +171,14 @@ class Qwen38ChunkPrefill:
                 )
             ttnn.synchronize_device(self.mesh)
             self.model.reset_chunk_state_inplace(self.state, self.chunk_state)
+            if self.mtp is not None:
+                self.mtp.reset_chunk()
             if self.verify_allocations and self.chunk_trace_id is not None:
                 verify_started_ns = time.perf_counter_ns()
                 UnsafeAllocationTracker(self.mesh).verify_before_replay(self.chunk_trace_id)
                 verify_ms = (time.perf_counter_ns() - verify_started_ns) / 1_000_000
+            # The MTP layer's tokens sit one position ahead: the chunk's rows shifted by one, then the following token.
+            following = remaining[1:] + [following_token if following_token is not None else self.pad_token_id]
             for index, accepted in enumerate(accepts):
                 rows = remaining[CHUNK_ROWS * index : CHUNK_ROWS * (index + 1)]
                 real_rows = len(rows)
@@ -172,6 +188,9 @@ class Qwen38ChunkPrefill:
                     rows = rows + [self.pad_token_id] * (CHUNK_ROWS - real_rows)
                 contexts = self.model.write_chunk_inputs(self.chunk_state, rows, ple_context=ple_context)
                 ple_context = contexts[real_rows]
+                if self.mtp is not None:
+                    ahead = following[CHUNK_ROWS * index : CHUNK_ROWS * (index + 1)]
+                    self.mtp.write_tokens(self.model, ahead + [self.pad_token_id] * (CHUNK_ROWS - len(ahead)))
                 if time_each_chunk:
                     replay_started_ns = time.perf_counter_ns()
                     host_ms.append((replay_started_ns - host_started_ns) / 1_000_000)
@@ -185,6 +204,8 @@ class Qwen38ChunkPrefill:
             handoff_started_ns = time.perf_counter_ns()
             ttnn.synchronize_device(self.mesh)
             self.model.finish_prefill(self.state, self.chunk_state, position)
+            if self.mtp is not None:
+                self.mtp.finish_chunk(self.model, prefilled=position)
             ttnn.synchronize_device(self.mesh)
             handoff_ms = (time.perf_counter_ns() - handoff_started_ns) / 1_000_000
         timing = Qwen38PrefillTiming(

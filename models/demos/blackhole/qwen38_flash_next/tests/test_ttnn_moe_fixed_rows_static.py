@@ -160,6 +160,25 @@ def test_fixed_row_contract_is_exact_and_fail_closed() -> None:
             Qwen38TTNNMoERowContract(rows)
 
 
+def test_row_contract_admits_an_explicit_override_for_one_instance_only() -> None:
+    """``admitted_rows`` widens the admission for the instance that names it (the MTP v2 runner's explicit MoE rows
+    override, e.g. 6 rows for k = 5); the module's ``SUPPORTED_ROWS`` and proof flags do not move."""
+
+    six = Qwen38TTNNMoERowContract(6, (6,))
+    assert six.rows == 6 and six.hidden_sharded == (1, 1, 6, 640) and six.moe_sparse_input == (1, 6, HIDDEN_SIZE)
+    assert six.moe_routing == (1, 6, TOP_K) and six.fast_reduce_scores == (6, 1, 1, TOP_K)
+    assert Qwen38TTNNMoERowContract(5, (5, 6)).rows == 5
+    assert Qwen38TTNNMoERowContract(1).admitted_rows == SUPPORTED_ROWS == (1, 5, 32)
+    for rows, admitted in ((6, SUPPORTED_ROWS), (7, (6,)), (0, (0,)), (33, (33,)), (6, (True, 6)), (6, [6])):
+        with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
+            Qwen38TTNNMoERowContract(rows, admitted)
+    with pytest.raises(ValueError):  # allow-pytest.raises: an empty admission admits nothing
+        Qwen38TTNNMoERowContract(1, ())
+    parameter = inspect.signature(Qwen38TTNNMoE.__init__).parameters["admitted_rows"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY and parameter.default == SUPPORTED_ROWS
+    assert moe_module.ROWS5_HARDWARE_PROVEN is True and moe_module.ROWS32_HARDWARE_PROVEN is True
+
+
 def test_default_constructor_contract_preserves_the_one_row_api() -> None:
     parameter = inspect.signature(Qwen38TTNNMoE.__init__).parameters["rows"]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY

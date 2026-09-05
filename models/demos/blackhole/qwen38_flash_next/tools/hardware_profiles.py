@@ -1,8 +1,9 @@
 """Hardware profiles: which four Blackhole chips make the model's 1x4 mesh, and how the host wires them.
 
 A profile pins the KMD device nodes, the route derivation (``physical_route``), the derived route to expect and the
-system mesh shape ttnn discovers.  The public table holds the QuietBox profiles; a private table (a module named by
-``QWEN38_HARDWARE_PROFILE_TABLE`` exposing ``HARDWARE_PROFILES``) extends it for other hosts.
+system mesh shape ttnn discovers.  The public table holds the QuietBox, the Blackhole LoudBox and the QuietBox 2
+profiles; a private table (a module named by ``QWEN38_HARDWARE_PROFILE_TABLE`` exposing ``HARDWARE_PROFILES``)
+extends it for other hosts.
 """
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ import importlib
 import os
 import re
 import socket
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -32,8 +33,8 @@ class ResidentHardwareProfile:
     host, ``"0"``/``"1"`` the same on a QuietBox 2 class host).  ``ethernet_graph`` selects the route derivation:
     ``"line"`` is ``physical_route.derive_canonical_line_route``, ``"ring"`` is ``derive_ring_walk_route`` (chips in
     an ethernet ring, opened as a 1x4 LINE through a mesh graph descriptor).  ``route`` / ``route_nodes`` pin the
-    derived order; ``None`` means the wiring has never been probed: the mesh open refuses after printing the derived
-    route, so the first run yields the value to pin.  ``boards`` (serial per node), ``bdfs`` and ``numa_node`` are
+    derived order; ``None`` means the route is derived at start (``qwen38_chat_session.resolve_route``) and
+    recorded, not pinned.  ``boards`` (serial per node), ``bdfs`` and ``numa_node`` are
     optional identity checks (empty: not checked).  ``required_locks`` are exclusive flocks the launcher must hold
     (fd -> path; empty: none).  ``lan_serving`` lets the chat server bind a non-loopback address without
     ``--allow-lan``.  ``mesh_graph_descriptor`` names the descriptor file next to this module the launcher exports as
@@ -60,6 +61,13 @@ class ResidentHardwareProfile:
     def lane(self) -> str:
         return f"{self.host} partition-{self.partition.upper()}"
 
+    def with_device_nodes(self, nodes: tuple[int, int, int, int]) -> "ResidentHardwareProfile":
+        """The same profile on other KMD nodes (a four-chip half of an eight-chip host)."""
+
+        if len(nodes) != 4 or len(set(nodes)) != 4 or any(type(node) is not int or node < 0 for node in nodes):
+            raise HardwareProfileError(f"device nodes must be four distinct non-negative ints, got {nodes!r}")
+        return replace(self, device_nodes=nodes, visible_devices=",".join(str(node) for node in nodes))
+
     @property
     def default_lane(self) -> bool:
         """The lane a host runs when ``TT_VISIBLE_DEVICES`` names none: the whole box, partition B, instance 0."""
@@ -81,6 +89,23 @@ QUIETBOX = ResidentHardwareProfile(
     system_mesh_local_shape=(1, 4),
     lan_serving=True,
     mesh_graph_descriptor="qb_p150_x4_1x4_line_mesh_graph_descriptor.textproto",
+)
+
+
+# Blackhole LoudBox: 4x p150 in one host, KMD nodes 0-3, the chips in an ethernet line opened as the 1x4 with
+# ttnn's default mesh descriptor (the same mesh as one four-chip half of the lab's eight-chip hosts); the route is
+# derived at start and recorded.  ``--device-nodes`` moves it to another four nodes.
+LOUDBOX = ResidentHardwareProfile(
+    host="bh-loudbox",
+    partition="lb",
+    visible_devices="0,1,2,3",
+    device_nodes=(0, 1, 2, 3),
+    numa_node=None,
+    ethernet_graph="line",
+    route=None,
+    route_nodes=None,
+    system_mesh_local_shape=(1, 4),
+    lan_serving=True,
 )
 
 
@@ -111,6 +136,7 @@ def _quietbox_2_instance(instance: int) -> ResidentHardwareProfile:
 
 HARDWARE_PROFILES: dict[str, ResidentHardwareProfile] = {
     "tt-quietbox": QUIETBOX,
+    "bh-loudbox": LOUDBOX,
     "tt-quietbox-2": _quietbox_2_instance(0),
     "tt-quietbox-2-instance-1": _quietbox_2_instance(1),
 }
@@ -191,7 +217,7 @@ def live_mapping(
     identities; the node order must be the pinned route."""
 
     if profile.route is None or profile.route_nodes is None:
-        raise HardwareProfileError(f"profile {profile.lane} has no pinned route")
+        raise HardwareProfileError(f"profile {profile.lane} has no route yet (resolve it before the mesh opens)")
     mapping = []
     for column, physical_id in enumerate(profile.route):
         coordinate = ttnn.MeshCoordinate(0, column)

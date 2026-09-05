@@ -318,17 +318,50 @@ def _strip_one_terminator(text: str) -> str:
     return prefix
 
 
-def _parse_argument(value: str) -> Any:
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _parse_argument(value: str, declared: Any = None) -> Any:
+    """A ``<parameter>`` body typed by its schema: the template renders a string argument raw and every other type
+    with ``tojson``, so a parameter declared ``string`` stays verbatim and any other (or an undeclared one) is parsed
+    when it is JSON, else kept as text.  NaN and Infinity are not JSON and stay text."""
+
     stripped = value.strip()
+    types = {declared} if isinstance(declared, str) else set(declared) if isinstance(declared, list) else set()
+    if "string" in types and not (stripped == "null" and "null" in types):
+        return stripped
     if not stripped:
         return ""
     try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
+        return json.loads(stripped, parse_constant=_reject_constant)
+    except ValueError:
         return stripped
 
 
-def _parse_tool_tail(text: str) -> tuple[str, tuple[Qwen38ToolCall, ...]]:
+def _parameter_types(tools: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Function name -> parameter name -> the declared JSON-schema ``type`` (``parameters.properties``)."""
+
+    result: dict[str, dict[str, Any]] = {}
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, Mapping) else None
+        if not isinstance(function, Mapping):
+            continue
+        parameters = function.get("parameters")
+        properties = parameters.get("properties") if isinstance(parameters, Mapping) else None
+        result[str(function.get("name"))] = {
+            name: schema.get("type")
+            for name, schema in (properties.items() if isinstance(properties, Mapping) else ())
+            if isinstance(schema, Mapping)
+        }
+    return result
+
+
+def parse_tool_calls(text: str, tools: Sequence[Mapping[str, Any]] = ()) -> tuple[str, tuple[Qwen38ToolCall, ...]]:
+    """The visible text before the first ``<tool_call>`` and the calls after it, their arguments typed by ``tools``
+    (``parse_assistant_completion`` on the content part; the server's assembler on one block, whose parameter
+    text may quote any tag)."""
+
     marker = text.find("<tool_call>")
     if marker < 0:
         if "</tool_call>" in text or "<function=" in text or "<parameter=" in text:
@@ -336,6 +369,7 @@ def _parse_tool_tail(text: str) -> tuple[str, tuple[Qwen38ToolCall, ...]]:
         return text.strip(), ()
     visible = text[:marker].strip()
     tail = text[marker:]
+    declared = _parameter_types(tools)
     calls: list[Qwen38ToolCall] = []
     cursor = 0
     while cursor < len(tail):
@@ -362,7 +396,7 @@ def _parse_tool_tail(text: str) -> tuple[str, tuple[Qwen38ToolCall, ...]]:
             parameter_name, value = parameter.groups()
             if parameter_name in arguments:
                 raise Qwen38ChatFormatError(f"tool {name!r} repeats parameter {parameter_name!r}")
-            arguments[parameter_name] = _parse_argument(value)
+            arguments[parameter_name] = _parse_argument(value, declared.get(name, {}).get(parameter_name))
             body_cursor = parameter.end()
         calls.append(Qwen38ToolCall(name=name, arguments=arguments))
         cursor = match.end()
@@ -371,13 +405,17 @@ def _parse_tool_tail(text: str) -> tuple[str, tuple[Qwen38ToolCall, ...]]:
     return visible, tuple(calls)
 
 
-def parse_assistant_completion(text: str, *, enable_thinking: bool) -> Qwen38AssistantCompletion:
+def parse_assistant_completion(
+    text: str, *, enable_thinking: bool, tools: Sequence[Mapping[str, Any]] = ()
+) -> Qwen38AssistantCompletion:
     """Parse only the newly generated assistant suffix.
 
     For thinking mode the rendered prompt already ends in ``<think>\n``; the
     generated suffix therefore begins with reasoning and must close that tag.
     For non-thinking mode the prompt already contains the complete empty think
     block and the generated suffix begins directly with visible content.
+    ``tools`` (the request's schemas) type the tool-call arguments; without
+    them every argument that is JSON is parsed.
     """
 
     if not isinstance(text, str):
@@ -398,7 +436,7 @@ def parse_assistant_completion(text: str, *, enable_thinking: bool) -> Qwen38Ass
             raise Qwen38ChatFormatError("non-thinking output must not emit another think block")
         reasoning = ""
         visible = generated.strip()
-    content, calls = _parse_tool_tail(visible)
+    content, calls = parse_tool_calls(visible, tools)
     return Qwen38AssistantCompletion(
         reasoning_content=reasoning,
         content=content,
@@ -518,4 +556,5 @@ __all__ = [
     "Qwen38ToolCall",
     "Qwen38ToolExecutionError",
     "parse_assistant_completion",
+    "parse_tool_calls",
 ]

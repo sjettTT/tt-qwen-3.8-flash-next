@@ -422,10 +422,22 @@ def test_capture_api_signature_is_the_runner_contract() -> None:
         "regime",
         "cq_id",
         "clock_ns",
+        "retain_mtp_inputs",
     )
     keyword_only = [name for name, p in signature.parameters.items() if p.kind is inspect.Parameter.KEYWORD_ONLY]
-    assert keyword_only == ["residue", "split", "guard", "epilogue", "phase_observer", "regime", "cq_id", "clock_ns"]
+    assert keyword_only == [
+        "residue",
+        "split",
+        "guard",
+        "epilogue",
+        "phase_observer",
+        "regime",
+        "cq_id",
+        "clock_ns",
+        "retain_mtp_inputs",
+    ]
     assert (signature.parameters["regime"].default, signature.parameters["cq_id"].default) == (0, 0)
+    assert signature.parameters["retain_mtp_inputs"].default is False  # the MTP server's epilogue input; off elsewhere
     assert tuple(inspect.signature(Qwen38TTNNTextModel.forward_decode_generic_head).parameters) == (
         "self",
         "prepared",
@@ -438,6 +450,7 @@ def test_capture_api_signature_is_the_runner_contract() -> None:
         "state",
         "return_logits",
         "release_head",
+        "retain_mtp_inputs",
     )
     # The per-position eager body and the runner-facing fused body are untouched in shape.
     assert tuple(inspect.signature(Qwen38TTNNTextModel.forward_decode_generic).parameters) == (

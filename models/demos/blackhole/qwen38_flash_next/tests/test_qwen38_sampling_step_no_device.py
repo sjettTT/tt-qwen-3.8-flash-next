@@ -255,7 +255,9 @@ def test_clocks_summary_reports_period_and_host_segment() -> None:
         "seed",
         "fallbacks",
         "candidate_misses",
+        "logprobs_normalizer",
     }
+    assert request.as_dict()["logprobs_normalizer"] == "candidate_row"  # the reported logprobs are row-relative
 
 
 # --- the request mapping ----------------------------------------------------------------------------------------

@@ -1248,6 +1248,9 @@ class Qwen38TTNNDecoderLayer:
         self._validate_chunk_state(state)
         self._validate_generic_state(generic_state)
         if isinstance(self.attention, Qwen38TTNNGDN):
+            # A chunk starts at P % 32 == 0: the next token lands in slot 0.  The traced steps never advance the
+            # host phase, so it is set here rather than read (a hand-off at P % 4 != 0 may have left it there).
+            generic_state.attention.conv_phase = 0
             self.attention.sync_rows_history_from_state(generic_state.attention, state.attention)
         else:
             for label, tensor in (

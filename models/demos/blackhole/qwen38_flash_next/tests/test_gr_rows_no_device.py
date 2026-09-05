@@ -112,7 +112,11 @@ def _gr_fake():
     fake.linear = linear
     fake.multiply = multiply
     fake.rms_norm_post_all_gather = post_all_gather
-    fake.experimental = SimpleNamespace(all_gather_async=all_gather_async, fast_reduce_nc=fast_reduce_nc, view=view)
+    # ttnn.experimental.view as the step-4 fake models it: the same tile pages under the new shape (a torch reshape
+    # would give the 1-row shapes the same values but not the 32-row flat rows, which is the claim under test).
+    fake.experimental = SimpleNamespace(
+        all_gather_async=all_gather_async, fast_reduce_nc=fast_reduce_nc, view=step4._view, torch_view=view
+    )
     return fake
 
 
@@ -179,13 +183,14 @@ def _equal(batched: FakeTensor, per_row: list[FakeTensor], *, dim: int, label: s
         assert torch.equal(stacked.view(torch.int16), local.view(torch.int16)), (label, device)
 
 
-def test_read_rows_and_write_rows_equal_the_one_row_read_and_write_row_for_row(fake) -> None:
+@pytest.mark.parametrize("flat_views", (False, True))
+def test_read_rows_and_write_rows_equal_the_one_row_read_and_write_row_for_row(fake, flat_views: bool) -> None:
     module = _gr_module(fake)
     torch.manual_seed(11)
     residual_rows = FakeTensor([_bf16(*RESIDUAL_ROWS_LOCAL_SHAPE) for _ in range(TP)], BF16, TILE, 3)
     block_rows = FakeTensor([_bf16(*BLOCK_ROWS_LOCAL_SHAPE) for _ in range(TP)], BF16, TILE, 3)
 
-    block_input, state = module.read_rows(residual_rows)
+    block_input, state = module.read_rows(residual_rows, flat_views=flat_views)
     written = module.write_rows(block_rows, state)
     assert block_input.shape == BLOCK_ROWS_LOCAL_SHAPE and state.injection.shape == INJECTION_ROWS_SHAPE
     assert written.shape == RESIDUAL_ROWS_LOCAL_SHAPE and state.residual is residual_rows
@@ -215,9 +220,33 @@ def _calls(function: ast.FunctionDef) -> list[str]:
     return [ast.unparse(node.func) for node in ast.walk(function) if isinstance(node, ast.Call)]
 
 
-def test_rows_bodies_replace_the_views_with_permutes_and_touch_no_host() -> None:
+def test_flat_views_read_rows_is_the_permute_form_bitwise(fake) -> None:
+    """Every branch is one 32-row tile row, so the branch-major tile sequence is the flat rows' tile sequence: the
+    view over the same pages reads what the permute + reshape pair materializes (the fake models the tile pages)."""
+
+    module = _gr_module(fake)
+    torch.manual_seed(13)
+    residual_rows = FakeTensor([_bf16(*RESIDUAL_ROWS_LOCAL_SHAPE) for _ in range(TP)], BF16, TILE, 3)
+    permuted, permuted_state = module.read_rows(residual_rows)
+    viewed, viewed_state = module.read_rows(residual_rows, flat_views=True)
+    _equal(viewed, [permuted], dim=2, label="GR read block input (flat views vs permutes)")
+    _equal(
+        viewed_state.injection, [permuted_state.injection], dim=2, label="GR read injection (flat views vs permutes)"
+    )
+    unit = FakeTensor([_bf16(*RESIDUAL_ROWS_LOCAL_SHAPE) for _ in range(TP)], BF16, TILE, 3)
+    flat_shape = (1, 1, ROWS, FLAT_LOCAL_WIDTH)
+    by_view = fake.experimental.view(unit, flat_shape)
+    by_permute = fake.reshape(fake.permute(unit, (0, 2, 1, 3)), flat_shape)
+    _equal(by_view, [by_permute], dim=2, label="flat rows view vs permute + reshape")
+    assert not torch.equal(
+        by_view.torch_shards()[0].view(torch.int16),
+        fake.experimental.torch_view(unit, flat_shape).torch_shards()[0].view(torch.int16),
+    )  # a plain torch reshape of the 32-row branch-major tensor is not the device view: the fake's model matters
+
+
+def test_rows_bodies_walk_the_layout_by_permutes_or_flat_views_and_touch_no_host() -> None:
     read_calls = _calls(_method("read_rows"))
-    assert read_calls.count("ttnn.permute") == 2 and "ttnn.experimental.view" not in read_calls
+    assert read_calls.count("ttnn.permute") == 2 and read_calls.count("ttnn.experimental.view") == 2
     assert read_calls.count("ttnn.reshape") == 3  # stats, flat rows, token-major rows
     assert read_calls.count("ttnn.linear") == 2 and read_calls.count("ttnn.experimental.fast_reduce_nc") == 2
     assert read_calls.count("ttnn.experimental.all_gather_async") == 1 and "ttnn.all_reduce" not in read_calls

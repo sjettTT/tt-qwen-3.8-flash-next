@@ -645,6 +645,83 @@ class Qwen38TTNNMTPInput:
             _cleanup_after_failure([output], label="MTP input fusion output", primary=error)
         return output
 
+    def rows(self, input_embedding_rows, hidden_residual_rows):
+        """:meth:`__call__` for 32 token rows (the MTP alignment rows of an MTP v2 verify pass).
+
+        ``input_embedding_rows`` ``[1,1,32,640]`` and the branch-major ``hidden_residual_rows`` ``[1,4,32,640]``
+        give the fused ``[1,4,32,640]`` rows.  The hidden norm keeps its 10,240-wide per-token contract: the
+        rows go token-major and flat (``[1,1,32,2560]`` local, the GR rows walk), are normalized with the same
+        flattened scale, and go back to branch-major for the per-branch projection.  Row j depends only on row j.
+        """
+
+        if self.weights.released:
+            raise RuntimeError("cannot run MTP input fusion after its weights were deallocated")
+        rows = ttnn.TILE_SIZE
+        embedding_shape = (1, 1, rows, LOCAL_HIDDEN_SIZE)
+        residual_shape = (1, RESIDUAL_BRANCHES, rows, LOCAL_HIDDEN_SIZE)
+        flat_shape = (1, 1, rows, RESIDUAL_BRANCHES * LOCAL_HIDDEN_SIZE)
+        self._validate_input(input_embedding_rows, label="embedding rows", shape=embedding_shape)
+        self._validate_input(hidden_residual_rows, label="hidden residual rows", shape=residual_shape)
+        dram = ttnn.DRAM_MEMORY_CONFIG
+
+        normalized_embedding = self._normalize(
+            input_embedding_rows, self.weights.embedding_norm_scale, label="embedding rows", local_shape=embedding_shape
+        )
+        token_rows = ttnn.permute(hidden_residual_rows, (0, 2, 1, 3), memory_config=dram)
+        flat_rows = ttnn.reshape(token_rows, flat_shape)
+        if _tensor_key(flat_rows) != _tensor_key(token_rows):
+            ttnn.deallocate(token_rows)
+        self.mesh_contract.validate_tensor(flat_rows, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        # The flattened scale broadcasts over the token rows (one [1,1,1,2560] row).
+        normalized_flat = self._normalize(
+            flat_rows,
+            ttnn.reshape(self.weights.hidden_norm_scale, (1, 1, 1, RESIDUAL_BRANCHES * LOCAL_HIDDEN_SIZE)),
+            label="hidden residual rows",
+            local_shape=flat_shape,
+        )
+        ttnn.deallocate(flat_rows)
+        normalized_tokens = ttnn.reshape(normalized_flat, (1, rows, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE))
+        if _tensor_key(normalized_tokens) != _tensor_key(normalized_flat):
+            ttnn.deallocate(normalized_flat)
+        normalized_hidden = ttnn.permute(normalized_tokens, (0, 2, 1, 3), memory_config=dram)
+        ttnn.deallocate(normalized_tokens)
+        self._validate_input(normalized_hidden, label="normalized hidden rows", shape=residual_shape)
+
+        full_embedding = self._all_gather(
+            normalized_embedding, label="embedding rows", global_shape=(1, 1, rows, HIDDEN_SIZE)
+        )
+        full_hidden = self._all_gather(
+            normalized_hidden, label="hidden residual rows", global_shape=(1, RESIDUAL_BRANCHES, rows, HIDDEN_SIZE)
+        )
+        ttnn.deallocate(normalized_embedding)
+        ttnn.deallocate(normalized_hidden)
+        projected_embedding = ttnn.linear(
+            full_embedding,
+            self.weights.fc_embedding,
+            memory_config=dram,
+            dtype=ttnn.bfloat16,
+            compute_kernel_config=self.compute_config,
+        )
+        projected_hidden = ttnn.linear(
+            full_hidden,
+            self.weights.fc_hidden,
+            memory_config=dram,
+            dtype=ttnn.bfloat16,
+            compute_kernel_config=self.compute_config,
+        )
+        ttnn.deallocate(full_embedding)
+        ttnn.deallocate(full_hidden)
+        self._validate_input(projected_embedding, label="projected embedding rows", shape=embedding_shape)
+        self._validate_input(projected_hidden, label="projected hidden rows", shape=residual_shape)
+        broadcast_embedding = ttnn.repeat(projected_embedding, (1, RESIDUAL_BRANCHES, 1, 1), memory_config=dram)
+        ttnn.deallocate(projected_embedding)
+        self._validate_input(broadcast_embedding, label="broadcast projected embedding rows", shape=residual_shape)
+        output = ttnn.add(projected_hidden, broadcast_embedding, memory_config=dram)
+        ttnn.deallocate(projected_hidden)
+        ttnn.deallocate(broadcast_embedding)
+        self._validate_input(output, label="fused output rows", shape=residual_shape)
+        return output
+
 
 validate_mtp_input_static_contract()
 

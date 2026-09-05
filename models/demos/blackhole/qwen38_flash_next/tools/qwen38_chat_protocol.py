@@ -26,9 +26,10 @@ from typing import Any, Callable
 import jinja2
 from models.demos.blackhole.qwen38_flash_next.chat import (
     EOS_TOKEN_IDS,
+    IM_END_ID,
     VOCAB_SIZE,
     Qwen38ChatFormatError,
-    parse_assistant_completion,
+    parse_tool_calls,
 )
 
 # tokenizer_config.json added_tokens_decoder; verified against the tokenizer by the checkpoint tests.
@@ -215,10 +216,11 @@ def effort_level(value: Any) -> str:
 
 def thinking_budget(level: str, max_tokens: int, requested: int | None = None) -> int:
     """Reasoning tokens before </think> is forced: the client's ``thinking_budget``, else the level's cap; both
-    leave ``ANSWER_RESERVE_TOKENS`` of ``max_tokens`` (at least half of it) for the answer."""
+    leave ``ANSWER_RESERVE_TOKENS`` of ``max_tokens`` (at least half of it) for the answer after the forced
+    ``</think>``, which counts against ``max_tokens`` too."""
 
     cap = THINKING_TOKEN_CAPS[level] if requested is None else requested
-    room = max(max_tokens - ANSWER_RESERVE_TOKENS, max_tokens // 2)
+    room = max(max_tokens - ANSWER_RESERVE_TOKENS - 1, max_tokens // 2)
     return room if cap is None else min(cap, room)
 
 
@@ -315,9 +317,10 @@ def splice_prompt(
         return None
     echo = messages[count]
     content = echo["content"]
+    if isinstance(content, list):  # text parts render as their concatenation
+        content = "".join(item["text"] for item in content)
     if (
         echo["role"] != "assistant"
-        or not isinstance(content, str)
         or content.strip() != served.reply["content"]
         or echo.get("tool_calls", []) != served.reply.get("tool_calls", [])
         or echo.get("reasoning_content", "").strip() not in ("", served.reply["reasoning_content"])
@@ -326,11 +329,12 @@ def splice_prompt(
     flags = {"enable_thinking": enable_thinking, "reasoning_effort": reasoning_effort}
     history = render_chat(tokenizer, messages[: count + 1], tools, add_generation_prompt=False, **flags)
     full = render_chat(tokenizer, messages, tools, **flags)
-    if not history.endswith(TURN_END) or not full.startswith(history):
-        return None
-    # The committed ids already carry the reply's terminator when an EOS was consumed; otherwise the
+    last = served.committed[-1]
+    if not history.endswith(TURN_END) or not full.startswith(history) or (last in EOS_TOKEN_IDS and last != IM_END_ID):
+        return None  # <|endoftext|> closed the reply where the template puts <|im_end|>: no exact continuation
+    # The committed ids already carry the reply's terminator when <|im_end|> was consumed; otherwise the
     # template's <|im_end|> closes the partial reply.
-    cut = len(history) - (1 if served.committed[-1] in EOS_TOKEN_IDS else len(TURN_END))
+    cut = len(history) - (1 if last == IM_END_ID else len(TURN_END))
     return served.committed + encode_chat(tokenizer, full[cut:])
 
 
@@ -341,18 +345,28 @@ class Qwen38ReplyAssembler:
     """Generated ids -> OpenAI message pieces, one ``push`` per token, ``finish`` at the end.
 
     Phases: reasoning (until 248069), content, tool (between 248058 and 248059,
-    parsed as one block at its end).  Held back: a split UTF-8 sequence, the
-    whitespace at each phase's edges (the template trims it), the tail that
-    could start a stop string.  A block the parser rejects, or one cut by the
-    token budget, is emitted as raw content; the caller logs ``parse_errors``.
+    parsed as one block at its end, its arguments typed by ``tools``).  A tag id
+    acts only in the phase that expects it and is text anywhere else: a tool
+    block drafted inside the reasoning is reasoning, think tags quoted in the
+    answer or inside a tool block are their text.  Held back: a split UTF-8
+    sequence, the whitespace at each phase's edges (the template trims it), the
+    tail that could start a stop string.  A block the parser rejects, or one cut
+    by the token budget, is emitted as raw content; the caller logs
+    ``parse_errors``.
     """
 
     def __init__(
-        self, decode: Callable[[list[int]], str], *, thinking_open: bool, stop_strings: Sequence[str] = ()
+        self,
+        decode: Callable[[list[int]], str],
+        *,
+        thinking_open: bool,
+        stop_strings: Sequence[str] = (),
+        tools: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         self.decode = decode
         self.phase = "reasoning" if thinking_open else "content"
         self.stop_strings = tuple(stop_strings)
+        self.tools = list(tools)
         self.stop_hold = max((len(value) for value in self.stop_strings), default=1) - 1
         self.pending_ids: list[int] = []
         self.held_text = ""
@@ -371,21 +385,14 @@ class Qwen38ReplyAssembler:
         if self.stop_hit or token_id in EOS_TOKEN_IDS:  # EOS reaches the assembler only with ignore_eos
             return []
         self.tokens += 1
-        if token_id == THINK_START_ID:
-            return self._enter("reasoning")
-        if token_id == THINK_END_ID:
-            return self._enter("content") if self.phase == "reasoning" else []
-        if token_id == TOOL_CALL_START_ID:
-            deltas = self._enter("tool")
-            self.tool_ids = []
-            return deltas
-        if token_id == TOOL_CALL_END_ID:
-            if self.phase != "tool":
+        if self.phase == "tool":
+            if token_id != TOOL_CALL_END_ID:
+                self.tool_ids.append(token_id)
                 return []
             block = "<tool_call>" + self.decode(self.tool_ids) + "</tool_call>"
             self.phase = "content"
             try:
-                parsed = parse_assistant_completion(block, enable_thinking=False)
+                _visible, parsed = parse_tool_calls(block, self.tools)
             except Qwen38ChatFormatError as error:
                 self.parse_errors.append(str(error))
                 return self._text(block)
@@ -396,15 +403,18 @@ class Qwen38ReplyAssembler:
                     "type": "function",
                     "function": {"name": call.name, "arguments": json.dumps(dict(call.arguments))},
                 }
-                for position, call in enumerate(parsed.tool_calls)
+                for position, call in enumerate(parsed)
             ]
             self.calls.extend(calls)
             return [{"tool_calls": calls}]
-        if self.phase == "tool":
-            self.tool_ids.append(token_id)
-            return []
         if self.phase == "reasoning":
+            if token_id == THINK_END_ID:
+                return self._enter("content")
             self.reasoning_tokens += 1
+        elif token_id == TOOL_CALL_START_ID:
+            deltas = self._enter("tool")
+            self.tool_ids = []
+            return deltas
         self.pending_ids.append(token_id)
         text = self.decode(self.pending_ids)
         if text.endswith("�"):
@@ -465,10 +475,23 @@ class Qwen38ReplyAssembler:
     def _flush(self) -> list[dict[str, Any]]:
         text = self.decode(self.pending_ids) if self.pending_ids else ""
         self.pending_ids = []
-        deltas = self._emit((self.held_text + text).rstrip()) if self.phase_text_started else []
-        self.held_text = ""
+        buffer, self.held_text = self.held_text + text, ""
+        if not self.phase_text_started:
+            return []
         self.phase_text_started = False
-        return deltas
+        stop = self._stop_index(buffer)
+        return self._emit(buffer[: len(buffer) if stop is None else stop].rstrip())
+
+    def _stop_index(self, buffer: str) -> int | None:
+        """Where the first stop string starts in ``buffer`` (content phase only); sets ``stop_hit``."""
+
+        if self.phase != "content" or not self.stop_strings:
+            return None
+        hits = [buffer.find(value) for value in self.stop_strings if value in buffer]
+        if not hits:
+            return None
+        self.stop_hit = True
+        return min(hits)
 
     def _text(self, text: str) -> list[dict[str, Any]]:
         buffer = self.held_text + text
@@ -480,11 +503,10 @@ class Qwen38ReplyAssembler:
             self.phase_text_started = True
         hold = 0
         if self.phase == "content" and self.stop_strings:
-            hits = [(buffer.find(value), value) for value in self.stop_strings if value in buffer]
-            if hits:
-                self.stop_hit = True
+            stop = self._stop_index(buffer)
+            if stop is not None:
                 self.held_text = ""
-                return self._emit(buffer[: min(hits)[0]].rstrip())
+                return self._emit(buffer[:stop].rstrip())
             hold = self.stop_hold
         # Emit up to the hold-back window, never ending in whitespace (the template trims it; a stop match
         # right after would otherwise leave a stray space).

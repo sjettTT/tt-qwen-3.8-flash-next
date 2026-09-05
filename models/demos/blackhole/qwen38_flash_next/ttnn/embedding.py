@@ -129,6 +129,9 @@ TILE_SIZE = 32
 # the SFPU (every id < 2**24) and a full tile width keeps the fused embedding
 # lookup tile-aligned.
 TOKEN_ROW_SHAPE = (1, 1, 1, TILE_SIZE)
+# A token-row lane below every vocabulary range: each coordinate clamps it to its zero sentinel row, so the
+# device-token embedding of that lane is exactly zero (the padding rows of an MTP v2 verify pass).
+ZERO_EMBEDDING_TOKEN = -1
 
 # The optional sampling epilogue of TAIL: per vocabulary shard the top-k logits and their
 # global ids, packed per shard and all-gathered into one replicated FP32 ROW_MAJOR row
@@ -1390,6 +1393,27 @@ class Qwen38TTNNTokenEmbedding:
                 raise ValueError(f"token rows require exact integer tokens in [0,{VOCAB_SIZE}), got {token_id!r}")
         return torch.tensor(token_ids, dtype=torch.float32).reshape(TOKEN_ROW_SHAPE)
 
+    @staticmethod
+    def host_verify_token_rows(token_ids) -> torch.Tensor:
+        """Host image of a token row whose lanes past ``len(token_ids)`` embed to exact zeros (an MTP v2 verify pass).
+
+        Lane j < R holds token j; the remaining lanes hold ``ZERO_EMBEDDING_TOKEN`` (-1), which every coordinate
+        localizes below its range and clamps to its zero sentinel row, so :meth:`embed_device_token_rows`
+        returns zero rows there.
+        """
+
+        token_ids = list(token_ids)
+        if not 1 <= len(token_ids) <= CHUNK_ROWS:
+            raise ValueError(f"verify token rows need 1..{CHUNK_ROWS} token ids, got {len(token_ids)}")
+        for token_id in token_ids:
+            if isinstance(token_id, bool) or type(token_id) is not int or not 0 <= token_id < VOCAB_SIZE:
+                raise ValueError(
+                    f"verify token rows require exact integer tokens in [0,{VOCAB_SIZE}), got {token_id!r}"
+                )
+        host = torch.full(TOKEN_ROW_SHAPE, float(ZERO_EMBEDDING_TOKEN), dtype=torch.float32)
+        host[..., : len(token_ids)] = torch.tensor(token_ids, dtype=torch.float32)
+        return host
+
     def embed_device_token_rows(self, token_row):
         """Hidden-sharded ``[1,1,32,640]`` embedding of the 32 lanes of a token row (one prefill chunk).
 
@@ -1766,28 +1790,53 @@ class Qwen38TTNNLMHead:
             raise RuntimeError("full-logit correctness gather did not reconstruct the exact vocabulary")
         return gathered
 
-    def greedy_candidates(self, logits: Qwen38ShardedLogits) -> Qwen38GreedyCandidates:
+    def greedy_candidates(
+        self, logits: Qwen38ShardedLogits, *, values_by_gather: bool = False
+    ) -> Qwen38GreedyCandidates:
+        """The per-row local argmax and maximum of the vocabulary shard.
+
+        ``values_by_gather``: the maximum of each row as a ROW_MAJOR ``ttnn.gather`` copy of the row's argmax element
+        (a maximum is one of the row's own bf16 values, so this is the reduce's result bitwise), tilized for the
+        resolve's all-gather: one data-movement op instead of the padded grid's pad, relayout and two reduces.  The
+        default keeps the grid reduce (the 1-row production path's form).
+        """
+
         rows = self._validate_logits(logits)
         row_major = ttnn.to_layout(logits.tensor, ttnn.ROW_MAJOR_LAYOUT)
         local_indices = ttnn.argmax(row_major, dim=-1, keepdim=False)
-        _deallocate(row_major)
+        if values_by_gather:
+            index_column = ttnn.reshape(local_indices, (1, 1, rows, 1))
+            picked = ttnn.gather(row_major, 3, index_column, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(row_major)
+            if (
+                _shape(picked) != (1, 1, rows, 1)
+                or picked.dtype != ttnn.bfloat16
+                or picked.layout != ttnn.ROW_MAJOR_LAYOUT
+            ):
+                raise RuntimeError(
+                    f"gathered row maxima must be BF16 ROW_MAJOR [1,1,{rows},1], got {_metadata(picked)}"
+                )
+            local_values = ttnn.to_layout(picked, ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(picked)
+        else:
+            _deallocate(row_major)
 
-        # The reduction kernel parallelizes over the tall tile-row dimension.
-        # Padding is only temporary and uses -inf semantics, so neither the
-        # local candidate nor tie order can change.
-        maxval_columns = 32
-        maxval_rows = ((LOCAL_VOCAB_SIZE + maxval_columns - 1) // maxval_columns + 31) // 32 * 32
-        padded_width = maxval_rows * maxval_columns
-        padded = ttnn.pad(
-            logits.tensor,
-            [(0, 0), (0, 0), (0, 0), (0, padded_width - LOCAL_VOCAB_SIZE)],
-            value=-1e30,
-        )
-        grid = ttnn.reshape(padded, (1, rows, maxval_rows, maxval_columns))
-        partial = ttnn.max(grid, dim=-1)
-        partial_rows = ttnn.reshape(partial, (1, 1, rows, maxval_rows))
-        local_values = ttnn.max(partial_rows, dim=-1, keepdim=True)
-        _deallocate(padded, grid, partial, partial_rows)
+            # The reduction kernel parallelizes over the tall tile-row dimension.
+            # Padding is only temporary and uses -inf semantics, so neither the
+            # local candidate nor tie order can change.
+            maxval_columns = 32
+            maxval_rows = ((LOCAL_VOCAB_SIZE + maxval_columns - 1) // maxval_columns + 31) // 32 * 32
+            padded_width = maxval_rows * maxval_columns
+            padded = ttnn.pad(
+                logits.tensor,
+                [(0, 0), (0, 0), (0, 0), (0, padded_width - LOCAL_VOCAB_SIZE)],
+                value=-1e30,
+            )
+            grid = ttnn.reshape(padded, (1, rows, maxval_rows, maxval_columns))
+            partial = ttnn.max(grid, dim=-1)
+            partial_rows = ttnn.reshape(partial, (1, 1, rows, maxval_rows))
+            local_values = ttnn.max(partial_rows, dim=-1, keepdim=True)
+            _deallocate(padded, grid, partial, partial_rows)
 
         self.mesh_contract.mark_local_partial(
             local_indices,
@@ -1980,6 +2029,87 @@ class Qwen38TTNNLMHead:
         self.mesh_contract.validate_tensor(row, placement=TensorPlacement.REPLICATED)
         ttnn.copy(row, constants.readback_row)
         return row
+
+    def resolve_greedy_rows_on_device(self, candidates: Qwen38GreedyCandidates):
+        """:meth:`resolve_greedy_on_device` for ``rows`` candidate rows (1 .. 32): one FP32 ROW_MAJOR ``[1,1,1,rows]``
+        row whose lane j is the global greedy id of row j (the MTP v2 verify pass's per-row argmaxes).
+
+        The same arithmetic per row (the owner tie-break in FP32, a width-four ROW_MAJOR argmax, the rebase and
+        a 32-bit ``ttnn.gather`` copy of the owner's id), then one ROW_MAJOR transpose of the ``[1,1,rows,1]`` id
+        column into the lane row the accept logic reads (a data-movement copy: no id enters an FPU or reduce
+        stage).  Fewer rows are the 32-row form's first rows, bitwise.
+        """
+
+        if not isinstance(candidates, Qwen38GreedyCandidates) or not 1 <= candidates.rows <= TILE_SIZE:
+            raise TypeError(f"on-device greedy row resolve requires 1..{TILE_SIZE}-row Qwen38GreedyCandidates")
+        if candidates.vocab_ranges != self.weights.vocab_ranges:
+            raise ValueError("greedy candidates have different vocabulary ownership")
+        if self.collective_topology != ttnn.Topology.Linear:
+            raise RuntimeError("on-device greedy resolve requires Linear topology")
+        self.mesh_contract.validate_tensor(candidates.local_indices, placement=TensorPlacement.LOCAL_PARTIAL)
+        self.mesh_contract.validate_tensor(candidates.local_values, placement=TensorPlacement.LOCAL_PARTIAL)
+        constants = self.weights.token_row
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        rows = candidates.rows
+
+        gathered_values = ttnn.all_gather(candidates.local_values, dim=3, cluster_axis=TP_AXIS, memory_config=dram)
+        self.mesh_contract.validate_tensor(gathered_values, placement=TensorPlacement.REPLICATED)
+        if _shape(gathered_values) != (1, 1, rows, TP_SIZE):
+            raise RuntimeError(
+                f"greedy value gather returned {_shape(gathered_values)}, expected [1,1,{rows},{TP_SIZE}]"
+            )
+        values_row_major = ttnn.to_layout(gathered_values, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+        _deallocate(gathered_values)
+        values_fp32 = ttnn.typecast(values_row_major, ttnn.float32, memory_config=dram)
+        _deallocate(values_row_major)
+        ranked = ttnn.subtract(values_fp32, constants.owner_tie_break, memory_config=dram)
+        _deallocate(values_fp32)
+        if (
+            _shape(ranked) != (1, 1, rows, TP_SIZE)
+            or ranked.dtype != ttnn.float32
+            or ranked.layout != ttnn.ROW_MAJOR_LAYOUT
+        ):
+            raise RuntimeError(
+                f"greedy tie-break rows must be FP32 ROW_MAJOR [1,1,{rows},{TP_SIZE}], got {_metadata(ranked)}"
+            )
+        owner = ttnn.argmax(ranked, dim=-1, keepdim=True)
+        _deallocate(ranked)
+        if _shape(owner) != (1, 1, rows, 1) or owner.dtype != ttnn.uint32:
+            raise RuntimeError(f"greedy owner argmax must be UINT32 [1,1,{rows},1], got {_metadata(owner)}")
+
+        index_column = ttnn.reshape(candidates.local_indices, (1, 1, rows, 1))
+        gathered_indices = ttnn.all_gather(index_column, dim=3, cluster_axis=TP_AXIS, memory_config=dram)
+        self.mesh_contract.validate_tensor(gathered_indices, placement=TensorPlacement.REPLICATED)
+        if _shape(gathered_indices) != (1, 1, rows, TP_SIZE):
+            raise RuntimeError(
+                f"greedy index gather returned {_shape(gathered_indices)}, expected [1,1,{rows},{TP_SIZE}]"
+            )
+        index_fp32 = ttnn.typecast(gathered_indices, ttnn.float32, memory_config=dram)
+        _deallocate(gathered_indices)
+        candidate_tokens = ttnn.add(index_fp32, constants.lm_head_vocab_starts, memory_config=dram)
+        _deallocate(index_fp32)
+        token_column = ttnn.gather(candidate_tokens, 3, owner, memory_config=dram)
+        _deallocate(candidate_tokens, owner)
+        if (
+            _shape(token_column) != (1, 1, rows, 1)
+            or token_column.dtype != ttnn.float32
+            or token_column.layout != ttnn.ROW_MAJOR_LAYOUT
+        ):
+            raise RuntimeError(
+                f"greedy token select must be FP32 ROW_MAJOR [1,1,{rows},1], got {_metadata(token_column)}"
+            )
+        token_lanes = ttnn.transpose(token_column, 2, 3, memory_config=dram)
+        _deallocate(token_column)
+        self.mesh_contract.validate_tensor(token_lanes, placement=TensorPlacement.REPLICATED)
+        if (
+            _shape(token_lanes) != (1, 1, 1, rows)
+            or token_lanes.dtype != ttnn.float32
+            or token_lanes.layout != ttnn.ROW_MAJOR_LAYOUT
+        ):
+            raise RuntimeError(
+                f"resolved token lanes must be FP32 ROW_MAJOR [1,1,1,{rows}], got {_metadata(token_lanes)}"
+            )
+        return token_lanes
 
     def greedy_token(self, logits: Qwen38ShardedLogits) -> torch.Tensor:
         """Convenience path that transfers candidates, never full logits."""

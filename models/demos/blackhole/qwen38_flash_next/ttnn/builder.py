@@ -771,12 +771,12 @@ class Qwen38TTNNBuilder:
             qsa_cache_capacity=qsa_cache_capacity,
         )
 
-        # Every underlying cache receives a root already namespaced by the
-        # complete builder identity.  Component-specific paths then add their
-        # own layer/block key.  This binds caches which otherwise omit the
-        # runtime digest or live ring from their local path schema.
+        # The component and model-I/O caches receive a root namespaced by the complete builder identity (the
+        # runtime digest, the live ring, the allocated context); component-specific paths add their own layer/block
+        # key.  The routed BF4 cache is keyed by its own identity only (checkpoint, tt-metal revision, mesh, ring):
+        # the expert bytes do not depend on the allocated context, so one conversion serves every context.
         component_cache_root = cache_roots.component_weights / live_identity.key
-        routed_cache_root = cache_roots.routed_bf4 / live_identity.key
+        routed_cache_root = cache_roots.routed_bf4
         io_cache_root = cache_roots.model_io / live_identity.key
         bf4_identity = BF4CacheIdentity(
             checkpoint_revision=provenance.checkpoint_revision,

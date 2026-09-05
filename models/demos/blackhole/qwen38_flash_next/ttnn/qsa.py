@@ -1125,11 +1125,17 @@ class Qwen38TTNNQSAChunkInputs:
 
 
 def derive_qsa_chunk_inputs(
-    position_scalar, constants: Qwen38TTNNQSAPositionConstants, chunk: Qwen38TTNNQSAChunkConstants
+    position_scalar,
+    constants: Qwen38TTNNQSAPositionConstants,
+    chunk: Qwen38TTNNQSAChunkConstants,
+    *,
+    completed_blocks: int = CHUNK_BLOCKS,
 ) -> Qwen38TTNNQSAChunkInputs:
     """:func:`derive_qsa_position_inputs` for the 32 rows of a chunk: the same exact UINT32 ops on the
     same-shape templates, with ``P`` the only broadcast operand (``pos = row_index + P``).  The staging
-    and ring one-hots have no chunk form: the slab and the compressed blocks are written whole."""
+    and ring one-hots have no chunk form: the slab and the compressed blocks are written whole.
+    ``completed_blocks`` is the number of compressed block indices derived (P // 4 + i): the chunk's eight, or
+    the two a verify pass can complete."""
 
     _require_shape(position_scalar, (1, 1, 1, 1), "QSA position scalar")
     if position_scalar.dtype != ttnn.uint32 or position_scalar.layout != ttnn.ROW_MAJOR_LAYOUT:
@@ -1143,10 +1149,16 @@ def derive_qsa_chunk_inputs(
             f"the position constants for {constants.allocated_compressed_blocks}"
         )
 
+    if (
+        isinstance(completed_blocks, bool)
+        or type(completed_blocks) is not int
+        or not 1 <= completed_blocks <= CHUNK_BLOCKS
+    ):
+        raise ValueError(f"QSA chunk inputs derive 1..{CHUNK_BLOCKS} block indices, got {completed_blocks!r}")
     kv_block_start = ttnn.bitwise_and(position_scalar, constants.high27_mask, memory_config=dram)
     block_index = ttnn.bitwise_right_shift(position_scalar, 2, memory_config=dram)
     block_indices_i32 = []
-    for block in range(CHUNK_BLOCKS):
+    for block in range(completed_blocks):
         shifted = block_index if block == 0 else ttnn.add(block_index, block, memory_config=dram)
         block_indices_i32.append(ttnn.reshape(ttnn.typecast(shifted, ttnn.int32, memory_config=dram), (1,)))
         if block:
@@ -1259,6 +1271,372 @@ def chunk_handoff_ring_select_rows(prefilled: int) -> torch.Tensor:
     for row in range(prefilled % COMPRESS_RATIO):
         select[0, 0, row, first + row] = 1.0
     return select
+
+
+def verify_handoff_ring_select_rows(position: int) -> torch.Tensor:
+    """Host image of the BF16 ``[1,1,32,32]`` 0/1 select whose matmul with a verify state's raw history (rows
+    0..2 = the raw keys of positions P - 3 .. P - 1) is the raw-key ring at ``P = position``: ring row j <
+    P % 4 picks history row 3 - P % 4 + j, the raw key of position (P & ~3) + j; every other row is zero (the
+    form :func:`chunk_handoff_ring_select_rows` leaves)."""
+
+    if isinstance(position, bool) or type(position) is not int or position < 0:
+        raise ValueError(f"position must be a non-negative int, got {position!r}")
+    select = torch.zeros(1, 1, CHUNK_ROWS, CHUNK_ROWS, dtype=torch.bfloat16)
+    open_rows = position % COMPRESS_RATIO
+    for row in range(open_rows):
+        select[0, 0, row, RAW_HISTORY_ROWS - open_rows + row] = 1.0
+    return select
+
+
+# --------------------------------------------------------------------------- MTP v2 verify (R = k + 1 rows at any P)
+# The verify body runs the R rows P .. P + R - 1 of one pass on the chunk path's 32-row operands at an
+# arbitrary P (rows R .. 31 of every tile are padding: zero hidden rows, geometry of row R - 1).  Two
+# facts bound the state it touches: R <= VERIFY_MAX_ROWS rows complete at most two compressed blocks
+# (P // 4 and P // 4 + 1) and span at most two 32-row KV blocks (P & ~31 and the next one).  Both blocks of
+# each kind are written every pass, so the op sequence never depends on P.
+VERIFY_MAX_ROWS = 6
+VERIFY_COMPLETED_BLOCKS = 2
+RAW_HISTORY_ROWS = COMPRESS_RATIO - 1
+RAW_WINDOW_TILE_ROWS = 2 * CACHE_WRITE_ROWS
+STAGE_LANE_BIAS = CACHE_WRITE_ROWS
+
+
+def qsa_verify_constant_rows(rows: int, allocated_compressed_blocks: int) -> dict[str, torch.Tensor]:
+    """Host images of the verify constants of one row count (UINT32 as int64; the bf16 select stack as float).
+
+    ``row_index_blocks`` / ``row_index_slots`` are the chunk templates with the row index clamped to
+    ``rows - 1``: row j >= rows takes the geometry of the last real row, so its sparse row and mask are
+    valid (finite attention) and never read a position past the pass.  ``stage_a_lanes[i, j] = i - j + 32``
+    (j < rows, else 0) equals ``P % 32 + 32`` exactly where staging row i of the block at ``P & ~31`` takes
+    new row j (i = P % 32 + j); ``stage_b_lanes[i, j] = i - j + 64`` does the same for the next block
+    (i = P % 32 + j - 32).  ``pool_select_stack`` row r (r = P % 4) is the flattened ``[32, 64]`` 0.25-valued
+    select over the raw window ``[history tile | new rows tile]`` (history row w holds position P - 3 + w, new
+    row j position P + j): output row 0 pools the four positions of block P // 4, row 1 those of block
+    P // 4 + 1 (only the new rows below ``rows`` can belong to it; a block that does not complete inside the
+    pass pools finite garbage that the per-row mask hides until the pass that completes it rewrites it).
+    """
+
+    if isinstance(rows, bool) or type(rows) is not int or not 1 <= rows <= VERIFY_MAX_ROWS:
+        raise ValueError(f"QSA verify path admits 1..{VERIFY_MAX_ROWS} rows, got {rows!r}")
+    blocks = validate_qsa_cache_capacity(allocated_compressed_blocks * COMPRESS_RATIO) // COMPRESS_RATIO
+    clamped = torch.arange(CHUNK_ROWS, dtype=torch.int64).clamp(max=rows - 1).reshape(1, 1, CHUNK_ROWS, 1)
+    lane = torch.arange(CHUNK_ROWS, dtype=torch.int64)
+    offset = lane.reshape(CHUNK_ROWS, 1) - lane.reshape(1, CHUNK_ROWS)  # i - j
+    new_row = lane.reshape(1, CHUNK_ROWS) < rows
+    stack = torch.zeros(CHUNK_ROWS, CHUNK_ROWS * RAW_WINDOW_TILE_ROWS)
+    for remainder in range(COMPRESS_RATIO):
+        select = torch.zeros(CHUNK_ROWS, RAW_WINDOW_TILE_ROWS)
+        for lane_in_block in range(COMPRESS_RATIO):
+            if lane_in_block < remainder:
+                select[0, RAW_HISTORY_ROWS - remainder + lane_in_block] = 1.0 / COMPRESS_RATIO
+            elif lane_in_block - remainder < rows:
+                select[0, CACHE_WRITE_ROWS + lane_in_block - remainder] = 1.0 / COMPRESS_RATIO
+            if COMPRESS_RATIO - remainder + lane_in_block < rows:
+                select[1, CACHE_WRITE_ROWS + COMPRESS_RATIO - remainder + lane_in_block] = 1.0 / COMPRESS_RATIO
+        stack[remainder] = select.reshape(-1)
+    return {
+        "row_index_blocks": clamped.expand(1, 1, CHUNK_ROWS, blocks).contiguous(),
+        "row_index_slots": clamped.expand(1, 1, CHUNK_ROWS, SPARSE_INDEX_CAPACITY).contiguous(),
+        "stage_a_lanes": torch.where(new_row, offset + STAGE_LANE_BIAS, torch.zeros_like(offset)).reshape(
+            1, 1, CHUNK_ROWS, CHUNK_ROWS
+        ),
+        "stage_b_lanes": torch.where(new_row, offset + 2 * STAGE_LANE_BIAS, torch.zeros_like(offset)).reshape(
+            1, 1, CHUNK_ROWS, CHUNK_ROWS
+        ),
+        "arange32_row": lane.reshape(1, 1, 1, CHUNK_ROWS),
+        "pool_select_stack": stack.reshape(1, 1, CHUNK_ROWS, CHUNK_ROWS * RAW_WINDOW_TILE_ROWS),
+    }
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNQSAVerifyConstants:
+    """Replicated constants of the verify path for one row count, beside one set of chunk constants.
+
+    Exposes the six template names :func:`derive_qsa_chunk_inputs` reads (``allocated_compressed_blocks``,
+    ``row_index_blocks``, ``row_index_slots`` clamped to ``rows``; ``arange_blocks_rows``,
+    ``arange_slots_rows``, ``all_ones_rows`` shared with the chunk constants), so the per-row masks and sparse
+    rows of a verify pass are the chunk derivation on the clamped templates.  UINT32 TILE ``stage_a_lanes`` /
+    ``stage_b_lanes`` ``[1,1,32,32]`` and ``arange32_row`` ``[1,1,1,32]`` compare against the tiled
+    position remainders; BF16 TILE ``pool_select_stack`` ``[1,1,32,2048]`` is read with one exact one-hot
+    matmul per pass.
+    """
+
+    rows: int
+    chunk: Qwen38TTNNQSAChunkConstants
+    row_index_blocks: Any
+    row_index_slots: Any
+    stage_a_lanes: Any
+    stage_b_lanes: Any
+    arange32_row: Any
+    pool_select_stack: Any
+    select_compute_config: Any
+
+    @property
+    def allocated_compressed_blocks(self) -> int:
+        return self.chunk.allocated_compressed_blocks
+
+    @property
+    def arange_blocks_rows(self):
+        return self.chunk.arange_blocks_rows
+
+    @property
+    def arange_slots_rows(self):
+        return self.chunk.arange_slots_rows
+
+    @property
+    def all_ones_rows(self):
+        return self.chunk.all_ones_rows
+
+    @classmethod
+    def build(
+        cls, mesh_device, mesh_contract: Qwen38MeshContract, chunk: Qwen38TTNNQSAChunkConstants, *, rows: int
+    ) -> "Qwen38TTNNQSAVerifyConstants":
+        mesh_contract.validate_mesh(mesh_device)
+        host = qsa_verify_constant_rows(rows, chunk.allocated_compressed_blocks)
+        uploaded: list[Any] = []
+
+        def upload_uint32(name: str, layout):
+            tensor = _upload_uint32(mesh_device, mesh_contract, host[name], layout=layout)
+            uploaded.append(tensor)
+            return tensor
+
+        try:
+            stack = ttnn.from_torch(
+                host["pool_select_stack"].to(torch.bfloat16),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=mesh_device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=replicate_tensor_2d_mesh_mapper(mesh_device),
+            )
+            uploaded.append(stack)
+            _require_shape(stack, (1, 1, CHUNK_ROWS, CHUNK_ROWS * RAW_WINDOW_TILE_ROWS), "QSA verify pool select stack")
+            mesh_contract.validate_tensor(stack, placement=TensorPlacement.REPLICATED)
+            return cls(
+                rows=rows,
+                chunk=chunk,
+                row_index_blocks=upload_uint32("row_index_blocks", ttnn.ROW_MAJOR_LAYOUT),
+                row_index_slots=upload_uint32("row_index_slots", ttnn.ROW_MAJOR_LAYOUT),
+                stage_a_lanes=upload_uint32("stage_a_lanes", ttnn.TILE_LAYOUT),
+                stage_b_lanes=upload_uint32("stage_b_lanes", ttnn.TILE_LAYOUT),
+                arange32_row=upload_uint32("arange32_row", ttnn.TILE_LAYOUT),
+                pool_select_stack=stack,
+                select_compute_config=ttnn.WormholeComputeKernelConfig(
+                    math_fidelity=ttnn.MathFidelity.HiFi4,
+                    math_approx_mode=False,
+                    fp32_dest_acc_en=True,
+                    packer_l1_acc=False,
+                ),
+            )
+        except BaseException:
+            _deallocate(*uploaded)
+            raise
+
+    def deallocate(self) -> None:
+        _deallocate(
+            self.row_index_blocks,
+            self.row_index_slots,
+            self.stage_a_lanes,
+            self.stage_b_lanes,
+            self.arange32_row,
+            self.pool_select_stack,
+        )
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNQSAVerifyInputs:
+    """Per-pass device tensors of the verify path, derived from ``P``; shared by every QSA layer.
+
+    ``chunk`` holds the per-row masks / sparse rows on the clamped templates, ``kv_block_start`` (= P & ~31)
+    and the block indices (``block_index_i32[0]`` = P // 4, ``[1]`` = P // 4 + 1 are the two blocks a pass
+    can complete).  ``kv_block_start_next`` UINT32 ``[1,1,1,1]`` is the next KV block, ``kv_read_indices``
+    UINT32 ``[1,1,32]`` the rows of the current block (an embedding index row: a view of ``kv_read_row``, the
+    rank-4 owner that ``deallocate`` releases), ``stage_keep`` BF16 TILE
+    ``[1,1,32,1]`` is 1.0 for the block rows below P % 32 (already committed), ``stage_a_select`` /
+    ``stage_b_select`` BF16 TILE ``[1,1,32,32]`` place new row j at staging row P % 32 + j of the current /
+    next block, ``pool_select`` BF16 TILE ``[1,1,32,64]`` pools the two blocks out of the raw window.
+
+    ``single_row`` (a one-row pass, the draft rows): the row never reaches the next KV block or the next compressed
+    block, so ``kv_block_start_next`` and ``stage_b_select`` are None and ``chunk.block_index_i32`` holds P // 4 alone;
+    the layer skips those two writes (they wrote rows and a block no pass reads before rewriting them).
+    """
+
+    chunk: Qwen38TTNNQSAChunkInputs
+    kv_block_start_next: Any
+    kv_read_indices: Any
+    kv_read_row: Any
+    stage_keep: Any
+    stage_a_select: Any
+    stage_b_select: Any
+    pool_select: Any
+    single_row: bool = False
+
+    def deallocate(self) -> None:
+        self.chunk.deallocate()
+        _deallocate(
+            self.kv_block_start_next,
+            self.kv_read_row,
+            self.stage_keep,
+            self.stage_a_select,
+            self.stage_b_select,
+            self.pool_select,
+        )
+
+
+def derive_qsa_verify_inputs(
+    position_scalar,
+    constants: Qwen38TTNNQSAPositionConstants,
+    verify: Qwen38TTNNQSAVerifyConstants,
+    *,
+    single_row: bool = False,
+) -> Qwen38TTNNQSAVerifyInputs:
+    """:func:`derive_qsa_chunk_inputs` on the clamped templates plus the two-block staging selects.
+
+    Exact UINT32 ops on the replicated scalar ``P``; the only casts are the 0/1 selects to BF16 (the
+    comparisons write 0/1 UINT32) and the pool select, one row of a 0.25-valued constant stack picked by a
+    one-hot matmul (each output element is one term times 1.0).  No value is read back to the host.
+    ``single_row``: the one-row pass's inputs (:class:`Qwen38TTNNQSAVerifyInputs`): no next-block index, no
+    next-block select, one compressed block index.
+    """
+
+    chunk = derive_qsa_chunk_inputs(
+        position_scalar, constants, verify, completed_blocks=1 if single_row else VERIFY_COMPLETED_BLOCKS
+    )
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    u32 = ttnn.uint32
+    allocated: list[Any] = []
+    try:
+        kv_block_start_next = None
+        if not single_row:
+            kv_block_start_next = ttnn.add(chunk.kv_block_start, CACHE_WRITE_ROWS, memory_config=dram)
+            allocated.append(kv_block_start_next)
+        # The rank-3 index row is a view of the rank-4 add result (a new tensor id over the same buffer, as the
+        # device-token embedding's index reshape): the rank-4 row stays alive as the owner and is the one released.
+        read_row = ttnn.add(verify.chunk.arange32_lanes, chunk.kv_block_start, memory_config=dram)
+        allocated.append(read_row)
+        kv_read_indices = ttnn.reshape(read_row, (1, 1, CACHE_WRITE_ROWS))
+
+        position_tiled = ttnn.to_layout(position_scalar, ttnn.TILE_LAYOUT, memory_config=dram)
+        remainder = ttnn.bitwise_and(position_tiled, KV_ROW_MASK, memory_config=dram)  # P % 32
+        keep_bits = ttnn.lt(constants.arange32_col, remainder, dtype=u32, memory_config=dram)
+        stage_keep = ttnn.typecast(keep_bits, ttnn.bfloat16, memory_config=dram)
+        allocated.append(stage_keep)
+        lane_key = ttnn.add(remainder, STAGE_LANE_BIAS, memory_config=dram)  # P % 32 + 32
+        a_bits = ttnn.eq(verify.stage_a_lanes, lane_key, dtype=u32, memory_config=dram)
+        stage_a_select = ttnn.typecast(a_bits, ttnn.bfloat16, memory_config=dram)
+        allocated.append(stage_a_select)
+        stage_b_select = b_bits = None
+        if not single_row:
+            b_bits = ttnn.eq(verify.stage_b_lanes, lane_key, dtype=u32, memory_config=dram)
+            stage_b_select = ttnn.typecast(b_bits, ttnn.bfloat16, memory_config=dram)
+            allocated.append(stage_b_select)
+        block_remainder = ttnn.bitwise_and(position_tiled, COMPRESS_RATIO - 1, memory_config=dram)  # P % 4
+        onehot_bits = ttnn.eq(verify.arange32_row, block_remainder, dtype=u32, memory_config=dram)
+        onehot = ttnn.typecast(onehot_bits, ttnn.bfloat16, memory_config=dram)
+        select_flat = ttnn.matmul(
+            onehot, verify.pool_select_stack, memory_config=dram, compute_kernel_config=verify.select_compute_config
+        )
+        _require_shape(select_flat, (1, 1, 1, CHUNK_ROWS * RAW_WINDOW_TILE_ROWS), "QSA verify pool select row")
+        # The last dim changes: a real relayout into a new buffer, not a view of select_flat.
+        pool_select = ttnn.reshape(select_flat, (1, 1, CHUNK_ROWS, RAW_WINDOW_TILE_ROWS))
+        allocated.append(pool_select)
+        _deallocate(
+            position_tiled,
+            remainder,
+            keep_bits,
+            lane_key,
+            a_bits,
+            b_bits,
+            block_remainder,
+            onehot_bits,
+            onehot,
+            select_flat,
+        )
+    except BaseException:
+        chunk.deallocate()
+        _deallocate(*allocated)
+        raise
+    inputs = Qwen38TTNNQSAVerifyInputs(
+        chunk=chunk,
+        kv_block_start_next=kv_block_start_next,
+        kv_read_indices=kv_read_indices,
+        kv_read_row=read_row,
+        stage_keep=stage_keep,
+        stage_a_select=stage_a_select,
+        stage_b_select=stage_b_select,
+        pool_select=pool_select,
+        single_row=single_row,
+    )
+    for name, tensor, shape, dtype, layout in (
+        ("kv_block_start_next", kv_block_start_next, (1, 1, 1, 1), u32, ttnn.ROW_MAJOR_LAYOUT),
+        ("kv_read_indices", kv_read_indices, (1, 1, CACHE_WRITE_ROWS), u32, ttnn.ROW_MAJOR_LAYOUT),
+        ("stage_keep", stage_keep, (1, 1, CACHE_WRITE_ROWS, 1), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+        ("stage_a_select", stage_a_select, (1, 1, CACHE_WRITE_ROWS, CHUNK_ROWS), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+        ("stage_b_select", stage_b_select, (1, 1, CACHE_WRITE_ROWS, CHUNK_ROWS), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+        ("pool_select", pool_select, (1, 1, CHUNK_ROWS, RAW_WINDOW_TILE_ROWS), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+    ):
+        if tensor is None:
+            if single_row and name in ("kv_block_start_next", "stage_b_select"):
+                continue
+            raise RuntimeError(f"QSA verify input {name} is missing")
+        _require_shape(tensor, shape, f"QSA verify input {name}")
+        if tensor.dtype != dtype or tensor.layout != layout:
+            raise RuntimeError(
+                f"QSA verify input {name} must be {dtype} {layout} {list(shape)}, got {tensor_metadata(tensor)}"
+            )
+    return inputs
+
+
+def emulate_qsa_verify_inputs(position: int, *, rows: int, allocated_compressed_blocks: int) -> dict[str, torch.Tensor]:
+    """Torch reference of :func:`derive_qsa_verify_inputs`: row j of the chunk fields is the 1-row derivation at
+    ``P + min(j, rows - 1)``; the staging selects and the pool select are the host constants at ``P``."""
+
+    if isinstance(position, bool) or not isinstance(position, int) or not 0 <= position < MAX_CONTEXT:
+        raise ValueError(f"QSA position must be an integer in [0, {MAX_CONTEXT}), got {position!r}")
+    host = qsa_verify_constant_rows(rows, allocated_compressed_blocks)
+    per_row = [
+        emulate_qsa_position_inputs(
+            position + min(row, rows - 1), allocated_compressed_blocks=allocated_compressed_blocks
+        )
+        for row in range(CHUNK_ROWS)
+    ]
+    remainder = position % CACHE_WRITE_ROWS
+    block_start = position & KV_BLOCK_START_MASK
+    lane = torch.arange(CHUNK_ROWS, dtype=torch.int64)
+    return {
+        "chunk": {
+            "kv_block_start": per_row[0]["kv_block_start"],
+            "block_index_i32": tuple(
+                torch.tensor([position // COMPRESS_RATIO + block], dtype=torch.int32)
+                for block in range(VERIFY_COMPLETED_BLOCKS)
+            ),
+            "indexer_neg_mask": torch.cat([row["indexer_neg_mask"] for row in per_row], dim=2),
+            "row_keep_bits": torch.cat([row["row_keep_bits"] for row in per_row], dim=2),
+            "row_fill": torch.cat([row["row_fill"] for row in per_row], dim=2),
+        },
+        "kv_block_start_next": torch.full((1, 1, 1, 1), block_start + CACHE_WRITE_ROWS, dtype=torch.int64),
+        "kv_read_indices": (lane + block_start).reshape(1, 1, CACHE_WRITE_ROWS),
+        "stage_keep": (lane < remainder).to(torch.bfloat16).reshape(1, 1, CACHE_WRITE_ROWS, 1),
+        "stage_a_select": (host["stage_a_lanes"] == remainder + STAGE_LANE_BIAS).to(torch.bfloat16),
+        "stage_b_select": (host["stage_b_lanes"] == remainder + STAGE_LANE_BIAS).to(torch.bfloat16),
+        "pool_select": host["pool_select_stack"][0, 0, position % COMPRESS_RATIO]
+        .reshape(1, 1, CHUNK_ROWS, RAW_WINDOW_TILE_ROWS)
+        .to(torch.bfloat16),
+    }
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNQSAVerifyState:
+    """Per-layer verify-path state beside the generic state: ``raw_history`` ``[1,1,32,128]`` BF16 TILE holds
+    at rows 0..2 the raw index keys of positions P - 3 .. P - 1 (rows 3..31 exactly zero); ``raw_rows`` holds
+    the last pass's raw keys (row j = position P_prev + j) so the next pass can select the history committed
+    by that pass.  Both have fixed addresses.  The KV staging of the generic state is not used: the verify
+    path reads the resident rows of the current block straight out of the cache."""
+
+    layer_index: int
+    epoch: int
+    raw_history: Any
+    raw_rows: Any
 
 
 @dataclass(frozen=True)
@@ -3022,7 +3400,7 @@ class Qwen38TTNNQSA:
         self.mesh_contract.validate_tensor(state.kept_kv, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=1)
         self.mesh_contract.validate_tensor(state.kept_raw, placement=TensorPlacement.REPLICATED)
 
-    def _validate_chunk_inputs(self, chunk: Qwen38TTNNQSAChunkInputs) -> None:
+    def _validate_chunk_inputs(self, chunk: Qwen38TTNNQSAChunkInputs, *, completed_blocks: int = CHUNK_BLOCKS) -> None:
         blocks = self.allocated_compressed_blocks
         expected = (
             ("kv_block_start", chunk.kv_block_start, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
@@ -3046,9 +3424,9 @@ class Qwen38TTNNQSA:
                 for i, tensor in enumerate(chunk.block_index_i32)
             ),
         )
-        if len(chunk.block_index_i32) != CHUNK_BLOCKS:
+        if len(chunk.block_index_i32) != completed_blocks:
             raise ValueError(
-                f"QSA chunk inputs carry {len(chunk.block_index_i32)} block indices, expected {CHUNK_BLOCKS}"
+                f"QSA chunk inputs carry {len(chunk.block_index_i32)} block indices, expected {completed_blocks}"
             )
         for name, tensor, shape, dtype, layout in expected:
             _require_shape(tensor, shape, f"QSA chunk input {name}")
@@ -3572,3 +3950,419 @@ class Qwen38TTNNQSA:
         )
         if ring is not None and _tensor_key(ring) != _tensor_key(state.raw_key_ring):
             raise RuntimeError("QSA raw-key ring hand-off was not in place")
+
+    # ------------------------------------------------------------------ MTP v2 verify (R rows at any P)
+    # forward_verify_generic is forward_chunk_generic at an arbitrary P for the R = k + 1 rows of one verify
+    # pass: the same projections, indexer, per-row selection and sparse_sdpa on the 32-row tile (rows past R
+    # are zero hidden rows with the geometry of row R - 1), with the cache writes replaced by the two-block
+    # forms below.  Nothing here is rolled back after a partial accept:
+    #   * packed KV cache: rows P .. P + R - 1 are written every pass (block P & ~31 is rebuilt from its
+    #     resident rows below P % 32 plus the new rows, the next block from the new rows that cross into it).
+    #     Rows past the accepted prefix are garbage that the next pass overwrites before any sparse row can
+    #     name them (every sparse row of pass N+1 holds positions <= P' + j with P' = P + a + 1 <= P + R).
+    #   * compressed index cache: blocks P // 4 and P // 4 + 1 are written every pass from the raw window
+    #     [history | new rows].  A block completed by a rejected row (or not completed at all) holds finite
+    #     garbage that the per-row mask hides (complete_blocks(P' + j) <= that block) until the pass whose rows
+    #     complete it rewrites it, inside the same trace, before its indexer runs.
+    #   * raw history: the only state with a commit.  The next pass selects rows a + 1 .. a + 3 of
+    #     [history | last raw rows] with the GDN selectors' history_select, exactly the FIR history rule.
+    # The verify path never touches the generic state's kv_staging or raw_key_ring; an eager sync loads the
+    # raw history from the ring at a mode switch.  The cache must hold the next KV block as well
+    # (P & ~31 + 64 <= allocated_context): the host stops verify passes before that.
+
+    def allocate_verify_state(self) -> Qwen38TTNNQSAVerifyState:
+        epoch = self._next_epoch
+        self._next_epoch += 1
+        self._live_generic_epochs.add(epoch)
+        return Qwen38TTNNQSAVerifyState(
+            layer_index=self.layer_index,
+            epoch=epoch,
+            raw_history=self._allocate_replicated_tile_zeros((1, 1, CACHE_WRITE_ROWS, INDEX_HEAD_DIM)),
+            raw_rows=self._allocate_replicated_tile_zeros((1, 1, CACHE_WRITE_ROWS, INDEX_HEAD_DIM)),
+        )
+
+    def release_verify_state(self, state: Qwen38TTNNQSAVerifyState) -> None:
+        self._validate_verify_state(state)
+        _deallocate(state.raw_history, state.raw_rows)
+        self._live_generic_epochs.remove(state.epoch)
+
+    def _validate_verify_state(self, state: Qwen38TTNNQSAVerifyState) -> None:
+        if state.layer_index != self.layer_index:
+            raise ValueError(f"QSA verify state belongs to layer {state.layer_index}, expected {self.layer_index}")
+        if state.epoch not in self._live_generic_epochs:
+            raise ValueError(f"QSA verify state epoch {state.epoch} was not allocated by this module")
+        for label, tensor in (("QSA raw history", state.raw_history), ("QSA raw rows", state.raw_rows)):
+            _require_shape(tensor, (1, 1, CACHE_WRITE_ROWS, INDEX_HEAD_DIM), label)
+            if tensor.dtype != ttnn.bfloat16 or tensor.layout != ttnn.TILE_LAYOUT:
+                raise RuntimeError(f"{label} must be BF16 TILE, got {tensor_metadata(tensor)}")
+            self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.REPLICATED)
+        if _tensor_key(state.raw_history) == _tensor_key(state.raw_rows):
+            raise RuntimeError("QSA raw history and raw rows must be distinct buffers")
+
+    def _validate_verify_inputs(self, verify: Qwen38TTNNQSAVerifyInputs) -> None:
+        self._validate_chunk_inputs(verify.chunk, completed_blocks=1 if verify.single_row else VERIFY_COMPLETED_BLOCKS)
+        if verify.single_row != (verify.kv_block_start_next is None) or verify.single_row != (
+            verify.stage_b_select is None
+        ):
+            raise RuntimeError(
+                f"QSA verify inputs single_row={verify.single_row} must omit exactly the next-block index and select, "
+                f"got kv_block_start_next={verify.kv_block_start_next is not None} "
+                f"stage_b_select={verify.stage_b_select is not None}"
+            )
+        for name, tensor, shape, dtype, layout in (
+            ("kv_block_start_next", verify.kv_block_start_next, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
+            ("kv_read_indices", verify.kv_read_indices, (1, 1, CACHE_WRITE_ROWS), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
+            ("stage_keep", verify.stage_keep, (1, 1, CACHE_WRITE_ROWS, 1), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+            (
+                "stage_a_select",
+                verify.stage_a_select,
+                (1, 1, CACHE_WRITE_ROWS, CHUNK_ROWS),
+                ttnn.bfloat16,
+                ttnn.TILE_LAYOUT,
+            ),
+            (
+                "stage_b_select",
+                verify.stage_b_select,
+                (1, 1, CACHE_WRITE_ROWS, CHUNK_ROWS),
+                ttnn.bfloat16,
+                ttnn.TILE_LAYOUT,
+            ),
+            (
+                "pool_select",
+                verify.pool_select,
+                (1, 1, CHUNK_ROWS, RAW_WINDOW_TILE_ROWS),
+                ttnn.bfloat16,
+                ttnn.TILE_LAYOUT,
+            ),
+        ):
+            if tensor is None:
+                continue  # the single-row form's next-block index and select (their absence is checked above)
+            _require_shape(tensor, shape, f"QSA verify input {name}")
+            if tensor.dtype != dtype or tensor.layout != layout:
+                raise RuntimeError(
+                    f"QSA verify input {name} must be {dtype} {layout} {list(shape)}, got {tensor_metadata(tensor)}"
+                )
+
+    def sync_verify_raw_history_from_ring(
+        self, state: Qwen38TTNNQSAGenericState, verify_state: Qwen38TTNNQSAVerifyState, *, position: int
+    ) -> None:
+        """Eager mode switch (1-row generic -> verify) at host-known ``P``: history row 2 - i <- ring slot
+        ``(P - 1 - i) % 4`` (the raw key of position P - 1 - i; a slot from before the current block has a zero
+        pool coefficient, so its stale contents are never pooled).  Rows 3..31 are zeroed."""
+
+        self._validate_generic_state(state)
+        self._validate_verify_state(verify_state)
+        if isinstance(position, bool) or type(position) is not int or position < 0:
+            raise ValueError(f"QSA verify raw-history sync needs a non-negative int position, got {position!r}")
+        rows = []
+        for back in range(RAW_HISTORY_ROWS, 0, -1):  # positions P - 3, P - 2, P - 1
+            slot = (position - back) % COMPRESS_RATIO
+            rows.append(
+                ttnn.slice(
+                    state.raw_key_ring,
+                    (0, 0, slot, 0),
+                    (1, 1, slot + 1, INDEX_HEAD_DIM),
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+            )
+        combined = ttnn.concat(rows, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(*rows)
+        # ttnn.pad inside the input's own tile returns a view of ``combined``: only ``combined`` is released.
+        padded = ttnn.pad(
+            combined,
+            [(0, 0), (0, 0), (0, CACHE_WRITE_ROWS - RAW_HISTORY_ROWS), (0, 0)],
+            0.0,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        _require_shape(padded, (1, 1, CACHE_WRITE_ROWS, INDEX_HEAD_DIM), "QSA verify raw history tile")
+        landed = ttnn.copy(padded, verify_state.raw_history)
+        if landed is not None and _tensor_key(landed) != _tensor_key(verify_state.raw_history):
+            raise RuntimeError("QSA verify raw history load was not in place")
+        _deallocate(combined)
+
+    def handoff_verify_state(
+        self, state: Qwen38TTNNQSAGenericState, verify_state: Qwen38TTNNQSAVerifyState, *, position: int
+    ) -> None:
+        """Eager mode switch (verify -> 1-row generic) at host-known ``P``, after the last pass's commit: the
+        staging tile takes the cache block at ``P & ~31`` (rows below ``P % 32`` are the committed rows; the rest
+        are rewritten or never gathered), the raw-key ring the open block's raw keys out of the raw history
+        (:func:`verify_handoff_ring_select_rows`).  The caches need nothing: the verify path wrote them by position.
+        The cache read is the verify body's embedding lookup; every op here is shape-fixed, so one warm covers
+        every P."""
+
+        self._validate_generic_state(state)
+        self._validate_verify_state(verify_state)
+        if isinstance(position, bool) or type(position) is not int or position < 0:
+            raise ValueError(f"QSA verify hand-off needs a non-negative int position, got {position!r}")
+        replicate = replicate_tensor_2d_mesh_mapper(self.mesh_device)
+        block_start = position - position % CACHE_WRITE_ROWS
+        read_indices = ttnn.from_torch(
+            (torch.arange(CACHE_WRITE_ROWS, dtype=torch.int32) + block_start).reshape(1, 1, CACHE_WRITE_ROWS),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.mesh_device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=replicate,
+        )
+        looked_up = ttnn.embedding(
+            read_indices,
+            state.packed_kv_cache,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        resident = ttnn.unsqueeze_to_4D(looked_up) if len(looked_up.shape) == 3 else looked_up
+        _retag_tensor(resident, reference=state.packed_kv_cache, shard_dim=1)
+        _require_shape(resident, (1, 1, CACHE_WRITE_ROWS, 2 * HEAD_DIM), "QSA hand-off resident KV block rows")
+        if resident.dtype != ttnn.bfloat16 or resident.layout != ttnn.TILE_LAYOUT:
+            raise RuntimeError(f"QSA hand-off KV block rows must be BF16 TILE, got {tensor_metadata(resident)}")
+        staged = ttnn.copy(resident, state.kv_staging)
+        if staged is not None and _tensor_key(staged) != _tensor_key(state.kv_staging):
+            raise RuntimeError("QSA KV staging verify hand-off was not in place")
+        _deallocate(resident, read_indices)
+        ring_select = ttnn.from_torch(
+            verify_handoff_ring_select_rows(position),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.mesh_device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=replicate,
+        )
+        ring = ttnn.matmul(
+            ring_select,
+            verify_state.raw_history,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+            optional_output_tensor=state.raw_key_ring,
+        )
+        if ring is not None and _tensor_key(ring) != _tensor_key(state.raw_key_ring):
+            raise RuntimeError("QSA raw-key ring verify hand-off was not in place")
+        _deallocate(ring_select)
+
+    def _raw_window_verify(self, verify_state: Qwen38TTNNQSAVerifyState, raw_rows):
+        """``[raw history tile | raw rows tile]``: two whole tiles on dim 2 (the GDN FIR window layout)."""
+
+        window = ttnn.concat([verify_state.raw_history, raw_rows], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _retag_tensor(window, reference=verify_state.raw_history, shard_dim=None)
+        _require_shape(window, (1, 1, RAW_WINDOW_TILE_ROWS, INDEX_HEAD_DIM), "QSA verify raw window")
+        return window
+
+    def commit_verify(
+        self, verify_state: Qwen38TTNNQSAVerifyState, selectors, *, target: Qwen38TTNNQSAVerifyState | None = None
+    ) -> None:
+        """``raw_history <- window[a + 1 : a + 4]`` over ``[history | last raw rows]`` (one exact 0/1 selection
+        matmul against the pass's ``selectors.history_select``, landing in the persistent history tile).
+
+        With ``target`` the selected history lands in ``target.raw_history`` and ``verify_state`` is read only:
+        the draft trace derives the MTP layer's committed history into its own state while the alignment state
+        keeps its window for the pass's real commit.
+        """
+
+        self._validate_verify_state(verify_state)
+        target = verify_state if target is None else target
+        self._validate_verify_state(target)
+        _require_shape(selectors.history_select, (1, 1, CHUNK_ROWS, RAW_WINDOW_TILE_ROWS), "QSA verify history select")
+        if selectors.history_select.dtype != ttnn.bfloat16:
+            raise RuntimeError(f"QSA verify history select must be BF16, got {selectors.history_select.dtype}")
+        window = self._raw_window_verify(verify_state, verify_state.raw_rows)
+        landed = ttnn.matmul(
+            selectors.history_select,
+            window,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+            optional_output_tensor=target.raw_history,
+        )
+        if landed is not None and _tensor_key(landed) != _tensor_key(target.raw_history):
+            raise RuntimeError("QSA verify raw history select did not land in its persistent buffer")
+        _deallocate(window)
+
+    def _write_compressed_index_verify(
+        self,
+        state: Qwen38TTNNQSAGenericState,
+        verify_state: Qwen38TTNNQSAVerifyState,
+        raw_key,
+        block_start_cos,
+        block_start_sin,
+        verify: Qwen38TTNNQSAVerifyInputs,
+        constants: Qwen38TTNNQSAChunkConstants,
+    ) -> None:
+        kept = ttnn.copy(raw_key, verify_state.raw_rows)
+        if kept is not None and _tensor_key(kept) != _tensor_key(verify_state.raw_rows):
+            raise RuntimeError("QSA verify raw rows were not kept in place")
+        # Block means of P // 4 (rows 0) and P // 4 + 1 (row 1) as one exact 0.25-select matmul over the raw
+        # window (four exact power-of-two products summed in fp32, one bf16 rounding: the ring's quarter-scaled
+        # sum), then the decode's norm and block-start RoPE on the whole tile and one paged write per block.
+        window = self._raw_window_verify(verify_state, raw_key)
+        _deallocate(raw_key)
+        pooled = ttnn.matmul(
+            verify.pool_select,
+            window,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+        )
+        _deallocate(window)
+        _retag_tensor(pooled, reference=state.compressed_index_cache, shard_dim=None)
+        _require_shape(pooled, (1, 1, CHUNK_ROWS, INDEX_HEAD_DIM), "pooled verify index keys")
+        normalized = ttnn.rms_norm(
+            pooled,
+            epsilon=self.rms_norm_eps,
+            weight=self.weights.index_k_norm,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+        )
+        _deallocate(pooled)
+        rotated = apply_partial_rope_prefill(normalized, block_start_cos, block_start_sin, 1, ROPE_DIM)
+        _deallocate(normalized)
+        _retag_tensor(rotated, reference=state.compressed_index_cache, shard_dim=None)
+        self.mesh_contract.validate_tensor(rotated, placement=TensorPlacement.REPLICATED)
+        _require_shape(rotated, (1, 1, CHUNK_ROWS, INDEX_HEAD_DIM), "rotated verify index keys")
+        one_row = ttnn.Shape((1, 1, 1, INDEX_HEAD_DIM))
+        tile = ttnn.Shape((1, 1, CHUNK_ROWS, INDEX_HEAD_DIM))
+        # The blocks the pass can complete: P // 4 and P // 4 + 1, or P // 4 alone for a one-row pass.
+        for block, block_index in enumerate(verify.chunk.block_index_i32):
+            picked = ttnn.matmul(
+                constants.row_selects[block],
+                rotated,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                compute_kernel_config=self.compute_config,
+            )
+            _retag_tensor(picked, reference=rotated, shard_dim=None)
+            _require_shape(picked, (1, 1, CHUNK_ROWS, INDEX_HEAD_DIM), f"picked verify compressed row {block}")
+            row = ttnn.reshape(picked, one_row, tile)  # a view of picked's tile: row 0 logical
+            _retag_tensor(row, reference=rotated, shard_dim=None)
+            row_sharded = ttnn.to_memory_config(row, self.compressed_row_memory_config)
+            _deallocate(picked)
+            result = ttnn.experimental.paged_update_cache(
+                state.compressed_index_cache, row_sharded, update_idxs_tensor=block_index
+            )
+            if _tensor_key(result) != _tensor_key(state.compressed_index_cache):
+                raise RuntimeError("compressed QSA verify index update was not in place")
+            _deallocate(row_sharded)
+        _deallocate(rotated)
+
+    def _write_packed_kv_verify(
+        self,
+        state: Qwen38TTNNQSAGenericState,
+        key,
+        value,
+        verify: Qwen38TTNNQSAVerifyInputs,
+    ) -> None:
+        packed_tiled = ttnn.concat([value, key], dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(value, key)
+        _require_shape(packed_tiled, (1, 1, CHUNK_ROWS, 2 * HEAD_DIM), "packed QSA verify KV rows")
+        # The current block's resident rows, read out of the cache at P & ~31 .. + 31 (the embedding lookup of
+        # the RoPE tables), keep rows below P % 32; new row j lands at row P % 32 + j (exact 0/1 select
+        # matmul); the whole tile is untilized once and rewritten at P & ~31.
+        looked_up = ttnn.embedding(
+            verify.kv_read_indices,
+            state.packed_kv_cache,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        resident = ttnn.unsqueeze_to_4D(looked_up) if len(looked_up.shape) == 3 else looked_up
+        _retag_tensor(resident, reference=state.packed_kv_cache, shard_dim=1)
+        _require_shape(resident, (1, 1, CACHE_WRITE_ROWS, 2 * HEAD_DIM), "resident QSA KV block rows")
+        if resident.dtype != ttnn.bfloat16 or resident.layout != ttnn.TILE_LAYOUT:
+            raise RuntimeError(f"resident QSA KV block rows must be BF16 TILE, got {tensor_metadata(resident)}")
+        kept = ttnn.multiply(resident, verify.stage_keep, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(resident)  # the 4D view owns the lookup's buffer (the device-token embedding's rule)
+        placed = ttnn.matmul(
+            verify.stage_a_select,
+            packed_tiled,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+        )
+        _retag_tensor(placed, reference=state.packed_kv_cache, shard_dim=1)
+        staged = ttnn.add(kept, placed, memory_config=ttnn.DRAM_MEMORY_CONFIG, fast_and_approximate_mode=False)
+        _deallocate(kept, placed)
+        _retag_tensor(staged, reference=state.packed_kv_cache, shard_dim=1)
+        self._write_kv_block_verify(state, staged, verify.chunk.kv_block_start, label="current")
+        # The next block: new row j lands at row P % 32 + j - 32 (an all-zero tile when the rows stay inside
+        # the current block; those rows are past P + R - 1 and never named by a sparse row before they are
+        # rewritten).  A one-row pass never reaches it: the write is skipped.
+        if verify.single_row:
+            _deallocate(packed_tiled)
+            return
+        placed_next = ttnn.matmul(
+            verify.stage_b_select,
+            packed_tiled,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+        )
+        _deallocate(packed_tiled)
+        _retag_tensor(placed_next, reference=state.packed_kv_cache, shard_dim=1)
+        self._write_kv_block_verify(state, placed_next, verify.kv_block_start_next, label="next")
+
+    def _write_kv_block_verify(
+        self, state: Qwen38TTNNQSAGenericState, staging_tiled, kv_block_start, *, label: str
+    ) -> None:
+        _require_shape(staging_tiled, (1, 1, CACHE_WRITE_ROWS, 2 * HEAD_DIM), f"QSA verify {label} block staging")
+        staging_row_major = ttnn.to_layout(staging_tiled, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(staging_tiled)
+        _retag_tensor(staging_row_major, reference=state.packed_kv_cache, shard_dim=1)
+        self.mesh_contract.validate_tensor(staging_row_major, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=1)
+        result = ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
+            state.packed_kv_cache,
+            staging_row_major,
+            self.slot_zero,
+            kv_block_start,
+            0,  # layer_idx inside this one-layer cache
+            1,  # num_layers
+            STAGING_AXIS,
+        )
+        if _tensor_key(result) != _tensor_key(state.packed_kv_cache):
+            raise RuntimeError(f"row-major QSA verify {label} block update was not in place")
+        _deallocate(staging_row_major)
+
+    def forward_verify_generic(
+        self,
+        hidden_rows,
+        state: Qwen38TTNNQSAGenericState,
+        verify_state: Qwen38TTNNQSAVerifyState,
+        *,
+        cos,
+        sin,
+        block_start_cos,
+        block_start_sin,
+        verify: Qwen38TTNNQSAVerifyInputs,
+        constants: Qwen38TTNNQSAChunkConstants,
+    ):
+        """The R rows P .. P + R - 1 of one verify pass on the 32-row tile at any P; same op sequence for every P.
+
+        ``hidden_rows`` is the ``[1,1,32,640]`` tile whose rows past R are zero.  ``state`` is mutated in
+        place (KV rows P .. P + R - 1 across the current and next 32-row block, compressed blocks P // 4 and
+        P // 4 + 1; with ``verify.single_row`` the current block and P // 4 alone); ``verify_state.raw_rows``
+        takes this pass's raw keys and ``raw_history`` is read only
+        (the caller commits it with :meth:`commit_verify` at the start of the next pass).  The RoPE rows are
+        the table lookups at P + j and at 4 * (P // 4) + 4i (rows 0 and 1 are used).  Returns the ``[1,1,32,640]``
+        BF16 TILE hidden-sharded rows; the input is left for the caller to release.
+        """
+
+        self._validate_generic_state(state)
+        self._validate_verify_state(verify_state)
+        self._validate_rope_rows(cos, sin, "QSA verify RoPE")
+        self._validate_rope_rows(block_start_cos, block_start_sin, "QSA verify block-start RoPE")
+        self._validate_verify_inputs(verify)
+        if constants.allocated_compressed_blocks != self.allocated_compressed_blocks:
+            raise ValueError(
+                f"QSA chunk constants were built for {constants.allocated_compressed_blocks} blocks, "
+                f"the layer has {self.allocated_compressed_blocks}"
+            )
+
+        full_hidden = self._all_gather_hidden_rows(hidden_rows)
+        index_query, raw_key = self._index_projection_rows(full_hidden, cos, sin)
+        self._write_compressed_index_verify(
+            state, verify_state, raw_key, block_start_cos, block_start_sin, verify, constants
+        )
+        masked_scores = self._score_blocks_chunk(index_query, state, verify.chunk)
+        _deallocate(index_query)
+        sparse_indices = self._materialize_rows_chunk(masked_scores, verify.chunk, constants)
+
+        query, gate, key, value = self._main_projection_rows(full_hidden, cos, sin)
+        self._write_packed_kv_verify(state, key, value, verify)
+        local_attention = self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)
+        _deallocate(sparse_indices)
+        output = self._project_output_rows(local_attention, full_hidden)
+        _deallocate(full_hidden)
+        return output

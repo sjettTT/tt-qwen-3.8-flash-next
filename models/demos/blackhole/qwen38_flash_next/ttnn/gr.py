@@ -708,8 +708,13 @@ class Qwen38TTNNGatedResidual:
             )
         self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
 
-    def read_rows(self, residual_rows) -> tuple[Any, Qwen38TTNNGatedResidualState]:
-        """:meth:`read` for the 32 residual rows ``[1,4,32,640]`` of a chunk -> block rows ``[1,1,32,640]``."""
+    def read_rows(self, residual_rows, *, flat_views: bool = False) -> tuple[Any, Qwen38TTNNGatedResidualState]:
+        """:meth:`read` for the 32 residual rows ``[1,4,32,640]`` of a chunk -> block rows ``[1,1,32,640]``.
+
+        ``flat_views``: the branch-major <-> flat walks as the 1-row read's ``ttnn.experimental.view`` (every branch
+        is one 32-row tile row, so the branch-major tile sequence is the flat rows' tile sequence: the same pages,
+        no permute and no relayout); the default keeps the permutes (the prefill chunk's form).
+        """
 
         self._validate_rows(residual_rows, RESIDUAL_ROWS_LOCAL_SHAPE, label="GR residual rows")
         dram = ttnn.DRAM_MEMORY_CONFIG
@@ -734,11 +739,14 @@ class Qwen38TTNNGatedResidual:
         _deallocate(gathered_stats)
         self._validate_rows(unit, RESIDUAL_ROWS_LOCAL_SHAPE, label="GR rows RMS unit")
         # Branch-major -> token-major -> one flat (branch, local hidden) row per token.
-        unit_tokens = ttnn.permute(unit, (0, 2, 1, 3), memory_config=dram)
-        _deallocate(unit)
-        unit_flat = ttnn.reshape(unit_tokens, FLAT_ROWS_LOCAL_SHAPE)
-        if _tensor_key(unit_flat) != _tensor_key(unit_tokens):
-            _deallocate(unit_tokens)
+        if flat_views:
+            unit_flat = ttnn.experimental.view(unit, FLAT_ROWS_LOCAL_SHAPE)  # the view owns unit's buffer
+        else:
+            unit_tokens = ttnn.permute(unit, (0, 2, 1, 3), memory_config=dram)
+            _deallocate(unit)
+            unit_flat = ttnn.reshape(unit_tokens, FLAT_ROWS_LOCAL_SHAPE)
+            if _tensor_key(unit_flat) != _tensor_key(unit_tokens):
+                _deallocate(unit_tokens)
         if _shape(unit_flat) != FLAT_ROWS_LOCAL_SHAPE or _padded_shape(unit_flat) != FLAT_ROWS_LOCAL_SHAPE:
             raise RuntimeError(
                 f"GR rows flat unit must be {FLAT_ROWS_LOCAL_SHAPE} backed by itself, "
@@ -846,11 +854,14 @@ class Qwen38TTNNGatedResidual:
         gated_flat = ttnn.multiply(normalized_ws, gate_flat, memory_config=dram)
         _deallocate(gate_flat, normalized_ws)
         # Flat rows -> token-major -> branch-major, then the branch mean (the 1/4 is in norm_scale).
-        gated_tokens = ttnn.reshape(gated_flat, TOKEN_MAJOR_ROWS_SHAPE)
-        if _tensor_key(gated_tokens) != _tensor_key(gated_flat):
-            _deallocate(gated_flat)
-        gated = ttnn.permute(gated_tokens, (0, 2, 1, 3), memory_config=dram)
-        _deallocate(gated_tokens)
+        if flat_views:
+            gated = ttnn.experimental.view(gated_flat, RESIDUAL_ROWS_LOCAL_SHAPE)  # owns gated_flat's buffer
+        else:
+            gated_tokens = ttnn.reshape(gated_flat, TOKEN_MAJOR_ROWS_SHAPE)
+            if _tensor_key(gated_tokens) != _tensor_key(gated_flat):
+                _deallocate(gated_flat)
+            gated = ttnn.permute(gated_tokens, (0, 2, 1, 3), memory_config=dram)
+            _deallocate(gated_tokens)
         self._validate_rows(gated, RESIDUAL_ROWS_LOCAL_SHAPE, label="GR rows gated unit")
         block_rows = ttnn.experimental.fast_reduce_nc(
             gated, dims=[1], output=None, compute_kernel_config=self.compute_config, memory_config=dram

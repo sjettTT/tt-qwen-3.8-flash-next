@@ -53,6 +53,14 @@ def _shape(tensor) -> tuple[int, ...]:
     return tuple(int(value) for value in tensor.shape)
 
 
+def _padded_shape(tensor) -> tuple[int, ...]:
+    return tuple(int(value) for value in tensor.padded_shape)
+
+
+def _tensor_key(tensor) -> tuple[str, int]:
+    return (str(tensor.device()), int(tensor.tensor_id))
+
+
 def _deallocate(*tensors) -> None:
     for tensor in tensors:
         if tensor is not None:
@@ -396,6 +404,121 @@ class Qwen38TTNNFinalMixer:
         self.mesh_contract.validate_tensor(output, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         if _shape(output) != OUTPUT_LOCAL_SHAPE or output.dtype != ttnn.bfloat16:
             raise RuntimeError(f"final mixer output must be BF16 {OUTPUT_LOCAL_SHAPE}, got {_shape(output)}")
+        return output
+
+    def rows(self, residual_rows, *, flat_views: bool = False):
+        """:meth:`__call__` for the 32 branch-major residual rows ``[1,4,32,640]`` of an MTP v2 verify pass.
+
+        The GR ``read_rows`` layout walk (branch-major -> token-major -> one flat row per token, and back for
+        the branch mean) around the same norm, matmuls, collective and gate; every row's result depends only on
+        its own row (``per_core_M = 1`` tiles), so row j is the 1-row path's result for that row.  Returns
+        ``[1,1,32,640]``.  ``flat_views``: the two walks as ``ttnn.experimental.view`` (the same tile pages, as
+        the 1-row path and GR ``read_rows(flat_views=True)``); the default keeps the permutes.
+        """
+
+        expected = (1, RESIDUAL_BRANCHES, ttnn.TILE_SIZE, LOCAL_HIDDEN_SIZE)
+        flat = (1, 1, ttnn.TILE_SIZE, FLAT_LOCAL_WIDTH)
+        if _shape(residual_rows) != expected or residual_rows.dtype != ttnn.bfloat16:
+            raise ValueError(f"final mixer rows input must be TILE BF16 {expected}, got {_shape(residual_rows)}")
+        self.mesh_contract.validate_tensor(residual_rows, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        stats = ttnn.rms_norm_pre_all_gather(
+            residual_rows, dtype=ttnn.bfloat16, memory_config=dram, compute_kernel_config=self.compute_config
+        )
+        stats = ttnn.reshape(stats, (1, RESIDUAL_BRANCHES, ttnn.TILE_SIZE, 32))
+        self.mesh_contract.validate_tensor(stats, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        gathered = ttnn.all_gather(stats, dim=3, cluster_axis=TP_AXIS, memory_config=dram)
+        _deallocate(stats)
+        self.mesh_contract.validate_tensor(gathered, placement=TensorPlacement.REPLICATED)
+        unit = ttnn.rms_norm_post_all_gather(
+            residual_rows,
+            gathered,
+            epsilon=RMS_NORM_EPS,
+            memory_config=dram,
+            compute_kernel_config=self.compute_config,
+            dtype=ttnn.bfloat16,
+        )
+        _deallocate(gathered)
+        if flat_views:
+            unit_flat = ttnn.experimental.view(unit, flat)  # the view owns unit's buffer
+        else:
+            unit_tokens = ttnn.permute(unit, (0, 2, 1, 3), memory_config=dram)
+            _deallocate(unit)
+            unit_flat = ttnn.reshape(unit_tokens, flat)
+            if _tensor_key(unit_flat) != _tensor_key(unit_tokens):
+                _deallocate(unit_tokens)
+        if _shape(unit_flat) != flat or _padded_shape(unit_flat) != flat:
+            raise RuntimeError(f"final mixer flat unit rows must be {flat} backed by itself, got {_shape(unit_flat)}")
+        normalized_ws = ttnn.multiply(
+            unit_flat, self.norm_scale_flat, dtype=ttnn.bfloat16, memory_config=self.down_act_memory_config
+        )
+        _deallocate(unit_flat)
+        self.mesh_contract.validate_tensor(normalized_ws, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        if _shape(normalized_ws) != flat or normalized_ws.memory_config() != self.down_act_memory_config:
+            raise RuntimeError(
+                f"final mixer rows normalization produced {_shape(normalized_ws)} {normalized_ws.memory_config()}"
+            )
+        partial_ws = ttnn.linear(
+            normalized_ws,
+            self.weights.down,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.down_program_config,
+            dtype=ttnn.float32,
+            compute_kernel_config=self.compute_config,
+        )
+        partial = ttnn.to_memory_config(partial_ws, dram)
+        _deallocate(partial_ws)
+        self.mesh_contract.mark_local_partial(
+            partial,
+            replicated_reference=self.weights.replicated_anchor,
+            expected_shape=(1, 1, ttnn.TILE_SIZE, RESIDUAL_RANK),
+        )
+        down = ttnn.all_reduce(partial, cluster_axis=TP_AXIS, memory_config=dram, topology=self.collective_topology)
+        _deallocate(partial)
+        self.mesh_contract.validate_tensor(down, placement=TensorPlacement.REPLICATED)
+        down_bf16 = ttnn.typecast(down, ttnn.bfloat16, memory_config=dram)
+        _deallocate(down)
+        low_rank_ws = ttnn.silu(down_bf16, memory_config=self.up_act_memory_config)
+        _deallocate(down_bf16)
+        if low_rank_ws.memory_config() != self.up_act_memory_config:
+            raise RuntimeError(f"final mixer low-rank rows have memory config {low_rank_ws.memory_config()}")
+        self.mesh_contract.validate_tensor(low_rank_ws, placement=TensorPlacement.REPLICATED)
+        up_ws = ttnn.linear(
+            low_rank_ws,
+            self.weights.up,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.up_program_config,
+            compute_kernel_config=self.compute_config,
+        )
+        _deallocate(low_rank_ws)
+        up_flat = ttnn.to_memory_config(up_ws, dram)
+        _deallocate(up_ws)
+        self.mesh_contract.validate_tensor(up_flat, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        if _shape(up_flat) != flat:
+            raise RuntimeError(f"final mixer up projection rows have unexpected shape {_shape(up_flat)}")
+        gate_flat = ttnn.sigmoid(up_flat, memory_config=dram)
+        _deallocate(up_flat)
+        gated_flat = ttnn.multiply(normalized_ws, gate_flat, memory_config=dram)
+        _deallocate(gate_flat, normalized_ws)
+        if flat_views:
+            gated = ttnn.experimental.view(gated_flat, expected)  # owns gated_flat's buffer
+        else:
+            gated_tokens = ttnn.reshape(gated_flat, (1, ttnn.TILE_SIZE, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE))
+            if _tensor_key(gated_tokens) != _tensor_key(gated_flat):
+                _deallocate(gated_flat)
+            gated = ttnn.permute(gated_tokens, (0, 2, 1, 3), memory_config=dram)
+            _deallocate(gated_tokens)
+        if _shape(gated) != expected:
+            raise RuntimeError(f"final mixer gated rows have shape {_shape(gated)}, expected {expected}")
+        output = ttnn.experimental.fast_reduce_nc(
+            gated, dims=[1], output=None, compute_kernel_config=self.compute_config, memory_config=dram
+        )
+        _deallocate(gated)
+        self.mesh_contract.validate_tensor(output, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        if _shape(output) != (1, 1, ttnn.TILE_SIZE, LOCAL_HIDDEN_SIZE) or output.dtype != ttnn.bfloat16:
+            raise RuntimeError(
+                f"final mixer output rows must be BF16 [1,1,32,{LOCAL_HIDDEN_SIZE}], got {_shape(output)}"
+            )
         return output
 
 
