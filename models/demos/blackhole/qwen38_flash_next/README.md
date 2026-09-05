@@ -24,7 +24,7 @@ This was implemented with the intention of the n-gram model residing in system m
 
 | path | measured | notes |
 |---|---|---|
-| prompt prefill | 300 tok/s (and climbing) | 32-token chunk trace, 3.0-3.5 ms per prompt token, flat from 2k to 261k tokens; 128- and 256-token chunks are in progress |
+| prompt prefill | 300 tok/s (and climbing); 380 tok/s with `--long-chunks` | 32-token chunk trace, 3.0-3.5 ms per prompt token, flat from 2k to 261k tokens; 128- and 256-token chunks are in progress |
 | decode, one stream | 19.9 tok/s | position-generic traced decode, 50 ms per token, flat with depth |
 | decode with MTP (`--mtp 4`) | 37 tok/s aggregate, 55 tok/s on structured output | speculative drafting with exact acceptance: the committed stream equals greedy decode |
 | contexts | 32k, 64k, 128k, 256k | 256k is single-user; MTP fits at 32k, 64k and 128k |
@@ -196,6 +196,9 @@ The command-line client:
   through the chunk trace at about 3.2-3.5 ms per token (a 40k prompt: 125 s to the first token; 200k: 671 s), decode
   stays at 17-19 tokens/s to 256k.  Each context has its own component and model I/O caches under `--cache-root`
   (the BF4 expert cache is shared); 256k leaves about 750 MB per device free and is single-user.
+- `--long-chunks` prefills in 128-row chunks where the prompt allows (the remainder in 32-row chunks): 2.6 ms per prompt
+  token through the server against 3.3 with 32-row chunks alone, the same tokens (bitwise on all 48 layers); off by default and
+  not combined with `--mtp`, whose chain prefills in 32-row chunks.
 - MTP drafting (`--mtp 3|4`, 31-37 tokens/s on 4x p150) is off by default; greedy requests in the chunked prefill
   mode draft K tokens per pass and the committed stream equals greedy decode.  `--mtp-gdn-anchor layer0` (server
   flag) re-anchors the layer-0 GDN state from the 1-row recurrence.  MTP does not fit at 256k (94 MB free per bank

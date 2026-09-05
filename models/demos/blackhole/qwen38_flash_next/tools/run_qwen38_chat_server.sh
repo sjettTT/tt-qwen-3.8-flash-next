@@ -14,6 +14,7 @@
 #                           directories (about 23 GB for 32k plus 107 GB of BF4 experts on the first start)
 #   --allocated-context N   32768 (default) | 65536 | 131072 | 262144
 #   --mtp K                 multi-token-prediction drafting depth, 3 or 4 (off by default; greedy chunked-mode requests draft)
+#   --long-chunks           prefill in 128-row chunks where the prompt allows (off by default; not with --mtp)
 #   --port N --host ADDR    default 8000 on 0.0.0.0
 #   --acceptance            replay the shipped CPU greedy records (tools/acceptance/greedy-prompts) at startup
 #   --acceptance-prompts D  replay the records in D instead
@@ -39,7 +40,7 @@ readonly SERVER="$HERE/qwen38_chat_server.py"
 die() { printf 'run_qwen38_chat_server: %s\n' "$*" >&2; exit 2; }
 usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
-profile= instance=0 devices= checkpoint= cache_root= allocated_context=32768 mtp= port=8000 host=0.0.0.0
+profile= instance=0 devices= checkpoint= cache_root= allocated_context=32768 mtp= port=8000 host=0.0.0.0 long_chunks=
 acceptance= acceptance_prompts= require_json_96= prepare_only= bf4_stage_limit= bf4_corpus= bf4_corpus_verification=
 serve_seconds= python= validate_only= prefill_mode=chunked
 while [[ $# -gt 0 ]]; do
@@ -51,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --cache-root) cache_root=${2-}; shift 2 ;;
         --allocated-context) allocated_context=${2-}; shift 2 ;;
         --mtp) mtp=${2-}; shift 2 ;;
+        --long-chunks) long_chunks=1; shift ;;
         --port) port=${2-}; shift 2 ;;
         --host) host=${2-}; shift 2 ;;
         --acceptance) acceptance=1; shift ;;
@@ -143,6 +145,8 @@ if [[ -n "$mtp" ]]; then
     [[ "$mtp" == 3 || "$mtp" == 4 ]] || die "--mtp takes 3 or 4, got $mtp"
     args+=(--mtp "$mtp")
 fi
+[[ -z "$long_chunks" || -z "$mtp" ]] || die "--long-chunks and --mtp are alternatives (the MTP chain prefills in 32-row chunks)"
+[[ -z "$long_chunks" ]] || args+=(--long-chunks)
 [[ -z "$acceptance" ]] || args+=(--acceptance-prompts "$HERE/acceptance/greedy-prompts")
 [[ -z "$acceptance_prompts" ]] || args+=(--acceptance-prompts "$acceptance_prompts")
 [[ -z "$require_json_96" ]] || args+=(--require-json-96)

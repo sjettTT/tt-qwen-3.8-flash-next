@@ -4417,8 +4417,12 @@ class Qwen38TTNNQSA:
 
         self._validate_generic_state(state)
         self._validate_verify_state(verify_state)
-        self._validate_rope_rows(cos, sin, "QSA verify RoPE")
-        self._validate_rope_rows(block_start_cos, block_start_sin, "QSA verify block-start RoPE")
+        if constants.rows != CHUNK_ROWS:
+            raise ValueError(
+                f"QSA verify runs on the {CHUNK_ROWS}-row tile, the chunk constants have {constants.rows} rows"
+            )
+        self._validate_rope_rows(cos, sin, CHUNK_ROWS, "QSA verify RoPE")
+        self._validate_rope_rows(block_start_cos, block_start_sin, CHUNK_ROWS, "QSA verify block-start RoPE")
         self._validate_verify_inputs(verify)
         if constants.allocated_compressed_blocks != self.allocated_compressed_blocks:
             raise ValueError(
@@ -4426,8 +4430,8 @@ class Qwen38TTNNQSA:
                 f"the layer has {self.allocated_compressed_blocks}"
             )
 
-        full_hidden = self._all_gather_hidden_rows(hidden_rows)
-        index_query, raw_key = self._index_projection_rows(full_hidden, cos, sin)
+        full_hidden = self._all_gather_hidden_rows(hidden_rows, constants)
+        index_query, raw_key = self._index_projection_rows(full_hidden, cos, sin, constants)
         self._write_compressed_index_verify(
             state, verify_state, raw_key, block_start_cos, block_start_sin, verify, constants
         )
@@ -4435,10 +4439,10 @@ class Qwen38TTNNQSA:
         _deallocate(index_query)
         sparse_indices = self._materialize_rows_chunk(masked_scores, verify.chunk, constants)
 
-        query, gate, key, value = self._main_projection_rows(full_hidden, cos, sin)
+        query, gate, key, value = self._main_projection_rows(full_hidden, cos, sin, constants)
         self._write_packed_kv_verify(state, key, value, verify)
         local_attention = self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)
         _deallocate(sparse_indices)
-        output = self._project_output_rows(local_attention, full_hidden)
+        output = self._project_output_rows(local_attention, full_hidden, constants)
         _deallocate(full_hidden)
         return output

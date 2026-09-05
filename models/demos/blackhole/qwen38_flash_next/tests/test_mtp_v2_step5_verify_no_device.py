@@ -1028,6 +1028,21 @@ def test_qsa_verify_methods_are_the_chunk_ops_plus_two_block_writes_without_host
         "_sparse_value_attention_rows",
         "_project_output_rows",
     ]
+    # The shared row helpers take the chunk constants (32 or 128 rows); the fake ttnn never reaches the verify
+    # body, so its calls are pinned to the helpers' signatures here.
+    for call in (n for n in ast.walk(functions["forward_verify_generic"]) if isinstance(n, ast.Call)):
+        if not ast.unparse(call.func).startswith("self._"):
+            continue
+        arguments = functions[call.func.attr].args
+        positional = [a.arg for a in arguments.args[1:]]
+        keywords = {k.arg for k in call.keywords}
+        required_keywords = {a.arg for a, d in zip(arguments.kwonlyargs, arguments.kw_defaults) if d is None}
+        assert len(call.args) <= len(positional), (call.func.attr, call.lineno)
+        assert len(call.args) + len(keywords & set(positional)) >= len(positional) - len(arguments.defaults), (
+            call.func.attr,
+            call.lineno,
+        )
+        assert required_keywords <= keywords, (call.func.attr, call.lineno)
     compressed = _segment(QSA_SOURCE, functions["_write_compressed_index_verify"])
     assert (
         compressed.count("ttnn.experimental.paged_update_cache(") == 1
