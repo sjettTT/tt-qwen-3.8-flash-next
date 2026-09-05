@@ -399,14 +399,18 @@ class Qwen38ChatSession:
 
         return count - alignment_steps(len(self.committed), count) if count > 0 else 0
 
-    def _prefill_chunked(self, token_ids: Sequence[int], following_token: int) -> Qwen38PrefillResult:
+    def _prefill_chunked(
+        self, token_ids: Sequence[int], following_token: int, should_stop: Callable[[], str | None] | None
+    ) -> Qwen38PrefillResult:
         """The chunk driver over ``token_ids`` from the committed position; its alignment steps are this session's
         forced steps (with the prefill event cadence).  Runs outside the loop guard: the seed and the hand-off
-        synchronize and allocate.  The committed sequence and the n-gram context follow the device.
+        synchronize and allocate.  The committed sequence and the n-gram context follow the device: a stop at one
+        of the driver's event syncs (``result.stopped``) leaves the prompt committed up to the hand-off.
         ``following_token`` (the last prompt token, teacher-forced afterwards) is the MTP layer's token at the last
         prefilled position."""
 
         forced = 0
+        start = len(self.committed)
         ahead = [*token_ids[1:], following_token]
 
         def forced_step(token_id: int, context: tuple[int, int] | None) -> tuple[int, int] | None:
@@ -421,19 +425,22 @@ class Qwen38ChatSession:
 
         result = self.chain.chunk_prefill(
             token_ids,
-            start_position=len(self.committed),
+            start_position=start,
             ple_context=self.ple_context,
             forced_step=forced_step,
             following_token=following_token,
+            should_stop=should_stop,
         )
         if result.timing.alignment_steps != forced:
             raise Qwen38ChatChainError(f"chunk prefill forced {forced} alignment steps, reported {result.timing}")
-        self.committed.extend(token_ids[forced:])
+        self.committed.extend(token_ids[forced : result.position - start])
         self.ple_context = result.ple_context
-        if result.position != len(self.committed):
+        if result.position != len(self.committed) or (
+            result.stopped is None and result.position != start + len(token_ids)
+        ):
             raise Qwen38ChatChainError(
-                f"chunk prefill ended at position {result.position} vs committed input sequence length "
-                f"{len(self.committed)}"
+                f"chunk prefill ended at position {result.position} (stopped {result.stopped!r}) vs committed input "
+                f"sequence length {len(self.committed)} of {start + len(token_ids)}"
             )
         return result
 
@@ -724,9 +731,12 @@ class Qwen38ChatSession:
         not such a failure: it is called between steps, so generation stops with
         ``disconnected`` and, as after ``length``, the next token stays in the row.
         ``prefill_mode`` overrides the session's mode for this request.
-        ``should_stop`` is polled between steps (and at the teacher-forced
-        prefill's event syncs; the chunk driver runs to its hand-off first) and
-        ends the request with the reason it returns, the row unconsumed;
+        ``should_stop`` is polled between steps and at the prefill's event syncs
+        (the teacher-forced cadence, the chunk driver's per-chunk events) and
+        ends the request with the reason it returns, the row unconsumed (a stop
+        inside the chunk driver hands off at the chunks replayed so far; the row
+        then holds no prediction and an exact repeat of the committed prefix
+        resets);
         ``think_budget`` forces ``</think>`` after that many reasoning tokens
         (the caller passes it only when the prompt left the think block open).
         ``sampling`` (a request with ``temperature > 0``) runs the sampled loop over
@@ -764,11 +774,13 @@ class Qwen38ChatSession:
             # All but the last prompt token through the chunk trace when enough rows remain after the alignment
             # steps; the last one is the first decode replay and is always teacher-forced inside the guard.
             if mode == "chunked" and self.chunk_prefill_rows(len(suffix) - 1) >= CHUNK_PREFILL_MIN_ROWS:
-                chunked = self._prefill_chunked(suffix[:-1], suffix[-1])
+                chunked = self._prefill_chunked(suffix[:-1], suffix[-1], should_stop)
                 suffix = suffix[-1:]
+            # A stop inside the chunk driver ended the request at its hand-off: nothing more runs on the device.
+            chunk_stopped = chunked is not None and chunked.stopped is not None
             generated: list[int] = []
-            finish: str | None = None
-            hook_stopped = False
+            finish: str | None = chunked.stopped if chunk_stopped else None
+            hook_stopped = chunk_stopped
             first_ns = last_ns = started_ns
             mtp_before = None if not drafting else (self.mtp.passes, self.mtp.accepted_drafts)
 
@@ -792,7 +804,10 @@ class Qwen38ChatSession:
                                 finish = "disconnected"
                             break
 
-            if drafting:
+            if chunk_stopped:
+                prefill_done_ns = self.clock_ns()
+                first_ns = last_ns = prefill_done_ns
+            elif drafting:
                 # The pass loop takes the guard per pass (its mode switches synchronize) and settles outside it.
                 with self.chain.loop_guard():
                     finish = self._prefill(suffix, should_stop)
@@ -827,7 +842,7 @@ class Qwen38ChatSession:
                             )
                         )
             self.last_finish = finish
-            self.row_unconsumed = hook_stopped or finish in ("length", "disconnected")
+            self.row_unconsumed = not chunk_stopped and (hook_stopped or finish in ("length", "disconnected"))
             position = self.chain.position()
             if position != len(self.committed):
                 raise Qwen38ChatChainError(
@@ -856,7 +871,9 @@ class Qwen38ChatSession:
             tokens_per_second=tokens_per_second,
             position=position,
             prefill_mode="teacher_forced" if chunked is None else "chunked",
-            prefill_forced_tokens=prefill_tokens if chunked is None else chunked.timing.alignment_steps + 1,
+            prefill_forced_tokens=(
+                prefill_tokens if chunked is None else chunked.timing.alignment_steps + (0 if chunk_stopped else 1)
+            ),
             prefill_chunks=0 if chunked is None else chunked.timing.chunks,
             prefill_tail_rows=0 if chunked is None else chunked.timing.tail_rows,
             prefill_handoff_ms=0.0 if chunked is None else chunked.timing.handoff_ms,
@@ -1176,10 +1193,12 @@ class Qwen38TracedChain:
         ple_context: tuple[int, int] | None,
         forced_step: Callable[[int, tuple[int, int] | None], tuple[int, int] | None],
         following_token: int | None = None,
+        should_stop: Callable[[], str | None] | None = None,
     ) -> Qwen38PrefillResult:
         """The chunk driver on this chain (the full-model gate's prefill path): alignment steps through
-        ``forced_step``, the seed, chunk replays, the padded tail, the hand-off.  Not under the loop guard.
-        ``following_token`` is the MTP layer's token at the last prefilled position (MTP chains)."""
+        ``forced_step``, the seed, chunk replays (``should_stop`` polled at their event syncs), the padded tail,
+        the hand-off.  Not under the loop guard.  ``following_token`` is the MTP layer's token at the last
+        prefilled position (MTP chains)."""
 
         if self.chunk_trace_id is None:
             raise Qwen38ChatChainError("the chain was opened without the chunk trace")
@@ -1193,7 +1212,13 @@ class Qwen38TracedChain:
             verify_allocations=self.verify_each_prefill,
             gdn_step_anchor=self.chunk_gdn_step_anchor,
             mtp=None if self.mtp is None else self.mtp.chunk_extension,
-        ).run(token_ids, start_position=start_position, ple_context=ple_context, following_token=following_token)
+        ).run(
+            token_ids,
+            start_position=start_position,
+            ple_context=ple_context,
+            following_token=following_token,
+            should_stop=should_stop,
+        )
 
     # -- the MTP pass loop primitives (mtp chains) ---------------------------------------------
 

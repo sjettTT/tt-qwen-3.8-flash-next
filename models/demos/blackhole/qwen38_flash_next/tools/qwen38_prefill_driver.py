@@ -72,6 +72,7 @@ class Qwen38PrefillResult:
     position: int  # P after the prefill: the count of positions consumed
     ple_context: tuple[int, int] | None  # the n-gram context of the committed stream
     timing: Qwen38PrefillTiming
+    stopped: str | None = None  # the should_stop reason that ended the prefill after the chunks already replayed
 
 
 class Qwen38ChunkPrefill:
@@ -135,10 +136,13 @@ class Qwen38ChunkPrefill:
         ple_context: tuple[int, int] | None,
         time_each_chunk: bool = False,
         following_token: int | None = None,
+        should_stop: Callable[[], str | None] | None = None,
     ) -> Qwen38PrefillResult:
         """Prefill ``token_ids`` at positions ``start_position ..``; the caller's first decode replay consumes the
         token after them (``following_token``, the MTP token of the last prefilled position when the chain drafts).
-        Returns the position after the prefill and the committed stream's n-gram context."""
+        Returns the position after the prefill and the committed stream's n-gram context.  ``should_stop`` is
+        polled at every event sync: a reason ends the prefill after the chunks already replayed (the hand-off runs
+        at that position; ``stopped`` carries the reason, ``position`` what was consumed)."""
 
         tokens = [int(token) for token in token_ids]
         if isinstance(start_position, bool) or type(start_position) is not int or start_position < 0:
@@ -161,6 +165,9 @@ class Qwen38ChunkPrefill:
         handoff_ms = 0.0
         replay_ms: list[float] = []
         host_ms: list[float] = []
+        stopped = None
+        consumed = len(remaining)
+        chunks = len(accepts)
         if accepts:
             if position % CHUNK_ROWS:
                 raise AssertionError(f"chunks must start at P % {CHUNK_ROWS} == 0, got P = {position}")
@@ -200,7 +207,11 @@ class Qwen38ChunkPrefill:
                     self._run_chunk(blocking=False)
                     if (index + 1) % self.event_interval == 0:
                         ttnn.event_synchronize(ttnn.record_event(self.mesh, cq_id=0))
-            position += len(remaining)
+                        stopped = None if should_stop is None else should_stop()
+                        if stopped is not None:
+                            consumed, chunks = min(CHUNK_ROWS * (index + 1), len(remaining)), index + 1
+                            break
+            position += consumed
             handoff_started_ns = time.perf_counter_ns()
             ttnn.synchronize_device(self.mesh)
             self.model.finish_prefill(self.state, self.chunk_state, position)
@@ -210,8 +221,8 @@ class Qwen38ChunkPrefill:
             handoff_ms = (time.perf_counter_ns() - handoff_started_ns) / 1_000_000
         timing = Qwen38PrefillTiming(
             alignment_steps=aligned,
-            chunks=len(accepts),
-            tail_rows=len(remaining) % CHUNK_ROWS,
+            chunks=chunks,
+            tail_rows=consumed % CHUNK_ROWS,
             chunk_replay_ms=tuple(replay_ms),
             chunk_host_ms=tuple(host_ms),
             verify_ms=verify_ms,
@@ -220,7 +231,7 @@ class Qwen38ChunkPrefill:
             traced=self.chunk_trace_id is not None,
             gdn_step_anchor=self.gdn_step_anchor,
         )
-        return Qwen38PrefillResult(position, ple_context, timing)
+        return Qwen38PrefillResult(position, ple_context, timing, stopped)
 
 
 __all__ = [

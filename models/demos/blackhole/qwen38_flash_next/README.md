@@ -171,6 +171,18 @@ read candidate row, not the vocabulary (`logprobs_normalizer` in `/health` and `
 decodes at a time; up to four wait in the queue (`queue_wait_seconds` in `usage`), the fifth gets HTTP 503.  A prompt
 over the context limit gets HTTP 400 `context_length_exceeded`.
 
+A client that hangs up is noticed at the next device step (or prefill event) whether or not anything was being
+streamed to it, and a queued request whose client left gives up its place: the device never runs a request for
+nobody.  A streaming request gets its head and role chunk as soon as it is admitted and an SSE comment
+(`: keepalive`) every `--heartbeat-seconds` (30 s) through the queue wait and the prefill, so a 60 s proxy or SDK
+read timeout does not cut a long prompt.  A socket write blocked for `--socket-timeout-seconds` (60 s: a reader that
+stopped reading) ends the request as `disconnected`.  `--request-deadline-seconds` (off by default) is honoured
+inside the chunked prefill too.  `/health.current_request` shows the request holding the device with the seconds
+since its last completed step; `--stall-seconds` (off by default) ends the server when a device call never returns.
+The stop signal (`--serve-seconds`, SIGTERM) drains: the request in flight ends at its next step with `qwen38.finish`
+`shutdown` and gets its reply, queued and new requests get 503, then the chain is released.  `HEAD` and `OPTIONS` are
+served (no CORS headers); a body needs `Content-Length`.
+
 The command-line client:
 
     python_env/bin/python -m models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_cli --url http://<host>:8000/v1 --thinking --tools

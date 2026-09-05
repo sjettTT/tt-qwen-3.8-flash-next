@@ -33,7 +33,9 @@ import itertools
 import json
 import os
 import secrets
+import select
 import signal
+import socket
 import sys
 import threading
 import time
@@ -98,8 +100,16 @@ REASONING_EFFORT_DEFAULT = "medium"
 # bounded by it: the session's require_budget, once the prompt is rendered.  /health and /v1/models say so.
 MAX_TOKENS_RULE = {"default_max_tokens": "remaining context", "max_tokens_limit": "remaining context"}
 QUEUE_LIMIT = 4
+QUEUE_POLL_SECONDS = 0.5  # a queued request looks at its client's socket this often: a hang-up gives up its place
 RETRY_AFTER_SECONDS = 5
 HEARTBEAT_SECONDS = 30.0
+# A socket write that makes no progress for this long (a streaming reader that stopped reading) raises, so the device
+# loop ends the request as "disconnected" instead of blocking in sendall with the device held.
+SOCKET_TIMEOUT_SECONDS = 60.0
+# The stop signal waits this long for the request in flight to end at its next poll and release the device before
+# the chain is released; the launchers' timeout --kill-after is 60 s.
+DRAIN_SECONDS = 30.0
+ALLOWED_METHODS = "GET, HEAD, OPTIONS, POST"
 # The template flags a client may send under chat_template_kwargs (the vLLM/SGLang convention the model card uses).
 TEMPLATE_KWARGS = ("enable_thinking", "reasoning_effort", "preserve_thinking")
 # Every field parse_chat_request reads; any other top-level key is logged as ignored.
@@ -352,11 +362,15 @@ def _finish_reason(session_finish: str, assembler: protocol.Qwen38ReplyAssembler
         return "stop"
     if assembler.calls:
         return "tool_calls"
-    return {"deadline": "length", "disconnected": "stop"}.get(session_finish, session_finish)
+    return {"deadline": "length", "shutdown": "length", "disconnected": "stop"}.get(session_finish, session_finish)
 
 
 class Qwen38ServerBusy(RuntimeError):
     """The bounded request queue is full: HTTP 503 with Retry-After."""
+
+
+class Qwen38ClientGone(RuntimeError):
+    """The client hung up while its request waited for the device: the ticket is dropped, nothing is generated."""
 
 
 class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
@@ -365,6 +379,7 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
     A request that fails validation is answered at once even while the device
     is busy; a valid one waits its turn behind at most ``queue_limit`` others
     (``queue_wait_seconds`` is reported) or is refused with 503 above the bound.
+    A queued request whose client hangs up gives up its place.
     """
 
     allow_reuse_address = True
@@ -373,21 +388,40 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
     def __init__(
         self,
         address: tuple[str, int],
-        session: Qwen38ChatSession,
+        session: Qwen38ChatSession | None,
         *,
         ledger: Path,
         queue_limit: int = QUEUE_LIMIT,
         request_deadline_seconds: float | None = None,
         heartbeat_seconds: float = HEARTBEAT_SECONDS,
+        socket_timeout_seconds: float = SOCKET_TIMEOUT_SECONDS,
+        stall_seconds: float | None = None,
         system_fingerprint: str | None = None,
         dram_after_captures: Mapping[str, Any] | None = None,
+        listen: bool = True,
     ) -> None:
-        super().__init__(address, Qwen38ChatHandler)
+        # The address is bound here, so a taken port or a host the address family cannot carry fails at once (main
+        # constructs the server before the mesh opens, with the session attached after the captures); connections
+        # are accepted only from server_activate (``listen`` false: main's, right before serve_forever).
+        self.address_family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
+        super().__init__(address, Qwen38ChatHandler, bind_and_activate=False)
+        try:
+            self.server_bind()
+            if listen:
+                self.server_activate()
+        except BaseException:
+            self.server_close()
+            raise
         self.session = session
         self.ledger = ledger
         self.queue_limit = queue_limit
         self.request_deadline_seconds = request_deadline_seconds
         self.heartbeat_seconds = heartbeat_seconds
+        self.socket_timeout_seconds = socket_timeout_seconds
+        # A request whose device made no progress (no should_stop poll: a step, a prefill event) for this long is a
+        # wedge, not a long prompt: the server ends as fatal so the launcher restarts it.  None: no watchdog.
+        self.stall_seconds = stall_seconds
+        self.progress: dict[str, Any] | None = None  # the request holding the device: start, last poll, polls
         self.system_fingerprint = system_fingerprint  # source head + runtime .so: what a seed reproduces against
         # The mesh allocator read after the traces were captured (hardware_profiles.symmetric_mesh_dram_memory: one observation
         # that applies to every card): free_bytes_per_bank is the build's headroom, reported as read, never updated.
@@ -397,6 +431,7 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
         self.waiting: collections.deque[int] = collections.deque()
         self.tickets = itertools.count()
         self.busy = False
+        self.stopping = False  # the stop signal came: new and queued requests get 503, the in-flight one ends
         self.served: protocol.Qwen38ServedTurn | None = None
         self.last_prefill_ms_per_token: float | None = None
         self.fatal: BaseException | None = None
@@ -405,19 +440,77 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
     def queue_depth(self) -> int:
         return len(self.waiting)
 
-    def acquire_device(self) -> float:
-        """Wait for the device in arrival order; returns the seconds waited."""
+    def current_request(self) -> dict[str, Any] | None:
+        """The request holding the device: when it started and how long since the device last completed a step
+        (should_stop is polled after every one), so a long prefill can be told from a wedge."""
+
+        progress = self.progress
+        if progress is None:
+            return None
+        now = time.perf_counter()
+        return {
+            "id": progress["id"],
+            "started_utc": progress["started_utc"],
+            "elapsed_seconds": round(now - progress["started"], 3),
+            "seconds_since_progress": round(now - progress["last_progress"], 3),
+            "polls": progress["polls"],
+        }
+
+    def enqueue(self) -> int:
+        """A place in the FIFO (the ticket), or ``Qwen38ServerBusy`` when ``queue_limit`` requests already wait or
+        the server is stopping."""
 
         with self.turnstile:
+            if self.stopping:
+                raise Qwen38ServerBusy("the server is stopping")
             if len(self.waiting) >= self.queue_limit:
                 raise Qwen38ServerBusy(f"{len(self.waiting)} requests are queued, the limit is {self.queue_limit}")
             ticket = next(self.tickets)
             self.waiting.append(ticket)
-            started = time.perf_counter()
-            self.turnstile.wait_for(lambda: not self.busy and self.waiting[0] == ticket)
+            return ticket
+
+    def await_turn(self, ticket: int, abandoned: Callable[[], bool]) -> float:
+        """Wait for the device in arrival order; returns the seconds waited.  ``abandoned`` is asked every
+        ``QUEUE_POLL_SECONDS`` whether the client is still there: a hang-up drops the ticket (``Qwen38ClientGone``);
+        a stop while waiting drops it with ``Qwen38ServerBusy``."""
+
+        started = time.perf_counter()
+        with self.turnstile:
+            while not self.turnstile.wait_for(
+                lambda: self.stopping or (not self.busy and self.waiting[0] == ticket), timeout=QUEUE_POLL_SECONDS
+            ):
+                if abandoned():
+                    self.waiting.remove(ticket)
+                    self.turnstile.notify_all()
+                    raise Qwen38ClientGone(
+                        f"the client hung up after {time.perf_counter() - started:.1f} s in the queue"
+                    )
+            if self.stopping:
+                self.waiting.remove(ticket)
+                self.turnstile.notify_all()
+                raise Qwen38ServerBusy("the server is stopping")
             self.waiting.popleft()
             self.busy = True
             return time.perf_counter() - started
+
+    def drain(self, seconds: float) -> bool:
+        """The stop: no more connections (the listening socket closes), queued requests are refused, the request in
+        flight ends at its next poll with finish ``shutdown``; waits up to ``seconds`` for the device to be released
+        and says whether it was (False: the chain's ownership is uncertain)."""
+
+        with self.turnstile:
+            self.stopping = True
+            self.turnstile.notify_all()
+        self.server_close()
+        with self.turnstile:
+            return self.turnstile.wait_for(lambda: not self.busy, timeout=seconds)
+
+    def withdraw(self, ticket: int) -> None:
+        """A queued request that will not be served after all gives up its place."""
+
+        with self.turnstile:
+            self.waiting.remove(ticket)
+            self.turnstile.notify_all()
 
     def release_device(self) -> None:
         with self.turnstile:
@@ -431,13 +524,55 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
             raise self.fatal
 
 
+class _ClientWire:
+    """One request's writes to its client, one at a time (the device loop's chunks and the heartbeat's keepalives).
+    The first failed write is kept: a hang-up (BrokenPipeError) or a reader that stopped draining (TimeoutError);
+    later writes raise it again at once instead of waiting on the socket."""
+
+    def __init__(self, handler: http.server.BaseHTTPRequestHandler) -> None:
+        self.handler = handler
+        self.lock = threading.Lock()
+        self.streaming = False  # the SSE head went out: errors ride the stream, keepalives are due
+        self.error: OSError | None = None
+
+    def write(self, payload: bytes) -> None:
+        with self.lock:
+            if self.error is not None:
+                raise self.error
+            try:
+                self.handler.wfile.write(payload)
+                self.handler.wfile.flush()
+            except OSError as error:
+                self.error = error
+                raise
+
+    def event(self, document: Mapping[str, Any]) -> None:
+        self.write(b"data: " + json.dumps(document).encode("utf-8") + b"\n\n")
+
+
 class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
     server_version = "qwen38-chat/2"
     protocol_version = "HTTP/1.0"
     server: Qwen38ChatHTTPServer
 
+    def setup(self) -> None:
+        # Every read and write on the connection is bounded (StreamRequestHandler applies ``timeout`` to the socket):
+        # a reader that stopped draining raises TimeoutError, an OSError, and the request ends as "disconnected".
+        self.timeout = self.server.socket_timeout_seconds
+        super().setup()
+
     def log_message(self, format: str, *args: Any) -> None:
         _log("http", client=self.address_string(), line=format % args)
+
+    def _peer_closed(self) -> bool:
+        """The client hung up: its socket is readable with nothing left to read (FIN) or reset.  A client that sent
+        its request and waits for the reply sends nothing more, so anything readable is the close."""
+
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
 
     def _send_json(self, status: int, document: Mapping[str, Any], **headers: str) -> None:
         body = json.dumps(document).encode("utf-8")
@@ -448,7 +583,30 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
         for name, value in headers.items():
             self.send_header(name.replace("_", "-"), value)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        # The stdlib's own refusals (a method without a handler, a malformed request line) in the JSON error shape,
+        # naming the methods served, instead of its HTML page.
+        self.close_connection = True
+        self._send_error_json(
+            code,
+            message or self.responses.get(code, ("", ""))[0],
+            "invalid_request_error" if code < 500 or code == 501 else "server_error",  # 501: a method not served
+            Allow=ALLOWED_METHODS,
+        )
+
+    def do_OPTIONS(self) -> None:
+        # The methods served; no CORS headers (a browser page on another origin needs a deployment decision).
+        self.send_response(204)
+        self.send_header("Allow", ALLOWED_METHODS)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def do_HEAD(self) -> None:
+        self.do_GET()  # the same status and headers; _send_json writes no body for HEAD
 
     def _send_error_json(
         self, status: int, message: str, kind: str, *, code: str | None = None, param: str | None = None, **headers: str
@@ -486,10 +644,11 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(
                 200,
                 {
-                    "status": "ready",
+                    "status": "stopping" if self.server.stopping else "ready",
                     "model": MODEL_ID,
                     "busy": self.server.busy,
                     "queue_depth": self.server.queue_depth,
+                    "current_request": self.server.current_request(),
                     "committed_tokens": len(session.committed),
                     "requests_served": session.requests_served,
                     "last_tokens_per_second": session.last_tokens_per_second,
@@ -504,6 +663,8 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                         "stop_strings": protocol.MAX_STOP_STRINGS,
                         "queue_depth": self.server.queue_limit,
                         "request_deadline_seconds": self.server.request_deadline_seconds,
+                        "socket_timeout_seconds": self.server.socket_timeout_seconds,
+                        "stall_seconds": self.server.stall_seconds,
                         "request_bytes": MAX_REQUEST_BYTES,
                     },
                     "defaults": {
@@ -544,11 +705,14 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
         if path != "/v1/chat/completions":
             self._send_error_json(404, f"no such path: {path}", "not_found")
             return
-        length = self.headers.get("Content-Length")
-        if length is None or not length.isdigit() or int(length) > MAX_REQUEST_BYTES:
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:  # absent (a chunked body is not read), or not a number int accepts
+            length = -1
+        if not 0 <= length <= MAX_REQUEST_BYTES:
             self._send_error_json(
                 400,
-                f"Content-Length must be a number up to {MAX_REQUEST_BYTES}, got {length!r}",
+                f"Content-Length must be a number up to {MAX_REQUEST_BYTES}, got {self.headers.get('Content-Length')!r}",
                 "invalid_request_error",
             )
             return
@@ -580,18 +744,128 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
         if request["ignored"]:
             _log("ignored_request_fields", fields=request["ignored"])
         received_utc = utc_now()
+        request_id = _completion_id()
+        created = int(time.time())
+        wire = _ClientWire(self)
         try:
-            queue_wait = self.server.acquire_device()
+            ticket = self.server.enqueue()
         except Qwen38ServerBusy as error:
             self._send_error_json(503, str(error), "server_busy", Retry_After=str(RETRY_AFTER_SECONDS))
             return
-        request_id = _completion_id()
         assembler = protocol.Qwen38ReplyAssembler(
             template_decoder(session.template),
             thinking_open=request["enable_thinking"],
             stop_strings=request["stop"],
             tools=request["tools"],
         )
+        heartbeat_stop = threading.Event()
+        heartbeats = [0]
+        started = time.perf_counter()
+
+        def chunk(choice: dict[str, Any], **extra: Any) -> dict[str, Any]:
+            return {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": MODEL_ID,
+                "system_fingerprint": self.server.system_fingerprint,
+                "choices": [{"index": 0, **choice}],
+                **extra,
+            }
+
+        # Every heartbeat_seconds: a progress log line, and on an open stream an SSE comment so a proxy or client
+        # idle timeout does not cut a long queue wait or prefill (nothing else is written before the first token).
+        # With --stall-seconds, a device turn whose last poll is older than that ends the server (fatal): a wedged
+        # device call never returns to the poll, and a long prefill polls every few chunks.
+        def heartbeat() -> None:
+            while not heartbeat_stop.wait(self.server.heartbeat_seconds):
+                heartbeats[0] += 1
+                progress = self.server.current_request()
+                silent = (
+                    None if progress is None or progress["id"] != request_id else progress["seconds_since_progress"]
+                )
+                _log(
+                    "heartbeat",
+                    request_id=request_id,
+                    elapsed_seconds=round(time.perf_counter() - started, 3),
+                    committed_tokens=len(session.committed),
+                    emitted_tokens=assembler.tokens,
+                    reasoning_tokens=assembler.reasoning_tokens,
+                    tool_calls=len(assembler.calls),
+                    seconds_since_progress=silent,
+                    host_vmrss_kib=_vmrss_kib(),
+                )
+                stall = self.server.stall_seconds
+                if stall is not None and silent is not None and silent > stall and self.server.fatal is None:
+                    self.server.fatal = Qwen38ChatChainError(
+                        f"request {request_id} made no progress for {silent:.1f} s (--stall-seconds {stall})"
+                    )
+                    _log("stalled", request_id=request_id, seconds_since_progress=silent, stall_seconds=stall)
+                if wire.streaming and wire.error is None:
+                    try:
+                        wire.write(b": keepalive\n\n")
+                    except (OSError, ValueError):  # the wire remembers; should_stop sees the peer closed
+                        pass
+
+        try:
+            if request["stream"]:
+                # The stream opens before the queue wait: the client sees the head and the role chunk at once, then
+                # keepalives while it waits and while the prompt prefills.
+                try:
+                    self._send_stream_head()
+                    wire.streaming = True
+                    wire.event(chunk({"delta": {"role": "assistant", "content": ""}, "finish_reason": None}))
+                except OSError as error:
+                    self.server.withdraw(ticket)
+                    _log(
+                        "client_disconnected",
+                        request_id=request_id,
+                        phase="queued",
+                        error=f"{type(error).__name__}: {error}",
+                    )
+                    return
+            threading.Thread(target=heartbeat, name=f"heartbeat-{request_id}", daemon=True).start()
+            try:
+                queue_wait = self.server.await_turn(ticket, self._peer_closed)
+            except Qwen38ClientGone as error:
+                _log("client_disconnected", request_id=request_id, phase="queued", error=str(error))
+                return
+            except Qwen38ServerBusy as error:  # the stop came while this request waited
+                self._answer_error(wire, 503, str(error), "server_busy", Retry_After=str(RETRY_AFTER_SECONDS))
+                return
+            self._serve(
+                session,
+                request,
+                flags,
+                rendered_ids,
+                request_id,
+                received_utc,
+                wire,
+                chunk,
+                assembler,
+                heartbeats,
+                queue_wait,
+            )
+        finally:
+            heartbeat_stop.set()
+
+    def _serve(
+        self,
+        session: Qwen38ChatSession,
+        request: dict[str, Any],
+        flags: Mapping[str, Any],
+        rendered_ids: list[int],
+        request_id: str,
+        received_utc: str,
+        wire: _ClientWire,
+        chunk: Callable[..., dict[str, Any]],
+        assembler: protocol.Qwen38ReplyAssembler,
+        heartbeats: list[int],
+        queue_wait: float,
+    ) -> None:
+        """The device turn: the prompt (spliced onto the served turn or the reference render), the run, the served
+        turn, the reply, the ledger.  The device is released before anything is written to the client."""
+
         try:
             prompt_ids = protocol.splice_prompt(
                 session.template.tokenizer, self.server.served, request["messages"], request["tools"], **flags
@@ -618,7 +892,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 max_tokens = session.require_budget(len(prompt_ids), request["max_tokens"])
         except ValueError as error:
             self.server.release_device()
-            self._send_error_json(400, str(error), "invalid_request_error", code="context_length_exceeded")
+            self._answer_error(wire, 400, str(error), "invalid_request_error", code="context_length_exceeded")
             return
         request = {
             **request,
@@ -630,34 +904,34 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 else None
             ),
         }
-        streaming_started = False
-        heartbeat_stop = threading.Event()
-        heartbeats = [0]
         started = time.perf_counter()
         deadline = self.server.request_deadline_seconds
+        progress = {
+            "id": request_id,
+            "started_utc": utc_now(),
+            "started": started,
+            "last_progress": started,
+            "polls": 0,
+        }
+        self.server.progress = progress
 
-        def heartbeat() -> None:
-            while not heartbeat_stop.wait(self.server.heartbeat_seconds):
-                heartbeats[0] += 1
-                _log(
-                    "heartbeat",
-                    request_id=request_id,
-                    elapsed_seconds=round(time.perf_counter() - started, 3),
-                    committed_tokens=len(session.committed),
-                    emitted_tokens=assembler.tokens,
-                    reasoning_tokens=assembler.reasoning_tokens,
-                    tool_calls=len(assembler.calls),
-                    host_vmrss_kib=_vmrss_kib(),
-                )
-
+        # Polled between steps and at the prefill's event syncs (so each poll is a device step completed: the
+        # progress record, /health current_request and the stall watchdog read it): the stop string, the stop
+        # signal, the deadline, and the client's socket (a hang-up ends the request as "disconnected" whether or not
+        # anything was being streamed to it).
         def should_stop() -> str | None:
+            progress["last_progress"] = time.perf_counter()
+            progress["polls"] += 1
             if assembler.stop_hit:
                 return "stop"
+            if self.server.stopping:
+                return "shutdown"
             if deadline is not None and time.perf_counter() - started > deadline:
                 return "deadline"
+            if wire.error is not None or self._peer_closed():
+                return "disconnected"
             return None
 
-        threading.Thread(target=heartbeat, name=f"heartbeat-{request_id}", daemon=True).start()
         sampling = (
             None
             if request["sampling"] is None
@@ -683,32 +957,36 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 logprob_items.append(logprobs_of(token_id))
             assembler.push(token_id)
 
-        try:
-            run = {
-                "stop_ids": () if request["ignore_eos"] else EOS_TOKEN_IDS,
-                "think_budget": request["think_budget"],
-                "should_stop": should_stop,
-                "prefill_mode": request["prefill_mode"],
-                "sampling": sampling,
-            }
-            if request["stream"]:
-                self._send_stream_head()
-                streaming_started = True
-                completion = self._stream(
-                    session,
-                    prompt_ids,
-                    request,
-                    assembler,
-                    request_id,
-                    run,
-                    queue_wait,
-                    extension_of,
-                    logprobs_of if request["logprobs"] else None,
+        # Streaming: one chunk per assembled piece (reasoning_content, content, or a completed tool call), flushed
+        # per token; with logprobs every token's item rides on its first chunk (an empty delta when the assembler
+        # held the text back).  A write that fails (the client went away, or stopped reading: TimeoutError) raises
+        # OSError out of on_token and the session ends the request as "disconnected".
+        def on_token_streaming(token_id: int) -> None:
+            deltas = assembler.push(token_id)
+            if request["logprobs"]:
+                deltas = deltas or [{}]
+                wire.event(
+                    chunk({"delta": deltas[0], "logprobs": {"content": [logprobs_of(token_id)]}, "finish_reason": None})
                 )
-            else:
-                completion = session.complete(prompt_ids, request["max_tokens"], on_token=on_token, **run)
-                assembler.finish()
+                deltas = deltas[1:]
+            for delta in deltas:
+                wire.event(chunk({"delta": delta, "finish_reason": None}))
+
+        failure: BaseException | None = None
+        try:
+            completion = session.complete(
+                prompt_ids,
+                request["max_tokens"],
+                on_token=on_token_streaming if request["stream"] else on_token,
+                stop_ids=() if request["ignore_eos"] else EOS_TOKEN_IDS,
+                think_budget=request["think_budget"],
+                should_stop=should_stop,
+                prefill_mode=request["prefill_mode"],
+                sampling=sampling,
+            )
+            final_deltas = assembler.finish()
         except Exception as error:  # noqa: BLE001  the device loop failed: report, then end the server
+            failure = error
             _log(
                 "request_failed",
                 request_id=request_id,
@@ -718,21 +996,12 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             self.server.served = None
             if session.poisoned:
                 self.server.fatal = error
-            try:
-                if streaming_started:
-                    self._write_event(
-                        {"error": {"message": f"{type(error).__name__}: {error}", "type": "server_error"}}
-                    )
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
-                else:
-                    self._send_error_json(500, f"{type(error).__name__}: {error}", "server_error")
-            except OSError:
-                pass
-            return
         finally:
-            heartbeat_stop.set()
+            self.server.progress = None
             self.server.release_device()
+        if failure is not None:
+            self._answer_error(wire, 500, f"{type(failure).__name__}: {failure}", "server_error")
+            return
         finish_reason = _finish_reason(completion.finish_reason, assembler)
         # The next request continues this turn from the committed ids only when they are the reply the client will
         # echo: the prompt fully prefilled, no stop-string tail (the match's tokens are committed), the think block
@@ -761,63 +1030,109 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 1e3 * completion.prefill_seconds / completion.prefill_tokens, 3
             )
         extension = extension_of(completion)
-        append_phase_record(
-            self.server.ledger,
-            {
-                "phase": "chat-request",
-                "request_id": request_id,
-                "received_utc": received_utc,
-                "stream": request["stream"],
-                "prompt_tokens": completion.prompt_tokens,
-                "completion_tokens": len(completion.token_ids),
-                "max_tokens": request["max_tokens"],
-                "max_tokens_requested": request["max_tokens_requested"],
-                "finish_reason": finish_reason,
-                "text_characters": sum(len(piece) for piece in assembler.content),
-                "reasoning_characters": sum(len(piece) for piece in assembler.reasoning),
-                "enable_thinking": request["enable_thinking"],
-                "reasoning_effort": request["reasoning_effort"],
-                "think_budget": request["think_budget"],
-                "tools_offered": len(request["tools"]),
-                "ignore_eos": request["ignore_eos"],
-                "logprobs": request["logprobs"],
-                "deadline_seconds": deadline,
-                "heartbeats": heartbeats[0],
-                "host_vmrss_kib": _vmrss_kib(),
-                "program_cache_entries": getattr(session.chain, "program_cache_entries", None),
-                **extension,
-                "position_after": completion.position,
-            },
-        )
-        _log(
-            "request",
-            request_id=request_id,
-            prompt_tokens=completion.prompt_tokens,
-            completion_tokens=len(completion.token_ids),
-            finish_reason=finish_reason,
-            **extension,
-        )
-        if request["stream"]:
-            return
-        choice: dict[str, Any] = {"index": 0, "message": assembler.message(), "finish_reason": finish_reason}
-        if request["logprobs"]:
-            choice["logprobs"] = {"content": logprob_items}
+        # The evidence (the ledger line, the log line) cannot cost the reply: a full disk or a lost evidence directory
+        # loses the record, never the answer the device already produced.
         try:
-            self._send_json(
-                200,
+            append_phase_record(
+                self.server.ledger,
                 {
-                    "id": request_id,
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": MODEL_ID,
-                    "system_fingerprint": self.server.system_fingerprint,
-                    "choices": [choice],
-                    "usage": _usage(completion.prompt_tokens, len(completion.token_ids), queue_wait),
-                    "qwen38": extension,
+                    "phase": "chat-request",
+                    "request_id": request_id,
+                    "received_utc": received_utc,
+                    "stream": request["stream"],
+                    "prompt_tokens": completion.prompt_tokens,
+                    "completion_tokens": len(completion.token_ids),
+                    "max_tokens": request["max_tokens"],
+                    "max_tokens_requested": request["max_tokens_requested"],
+                    "finish_reason": finish_reason,
+                    "text_characters": sum(len(piece) for piece in assembler.content),
+                    "reasoning_characters": sum(len(piece) for piece in assembler.reasoning),
+                    "enable_thinking": request["enable_thinking"],
+                    "reasoning_effort": request["reasoning_effort"],
+                    "think_budget": request["think_budget"],
+                    "tools_offered": len(request["tools"]),
+                    "ignore_eos": request["ignore_eos"],
+                    "logprobs": request["logprobs"],
+                    "deadline_seconds": deadline,
+                    "heartbeats": heartbeats[0],
+                    "host_vmrss_kib": _vmrss_kib(),
+                    "program_cache_entries": getattr(session.chain, "program_cache_entries", None),
+                    **extension,
+                    "position_after": completion.position,
                 },
             )
+            _log(
+                "request",
+                request_id=request_id,
+                prompt_tokens=completion.prompt_tokens,
+                completion_tokens=len(completion.token_ids),
+                finish_reason=finish_reason,
+                **extension,
+            )
         except OSError as error:
-            _log("client_disconnected", request_id=request_id, error=f"{type(error).__name__}: {error}")
+            try:
+                _log("evidence_write_failed", request_id=request_id, error=f"{type(error).__name__}: {error}")
+            except OSError:
+                pass
+        usage = _usage(completion.prompt_tokens, len(completion.token_ids), queue_wait)
+        if completion.finish_reason == "disconnected":
+            _log(
+                "client_disconnected",
+                request_id=request_id,
+                phase="streaming" if request["stream"] else "generating",
+                completion_tokens=len(completion.token_ids),
+                error=None if wire.error is None else f"{type(wire.error).__name__}: {wire.error}",
+            )
+        else:
+            try:
+                if request["stream"]:
+                    for delta in final_deltas:
+                        wire.event(chunk({"delta": delta, "finish_reason": None}))
+                    wire.event(chunk({"delta": {}, "finish_reason": finish_reason}, usage=usage, qwen38=extension))
+                    wire.write(b"data: [DONE]\n\n")
+                else:
+                    choice: dict[str, Any] = {
+                        "index": 0,
+                        "message": assembler.message(),
+                        "finish_reason": finish_reason,
+                    }
+                    if request["logprobs"]:
+                        choice["logprobs"] = {"content": logprob_items}
+                    self._send_json(
+                        200,
+                        {
+                            "id": request_id,
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": MODEL_ID,
+                            "system_fingerprint": self.server.system_fingerprint,
+                            "choices": [choice],
+                            "usage": usage,
+                            "qwen38": extension,
+                        },
+                    )
+            except OSError as error:
+                _log(
+                    "client_disconnected",
+                    request_id=request_id,
+                    phase="reply",
+                    error=f"{type(error).__name__}: {error}",
+                )
+
+    def _answer_error(
+        self, wire: _ClientWire, status: int, message: str, kind: str, *, code: str | None = None, **headers: str
+    ) -> None:
+        """An error after the request was admitted: HTTP ``status`` before the stream opened, an SSE error event
+        (then ``[DONE]``) once it has."""
+
+        try:
+            if wire.streaming:
+                wire.event({"error": {"message": message, "type": kind, "param": None, "code": code or kind}})
+                wire.write(b"data: [DONE]\n\n")
+            else:
+                self._send_error_json(status, message, kind, code=code, **headers)
+        except OSError:
+            pass
 
     def _send_stream_head(self) -> None:
         self.send_response(200)
@@ -825,70 +1140,6 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
-
-    def _write_event(self, document: Mapping[str, Any]) -> None:
-        self.wfile.write(b"data: " + json.dumps(document).encode("utf-8") + b"\n\n")
-        self.wfile.flush()
-
-    def _stream(
-        self,
-        session: Qwen38ChatSession,
-        prompt_ids: list[int],
-        request: Mapping[str, Any],
-        assembler: protocol.Qwen38ReplyAssembler,
-        completion_id: str,
-        run: Mapping[str, Any],
-        queue_wait: float,
-        extension_of: Callable[[Any], dict[str, Any]],
-        logprobs_of: Callable[[int], dict[str, Any]] | None,
-    ) -> Any:
-        """SSE in the chat.completion.chunk delta format: one chunk per assembled piece (reasoning_content, content,
-        or a completed tool call), flushed per token; with ``logprobs_of`` every token's item rides on its first
-        chunk (an empty delta when the assembler held the text back); the final chunk carries finish_reason, usage
-        and qwen38."""
-
-        created = int(time.time())
-
-        def emit(choice: dict[str, Any], **extra: Any) -> None:
-            self._write_event(
-                {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": MODEL_ID,
-                    "system_fingerprint": self.server.system_fingerprint,
-                    "choices": [{"index": 0, **choice}],
-                    **extra,
-                }
-            )
-
-        emit({"delta": {"role": "assistant", "content": ""}, "finish_reason": None})
-
-        def on_token(token_id: int) -> None:
-            deltas = assembler.push(token_id)
-            if logprobs_of is not None:
-                deltas = deltas or [{}]
-                emit({"delta": deltas[0], "logprobs": {"content": [logprobs_of(token_id)]}, "finish_reason": None})
-                deltas = deltas[1:]
-            for delta in deltas:
-                emit({"delta": delta, "finish_reason": None})
-
-        # A client that went away raises OSError inside on_token; the session ends
-        # the request as "disconnected" and the final chunk is not deliverable.
-        completion = session.complete(prompt_ids, request["max_tokens"], on_token=on_token, **run)
-        try:
-            for delta in assembler.finish():
-                emit({"delta": delta, "finish_reason": None})
-            emit(
-                {"delta": {}, "finish_reason": _finish_reason(completion.finish_reason, assembler)},
-                usage=_usage(completion.prompt_tokens, len(completion.token_ids), queue_wait),
-                qwen38=extension_of(completion),
-            )
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except OSError as error:
-            _log("client_disconnected", request_id=completion_id, error=f"{type(error).__name__}: {error}")
-        return completion
 
 
 # -- acceptance replay ---------------------------------------------------------------------------
@@ -1126,6 +1377,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--heartbeat-seconds", type=float, default=HEARTBEAT_SECONDS, help="progress log interval")
     parser.add_argument(
+        "--socket-timeout-seconds",
+        type=float,
+        default=SOCKET_TIMEOUT_SECONDS,
+        help="a client socket read or write blocked this long ends the request as disconnected",
+    )
+    parser.add_argument(
+        "--stall-seconds",
+        type=float,
+        default=None,
+        help="a device turn with no completed step for this long (a wedge, not a long prompt: prefill polls every few "
+        "chunks) ends the server as fatal; default: no watchdog",
+    )
+    parser.add_argument(
         "--hardware-profile",
         choices=tuple(hardware_profiles.hardware_profile_table()),
         default=None,
@@ -1187,6 +1451,10 @@ def main() -> int:
         )
     if args.request_deadline_seconds is not None and args.request_deadline_seconds <= 0:
         raise SystemExit(f"--request-deadline-seconds must be positive, got {args.request_deadline_seconds}")
+    if args.socket_timeout_seconds <= 0:
+        raise SystemExit(f"--socket-timeout-seconds must be positive, got {args.socket_timeout_seconds}")
+    if args.stall_seconds is not None and args.stall_seconds <= 0:
+        raise SystemExit(f"--stall-seconds must be positive, got {args.stall_seconds}")
     if args.sampling_discriminator and (not args.sampling or args.acceptance_prompts is None):
         raise SystemExit("--sampling-discriminator needs --sampling and the acceptance prompt records")
     if args.bf4_stage_limit is not None and args.bf4_stage_limit <= 0:
@@ -1268,6 +1536,8 @@ def main() -> int:
         "port": args.port,
         "queue_limit": args.queue_limit,
         "request_deadline_seconds": args.request_deadline_seconds,
+        "socket_timeout_seconds": args.socket_timeout_seconds,
+        "stall_seconds": args.stall_seconds,
         "defaults": {"enable_thinking": ENABLE_THINKING_DEFAULT, "reasoning_effort": REASONING_EFFORT_DEFAULT},
         "sampling": "candidate_row_host_sampler" if args.sampling else "greedy",
         "sampling_discriminator": bool(args.sampling_discriminator),
@@ -1302,6 +1572,23 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_stop_signal)
     started_ns = time.perf_counter_ns()
     mesh = chain = server = None
+    if not (args.prepare_only or args.sampling_discriminator):
+        # The port is claimed before the minutes of mesh open, captures and replay: a taken port fails here.
+        try:
+            server = Qwen38ChatHTTPServer(
+                (args.host, args.port),
+                None,
+                ledger=evidence / "requests.jsonl",
+                queue_limit=args.queue_limit,
+                request_deadline_seconds=args.request_deadline_seconds,
+                heartbeat_seconds=args.heartbeat_seconds,
+                socket_timeout_seconds=args.socket_timeout_seconds,
+                stall_seconds=args.stall_seconds,
+                system_fingerprint=summary["system_fingerprint"],
+                listen=False,
+            )
+        except OSError as error:
+            raise SystemExit(f"--host {args.host} --port {args.port}: cannot bind: {error}") from error
     fabric_enabled = False
     uncertain = False
     cleanup_errors: list[str] = []
@@ -1423,16 +1710,9 @@ def main() -> int:
             )
             report["status"] = "stopped"
         else:
-            server = Qwen38ChatHTTPServer(
-                (args.host, args.port),
-                session,
-                ledger=evidence / "requests.jsonl",
-                queue_limit=args.queue_limit,
-                request_deadline_seconds=args.request_deadline_seconds,
-                heartbeat_seconds=args.heartbeat_seconds,
-                system_fingerprint=summary["system_fingerprint"],
-                dram_after_captures=report["chain"]["dram_after_captures"],
-            )
+            server.session = session
+            server.dram_after_captures = report["chain"]["dram_after_captures"]
+            server.server_activate()
             ready = {
                 "pid": os.getpid(),
                 "host": args.host,
@@ -1451,14 +1731,23 @@ def main() -> int:
             try:
                 server.serve_forever(poll_interval=0.5)
             except Qwen38ChatServerStop:
-                uncertain = server.busy or session.poisoned
-                report["status"] = "stopped" if not uncertain else "stopped_mid_request"
+                # The drain: no new connections, queued requests refused, the request in flight ends at its next
+                # step with finish "shutdown" and gets its reply; the chain is released only once the device is free
+                # (a second signal or a drain past DRAIN_SECONDS leaves the boundary uncertain).
+                uncertain = True
+                report["status"] = "stopped_mid_request"
+                _log("draining", busy=server.busy, queue_depth=server.queue_depth, seconds=DRAIN_SECONDS)
+                if server.drain(DRAIN_SECONDS) and not session.poisoned:
+                    uncertain = False
+                    report["status"] = "stopped"
     except Qwen38ChatServerStop as stop:
         if report["status"] != "stopped":
             report["error"] = f"{type(stop).__name__}: {stop}"
             _log("failed", error=report["error"])
     except BaseException as error:
-        uncertain = uncertain or (server is not None and (server.busy or server.session.poisoned))
+        uncertain = uncertain or (
+            server is not None and (server.busy or (server.session is not None and server.session.poisoned))
+        )
         report["error"] = f"{type(error).__name__}: {error}"
         report["traceback"] = traceback.format_exc()
         _log("failed", error=report["error"])
@@ -1498,7 +1787,7 @@ def main() -> int:
             end_utc=utc_now(),
             cleanup_errors=cleanup_errors,
             uncertain_boundary=uncertain,
-            requests_served=None if server is None else server.session.requests_served,
+            requests_served=None if server is None or server.session is None else server.session.requests_served,
         )
         stopped_marker.write_text(
             json.dumps({"pid": os.getpid(), "utc": utc_now(), "status": report["status"]}) + "\n",
