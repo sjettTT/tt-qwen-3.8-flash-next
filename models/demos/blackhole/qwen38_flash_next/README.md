@@ -33,7 +33,7 @@ This was implemented with the intention of the n-gram model residing in system m
 ## 1. What you need
 
 - Four Blackhole chips in one host as one 1x4 mesh: a QuietBox (4x p150c in an ethernet ring), a Blackhole LoudBox
-  (4x p150 in an ethernet line), or one four-chip half of an eight-chip host.  tt-kmd and the firmware bundle the
+  (4x p150 in an ethernet line), or four chips of a larger host (`--devices`).  tt-kmd and the firmware bundle the
   chips shipped with (19.4.1.0 or later).
 - This repository, built (section 2).  It is tt-metal main `d04395ed86` (2026-08-29) plus the runtime fixes the
   model needs, which are not on main yet:
@@ -125,7 +125,7 @@ context limit; the limit is the context minus 64 for the consumed EOS step), `--
 `0.0.0.0`: the QuietBox and LoudBox profiles serve the LAN), `--serve-seconds N` to stop after N seconds,
 `--validate-only` to run the checks and the CPU preparation without opening the mesh (a profile whose route is
 derived at start, the LoudBox, still needs the chips present), `--devices A,B,C,D` to run `bh-loudbox` on four other
-KMD device nodes (one half of an eight-chip host), `--python` for another interpreter of this checkout.
+KMD device nodes (four chips of a larger host), `--python` for another interpreter of this checkout.
 
 What the launcher does not do: no device locks, no runtime archives or digests.  It exports the QuietBox mesh graph
 descriptor for `tt-quietbox` (`tools/qb_p150_x4_1x4_line_mesh_graph_descriptor.textproto`: the four chips' ethernet

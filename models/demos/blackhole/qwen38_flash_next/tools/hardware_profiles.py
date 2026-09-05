@@ -29,7 +29,7 @@ class HardwareProfileError(RuntimeError):
 class ResidentHardwareProfile:
     """One four-chip mesh.
 
-    ``partition`` names the lane on the host (``"qb"``: the whole box; ``"a"``/``"b"``: one half of an eight-chip
+    ``partition`` names the lane on the host (``"qb"``: the whole box; ``"a"``/``"b"``: four chips of a larger
     host, ``"0"``/``"1"`` the same on a QuietBox 2 class host).  ``ethernet_graph`` selects the route derivation:
     ``"line"`` is ``physical_route.derive_canonical_line_route``, ``"ring"`` is ``derive_ring_walk_route`` (chips in
     an ethernet ring, opened as a 1x4 LINE through a mesh graph descriptor).  ``route`` / ``route_nodes`` pin the
@@ -62,7 +62,7 @@ class ResidentHardwareProfile:
         return f"{self.host} partition-{self.partition.upper()}"
 
     def with_device_nodes(self, nodes: tuple[int, int, int, int]) -> "ResidentHardwareProfile":
-        """The same profile on other KMD nodes (a four-chip half of an eight-chip host)."""
+        """The same profile on other KMD nodes (four chips of a larger host)."""
 
         if len(nodes) != 4 or len(set(nodes)) != 4 or any(type(node) is not int or node < 0 for node in nodes):
             raise HardwareProfileError(f"device nodes must be four distinct non-negative ints, got {nodes!r}")

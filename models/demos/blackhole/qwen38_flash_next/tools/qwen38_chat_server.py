@@ -1091,7 +1091,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device-nodes",
         default=None,
-        help="four KMD device nodes for a profile on other chips of an eight-chip host, e.g. 4,5,6,7",
+        help="four KMD device nodes for a profile on other chips of a larger host, e.g. 4,5,6,7",
     )
     parser.add_argument(
         "--prepare-only",

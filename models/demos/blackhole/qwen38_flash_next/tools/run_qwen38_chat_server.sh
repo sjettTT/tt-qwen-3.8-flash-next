@@ -8,7 +8,7 @@
 #   --profile bh-loudbox    Blackhole LoudBox, 4x p150 in an ethernet line, ttnn's default descriptor; the route is
 #                           derived at start
 #   --profile qb2           p300-based box (QuietBox 2, or a 4x p300 host with --instance 0|1) -- UNTESTED, see README
-#   --devices A,B,C,D       run bh-loudbox on these four KMD device nodes (a four-chip half of an eight-chip host)
+#   --devices A,B,C,D       run bh-loudbox on these four KMD device nodes (four chips of a larger host)
 #   --checkpoint DIR        the ModelScope checkpoint directory (tools/download_checkpoint.py)
 #   --cache-root DIR        the converted weights, the BF4 expert cache, the model I/O cache, the JIT cache and the run
 #                           directories (about 23 GB for 32k plus 107 GB of BF4 experts on the first start)

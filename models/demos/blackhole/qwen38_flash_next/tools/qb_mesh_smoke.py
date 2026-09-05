@@ -261,7 +261,7 @@ def main() -> int:
     all_local = bool(descriptor.all_local())
     report["topology"]["system_mesh_local_shape"] = list(physical_shape)
     report["topology"]["system_mesh_all_local"] = all_local
-    # Auto-discovery on an eight-chip host reports (4, 1); a 1x4 descriptor reports (1, 4).  Either is one 1D four-device mesh.
+    # Auto-discovery on a larger host reports (4, 1); a 1x4 descriptor reports (1, 4).  Either is one 1D four-device mesh.
     checks.expect(
         "SystemMeshDescriptor.local_shape is one 1D four-device mesh (sorted)", sorted(physical_shape), [1, 4]
     )

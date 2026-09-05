@@ -929,7 +929,7 @@ def open_partition_b_mesh(marker: Marker, hardware_profile: ResidentHardwareProf
     """The runner's mesh open for one lane: the profile's route derivation, FABRIC_1D, one 1D four-device mesh as
     the logical 1x4.
 
-    Same calls and checks as ``run()`` of the timing runner on an eight-chip
+    Same calls and checks as ``run()`` of the timing runner on a larger
     host (its partition-B values are the profile's defaults, hence the
     name; a partition-A profile brings its own nodes, route and locks; both
     are a 4x1 line reshaped to 1x4, ``derive_canonical_line_route``).  A ring
