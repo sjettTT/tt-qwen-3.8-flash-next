@@ -90,7 +90,13 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
     RESIDENT_QSA_CACHE_CAPACITIES,
     Qwen38ResidentContext,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import CHUNK_ROWS, MESH_SHAPE, TP_SIZE, Qwen38MeshContract
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
+    CHUNK_ROWS,
+    LONG_CHUNK_ROWS,
+    MESH_SHAPE,
+    TP_SIZE,
+    Qwen38MeshContract,
+)
 from models.demos.blackhole.qwen38_flash_next.ttnn.model import GENERIC_HEAD_LAYERS, Qwen38TTNNGenericTraceKey
 
 # The device position P must stay below allocated_context (RoPE table lookup, KV write); the consumed EOS step and a
@@ -112,6 +118,9 @@ CHUNK_PREFILL_MIN_ROWS = 16
 # The chunk warm pass embeds one token per vocabulary owner in every lane group (the decode warm pass's ids).
 WARM_CHUNK_TOKEN_IDS = tuple(
     resident_decode.SEQUENTIAL_TRACE_WARM_EMBEDDING_TOKEN_IDS[index % TP_SIZE] for index in range(CHUNK_ROWS)
+)
+WARM_LONG_CHUNK_TOKEN_IDS = tuple(
+    resident_decode.SEQUENTIAL_TRACE_WARM_EMBEDDING_TOKEN_IDS[index % TP_SIZE] for index in range(LONG_CHUNK_ROWS)
 )
 # The CPU acceptance study's rendering (mtp_acceptance_cpu_v2 at a97cb9e6b0): the
 # 12 prompt records render identically only with these.
@@ -1093,6 +1102,11 @@ class Qwen38TracedChain:
     chunk_state: Any = None
     chunk_trace_id: int | None = None
     chunk_capture_ms: float = 0.0
+    # (``long_chunks``) the 128-row chunk state beside the 32-row one and its trace, captured after the chunk trace;
+    # the driver runs the 128-row chunks first, then the 32-row chunks and the padded tail.
+    long_chunk_state: Any = None
+    long_chunk_trace_id: int | None = None
+    long_chunk_capture_ms: float = 0.0
     # The GDN state re-anchor the chunk trace was captured with (every chunk replay commits through it).
     chunk_gdn_step_anchor: bool = False
     # The allocation tracker verified every trace once after the captures; per-prefill re-verification (140-290 ms
@@ -1211,6 +1225,8 @@ class Qwen38TracedChain:
             forced_step=forced_step,
             verify_allocations=self.verify_each_prefill,
             gdn_step_anchor=self.chunk_gdn_step_anchor,
+            long_chunk_state=self.long_chunk_state,
+            long_chunk_trace_id=self.long_chunk_trace_id,
             mtp=None if self.mtp is None else self.mtp.chunk_extension,
         ).run(
             token_ids,
@@ -1288,6 +1304,7 @@ class Qwen38TracedChain:
         sampling: bool = False,
         warm_hook: Callable[[Qwen38TracedChain], None] | None = None,
         chunk_gdn_step_anchor: bool = False,
+        long_chunks: bool = False,
         mtp: int | None = None,
         mtp_gdn_anchor: str = "off",
     ) -> Qwen38TracedChain:
@@ -1309,10 +1326,18 @@ class Qwen38TracedChain:
 
         if type(chunk_gdn_step_anchor) is not bool:
             raise ValueError(f"chunk_gdn_step_anchor must be a bool, got {chunk_gdn_step_anchor!r}")
+        if type(long_chunks) is not bool:
+            raise ValueError(f"long_chunks must be a bool, got {long_chunks!r}")
+        if long_chunks and (not chunked_prefill or chunk_gdn_step_anchor):
+            raise ValueError("long chunks need the chunked prefill and run without the GDN step anchor")
         if mtp is not None and mtp not in MTP_DRAFTS:
             raise ValueError(f"mtp drafts must be one of {MTP_DRAFTS} or None, got {mtp!r}")
         if mtp_gdn_anchor not in MTP_GDN_ANCHORS:
             raise ValueError(f"mtp_gdn_anchor must be one of {MTP_GDN_ANCHORS}, got {mtp_gdn_anchor!r}")
+        if long_chunks and mtp is not None:
+            raise ValueError(
+                "long chunks and MTP drafting are alternatives: the MTP chunk extension is a 32-row chunk option"
+            )
         started_ns = clock_ns()
         runtime_surface = resident_decode.b5b_runtime_surface()
         if runtime_surface["nonblocking_read"] != "ttnn.from_device(local, blocking=False)":
@@ -1374,10 +1399,14 @@ class Qwen38TracedChain:
             marker("after-chat-mtp-build")
         state = model.allocate_generic_state()
         chunk_state = None
+        long_chunk_state = None
         if chunked_prefill:
             model.reset_generic_state_inplace(state)
             chunk_state = model.allocate_chunk_state(state)
             model.reset_chunk_state_inplace(state, chunk_state)
+            if long_chunks:
+                long_chunk_state = model.allocate_chunk_state(state, rows=LONG_CHUNK_ROWS, base=chunk_state)
+                model.reset_chunk_state_inplace(state, long_chunk_state)
         # The MTP states sit beside the generic and chunk states, before any capture: every trace bakes their
         # addresses in (the verify / draft states, the TAIL step inputs, the chunk extension).
         chain_mtp = None
@@ -1560,6 +1589,20 @@ class Qwen38TracedChain:
             synchronize()
             marker("after-chat-mtp-warm-pass")
 
+        if long_chunks:
+            # One eager 128-row chunk from the reset state: its programs compile here, before the miss guard.
+            marker("before-chat-long-chunk-warm-pass")
+            model.reset_generic_state_inplace(state)
+            model.reset_chunk_state_inplace(state, chunk_state)
+            model.reset_chunk_state_inplace(state, long_chunk_state)
+            model.write_chunk_inputs(long_chunk_state, list(WARM_LONG_CHUNK_TOKEN_IDS), ple_context=None)
+            synchronize()
+            model.forward_prefill_chunk_generic(long_chunk_state, state)
+            synchronize()
+            actual = state.position.read()
+            if actual != LONG_CHUNK_ROWS:
+                raise Qwen38ChatChainError(f"warm long chunk position counter {actual} vs expected {LONG_CHUNK_ROWS}")
+            marker("after-chat-long-chunk-warm-pass")
         if chunked_prefill:
             # One eager chunk from the reset state (the chunk body's programs compile here) and both hand-off
             # forms (a closed block fills the staging tile; an open block copies it and selects a non-empty ring).
@@ -1750,6 +1793,19 @@ class Qwen38TracedChain:
             synchronize()
             marker("after-chat-chunk-capture")
         dram_after_chunk = dram_allocated_per_bank()
+        if long_chunks:
+            marker("before-chat-long-chunk-capture")
+            long_chunk_capture_started_ns = clock_ns()
+            chain.long_chunk_state = long_chunk_state
+            chain.long_chunk_trace_id = model.capture_prefill_chunk(
+                long_chunk_state,
+                state,
+                guard=lambda label: resident_decode.forbid_trace_body_host_io_and_sync(phase=f"chat long {label}"),
+                cq_id=0,
+            )
+            chain.long_chunk_capture_ms = (clock_ns() - long_chunk_capture_started_ns) / 1e6
+            synchronize()
+            marker("after-chat-long-chunk-capture")
         if chain_mtp is not None:
             # The verify (first pass), commit and draft traces after the chunk trace; the draft body reads the
             # verify output's readback address, so the verify capture comes first.  Capture records without
@@ -1805,12 +1861,13 @@ class Qwen38TracedChain:
         return chain
 
     def trace_ids(self) -> list[int]:
-        """Every captured trace: 4 HEAD, 4 TAIL, then the chunk trace when captured, then the MTP traces."""
+        """Every captured trace: 4 HEAD, 4 TAIL, then the chunk trace, the long chunk trace and the MTP traces
+        when captured."""
 
         return (
             self.head_trace_ids
             + self.tail_trace_ids
-            + ([] if self.chunk_trace_id is None else [self.chunk_trace_id])
+            + [trace_id for trace_id in (self.chunk_trace_id, self.long_chunk_trace_id) if trace_id is not None]
             + ([] if self.mtp is None else self.mtp.captured_trace_ids())
         )
 
@@ -1829,6 +1886,7 @@ class Qwen38TracedChain:
         self.head_trace_ids.clear()
         self.tail_trace_ids.clear()
         self.chunk_trace_id = None
+        self.long_chunk_trace_id = None
         if self.mtp is not None:
             self.mtp.traces = None
             if self.mtp.verify_output is not None:
@@ -1850,6 +1908,9 @@ class Qwen38TracedChain:
         if self.prepared.active:
             self.prepared.release()
         ttnn.deallocate(self.token_row_io)
+        if self.long_chunk_state is not None:  # before the 32-row state whose histories it shares
+            self.built_target.model.release_chunk_state(self.long_chunk_state)
+            self.long_chunk_state = None
         if self.mtp is not None:
             # The MTP states before the chunk and generic states they sit beside.
             model = self.built_target.model
@@ -1876,6 +1937,7 @@ def construct_chain(
     chunked_prefill: bool = True,
     sampling: bool = False,
     bf4_stage_limit: int | None = None,
+    long_chunks: bool = False,
     mtp: int | None = None,
     mtp_gdn_anchor: str = "off",
 ) -> Qwen38TracedChain:
@@ -1893,6 +1955,7 @@ def construct_chain(
         marker=marker,
         chunked_prefill=chunked_prefill,
         sampling=sampling,
+        long_chunks=long_chunks,
         mtp=mtp,
         mtp_gdn_anchor=mtp_gdn_anchor,
     )

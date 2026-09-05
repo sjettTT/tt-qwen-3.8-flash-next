@@ -29,6 +29,18 @@ BLOCK_START_LANE_MASK = 0xFFFFFFFC
 UINT32_LIMIT = 2**32
 # Rows of one prefill chunk: one 32-row tile, so every decode matmul keeps its program.
 CHUNK_ROWS = ttnn.TILE_SIZE
+# Rows of one long prefill chunk: four tiles.  The DRAM-sharded decode matmuls run once per tile (the
+# pinned runtime admits one row tile); every other op runs natively on the four tiles.
+LONG_CHUNK_ROWS = 4 * ttnn.TILE_SIZE
+CHUNK_ROW_COUNTS = (CHUNK_ROWS, LONG_CHUNK_ROWS)
+
+
+def chunk_row_tiles(rows: int) -> int:
+    """The row tiles of a chunk form (1 or 4); rejects any other row count."""
+
+    if rows not in CHUNK_ROW_COUNTS:
+        raise ValueError(f"prefill chunk rows must be one of {CHUNK_ROW_COUNTS}, got {rows!r}")
+    return rows // ttnn.TILE_SIZE
 
 
 class TensorPlacement(str, Enum):

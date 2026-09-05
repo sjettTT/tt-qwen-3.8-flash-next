@@ -43,9 +43,11 @@ def test_layer_chunk_body_is_the_decode_order_on_rows_with_the_history_commits()
     calls = _self_calls(Qwen38TTNNDecoderLayer.forward_chunk_generic)
     assert calls == [
         "self.ple.inject_rows",
+        "self.ple.commit_rows_full",
         "self.ple.commit_rows",
         "self.attention_gr.read_rows",
         "self.attention.forward_rows",
+        "self.attention.commit_rows_full",
         "self.attention.commit_rows",
         "self.attention.forward_chunk_generic",
         "self.attention_gr.write_rows",
@@ -64,12 +66,16 @@ def test_layer_chunk_body_is_the_decode_order_on_rows_with_the_history_commits()
     for source in (decode, route):
         assert "chunk" not in source and "_rows" not in source.replace("_rows_", "")
     fields = tuple(Qwen38TTNNDecoderLayerChunkState.__dataclass_fields__)
-    assert fields == ("namespace", "layer_index", "attention", "ple", "moe")
+    assert fields == ("namespace", "layer_index", "attention", "ple", "moe", "rows")
     allocate = inspect.getsource(Qwen38TTNNDecoderLayer.allocate_chunk_state)
-    assert "rows=PREFILL_CHUNK_ROWS" in allocate and "self.mlp.weights" in allocate
-    assert "self.attention.allocate_rows_state(constants)" in allocate
-    assert "self.attention.allocate_chunk_state()" in allocate
-    assert "self.ple.allocate_rows_state(CHUNK_ROWS)" in allocate
+    assert "rows=rows" in allocate and "self.mlp.weights" in allocate and "rows = constants.rows" in allocate
+    assert (
+        "self.attention.allocate_rows_state(\n                constants, history=None if base is None else base.attention.history\n            )"
+        in allocate
+    )
+    assert "self.attention.allocate_chunk_state(rows)" in allocate
+    assert "self.ple.allocate_rows_state(rows, history=None if base is None else base.ple.history)" in allocate
+    assert "local_combine_output=local_combine_output" in allocate
     reset = inspect.getsource(Qwen38TTNNDecoderLayer.reset_chunk_state_inplace)
     assert "sync_rows_history_from_state(generic_state.attention, state.attention)" in reset
     assert (
@@ -86,6 +92,7 @@ def test_model_chunk_body_derives_everything_on_device_and_advances_by_32_last()
         assert forbidden not in body, forbidden
     order = (
         "gdn_module.build_rows_selectors(chunk_state.accepted, chunk_state.rows_constants)",
+        "if rows == CHUNK_ROWS",
         "state.position.index_row()",
         "chunk_state.qsa_chunk_constants.arange32_lanes",
         "chunk_state.qsa_chunk_constants.block_start_lanes",
@@ -96,7 +103,7 @@ def test_model_chunk_body_derives_everything_on_device_and_advances_by_32_last()
         "layer.forward_chunk_generic(",
         "prepared_ple_rows=chunk_state.ple_rows if layer_index == PLE_CHECKPOINT_LAYER else None",
         "selectors.deallocate()",
-        "state.position.advance_by(CHUNK_ROWS)",
+        "state.position.advance_by(rows)",
     )
     positions = [body.index(fragment) for fragment in order]
     assert positions == sorted(positions)
@@ -105,19 +112,32 @@ def test_model_chunk_body_derives_everything_on_device_and_advances_by_32_last()
         assert forbidden not in body, forbidden
     tree = ast.parse(_dedent(Qwen38TTNNTextModel.forward_prefill_chunk_generic))
     try_body = next(node for node in ast.walk(tree) if isinstance(node, ast.Try)).body
-    assert ast.unparse(try_body[-1]) == "state.position.advance_by(CHUNK_ROWS)"
-    assert CHUNK_ROWS == 32
+    assert ast.unparse(try_body[-1]) == "state.position.advance_by(rows)"
+    assert "rows = chunk_state.rows" in body and CHUNK_ROWS == 32
 
 
 def test_model_chunk_state_is_allocated_before_capture_with_host_written_inputs() -> None:
     fields = tuple(Qwen38TTNNTextModelChunkState.__dataclass_fields__)
-    assert fields == ("rows_constants", "qsa_chunk_constants", "layers", "token_row", "ple_rows", "accepted", "_owner")
+    assert fields == (
+        "rows_constants",
+        "qsa_chunk_constants",
+        "layers",
+        "token_row",
+        "ple_rows",
+        "accepted",
+        "_owner",
+        "rows",
+        "local_combine_output",
+    )
     allocate = inspect.getsource(Qwen38TTNNTextModel.allocate_chunk_state)
-    assert "gdn.allocate_rows_constants(CHUNK_ROWS)" in allocate
-    assert "qsa_module.Qwen38TTNNQSAChunkConstants.build(" in allocate
-    assert "layer.allocate_chunk_state(rows_constants)" in allocate
-    assert "self.model_io.embedding.upload_token_row(0)" in allocate
-    assert "ple_layer.ple.prepare_rows_input([0] * CHUNK_ROWS, ple_rows_state)" in allocate
+    assert "gdn.allocate_rows_constants(rows)" in allocate
+    assert "qsa_module.Qwen38TTNNQSAChunkConstants.build(" in allocate and "rows=rows" in allocate
+    assert (
+        "layer.allocate_chunk_state(\n                        rows_constants,\n                        base=None if base is None else base.layers[index],\n                        local_combine_output=local_combine_output,\n                    )"
+        in allocate
+    )
+    assert "self.model_io.embedding.upload_token_rows(rows)" in allocate
+    assert "ple_layer.ple.prepare_rows_input([0] * rows, ple_rows_state)" in allocate
     assert "float(CHUNK_ROWS - 1)" in allocate  # a full chunk by default
     # The host writers are the only host paths into the chunk buffers, all outside the body.
     accepted = inspect.getsource(Qwen38TTNNTextModel.write_chunk_accepted)
@@ -129,7 +149,10 @@ def test_model_chunk_state_is_allocated_before_capture_with_host_written_inputs(
     assert "ple.host_rows(token_ids, ple_context)" in inputs and "chunk_state.ple_rows.embedding_rows" in inputs
     reset = inspect.getsource(Qwen38TTNNTextModel.reset_chunk_state_inplace)
     assert "layer.reset_chunk_state_inplace(layer_chunk, layer_state)" in reset
-    assert "self.write_chunk_accepted(chunk_state, CHUNK_ROWS - 1)" in reset
+    assert (
+        "self.write_chunk_accepted(chunk_state, CHUNK_ROWS - 1)" in reset
+        and "if chunk_state.accepted is not None:" in reset
+    )
     assert "position.reset" not in reset  # the position is the decode's; the driver sets it
     capture = inspect.getsource(Qwen38TTNNTextModel.capture_prefill_chunk)
     assert "ttnn.corruptible_allocation_scope(self.mesh_device)" in capture
@@ -161,11 +184,16 @@ def test_gdn_step_anchor_is_a_keyword_off_by_default_from_the_chain_to_the_gdn_c
     layer = inspect.getsource(Qwen38TTNNDecoderLayer.forward_chunk_generic)
     assert (
         "self.attention.commit_rows(\n"
-        "                generic_state.attention, chunk_state.attention, selectors, step_committed_rows=gdn_step_anchor\n"
-        "            )"
+        "                    generic_state.attention, chunk_state.attention, selectors, step_committed_rows=gdn_step_anchor\n"
+        "                )"
     ) in layer
+    assert (
+        "self.attention.commit_rows_full(generic_state.attention, chunk_state.attention, result.final_state)" in layer
+    )
     body = inspect.getsource(Qwen38TTNNTextModel.forward_prefill_chunk_generic)
-    assert body.count("gdn_step_anchor") == 4  # the signature, the docstring, the call's keyword and its value
+    assert (
+        body.count("gdn_step_anchor") == 5
+    )  # the signature, the docstring, the 32-row guard, the call's keyword and its value
     assert body.count("gdn_step_anchor=gdn_step_anchor,") == 1
     opened = inspect.getsource(session_module.Qwen38TracedChain.open)
     assert "chunk_state, state, gdn_step_anchor=chunk_gdn_step_anchor, mtp=chunk_extension" in opened

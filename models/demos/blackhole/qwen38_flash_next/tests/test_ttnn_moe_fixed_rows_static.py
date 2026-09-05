@@ -67,6 +67,7 @@ def _bare_moe(rows: int) -> Qwen38TTNNMoE:
     instance.compute_config = object()
     instance.routing_l1_memory_config = object()
     instance.hidden_act_memory_config = object()
+    instance.hidden_gather_memory_config = instance.hidden_act_memory_config
     instance.expert_mapping = _FakeTensor((4, ROUTED_EXPERTS), dtype=moe_module.ttnn.uint16)
     instance.local_combine_output = _FakeTensor(
         instance.row_contract.local_combine,
@@ -75,6 +76,10 @@ def _bare_moe(rows: int) -> Qwen38TTNNMoE:
         memory=moe_module.ttnn.DRAM_MEMORY_CONFIG,
     )
     instance._owned_buffers_released = False
+    instance._owns_local_combine_output = True
+    instance.output_height_shard_dim = 1
+    instance.routed_tokens = rows
+    instance.routed_calls = 1
     instance._poisoned_error = None
     instance._poisoned_device_owners = []
     return instance
@@ -118,7 +123,7 @@ def test_builder_owns_one_lazy_ccl_manager(monkeypatch) -> None:
 
 
 def test_fixed_row_contract_is_exact_and_fail_closed() -> None:
-    assert SUPPORTED_ROWS == (1, 5, 32) and PREFILL_CHUNK_ROWS == 32
+    assert SUPPORTED_ROWS == (1, 5, 32, 128) and PREFILL_CHUNK_ROWS == 32 and moe_module.LONG_PREFILL_CHUNK_ROWS == 128
     ordinary = Qwen38TTNNMoERowContract(1)
     assert ordinary.hidden_sharded == (1, 1, 1, 640)
     assert ordinary.full_hidden == (1, 1, 1, HIDDEN_SIZE)
@@ -168,8 +173,8 @@ def test_row_contract_admits_an_explicit_override_for_one_instance_only() -> Non
     assert six.rows == 6 and six.hidden_sharded == (1, 1, 6, 640) and six.moe_sparse_input == (1, 6, HIDDEN_SIZE)
     assert six.moe_routing == (1, 6, TOP_K) and six.fast_reduce_scores == (6, 1, 1, TOP_K)
     assert Qwen38TTNNMoERowContract(5, (5, 6)).rows == 5
-    assert Qwen38TTNNMoERowContract(1).admitted_rows == SUPPORTED_ROWS == (1, 5, 32)
-    for rows, admitted in ((6, SUPPORTED_ROWS), (7, (6,)), (0, (0,)), (33, (33,)), (6, (True, 6)), (6, [6])):
+    assert Qwen38TTNNMoERowContract(1).admitted_rows == SUPPORTED_ROWS == (1, 5, 32, 128)
+    for rows, admitted in ((6, SUPPORTED_ROWS), (7, (6,)), (0, (0,)), (129, (129,)), (6, (True, 6)), (6, [6])):
         with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
             Qwen38TTNNMoERowContract(rows, admitted)
     with pytest.raises(ValueError):  # allow-pytest.raises: an empty admission admits nothing
@@ -628,7 +633,7 @@ def test_python_path_preserves_normalized_scores_and_dynamic_shared_gate() -> No
         for call in _attribute_call(shared_tree, "linear")
         if len(call.args) >= 2
         and isinstance(call.args[0], ast.Name)
-        and call.args[0].id == "full_hidden"
+        and call.args[0].id == "hidden_tile"
         and isinstance(call.args[1], ast.Attribute)
         and call.args[1].attr == "shared_scalar_gate"
     ]
@@ -717,19 +722,22 @@ def test_pinned_ttnn_source_contracts_match_the_five_row_choreography() -> None:
 
 def test_router_logits_widen_inside_the_sharded_to_interleaved_move() -> None:
     route = inspect.getsource(Qwen38TTNNMoE._route)
-    assert route.count("logits = ttnn.to_memory_config(logits_ws, ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32)") == 1
+    assert (
+        route.count(
+            "logits_tiles.append(ttnn.to_memory_config(logits_ws, ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32))"
+        )
+        == 1
+    )
     assert "ttnn.typecast(logits" not in route
     assert "logits_fp32" not in route
-    assert route.index("logits = ttnn.to_memory_config(") < route.index("probabilities = ttnn.softmax(")
+    assert route.index("logits_tiles.append(ttnn.to_memory_config(") < route.index("probabilities = ttnn.softmax(")
     route_tree = ast.parse(textwrap.dedent(route))
     softmaxes = _attribute_call(route_tree, "softmax")
     assert len(softmaxes) == 1
     assert ast.unparse(softmaxes[0].args[0]) == "logits"
     # The two remaining casts: normalized scores to BF16, indices to UINT16.
-    assert [ast.unparse(call.args[1]) for call in _attribute_call(route_tree, "typecast")] == [
-        "ttnn.bfloat16",
-        "ttnn.uint16",
-    ]
+    casts = sorted(_attribute_call(route_tree, "typecast"), key=lambda call: (call.lineno, call.col_offset))
+    assert [ast.unparse(call.args[1]) for call in casts] == ["ttnn.bfloat16", "ttnn.uint16"]
 
     # Runtime contract behind the fold: a sharded -> interleaved move with a
     # dtype dispatches to sharded_to_interleaved, which accepts a dtype change
@@ -779,13 +787,17 @@ _DEVICE_OPS_PER_CALL = {
 def _production_ttnn_calls(function) -> list[str]:
     """ttnn calls on the one-row production path, in source order.
 
-    Skips the multi-row reshapes (``if self.rows != 1:``) and deallocations.
+    Skips the multi-row reshapes (``if self.rows != 1:``), the long chunk's per-tile concats
+    (``if self.row_contract.row_tiles != 1:``) and deallocations.
     """
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
     skipped: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.If) and ast.unparse(node.test) == "self.rows != 1":
+        if isinstance(node, ast.If) and ast.unparse(node.test) in (
+            "self.rows != 1",
+            "self.row_contract.row_tiles != 1",
+        ):
             skipped.update(id(child) for statement in node.body for child in ast.walk(statement))
     calls: list[tuple[int, int, str]] = []
     for node in ast.walk(tree):
@@ -847,5 +859,5 @@ def test_one_row_moe_layer_device_op_sequence_and_count() -> None:
     assert per_layer * builder_module.BACKBONE_LAYERS == 1584
     gather = inspect.getsource(Qwen38TTNNMoE._all_gather_hidden)
     gather_call = gather.split("full_hidden = ttnn.all_gather(", 1)[1].split("\n        )", 1)[0]
-    assert "memory_config=self.hidden_act_memory_config" in gather_call
+    assert "memory_config=self.hidden_gather_memory_config" in gather_call
     assert "cluster_axis=EP_AXIS" in gather_call

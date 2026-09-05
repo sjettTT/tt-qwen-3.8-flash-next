@@ -915,6 +915,21 @@ class Qwen38BF4Cache:
             paths.append(expected_path)
         return paths[0], paths[1]
 
+    def _validate_mesh_shapes(self, tt_w01: Any, tt_w2: Any, *, label: str) -> None:
+        """A mesh tensor's shape is the coordinate-local shard: the slot's experts (dim 2) split over the mesh
+        columns, 128 per device; the rest of the canonical slot shape is per device already."""
+
+        canonical_shapes = _canonical_packed_shapes(ring_size=self.identity.ring_size)
+        for name, tensor in (("w0_w1", tt_w01), ("w2", tt_w2)):
+            slot_shape = canonical_shapes[name]
+            expected = (*slot_shape[:2], self.identity.experts_per_device, *slot_shape[3:])
+            loaded_shape = _native_integer_shape(tensor.shape, label=f"{label} {name} loaded")
+            if loaded_shape != expected:
+                raise RuntimeError(
+                    f"{label} {name} loaded shape {loaded_shape} differs from the coordinate-local slot shape "
+                    f"{expected} (slot {slot_shape})"
+                )
+
     def _read_manifest(self) -> dict[str, Any] | None:
         if not self.manifest_path.exists():
             return None
@@ -1061,16 +1076,7 @@ class Qwen38BF4Cache:
             ):
                 tt_w01 = ttnn.load_tensor(retained_w01.proc_path, device=mesh_device)
                 tt_w2 = ttnn.load_tensor(retained_w2.proc_path, device=mesh_device)
-                for name, tensor, artifact in (
-                    ("w0_w1", tt_w01, record.w0_w1),
-                    ("w2", tt_w2, record.w2),
-                ):
-                    loaded_shape = _native_integer_shape(tensor.shape, label=f"BF4 cache {name} loaded")
-                    if loaded_shape != artifact.logical_shape:
-                        raise RuntimeError(
-                            f"BF4 cache {name} loaded shape {loaded_shape} differs from "
-                            f"canonical slot shape {artifact.logical_shape}"
-                        )
+                self._validate_mesh_shapes(tt_w01, tt_w2, label="BF4 cache")
                 if tt_w01.memory_config() != memory_configs.w0_w1 or tt_w2.memory_config() != memory_configs.w2:
                     raise RuntimeError("BF4 cache memory configuration differs from the live Blackhole ring")
                 self.mesh_contract.validate_tensor(tt_w01, placement=TensorPlacement.EXPERT_SHARDED, shard_dim=2)
@@ -1206,35 +1212,37 @@ class Qwen38BF4Cache:
                     temporary_w2_path = _tensorbin_path(temporary_w2_base)
                     if not temporary_w01_path.is_file() or not temporary_w2_path.is_file():
                         raise RuntimeError("ttnn.as_tensor did not create both staged BF4 tensorbins")
-                    if w01_path.exists() or w2_path.exists():
-                        raise RuntimeError("BF4 destination appeared while the exclusive conversion lock was held")
-                    os.replace(temporary_w01_path, w01_path)
-                    os.replace(temporary_w2_path, w2_path)
-                artifacts = {
-                    "w0_w1": BF4Artifact(
-                        name="w0_w1",
-                        relative_path=str(w01_path.relative_to(self.root)),
-                        sha256=_sha256(w01_path),
-                        bytes=w01_path.stat().st_size,
-                        logical_shape=_native_integer_shape(tt_w01.shape, label="BF4 conversion w0_w1"),
-                    ),
-                    "w2": BF4Artifact(
-                        name="w2",
-                        relative_path=str(w2_path.relative_to(self.root)),
-                        sha256=_sha256(w2_path),
-                        bytes=w2_path.stat().st_size,
-                        logical_shape=_native_integer_shape(tt_w2.shape, label="BF4 conversion w2"),
-                    ),
-                }
-                self._record(
-                    BF4LayerRecord(
+                    # The record carries the slot's global shape (what the host packed: 512 experts on dim 2); the
+                    # mesh tensor presents one coordinate's shard.  Both are checked while the files are still
+                    # temporary, so a refused record publishes nothing.
+                    self._validate_mesh_shapes(tt_w01, tt_w2, label="BF4 conversion")
+                    canonical_shapes = _canonical_packed_shapes(ring_size=self.identity.ring_size)
+                    record = BF4LayerRecord(
                         namespace=namespace,
                         layer_index=layer_index,
                         expert_ranges=expected_ranges,
                         ring_size=self.identity.ring_size,
-                        **artifacts,
+                        w0_w1=BF4Artifact(
+                            name="w0_w1",
+                            relative_path=str(w01_path.relative_to(self.root)),
+                            sha256=_sha256(temporary_w01_path),
+                            bytes=temporary_w01_path.stat().st_size,
+                            logical_shape=canonical_shapes["w0_w1"],
+                        ),
+                        w2=BF4Artifact(
+                            name="w2",
+                            relative_path=str(w2_path.relative_to(self.root)),
+                            sha256=_sha256(temporary_w2_path),
+                            bytes=temporary_w2_path.stat().st_size,
+                            logical_shape=canonical_shapes["w2"],
+                        ),
                     )
-                )
+                    self._validate_record(record, namespace=namespace, layer_index=layer_index)
+                    if w01_path.exists() or w2_path.exists():
+                        raise RuntimeError("BF4 destination appeared while the exclusive conversion lock was held")
+                    os.replace(temporary_w01_path, w01_path)
+                    os.replace(temporary_w2_path, w2_path)
+                self._record(record)
                 verified = self.verify_layer(namespace, layer_index)
                 if verified is None:
                     raise RuntimeError("published BF4 layer is absent from its manifest")

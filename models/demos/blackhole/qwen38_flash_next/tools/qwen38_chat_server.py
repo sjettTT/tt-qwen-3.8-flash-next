@@ -1364,6 +1364,11 @@ def _parser() -> argparse.ArgumentParser:
         help="chunked: capture the chunk trace and prefill through it; teacher_forced: the decode traces only",
     )
     parser.add_argument(
+        "--long-chunks",
+        action="store_true",
+        help="chunked prefill only: also capture the 128-row chunk trace and run 128-row chunks ahead of the 32-row ones",
+    )
+    parser.add_argument(
         "--allocated-context",
         type=int,
         choices=RESIDENT_QSA_CACHE_CAPACITIES,
@@ -1623,6 +1628,7 @@ def main() -> int:
             chunked_prefill=args.prefill_mode == "chunked",
             sampling=bool(args.sampling),
             bf4_stage_limit=args.bf4_stage_limit,
+            long_chunks=bool(args.long_chunks),
             mtp=args.mtp,
             mtp_gdn_anchor=args.mtp_gdn_anchor,
         )
@@ -1649,8 +1655,9 @@ def main() -> int:
             "program_cache_entries": chain.program_cache_entries,
             "head_traces": len(chain.head_trace_ids),
             "tail_traces": len(chain.tail_trace_ids),
-            "chunk_traces": 0 if chain.chunk_trace_id is None else 1,
+            "chunk_traces": len([t for t in (chain.chunk_trace_id, chain.long_chunk_trace_id) if t is not None]),
             "chunk_capture_ms": chain.chunk_capture_ms,
+            "long_chunk_capture_ms": chain.long_chunk_capture_ms,
             "prefill_mode": session.prefill_mode,
             "sampling": chain.sampling is not None,
             "mtp": (

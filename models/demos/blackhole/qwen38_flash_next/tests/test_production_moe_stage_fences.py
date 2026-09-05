@@ -482,6 +482,7 @@ def test_diagnostic_failure_hook_drains_before_first_exception_cleanup_release(m
             "full_hidden",
             "routing_scores",
             "routing_indices",
+            "routing_tiles",
             "shared_partial",
             "routed_partial",
             "local_sum",

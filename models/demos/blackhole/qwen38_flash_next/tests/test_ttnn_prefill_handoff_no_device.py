@@ -238,6 +238,7 @@ def test_qsa_handoff_fills_the_staging_and_the_ring_from_the_kept_rows(fake_qsa,
     chunk = qsa_module.Qwen38TTNNQSAChunkState(
         layer_index=3,
         epoch=2,
+        rows=CHUNK_ROWS,
         kept_kv=_rows_valued(CHUNK_ROWS, 2 * head_dim, [block_start + i for i in range(CHUNK_ROWS)]),
         kept_raw=_rows_valued(CHUNK_ROWS, index_dim, [block_start + i + 0.5 for i in range(CHUNK_ROWS)]),
     )

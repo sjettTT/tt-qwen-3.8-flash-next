@@ -48,6 +48,7 @@ import ttnn
 from models.demos.blackhole.qwen38_flash_next.ttnn import qsa as qsa_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import Qwen38BF4Streamer
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
+    CHUNK_ROW_COUNTS,
     CHUNK_ROWS,
     Qwen38MeshContract,
     TensorPlacement,
@@ -63,8 +64,12 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.gdn import (
     Qwen38TTNNGDNState,
     Qwen38TTNNRowsSelectors,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.gr import Qwen38TTNNGatedResidual
-from models.demos.blackhole.qwen38_flash_next.ttnn.moe import PREFILL_CHUNK_ROWS, Qwen38TTNNMoE, Qwen38TTNNRouting
+from models.demos.blackhole.qwen38_flash_next.ttnn.gr import (
+    Qwen38TTNNGatedResidual,
+    block_rows_shape,
+    residual_rows_shape,
+)
+from models.demos.blackhole.qwen38_flash_next.ttnn.moe import Qwen38TTNNMoE, Qwen38TTNNRouting
 from models.demos.blackhole.qwen38_flash_next.ttnn.ple import (
     Qwen38TTNNPLE,
     Qwen38TTNNPLEPreparedInput,
@@ -171,8 +176,10 @@ class Qwen38TTNNDecoderLayerChunkState:
 
     ``attention`` is the GDN rows state (the FIR history carried between chunks, the chunk's kept q|k|v rows,
     the chunk kernel's inputs, the output rows) or the QSA chunk state (the kept slab and raw keys of the
-    hand-off); ``ple`` the PLE rows state on the PLE layer; ``moe`` a rows-32 instance borrowing the layer's
-    router and shared weights (its own [10,32,2560] combine buffer).
+    hand-off); ``ple`` the PLE rows state on the PLE layer; ``moe`` a rows-``rows`` instance borrowing the
+    layer's router and shared weights (its own [10,32,2560] combine buffer at 32 rows; the 128-row instances
+    share one).  The 128-row state shares the GDN and PLE histories with the 32-row state it was allocated
+    beside, so chunks of either row count carry one history.
     """
 
     namespace: Qwen38TTNNLayerNamespace
@@ -180,6 +187,7 @@ class Qwen38TTNNDecoderLayerChunkState:
     attention: Qwen38TTNNGDNRowsState | Any
     ple: Qwen38TTNNPLERowsState | None
     moe: Qwen38TTNNMoE
+    rows: int = CHUNK_ROWS
 
 
 @dataclass
@@ -1144,33 +1152,26 @@ class Qwen38TTNNDecoderLayer:
     def commit_ple_rows(self, rows_state: Qwen38TTNNPLERowsState, selectors: Qwen38TTNNRowsSelectors) -> None:
         self._require_ple("commit_ple_rows").commit_rows(rows_state, selectors)
 
-    # ------------------------------------------------------------------ prefill chunk (32 rows)
-    # forward_chunk_generic is forward_decode_generic over the 32 rows of one chunk: PLE rows (+ commit) ->
+    # ------------------------------------------------------------------ prefill chunk (32 or 128 rows)
+    # forward_chunk_generic is forward_decode_generic over the rows of one chunk: PLE rows (+ commit) ->
     # attention GR read_rows -> GDN forward_rows + commit_rows (the history carry) or QSA forward_chunk_generic
-    # -> attention GR write_rows -> MLP GR read_rows -> the rows-32 MoE -> MLP GR write_rows.  The chunk state
-    # holds what a chunk carries to the next one; the generic state is the decode's, updated in place.
+    # -> attention GR write_rows -> MLP GR read_rows -> the rows-32 / rows-128 MoE -> MLP GR write_rows.  The
+    # chunk state holds what a chunk carries to the next one; the generic state is the decode's, updated in
+    # place.  The 32-row form commits through the accept-scalar selectors (a full chunk or the padded tail);
+    # the 128-row form always commits every row (no selectors).
 
-    def _validate_residual_rows(self, residual, *, label: str) -> None:
-        if (
-            _shape(residual) != RESIDUAL_ROWS_LOCAL_SHAPE
-            or residual.dtype != ttnn.bfloat16
-            or residual.layout != ttnn.TILE_LAYOUT
-        ):
+    def _validate_residual_rows(self, residual, *, label: str, rows: int = CHUNK_ROWS) -> None:
+        expected = residual_rows_shape(rows)
+        if _shape(residual) != expected or residual.dtype != ttnn.bfloat16 or residual.layout != ttnn.TILE_LAYOUT:
             raise ValueError(
-                f"{label} must be branch-major BF16 TILE {list(RESIDUAL_ROWS_LOCAL_SHAPE)}, "
-                f"got {tensor_metadata(residual)}"
+                f"{label} must be branch-major BF16 TILE {list(expected)}, got {tensor_metadata(residual)}"
             )
         self.mesh_contract.validate_tensor(residual, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
 
-    def _validate_block_rows(self, hidden, *, label: str) -> None:
-        if (
-            _shape(hidden) != BLOCK_ROWS_LOCAL_SHAPE
-            or hidden.dtype != ttnn.bfloat16
-            or hidden.layout != ttnn.TILE_LAYOUT
-        ):
-            raise RuntimeError(
-                f"{label} must be BF16 TILE {list(BLOCK_ROWS_LOCAL_SHAPE)}, got {tensor_metadata(hidden)}"
-            )
+    def _validate_block_rows(self, hidden, *, label: str, rows: int = CHUNK_ROWS) -> None:
+        expected = block_rows_shape(rows)
+        if _shape(hidden) != expected or hidden.dtype != ttnn.bfloat16 or hidden.layout != ttnn.TILE_LAYOUT:
+            raise RuntimeError(f"{label} must be BF16 TILE {list(expected)}, got {tensor_metadata(hidden)}")
         self.mesh_contract.validate_tensor(hidden, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
 
     def _validate_chunk_state(self, state: Qwen38TTNNDecoderLayerChunkState) -> None:
@@ -1181,35 +1182,67 @@ class Qwen38TTNNDecoderLayer:
                 f"chunk state identity {(state.namespace, state.layer_index)} does not match "
                 f"{(self.namespace.value, self.layer_index)}"
             )
+        if state.rows not in CHUNK_ROW_COUNTS:
+            raise ValueError(f"chunk state rows must be one of {CHUNK_ROW_COUNTS}, got {state.rows!r}")
         if isinstance(self.attention, Qwen38TTNNGDN) != isinstance(state.attention, Qwen38TTNNGDNRowsState):
             raise TypeError(f"layer {self.layer_index} chunk attention state is {type(state.attention).__name__}")
+        attention_rows = (
+            state.attention.constants.rows
+            if isinstance(state.attention, Qwen38TTNNGDNRowsState)
+            else state.attention.rows
+        )
+        if attention_rows != state.rows:
+            raise ValueError(f"chunk attention state holds {attention_rows} rows, the chunk state {state.rows}")
         if (self.ple is None) != (state.ple is None):
             raise ValueError("PLE rows state must be present exactly on the PLE layer")
-        if state.moe.rows != PREFILL_CHUNK_ROWS or state.moe.weights is not self.mlp.weights:
-            raise ValueError(f"chunk MoE must be a rows-{PREFILL_CHUNK_ROWS} instance over this layer's weights")
+        if state.ple is not None and state.ple.rows != state.rows:
+            raise ValueError(f"PLE rows state holds {state.ple.rows} rows, the chunk state {state.rows}")
+        if state.moe.rows != state.rows or state.moe.weights is not self.mlp.weights:
+            raise ValueError(f"chunk MoE must be a rows-{state.rows} instance over this layer's weights")
 
-    def allocate_chunk_state(self, constants: Qwen38TTNNGDNRowsConstants) -> Qwen38TTNNDecoderLayerChunkState:
-        """Allocate this layer's chunk buffers before any capture: rows state, PLE rows state, the rows-32 MoE."""
+    def allocate_chunk_state(
+        self,
+        constants: Qwen38TTNNGDNRowsConstants,
+        *,
+        base: Qwen38TTNNDecoderLayerChunkState | None = None,
+        local_combine_output=None,
+    ) -> Qwen38TTNNDecoderLayerChunkState:
+        """Allocate this layer's chunk buffers before any capture: rows state, PLE rows state, the MoE instance.
 
-        attention = (
-            self.attention.allocate_rows_state(constants)
-            if isinstance(self.attention, Qwen38TTNNGDN)
-            else self.attention.allocate_chunk_state()
-        )
+        ``constants.rows`` picks the form.  The 128-row form needs ``base``, this layer's 32-row chunk state,
+        whose GDN and PLE histories it shares, and ``local_combine_output``, the combine buffer shared by every
+        layer's 128-row MoE instance.
+        """
+
+        rows = constants.rows
+        if rows != CHUNK_ROWS and (base is None or base.rows != CHUNK_ROWS or local_combine_output is None):
+            raise ValueError(
+                f"the {rows}-row chunk state needs the layer's 32-row chunk state and the shared combine buffer"
+            )
+        if rows == CHUNK_ROWS and (base is not None or local_combine_output is not None):
+            raise ValueError("the 32-row chunk state owns its histories and combine buffer")
+        if isinstance(self.attention, Qwen38TTNNGDN):
+            attention = self.attention.allocate_rows_state(
+                constants, history=None if base is None else base.attention.history
+            )
+        else:
+            attention = self.attention.allocate_chunk_state(rows)
         ple = None
         moe = None
         try:
-            ple = None if self.ple is None else self.ple.allocate_rows_state(CHUNK_ROWS)
+            if self.ple is not None:
+                ple = self.ple.allocate_rows_state(rows, history=None if base is None else base.ple.history)
             moe = Qwen38TTNNMoE(
                 self.mlp.mesh_device,
                 self.mlp.mesh_contract,
                 self.mlp.weights,
                 tt_ccl=self.mlp.tt_ccl,
                 collective_topology=self.mlp.collective_topology,
-                rows=PREFILL_CHUNK_ROWS,
+                rows=rows,
                 synchronization_policy=self.mlp.synchronization_policy,
+                local_combine_output=local_combine_output,
             )
-            result = Qwen38TTNNDecoderLayerChunkState(self.namespace, self.layer_index, attention, ple, moe)
+            result = Qwen38TTNNDecoderLayerChunkState(self.namespace, self.layer_index, attention, ple, moe, rows)
             self._validate_chunk_state(result)
             return result
         except BaseException as error:
@@ -1243,7 +1276,8 @@ class Qwen38TTNNDecoderLayer:
     ) -> None:
         """Seed the chunk carry from the generic state at fixed addresses (after the generic reset, or after
         decode steps that ended at P % 32 == 0): the GDN history from the ring, the PLE history from the nine
-        slots, the QSA kept buffers zeroed (hygiene; every chunk rewrites them)."""
+        slots, the QSA kept buffers zeroed (hygiene; every chunk rewrites them).  The 128-row state shares its
+        histories with the 32-row state, which seeds them; only its QSA buffers are zeroed here."""
 
         self._validate_chunk_state(state)
         self._validate_generic_state(generic_state)
@@ -1251,7 +1285,8 @@ class Qwen38TTNNDecoderLayer:
             # A chunk starts at P % 32 == 0: the next token lands in slot 0.  The traced steps never advance the
             # host phase, so it is set here rather than read (a hand-off at P % 4 != 0 may have left it there).
             generic_state.attention.conv_phase = 0
-            self.attention.sync_rows_history_from_state(generic_state.attention, state.attention)
+            if state.rows == CHUNK_ROWS:
+                self.attention.sync_rows_history_from_state(generic_state.attention, state.attention)
         else:
             for label, tensor in (
                 ("QSA kept KV slab", state.attention.kept_kv),
@@ -1260,7 +1295,7 @@ class Qwen38TTNNDecoderLayer:
                 zeroed = ttnn.fill(tensor, 0.0, output_tensor=tensor)
                 if _tensor_key(zeroed) != _tensor_key(tensor):
                     raise RuntimeError(f"{label} reset was not in place")
-        if state.ple is not None:
+        if state.ple is not None and state.rows == CHUNK_ROWS:
             state.ple.load_from_state(generic_state.ple)
 
     def forward_chunk_generic(
@@ -1273,21 +1308,28 @@ class Qwen38TTNNDecoderLayer:
         rope_rows,
         qsa_chunk: qsa_module.Qwen38TTNNQSAChunkInputs | None,
         qsa_chunk_constants: qsa_module.Qwen38TTNNQSAChunkConstants | None,
-        selectors: Qwen38TTNNRowsSelectors,
+        selectors: Qwen38TTNNRowsSelectors | None,
         gdn_step_anchor: bool = False,
     ):
-        """Advance the 32 rows of one chunk through this layer; the input rows are consumed.
+        """Advance the rows of one chunk through this layer; the input rows are consumed.
 
         ``selectors`` (from the device accept scalar: 31 for a full chunk, r - 1 for the padded tail) drive
-        the GDN and PLE history commits, so one trace serves both.  ``rope_rows`` holds the chunk's cos/sin
-        tiles and ``qsa_chunk`` the derived chunk inputs; both are None on GDN layers' callers' side only by
-        omission (they are shared by every layer).  ``gdn_step_anchor`` commits the GDN state through the 1-row
-        FP32 step arithmetic over the committed rows (``commit_rows(step_committed_rows=True)``: the committed
-        state is the 1-row path's, not the chunk kernel's) at about 16 ops per row per GDN layer.  Returns the
-        ``[1,4,32,640]`` residual rows.
+        the GDN and PLE history commits of the 32-row form, so one trace serves both; the 128-row form takes
+        ``None`` and commits every row (``commit_rows_full``: the forward pass's own final state, no re-run).
+        ``rope_rows`` holds the chunk's cos/sin tiles and ``qsa_chunk`` the derived chunk inputs; both are None
+        on GDN layers' callers' side only by omission (they are shared by every layer).  ``gdn_step_anchor``
+        commits the GDN state through the 1-row FP32 step arithmetic over the committed rows
+        (``commit_rows(step_committed_rows=True)``: the committed state is the 1-row path's, not the chunk
+        kernel's) at about 16 ops per row per GDN layer; the 128-row form does not offer it.  Returns the
+        ``[1,4,rows,640]`` residual rows.
         """
 
-        self._validate_residual_rows(residual_rows, label="chunk residual rows")
+        rows = chunk_state.rows
+        if (selectors is None) != (rows != CHUNK_ROWS):
+            raise ValueError(f"the {rows}-row chunk form {'takes no' if rows != CHUNK_ROWS else 'needs the'} selectors")
+        if gdn_step_anchor and rows != CHUNK_ROWS:
+            raise ValueError("the GDN step anchor is a 32-row chunk option")
+        self._validate_residual_rows(residual_rows, label="chunk residual rows", rows=rows)
         self._validate_generic_state(generic_state)
         self._validate_chunk_state(chunk_state)
         if self.ple is not None:
@@ -1295,21 +1337,27 @@ class Qwen38TTNNDecoderLayer:
                 raise ValueError("the PLE layer's chunk needs its prepared persistent PLE rows")
             generic_state.ple.token_context = None
             residual = self.ple.inject_rows(residual_rows, prepared_ple_rows, chunk_state.ple)
-            self.ple.commit_rows(chunk_state.ple, selectors)
+            if selectors is None:
+                self.ple.commit_rows_full(chunk_state.ple)
+            else:
+                self.ple.commit_rows(chunk_state.ple, selectors)
         else:
             if prepared_ple_rows is not None:
                 raise ValueError("prepared PLE rows were supplied outside checkpoint layer 1")
             residual = residual_rows
-        self._validate_residual_rows(residual, label="chunk PLE-injected residual rows")
+        self._validate_residual_rows(residual, label="chunk PLE-injected residual rows", rows=rows)
 
         attention_input, attention_gr_state = self.attention_gr.read_rows(residual)
-        self._validate_block_rows(attention_input, label="chunk attention GR read")
+        self._validate_block_rows(attention_input, label="chunk attention GR read", rows=rows)
         if isinstance(self.attention, Qwen38TTNNGDN):
             result = self.attention.forward_rows(attention_input, generic_state.attention, chunk_state.attention)
-            self.attention.commit_rows(
-                generic_state.attention, chunk_state.attention, selectors, step_committed_rows=gdn_step_anchor
-            )
-            _deallocate_unique(result.final_state)
+            if selectors is None:
+                self.attention.commit_rows_full(generic_state.attention, chunk_state.attention, result.final_state)
+            else:
+                self.attention.commit_rows(
+                    generic_state.attention, chunk_state.attention, selectors, step_committed_rows=gdn_step_anchor
+                )
+                _deallocate_unique(result.final_state)
             attention_hidden = result.hidden_rows  # the persistent rows output: never deallocated here
             persistent_hidden = True
         else:
@@ -1328,7 +1376,7 @@ class Qwen38TTNNDecoderLayer:
             )
             persistent_hidden = False
         _deallocate_unique(attention_input)
-        self._validate_block_rows(attention_hidden, label="chunk attention output")
+        self._validate_block_rows(attention_hidden, label="chunk attention output", rows=rows)
 
         residual = self.attention_gr.write_rows(attention_hidden, attention_gr_state)
         _deallocate_unique(
@@ -1336,20 +1384,20 @@ class Qwen38TTNNDecoderLayer:
             attention_gr_state.residual,
             attention_gr_state.injection,
         )
-        self._validate_residual_rows(residual, label="chunk post-attention residual rows")
+        self._validate_residual_rows(residual, label="chunk post-attention residual rows", rows=rows)
 
         mlp_input, mlp_gr_state = self.mlp_gr.read_rows(residual)
-        self._validate_block_rows(mlp_input, label="chunk MLP GR read")
+        self._validate_block_rows(mlp_input, label="chunk MLP GR read", rows=rows)
         with self.expert_streamer.layer(self.layer_index, namespace=self.namespace.value) as packed_experts:
             if not isinstance(packed_experts, tuple) or len(packed_experts) != 2:
                 raise RuntimeError("BF4 streamer must yield exactly (packed_w0_w1, packed_w2)")
             mlp_result = chunk_state.moe.forward(mlp_input, packed_experts[0], packed_experts[1])
         _deallocate_unique(mlp_input)
-        self._validate_block_rows(mlp_result.hidden_sharded, label="chunk routed/shared MoE output")
+        self._validate_block_rows(mlp_result.hidden_sharded, label="chunk routed/shared MoE output", rows=rows)
 
         residual = self.mlp_gr.write_rows(mlp_result.hidden_sharded, mlp_gr_state)
         _deallocate_unique(mlp_result.hidden_sharded, mlp_gr_state.residual, mlp_gr_state.injection)
-        self._validate_residual_rows(residual, label="chunk decoder-layer output residual rows")
+        self._validate_residual_rows(residual, label="chunk decoder-layer output residual rows", rows=rows)
         return residual
 
     def finish_chunk_state_inplace(
@@ -1367,6 +1415,8 @@ class Qwen38TTNNDecoderLayer:
 
         self._validate_chunk_state(state)
         self._validate_generic_state(generic_state)
+        if state.rows != CHUNK_ROWS:
+            raise ValueError(f"the hand-off reads the {CHUNK_ROWS}-row chunk state, got {state.rows} rows")
         if isinstance(self.attention, Qwen38TTNNGDN):
             # The next token lands in slot prefilled % 4; the history rows are the three before it, oldest first.
             generic_state.attention.conv_phase = prefilled % CONV_KERNEL_SIZE

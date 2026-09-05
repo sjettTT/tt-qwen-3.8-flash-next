@@ -149,6 +149,7 @@ def test_pool_select_is_the_decode_ring_mean_bitwise_and_row_selects_pick_one_ro
 def test_chunk_constants_and_inputs_declare_the_device_fields() -> None:
     assert tuple(Qwen38TTNNQSAChunkConstants.__dataclass_fields__) == (
         "allocated_compressed_blocks",
+        "rows",
         "arange32_lanes",
         "block_start_lanes",
         "row_index_blocks",
@@ -162,7 +163,7 @@ def test_chunk_constants_and_inputs_declare_the_device_fields() -> None:
         "row_selects",
         "zero_value_half_rows",
     )
-    assert tuple(Qwen38TTNNQSAChunkInputs.__dataclass_fields__) == CHUNK_INPUT_FIELDS
+    assert tuple(Qwen38TTNNQSAChunkInputs.__dataclass_fields__) == ("rows",) + CHUNK_INPUT_FIELDS
     build = inspect.getsource(Qwen38TTNNQSAChunkConstants.build)
     assert "_upload_uint32(" in build and "replicate_tensor_2d_mesh_mapper(mesh_device)" in build
     assert "layout=ttnn.TILE_LAYOUT" in build and "dtype=ttnn.bfloat16" in build
@@ -226,7 +227,9 @@ def test_chunk_derivation_uses_only_exact_integer_ops_and_the_scalar_broadcast()
 
 def test_rope_chunk_rows_keep_all_32_rows_and_the_one_row_lookup_keeps_its_view() -> None:
     chunk_rows = inspect.getsource(model_module.Qwen38TTNNRoPETable.rows_chunk)
-    assert chunk_rows.count("self._lookup_tile(") == 1 and "for label, table_indices, table in (" in chunk_rows
+    assert (
+        chunk_rows.count("self._lookup_tile(") == 1 and "for label, table_indices, table, row_count in (" in chunk_rows
+    )
     assert "ttnn.Shape(" not in chunk_rows and "ttnn.slice(" not in chunk_rows and "ttnn.embedding(" not in chunk_rows
     tile = inspect.getsource(model_module.Qwen38TTNNRoPETable._lookup_tile)
     assert tile.count("ttnn.embedding(") == 1 and "_padded_shape(rows) != padded" in tile
@@ -325,15 +328,15 @@ def test_chunk_body_has_no_host_ints_no_host_io_and_the_decode_order() -> None:
             assert annotation != "int", (name, argument.arg)
     body = _method_source("forward_chunk_generic")
     order = (
-        "self._all_gather_hidden_rows(hidden_rows)",
-        "self._index_projection_rows(full_hidden, cos, sin)",
+        "self._all_gather_hidden_rows(hidden_rows, constants)",
+        "self._index_projection_rows(full_hidden, cos, sin, constants)",
         "self._write_compressed_index_chunk(",
         "self._score_blocks_chunk(index_query, state, chunk)",
         "self._materialize_rows_chunk(masked_scores, chunk, constants)",
-        "self._main_projection_rows(full_hidden, cos, sin)",
+        "self._main_projection_rows(full_hidden, cos, sin, constants)",
         "self._write_packed_kv_chunk(state, chunk_state, key, value, chunk)",
         "self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)",
-        "self._project_output_rows(local_attention, full_hidden)",
+        "self._project_output_rows(local_attention, full_hidden, constants)",
     )
     positions = [body.index(fragment) for fragment in order]
     assert positions == sorted(positions)
@@ -363,12 +366,14 @@ def test_chunk_body_replaces_the_one_hots_with_whole_slab_writes_and_selection_m
     compressed = _ttnn_op_walk("_write_compressed_index_chunk")
     # Call sites: the pool select, then the per-block row pick / view / reshard / write inside the block loop.
     assert compressed == ["copy", "matmul", "rms_norm", "matmul", "reshape", "to_memory_config", "paged_update_cache"]
-    assert "for block in range(CHUNK_BLOCKS):" in _method_source("_write_compressed_index_chunk")
+    assert "for block in range(len(constants.row_selects)):" in _method_source("_write_compressed_index_chunk")
     assert "multiply" not in compressed and "sum" not in compressed  # no ring one-hots, no scaled sum
     kv = _ttnn_op_walk("_write_packed_kv_chunk")
     assert kv == ["concat", "copy", "to_layout", "update_padded_kv_cache"]
     score = _ttnn_op_walk("_score_blocks_chunk")
-    assert score == ["indexer_score_dsa", "slice", "all_reduce", "add"]  # the query rows are the tile itself: no view
+    # One indexer call per 32-row query tile (the query tile is the rows themselves at 32 rows, a row-tile slice at
+    # 128), the score tiles concatenated, then the all-reduce and the per-row mask on all rows.
+    assert score == ["slice", "indexer_score_dsa", "slice", "concat", "all_reduce", "add"]
     materialize = _ttnn_op_walk("_materialize_rows_chunk")
     assert materialize == [
         "topk_large_indices",
@@ -380,7 +385,9 @@ def test_chunk_body_replaces_the_one_hots_with_whole_slab_writes_and_selection_m
         "bitwise_or",
     ]
     projection = _ttnn_op_walk("_main_projection_rows")
-    assert projection.count("linear") == 3 and projection.count("slice") == 2 and projection.count("concat") == 2
+    assert _method_source("_main_projection_rows").count("self._linear_rows(") == 3
+    assert _ttnn_op_walk("_linear_rows") == ["linear", "to_memory_config", "linear", "to_memory_config", "concat"]
+    assert projection.count("linear") == 0 and projection.count("slice") == 2 and projection.count("concat") == 2
     assert "reshape" not in projection and "permute" not in projection  # tile-aligned head slices, no padded reshape
     attention = _ttnn_op_walk("_sparse_value_attention_rows")
     assert attention.count("sparse_sdpa") == 1 and attention.count("concat") == 2 and "reshape" not in attention
@@ -398,12 +405,13 @@ def test_chunk_state_is_allocated_beside_the_generic_state_and_released_by_epoch
     assert tuple(qsa_module.Qwen38TTNNQSAChunkState.__dataclass_fields__) == (
         "layer_index",
         "epoch",
+        "rows",
         "kept_kv",
         "kept_raw",
     )
     allocate = inspect.getsource(qsa_module.Qwen38TTNNQSA.allocate_chunk_state)
-    assert "self._allocate_pair_grouped((1, 1, CHUNK_ROWS, 2 * HEAD_DIM), layout=ttnn.TILE_LAYOUT)" in allocate
-    assert "self._allocate_replicated_tile_zeros((1, 1, CHUNK_ROWS, INDEX_HEAD_DIM))" in allocate
+    assert "self._allocate_pair_grouped((1, 1, rows, 2 * HEAD_DIM), layout=ttnn.TILE_LAYOUT)" in allocate
+    assert "self._allocate_replicated_tile_zeros((1, 1, rows, INDEX_HEAD_DIM))" in allocate
     assert "self._live_generic_epochs.add(epoch)" in allocate
     release = inspect.getsource(qsa_module.Qwen38TTNNQSA.release_chunk_state)
     assert "self._live_generic_epochs.remove(state.epoch)" in release
@@ -570,7 +578,9 @@ def test_chunk_inputs_at_the_long_context_positions_are_the_emulation(
         high27_mask=_u32(torch.full((1, 1, 1, 1), qsa_module.KV_BLOCK_START_MASK)),
     )
     chunk = SimpleNamespace(
-        allocated_compressed_blocks=blocks, **{name: _u32(host[name]) for name in CHUNK_UINT32_TEMPLATES}
+        allocated_compressed_blocks=blocks,
+        rows=CHUNK_ROWS,
+        **{name: _u32(host[name]) for name in CHUNK_UINT32_TEMPLATES},
     )
     inputs = qsa_module.derive_qsa_chunk_inputs(scalar, constants, chunk)
     expected = emulate_qsa_chunk_inputs(position, allocated_compressed_blocks=blocks)
@@ -610,6 +620,7 @@ def test_chunk_inputs_after_advancing_the_device_position_are_the_emulation(inte
     )
     chunk = SimpleNamespace(
         allocated_compressed_blocks=RESIDENT_BLOCKS,
+        rows=CHUNK_ROWS,
         **{name: _u32(host[name]) for name in CHUNK_UINT32_TEMPLATES},
     )
     inputs = qsa_module.derive_qsa_chunk_inputs(position.scalar, constants, chunk)

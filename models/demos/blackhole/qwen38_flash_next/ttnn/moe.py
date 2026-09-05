@@ -33,6 +33,7 @@ from models.demos.blackhole.qwen38_flash_next.config import Qwen38Placement
 from models.demos.blackhole.qwen38_flash_next.tt.moe import Qwen38MoEWeights
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROWS,
+    LONG_CHUNK_ROWS,
     MESH_SHAPE,
     Qwen38MeshContract,
     TensorPlacement,
@@ -40,6 +41,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
+    dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
 )
 from models.tt_transformers.tt.ccl import tt_all_reduce
@@ -53,14 +55,32 @@ LOCAL_COMBINE_AXIS = 0
 EP_AXIS = 1
 TARGET_VERIFIER_ROWS = 5
 PREFILL_CHUNK_ROWS = CHUNK_ROWS
-SUPPORTED_ROWS = (1, TARGET_VERIFIER_ROWS, PREFILL_CHUNK_ROWS)
+LONG_PREFILL_CHUNK_ROWS = LONG_CHUNK_ROWS
+SUPPORTED_ROWS = (1, TARGET_VERIFIER_ROWS, PREFILL_CHUNK_ROWS, LONG_PREFILL_CHUNK_ROWS)
+# moe_compute processes the tokens of one expert in 32-token chunks and admits at most
+# TOKEN_SIZE x num_data_parallel_cores x output_height_shard_dim tokens per call; num_data_parallel_cores is
+# the largest d <= 4 dividing both the hidden tile count (80) and the live DRAM bank count (the matmul ring).
+MOE_COMPUTE_TOKEN_SIZE = 32
+MOE_COMPUTE_HIDDEN_TILES = HIDDEN_SIZE // 32
+
+
+def moe_compute_output_height_shard_dim(rows: int, *, matmul_ring_size: int) -> int:
+    """The smallest ``output_height_shard_dim`` under which ``moe_compute`` admits ``rows`` tokens (1 for every
+    form up to 32 rows; the 128-row form needs 1 on an 8-bank part and 4 on a 7-bank part)."""
+
+    data_parallel_cores = max(d for d in range(1, 5) if MOE_COMPUTE_HIDDEN_TILES % d == 0 and matmul_ring_size % d == 0)
+    return -(-rows // (MOE_COMPUTE_TOKEN_SIZE * data_parallel_cores))
+
+
 # Both multi-row counts have run moe_compute on this model's silicon and matched the rows-1 path
 # bitwise (the rows-1 path is the production decode; 5 = the MTP verifier, 32 = the prefill chunk share
 # one code path past rows == 1): rows 32 vs 32 one-row calls on all 48 real layers, 1536/1536 rows
 # (2026-09-03, prefill stage-1 chunk discriminator); rows 5 vs one-row in the MTP-v2 step-1
-# discriminator and 245/245 rows in the MTP-v2 numerics gates (2026-09-03/04).
+# discriminator and 245/245 rows in the MTP-v2 numerics gates (2026-09-03/04).  The 128-row form has
+# not run on silicon yet.
 ROWS5_HARDWARE_PROVEN = True
 ROWS32_HARDWARE_PROVEN = True
+ROWS128_HARDWARE_PROVEN = False
 BLACKHOLE_MOE_NUMERIC_ISSUE = "https://github.com/tenstorrent/tt-metal/issues/50038"
 MOE_STAGE_FENCES = (
     "all-gather-hidden",
@@ -129,8 +149,10 @@ class Qwen38TTNNMoERowContract:
         if not isinstance(self.admitted_rows, tuple) or not self.admitted_rows:
             raise ValueError(f"MoE admitted rows must be a non-empty tuple, got {self.admitted_rows!r}")
         for count in self.admitted_rows:
-            if isinstance(count, bool) or type(count) is not int or not 1 <= count <= CHUNK_ROWS:
-                raise ValueError(f"MoE admitted rows must be ints in [1, {CHUNK_ROWS}], got {self.admitted_rows!r}")
+            if isinstance(count, bool) or type(count) is not int or not 1 <= count <= LONG_PREFILL_CHUNK_ROWS:
+                raise ValueError(
+                    f"MoE admitted rows must be ints in [1, {LONG_PREFILL_CHUNK_ROWS}], got {self.admitted_rows!r}"
+                )
         if type(self.rows) is not int or self.rows not in self.admitted_rows:
             raise ValueError(f"MoE rows must be exactly one of {self.admitted_rows}, got {self.rows!r}")
 
@@ -178,6 +200,28 @@ class Qwen38TTNNMoERowContract:
     @property
     def output_sharded(self) -> tuple[int, int, int, int]:
         return self.hidden_sharded
+
+    @property
+    def row_tiles(self) -> int:
+        """Row tiles per DRAM-sharded linear call: one up to 32 rows, four for the long prefill chunk."""
+
+        return -(-self.rows // CHUNK_ROWS)
+
+
+def allocate_local_combine_output(mesh_device, mesh_contract: Qwen38MeshContract, rows: int):
+    """The ``[10, rows, 2560]`` ROW_MAJOR BF16 local-combine buffer ``moe_compute`` writes (replicated: every
+    device combines its own experts); one per row instance, or one shared by the 48 long-chunk instances."""
+
+    tensor = ttnn.from_torch(
+        torch.zeros(Qwen38TTNNMoERowContract(rows).local_combine, dtype=torch.bfloat16),
+        device=mesh_device,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+        dtype=ttnn.bfloat16,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        mesh_mapper=replicate_tensor_2d_mesh_mapper(mesh_device),
+    )
+    mesh_contract.validate_tensor(tensor, placement=TensorPlacement.LOCAL_PARTIAL)
+    return tensor
 
 
 def _expert_owner_mapping() -> torch.Tensor:
@@ -319,8 +363,12 @@ class Qwen38TTNNMoEWeights:
 
 @dataclass(frozen=True)
 class Qwen38TTNNRouting:
+    """The ROW_MAJOR top-k scores (BF16) and indices (UINT16) ``[1,1,rows,10]``; ``tiles`` holds the same per
+    32-row tile when the routed stream runs one ``moe_compute`` call per tile (the long chunk)."""
+
     scores: Any
     indices: Any
+    tiles: tuple["Qwen38TTNNRouting", ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -342,8 +390,18 @@ class Qwen38TTNNMoE:
         collective_topology=None,
         rows: int = 1,
         synchronization_policy: Qwen38TTNNMoESyncPolicy = Qwen38TTNNMoESyncPolicy.CORRECTNESS_FENCED,
+        local_combine_output=None,
+        routed_tokens_per_call: int | None = None,
         admitted_rows: tuple[int, ...] = SUPPORTED_ROWS,
     ) -> None:
+        """``routed_tokens_per_call`` is the token count of one ``moe_compute`` call: the rows themselves up to 32
+        (the default), and for the 128-row form 32 (the default: four calls of the 32-row program, bitwise the
+        32-row chunk per tile) or 128 (one call; on the pinned runtime its rows past the first tile came back
+        wrong on silicon, 2026-09-04, so it is a micro-test form only).  ``local_combine_output`` hands in a shared
+        ``[10, routed_tokens_per_call, 2560]`` ROW_MAJOR BF16 combine buffer (the 48 long-chunk instances share one:
+        the layers run one after another and every call fills it first); it is borrowed, so
+        ``release_owned_buffers`` leaves it to its owner."""
+
         if type(synchronization_policy) is not Qwen38TTNNMoESyncPolicy:
             raise TypeError(
                 "MoE synchronization_policy must be an exact Qwen38TTNNMoESyncPolicy, "
@@ -361,9 +419,16 @@ class Qwen38TTNNMoE:
         self.collective_topology = collective_topology or ttnn.Topology.Linear
         self.row_contract = row_contract
         self.rows = self.row_contract.rows
+        self.routed_tokens = min(self.rows, CHUNK_ROWS) if routed_tokens_per_call is None else routed_tokens_per_call
+        if self.routed_tokens not in (self.rows, CHUNK_ROWS) or self.rows % self.routed_tokens:
+            raise ValueError(
+                f"routed tokens per call must be the rows ({self.rows}) or {CHUNK_ROWS}, got {routed_tokens_per_call!r}"
+            )
+        self.routed_calls = self.rows // self.routed_tokens
         self.synchronization_policy = synchronization_policy
         self.expert_mapping = None
         self.local_combine_output = None
+        self._owns_local_combine_output = local_combine_output is None
         self._owned_buffers_released = False
         self._poisoned_error: BaseException | None = None
         self._poisoned_device_owners: list[Any] = []
@@ -376,6 +441,9 @@ class Qwen38TTNNMoE:
         )
         ring_size = effective_matmul_ring_size(mesh_device)
         output_width_shard_dim = auto_output_width_shard_dim(HIDDEN_SIZE, matmul_ring_size=ring_size)
+        self.output_height_shard_dim = moe_compute_output_height_shard_dim(
+            self.routed_tokens, matmul_ring_size=ring_size
+        )
         drain = ttnn.experimental.get_moe_tilize_drain_core(
             mesh_device,
             1,
@@ -386,7 +454,7 @@ class Qwen38TTNNMoE:
         self.routing_l1_memory_config = ttnn.MemoryConfig(
             ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
             ttnn.BufferType.L1,
-            ttnn.ShardSpec(drain_cores, list(self.row_contract.routing_shard), ttnn.ShardOrientation.ROW_MAJOR),
+            ttnn.ShardSpec(drain_cores, [self.routed_tokens, TOP_K], ttnn.ShardOrientation.ROW_MAJOR),
         )
         # DRAM-sharded decode matmul configs.  Every K=2560 linear (router,
         # shared gate/up/scalar) reads the gathered hidden, which the hidden
@@ -406,6 +474,11 @@ class Qwen38TTNNMoE:
             mesh_device, local_intermediate, HIDDEN_SIZE, num_cores=5
         )
         _, self.shared_scalar_program_config = dram_sharded_matmul_configs(mesh_device, HIDDEN_SIZE, 1, num_cores=5)
+        # The gathered hidden lands in the five-core shard the dense linears read; the long chunk gathers its four
+        # row tiles interleaved and moves each tile into that shard per linear.
+        self.hidden_gather_memory_config = (
+            self.hidden_act_memory_config if self.row_contract.row_tiles == 1 else ttnn.DRAM_MEMORY_CONFIG
+        )
 
         try:
             mapping = _expert_owner_mapping()
@@ -417,14 +490,19 @@ class Qwen38TTNNMoE:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 mesh_mapper=replicate_tensor_2d_mesh_mapper(mesh_device),
             )
-            self.local_combine_output = ttnn.from_torch(
-                torch.zeros(self.row_contract.local_combine, dtype=torch.bfloat16),
-                device=mesh_device,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
-                dtype=ttnn.bfloat16,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=replicate_tensor_2d_mesh_mapper(mesh_device),
-            )
+            if local_combine_output is None:
+                local_combine_output = allocate_local_combine_output(mesh_device, mesh_contract, self.routed_tokens)
+            self.local_combine_output = local_combine_output
+            if not self._owns_local_combine_output and (
+                _shape(self.local_combine_output) != (TOP_K, self.routed_tokens, HIDDEN_SIZE)
+                or self.local_combine_output.dtype != ttnn.bfloat16
+                or self.local_combine_output.layout != ttnn.ROW_MAJOR_LAYOUT
+            ):
+                raise RuntimeError(
+                    f"MoE local combine buffer must be ROW_MAJOR BF16 {(TOP_K, self.routed_tokens, HIDDEN_SIZE)}, got "
+                    f"{self.local_combine_output.layout} {self.local_combine_output.dtype} "
+                    f"{_shape(self.local_combine_output)}"
+                )
             mesh_contract.validate_tensor(self.expert_mapping, placement=TensorPlacement.REPLICATED)
             mesh_contract.validate_tensor(self.local_combine_output, placement=TensorPlacement.LOCAL_PARTIAL)
         except BaseException as initialization_error:
@@ -456,7 +534,8 @@ class Qwen38TTNNMoE:
             if tensor is None:
                 continue
             try:
-                ttnn.deallocate(tensor)
+                if name != "local_combine_output" or self._owns_local_combine_output:
+                    ttnn.deallocate(tensor)
             except BaseException as error:
                 failures.append((name, error))
             else:
@@ -510,12 +589,13 @@ class Qwen38TTNNMoE:
         self.mesh_contract.validate_tensor(hidden_sharded, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         # Written in the dense linears' five-core layout; the routed untilize
         # reads the same shard, so the tensor stays allocated through the layer
-        # (32 KB per core).
+        # (32 KB per core).  The long chunk's four row tiles are gathered
+        # interleaved and moved into that layout one tile at a time per linear.
         full_hidden = ttnn.all_gather(
             hidden_sharded,
             dim=3,
             cluster_axis=EP_AXIS,
-            memory_config=self.hidden_act_memory_config,
+            memory_config=self.hidden_gather_memory_config,
         )
         self.mesh_contract.validate_tensor(full_hidden, placement=TensorPlacement.REPLICATED)
         if _shape(full_hidden) != self.row_contract.full_hidden:
@@ -527,58 +607,86 @@ class Qwen38TTNNMoE:
     def _route(self, full_hidden, *, phase_observer=None) -> Qwen38TTNNRouting:
         if phase_observer is None:
             phase_observer = _ignore_phase
+        # The router is a DRAM-sharded decode linear: one row tile per call.  Up to 32 rows the gathered
+        # shard is the call's input; the long chunk runs the router, the FP32 softmax and the top-k per row
+        # tile (the same programs on the same rows) and concatenates the four [1,1,32,10] results.
+        hidden_tiles = [full_hidden]
+        if self.row_contract.row_tiles != 1:
+            hidden_tiles = dram_sharded_row_tiles(full_hidden, self.hidden_act_memory_config)
         phase_observer("before-router-logits")
-        logits_ws = ttnn.linear(
-            full_hidden,
-            self.weights.router,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.router_program_config,
-            compute_kernel_config=self.compute_config,
-        )
-        # The pinned reference evaluates the router softmax in FP32 even though
-        # the projection is BF16.  The move that drains the router's L1 shard
-        # widens the logits on the way out (exact), so no separate typecast.
-        # FP32 is kept through top-k renormalization; only the selected scores
-        # are cast back to the BF16 format consumed by ``moe_compute``.
-        logits = ttnn.to_memory_config(logits_ws, ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32)
-        _deallocate(logits_ws)
-        self.mesh_contract.validate_tensor(logits, placement=TensorPlacement.REPLICATED)
-        expected_logits = (*self.row_contract.full_hidden[:-1], ROUTED_EXPERTS)
-        if _shape(logits) != expected_logits or logits.dtype != ttnn.float32:
-            raise RuntimeError(
-                f"router produced {_shape(logits)} {logits.dtype}, expected {expected_logits} {ttnn.float32}"
+        logits_tiles = []
+        for hidden_tile in hidden_tiles:
+            logits_ws = ttnn.linear(
+                hidden_tile,
+                self.weights.router,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=self.router_program_config,
+                compute_kernel_config=self.compute_config,
             )
+            # The pinned reference evaluates the router softmax in FP32 even though
+            # the projection is BF16.  The move that drains the router's L1 shard
+            # widens the logits on the way out (exact), so no separate typecast.
+            # FP32 is kept through top-k renormalization; only the selected scores
+            # are cast back to the BF16 format consumed by ``moe_compute``.
+            logits_tiles.append(ttnn.to_memory_config(logits_ws, ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32))
+            _deallocate(logits_ws)
+        expected_logits = (1, 1, self.rows, ROUTED_EXPERTS)
+        if self.row_contract.row_tiles != 1:
+            _deallocate(*hidden_tiles)
+            expected_logits = (1, 1, CHUNK_ROWS, ROUTED_EXPERTS)
+        for logits in logits_tiles:
+            self.mesh_contract.validate_tensor(logits, placement=TensorPlacement.REPLICATED)
+            if _shape(logits) != expected_logits or logits.dtype != ttnn.float32:
+                raise RuntimeError(
+                    f"router produced {_shape(logits)} {logits.dtype}, expected {expected_logits} {ttnn.float32}"
+                )
         phase_observer("after-router-logits")
 
         phase_observer("before-router-topk")
-        probabilities = ttnn.softmax(
-            logits,
-            dim=-1,
-            numeric_stable=True,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
-            compute_kernel_config=self.compute_config,
-        )
-        _deallocate(logits)
-        scores, indices = ttnn.topk(
-            probabilities,
-            k=TOP_K,
-            dim=-1,
-            largest=True,
-            sorted=True,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
-        )
-        _deallocate(probabilities)
-        denominator = ttnn.sum(
-            scores,
-            dim=-1,
-            keepdim=True,
-            memory_config=ttnn.L1_MEMORY_CONFIG,
-            compute_kernel_config=self.compute_config,
-        )
-        normalized_fp32 = ttnn.div(scores, denominator, memory_config=ttnn.L1_MEMORY_CONFIG)
-        _deallocate(scores, denominator)
-        normalized = ttnn.typecast(normalized_fp32, ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
-        _deallocate(normalized_fp32)
+        normalized_tiles, indices_tiles = [], []
+        for logits in logits_tiles:
+            probabilities = ttnn.softmax(
+                logits,
+                dim=-1,
+                numeric_stable=True,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+                compute_kernel_config=self.compute_config,
+            )
+            _deallocate(logits)
+            scores, indices = ttnn.topk(
+                probabilities,
+                k=TOP_K,
+                dim=-1,
+                largest=True,
+                sorted=True,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )
+            _deallocate(probabilities)
+            denominator = ttnn.sum(
+                scores,
+                dim=-1,
+                keepdim=True,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+                compute_kernel_config=self.compute_config,
+            )
+            normalized_fp32 = ttnn.div(scores, denominator, memory_config=ttnn.L1_MEMORY_CONFIG)
+            _deallocate(scores, denominator)
+            normalized_tiles.append(ttnn.typecast(normalized_fp32, ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG))
+            indices_tiles.append(indices)
+            _deallocate(normalized_fp32)
+        normalized, indices = normalized_tiles[0], indices_tiles[0]
+        if self.row_contract.row_tiles != 1:
+            # The 32-row program's ROW_MAJOR routing per tile (the per-tile routed stream reads it), stacked.
+            tiles = tuple(self._routing_rows(n, i) for n, i in zip(normalized_tiles, indices_tiles))
+            scores_rm = ttnn.concat([tile.scores for tile in tiles], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            indices_rm = ttnn.concat([tile.indices for tile in tiles], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            if _shape(scores_rm) != self.row_contract.routing or _shape(indices_rm) != self.row_contract.routing:
+                raise RuntimeError(
+                    f"router top-k shapes must be {self.row_contract.routing}, got scores={_shape(scores_rm)} "
+                    f"indices={_shape(indices_rm)}"
+                )
+            phase_observer("after-router-topk")
+            return Qwen38TTNNRouting(scores_rm, indices_rm, tiles)
         scores_rm = ttnn.to_layout(normalized, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         indices_rm = ttnn.to_layout(indices, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(normalized, indices)
@@ -629,6 +737,8 @@ class Qwen38TTNNMoE:
         if packed_w0_w1.dtype != ttnn.bfloat4_b or packed_w2.dtype != ttnn.bfloat4_b:
             raise RuntimeError("routed expert tensors must be BFLOAT4_B")
 
+        if self.routed_calls != 1:
+            return self._routed_partial_tiles(full_hidden, routing, packed_w0_w1, packed_w2, phase_observer)
         phase_observer("before-routed-dispatch")
         # Keep the ordinary one-row call byte/API-compatible with the existing
         # rank-four input.  A multi-row instance must expose its rows in dim 1:
@@ -691,7 +801,7 @@ class Qwen38TTNNMoE:
             packed_w0_w1,
             packed_w2,
             layer_id=0,
-            output_height_shard_dim=1,
+            output_height_shard_dim=self.output_height_shard_dim,
             intermediate_size=INTERMEDIATE_SIZE,
             has_bias=False,
             cluster_axis=LOCAL_COMBINE_AXIS,
@@ -759,6 +869,127 @@ class Qwen38TTNNMoE:
         phase_observer("after-selective-reduce")
         return fast_outputs[0]
 
+    def _routing_rows(self, normalized, indices) -> Qwen38TTNNRouting:
+        """One row tile's top-k as the 32-row program's ROW_MAJOR BF16 scores and UINT16 indices ``[1,1,32,10]``."""
+
+        scores_rm = ttnn.to_layout(normalized, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        indices_rm = ttnn.to_layout(indices, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(normalized, indices)
+        if indices_rm.dtype != ttnn.uint16:
+            converted = ttnn.typecast(indices_rm, ttnn.uint16, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(indices_rm)
+            indices_rm = converted
+        expected = (1, 1, CHUNK_ROWS, TOP_K)
+        if _shape(scores_rm) != expected or _shape(indices_rm) != expected:
+            raise RuntimeError(
+                f"router top-k tile shapes must be {expected}, got scores={_shape(scores_rm)} indices={_shape(indices_rm)}"
+            )
+        self.mesh_contract.validate_tensor(scores_rm, placement=TensorPlacement.REPLICATED)
+        self.mesh_contract.validate_tensor(indices_rm, placement=TensorPlacement.REPLICATED)
+        return Qwen38TTNNRouting(scores_rm, indices_rm)
+
+    def _routed_partial_tiles(self, full_hidden, routing: Qwen38TTNNRouting, packed_w0_w1, packed_w2, phase_observer):
+        """The routed stream one 32-row tile at a time: the 32-row instance's ``moe_compute`` and weighted reduce
+        on each tile (its rows and its ROW_MAJOR routing), the partials concatenated; bitwise the 32-row chunk."""
+
+        if routing.tiles is None or len(routing.tiles) != self.routed_calls:
+            raise ValueError(f"the per-tile routed stream needs {self.routed_calls} routing tiles")
+        phase_observer("before-routed-dispatch")
+        tile_rows = (1, 1, self.routed_tokens, HIDDEN_SIZE)
+        sparse_shape = (1, self.routed_tokens, HIDDEN_SIZE)
+        routing_shape = (1, self.routed_tokens, TOP_K)
+        combine_shape = (TOP_K, self.routed_tokens, HIDDEN_SIZE)
+        partials = []
+        for rows, tile_routing in zip(dram_sharded_row_tiles(full_hidden, None), routing.tiles):
+            if _shape(rows) != tile_rows:
+                raise RuntimeError(f"routed tile rows are {_shape(rows)}, expected {tile_rows}")
+            sparse_input = ttnn.to_layout(
+                ttnn.reshape(rows, sparse_shape), ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+            _deallocate(rows)
+            if _shape(sparse_input) != sparse_shape:
+                raise RuntimeError(f"moe_compute sparse input must be {sparse_shape}, got {_shape(sparse_input)}")
+            indices_l1 = ttnn.to_memory_config(
+                ttnn.reshape(tile_routing.indices, routing_shape), self.routing_l1_memory_config
+            )
+            scores_l1 = ttnn.to_memory_config(
+                ttnn.reshape(tile_routing.scores, routing_shape), self.routing_l1_memory_config
+            )
+            if (
+                _shape(indices_l1) != routing_shape
+                or indices_l1.layout != ttnn.ROW_MAJOR_LAYOUT
+                or indices_l1.dtype != ttnn.uint16
+                or _shape(scores_l1) != routing_shape
+                or scores_l1.layout != ttnn.ROW_MAJOR_LAYOUT
+                or scores_l1.dtype != ttnn.bfloat16
+            ):
+                raise RuntimeError("moe_compute tile routing is not RM UINT16 / BF16 on the exact L1 drain-core shard")
+            zeroed = ttnn.fill(self.local_combine_output, 0.0, output_tensor=self.local_combine_output)
+            if zeroed.tensor_id != self.local_combine_output.tensor_id:
+                raise RuntimeError("ttnn.fill did not update the persistent local-combine buffer in place")
+            phase_observer("before-moe-compute-launch")
+            outputs = ttnn.experimental.moe_compute(
+                sparse_input,
+                indices_l1,
+                scores_l1,
+                self.expert_mapping,
+                packed_w0_w1,
+                packed_w2,
+                layer_id=0,
+                output_height_shard_dim=self.output_height_shard_dim,
+                intermediate_size=INTERMEDIATE_SIZE,
+                has_bias=False,
+                cluster_axis=LOCAL_COMBINE_AXIS,
+                topology=None,
+                num_links=None,
+                mux_core_range_set=None,
+                output_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                optional_output_tensor=self.local_combine_output,
+                optional_cross_device_semaphore=None,
+                activation_type=MoEActivationFunction.SILU,
+                compute_only=False,
+                local_combine=True,
+                num_shared_experts_per_device=0,
+            )
+            phase_observer("after-moe-compute-launch")
+            if len(outputs) != 6 or outputs[5].tensor_id != self.local_combine_output.tensor_id:
+                raise RuntimeError("local moe_compute did not return the persistent six-slot output")
+            if _shape(outputs[5]) != combine_shape:
+                raise RuntimeError(f"local combine produced {_shape(outputs[5])}, expected {combine_shape}")
+            _deallocate(outputs[0], outputs[1], outputs[2], outputs[4], sparse_input, indices_l1, scores_l1)
+            local_stack_tiled = ttnn.to_layout(
+                ttnn.unsqueeze(outputs[5], dim=1), ttnn.TILE_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG, pad_value=0.0
+            )
+            fast_outputs = ttnn.experimental.deepseek_moe_fast_reduce_nc_fused(
+                local_stack_tiled,
+                tile_routing.indices,
+                self.expert_mapping,
+                reduce_dim=0,
+                split_size=HIDDEN_SIZE,
+                cluster_axis=LOCAL_COMBINE_AXIS,
+                output_memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                scores_tensor=ttnn.reshape(tile_routing.scores, (self.routed_tokens, 1, 1, TOP_K)),
+                num_shared_experts=0,
+                shared_expert_scale=1.0,
+                compute_kernel_config=self.compute_config,
+            )
+            _deallocate(local_stack_tiled)
+            if len(fast_outputs) != 1 or _shape(fast_outputs[0]) != tile_rows:
+                raise RuntimeError(
+                    f"weighted routed reduce must return one {tile_rows} partial, got "
+                    f"{tuple(_shape(item) for item in fast_outputs)}"
+                )
+            partials.append(fast_outputs[0])
+        phase_observer("after-routed-dispatch")
+        partial = ttnn.concat(partials, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(*partials)
+        self.mesh_contract.mark_local_partial(
+            partial, replicated_reference=full_hidden, expected_shape=self.row_contract.full_hidden
+        )
+        phase_observer("before-selective-reduce")
+        phase_observer("after-selective-reduce")
+        return partial
+
     def _shared_partial(self, hidden_sharded, full_hidden):
         if _shape(hidden_sharded) != self.row_contract.hidden_sharded:
             raise ValueError(
@@ -768,54 +999,68 @@ class Qwen38TTNNMoE:
             raise ValueError(
                 f"shared-expert full hidden must be {self.row_contract.full_hidden}, got {_shape(full_hidden)}"
             )
-        gate = ttnn.linear(
-            full_hidden,
-            self.weights.shared_gate,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.shared_gate_up_program_config,
-            compute_kernel_config=self.compute_config,
-        )
-        up = ttnn.linear(
-            full_hidden,
-            self.weights.shared_up,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.shared_gate_up_program_config,
-            compute_kernel_config=self.compute_config,
-        )
-        self.mesh_contract.validate_tensor(gate, placement=TensorPlacement.INTERMEDIATE_SHARDED, shard_dim=3)
-        self.mesh_contract.validate_tensor(up, placement=TensorPlacement.INTERMEDIATE_SHARDED, shard_dim=3)
-        gate_activated = ttnn.silu(gate, memory_config=self.shared_intermediate_memory_config)
-        intermediate = ttnn.mul(gate_activated, up, memory_config=self.shared_intermediate_memory_config)
-        _deallocate(gate, gate_activated, up)
-        partial = ttnn.linear(
-            intermediate,
-            self.weights.shared_down,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.shared_down_program_config,
-            compute_kernel_config=self.compute_config,
-        )
-        _deallocate(intermediate)
-        self.mesh_contract.mark_local_partial(
-            partial,
-            replicated_reference=full_hidden,
-            expected_shape=self.row_contract.full_hidden,
-        )
+        # The four shared-expert linears are DRAM-sharded decode linears (one row tile per call): the long
+        # chunk runs the whole shared chain per row tile and concatenates the gated partials.
+        hidden_tiles = [full_hidden]
+        tile_shape = self.row_contract.full_hidden
+        if self.row_contract.row_tiles != 1:
+            hidden_tiles = dram_sharded_row_tiles(full_hidden, self.hidden_act_memory_config)
+            tile_shape = (1, 1, CHUNK_ROWS, HIDDEN_SIZE)
+        gated_partials = []
+        for hidden_tile in hidden_tiles:
+            gate = ttnn.linear(
+                hidden_tile,
+                self.weights.shared_gate,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=self.shared_gate_up_program_config,
+                compute_kernel_config=self.compute_config,
+            )
+            up = ttnn.linear(
+                hidden_tile,
+                self.weights.shared_up,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=self.shared_gate_up_program_config,
+                compute_kernel_config=self.compute_config,
+            )
+            self.mesh_contract.validate_tensor(gate, placement=TensorPlacement.INTERMEDIATE_SHARDED, shard_dim=3)
+            self.mesh_contract.validate_tensor(up, placement=TensorPlacement.INTERMEDIATE_SHARDED, shard_dim=3)
+            gate_activated = ttnn.silu(gate, memory_config=self.shared_intermediate_memory_config)
+            intermediate = ttnn.mul(gate_activated, up, memory_config=self.shared_intermediate_memory_config)
+            _deallocate(gate, gate_activated, up)
+            partial = ttnn.linear(
+                intermediate,
+                self.weights.shared_down,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=self.shared_down_program_config,
+                compute_kernel_config=self.compute_config,
+            )
+            _deallocate(intermediate)
+            self.mesh_contract.mark_local_partial(
+                partial,
+                replicated_reference=full_hidden,
+                expected_shape=tile_shape,
+            )
 
-        scalar_ws = ttnn.linear(
-            full_hidden,
-            self.weights.shared_scalar_gate,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.shared_scalar_program_config,
-            compute_kernel_config=self.compute_config,
-        )
-        scalar = ttnn.to_memory_config(scalar_ws, ttnn.DRAM_MEMORY_CONFIG)
-        _deallocate(scalar_ws)
-        self.mesh_contract.validate_tensor(scalar, placement=TensorPlacement.REPLICATED)
-        scalar_gate = ttnn.sigmoid(scalar, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        # The five-core partial is read in place; the scalar gate broadcasts
-        # from DRAM and the product lands interleaved for the branch add.
-        gated_partial = ttnn.mul(partial, scalar_gate, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        _deallocate(partial, scalar, scalar_gate)
+            scalar_ws = ttnn.linear(
+                hidden_tile,
+                self.weights.shared_scalar_gate,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=self.shared_scalar_program_config,
+                compute_kernel_config=self.compute_config,
+            )
+            scalar = ttnn.to_memory_config(scalar_ws, ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(scalar_ws)
+            self.mesh_contract.validate_tensor(scalar, placement=TensorPlacement.REPLICATED)
+            scalar_gate = ttnn.sigmoid(scalar, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            # The five-core partial is read in place; the scalar gate broadcasts
+            # from DRAM and the product lands interleaved for the branch add.
+            gated_partials.append(ttnn.mul(partial, scalar_gate, memory_config=ttnn.DRAM_MEMORY_CONFIG))
+            _deallocate(partial, scalar, scalar_gate)
+        gated_partial = gated_partials[0]
+        if self.row_contract.row_tiles != 1:
+            _deallocate(*hidden_tiles)
+            gated_partial = ttnn.concat(gated_partials, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(*gated_partials)
         self.mesh_contract.mark_local_partial(
             gated_partial,
             replicated_reference=full_hidden,
@@ -859,6 +1104,7 @@ class Qwen38TTNNMoE:
             "full_hidden": None,
             "routing_scores": None,
             "routing_indices": None,
+            "routing_tiles": None,
             "shared_partial": None,
             "routed_partial": None,
             "local_sum": None,
@@ -869,7 +1115,12 @@ class Qwen38TTNNMoE:
             tensor = temporaries[name]
             if tensor is None:
                 return
-            ttnn.deallocate(tensor)
+            if name == "routing_tiles":
+                for tile in tensor:
+                    ttnn.deallocate(tile.scores)
+                    ttnn.deallocate(tile.indices)
+            else:
+                ttnn.deallocate(tensor)
             # Clear immediately after each successful release so a later
             # release failure never retries an already-freed device owner.
             temporaries[name] = None
@@ -897,6 +1148,7 @@ class Qwen38TTNNMoE:
             routing = self._route(temporaries["full_hidden"], phase_observer=observe)
             temporaries["routing_scores"] = routing.scores
             temporaries["routing_indices"] = routing.indices
+            temporaries["routing_tiles"] = routing.tiles
             self._synchronize_stage("route")
             raise_deferred_phase_error()
 
@@ -970,9 +1222,10 @@ class Qwen38TTNNMoE:
             # same-CQ ownership boundary; fenced mode additionally drains.
             observe("before-output-release")
             raise_deferred_phase_error()
-            release_many("local_sum", "full_hidden")
+            release_many("local_sum", "full_hidden", "routing_tiles")
 
             if return_routing:
+                # The routing tiles (the long chunk's per-tile inputs) are released above; the caller reads scores/indices.
                 result = Qwen38TTNNMoEResult(temporaries["output"], routing)
                 temporaries["output"] = None
                 temporaries["routing_scores"] = None
@@ -1041,6 +1294,7 @@ class Qwen38TTNNMoE:
                 "full_hidden",
                 "routing_scores",
                 "routing_indices",
+                "routing_tiles",
             ):
                 try:
                     release(name)

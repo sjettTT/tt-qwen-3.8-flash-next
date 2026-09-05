@@ -414,17 +414,19 @@ class FakeChunk:
                 "constants": (eye, tril, ones, masks),
             }
         )
-        assert output_final_state and chunk_size == 32 and q.shape[1] == 32, (chunk_size, q.shape)
+        # T is one full chunk (32) or the long prefill chunk's four chunks (128): pad == 0 either way.
+        rows = q.shape[1]
+        assert output_final_state and chunk_size == 32 and rows in (32, 128), (chunk_size, q.shape)
         assert q.dtype is BF16 and k.dtype is BF16 and v.dtype is BF16 and g.dtype is FP32 and beta.dtype is FP32
         assert initial_state.dtype is FP32
         if flat_v:
-            assert v.shape == (1, 32, HEADS * HEAD_DIM), v.shape  # T must be one full chunk: pad == 0
+            assert v.shape == (1, rows, HEADS * HEAD_DIM), v.shape
         outputs, states = [], []
         for index in range(TP):
             o, s = self.impl(
                 q.torch_shards()[index],
                 k.torch_shards()[index],
-                v.torch_shards()[index].reshape(1, 32, HEADS, HEAD_DIM) if flat_v else v.torch_shards()[index],
+                v.torch_shards()[index].reshape(1, rows, HEADS, HEAD_DIM) if flat_v else v.torch_shards()[index],
                 g.torch_shards()[index],
                 beta.torch_shards()[index],
                 scale,
@@ -434,7 +436,7 @@ class FakeChunk:
             states.append(s)
         if output_head_major:
             # [B*HV, T, V] TILE: the kernel's own head-major layout, fp32 on the pinned runtime.
-            heads = [o.permute(0, 2, 1, 3).reshape(HEADS, 32, HEAD_DIM).contiguous() for o in outputs]
+            heads = [o.permute(0, 2, 1, 3).reshape(HEADS, rows, HEAD_DIM).contiguous() for o in outputs]
             return FakeTensor(heads, FP32, TILE), FakeTensor(states, FP32, TILE)
         return FakeTensor(outputs, FP32, ROW_MAJOR), FakeTensor(states, FP32, TILE)  # fp32 token-major, as on device
 

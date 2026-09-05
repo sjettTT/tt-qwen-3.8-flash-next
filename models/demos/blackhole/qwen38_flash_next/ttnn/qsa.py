@@ -45,15 +45,18 @@ from models.demos.blackhole.qwen36.tt.attention.rope_tp import apply_partial_rop
 from models.demos.blackhole.qwen38_flash_next.checkpoint import INDEX_SHA256, Qwen38Checkpoint
 from models.demos.blackhole.qwen38_flash_next.config import Qwen38Placement
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
+    CHUNK_ROW_COUNTS,
     CHUNK_ROWS,
     MESH_SHAPE,
     Qwen38MeshContract,
     TensorPlacement,
+    chunk_row_tiles,
     replicate_tensor_2d_mesh_mapper,
     tensor_metadata,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
+    dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
 )
 
@@ -954,73 +957,85 @@ def emulate_qsa_position_inputs(position: int, *, allocated_compressed_blocks: i
     }
 
 
-# --------------------------------------------------------------------------- prefill chunk (32 rows)
-# One chunk holds CHUNK_ROWS consecutive positions P .. P + 31 with P % 32 == 0: eight complete
-# compressed blocks, one 32-row KV slab, and per row the selection geometry of position P + j.  Every
+# --------------------------------------------------------------------------- prefill chunk (32 or 128 rows)
+# One chunk holds ``rows`` consecutive positions P .. P + rows - 1 with P % 32 == 0: rows / 4 complete
+# compressed blocks, one rows-row KV slab, and per row the selection geometry of position P + j.  Every
 # per-row quantity below is the 1-row derivation on a same-shape template whose row j carries j, so
-# the only broadcast is the scalar P (the class the decode already uses).
+# the only broadcast is the scalar P (the class the decode already uses).  The 128-row form runs every
+# row-shaped op on the four tiles at once and the six DRAM-sharded linears and the indexer once per tile.
 
 CHUNK_BLOCKS = CHUNK_ROWS // COMPRESS_RATIO
 
 
-def qsa_chunk_constant_rows(allocated_compressed_blocks: int) -> dict[str, torch.Tensor]:
+def chunk_blocks(rows: int) -> int:
+    """Complete compressed blocks of one chunk form (8 or 32)."""
+
+    return chunk_row_tiles(rows) * CHUNK_BLOCKS
+
+
+def qsa_chunk_constant_rows(allocated_compressed_blocks: int, rows: int = CHUNK_ROWS) -> dict[str, torch.Tensor]:
     """Host images of the chunk constants (UINT32 rows as int64; the two bf16 select tiles as float).
 
-    ``pool_select`` row i (i < 8) holds 0.25 at columns 4i .. 4i+3: ``pool_select @ raw_keys`` is the block
-    mean of the chunk's raw index keys (four exact power-of-two products summed in fp32, one bf16 rounding:
-    the same value as the decode ring's quarter-scaled sum).  ``row_select[i]`` is the 0/1 tile whose row 0
-    picks row i (the exact selection matmul of the GDN rows path), so block i's compressed row becomes the
-    one-row input of ``paged_update_cache``.
+    ``arange32_lanes`` ``[1,1,tiles,32]`` carries lane j = j over the chunk's row tiles.  ``pool_select``
+    ``[32, rows]`` row i (i < rows / 4) holds 0.25 at columns 4i .. 4i+3: ``pool_select @ raw_keys`` is the
+    block mean of the chunk's raw index keys (four exact power-of-two products summed in fp32, one bf16
+    rounding: the same value as the decode ring's quarter-scaled sum; at 128 rows the other three K tiles add
+    exact zeros).  ``row_select[i]`` is the 0/1 tile whose row 0 picks row i (the exact selection matmul of
+    the GDN rows path), so block i's compressed row becomes the one-row input of ``paged_update_cache``.
     """
 
     blocks = validate_qsa_cache_capacity(allocated_compressed_blocks * COMPRESS_RATIO) // COMPRESS_RATIO
-    rows = torch.arange(CHUNK_ROWS, dtype=torch.int64).reshape(1, 1, CHUNK_ROWS, 1)
+    tiles = chunk_row_tiles(rows)
+    block_count = chunk_blocks(rows)
+    row_index = torch.arange(rows, dtype=torch.int64).reshape(1, 1, rows, 1)
     lanes = torch.arange(CHUNK_ROWS, dtype=torch.int64)
-    block_start_lanes = torch.where(lanes < CHUNK_BLOCKS, lanes * COMPRESS_RATIO, torch.zeros_like(lanes))
-    pool_select = torch.zeros(CHUNK_ROWS, CHUNK_ROWS)
-    for block in range(CHUNK_BLOCKS):
+    block_start_lanes = torch.where(lanes < block_count, lanes * COMPRESS_RATIO, torch.zeros_like(lanes))
+    pool_select = torch.zeros(CHUNK_ROWS, rows)
+    for block in range(block_count):
         pool_select[block, block * COMPRESS_RATIO : (block + 1) * COMPRESS_RATIO] = 1.0 / COMPRESS_RATIO
-    row_selects = torch.zeros(CHUNK_BLOCKS, CHUNK_ROWS, CHUNK_ROWS)
-    for block in range(CHUNK_BLOCKS):
+    row_selects = torch.zeros(block_count, CHUNK_ROWS, CHUNK_ROWS)
+    for block in range(block_count):
         row_selects[block, 0, block] = 1.0
     return {
-        "arange32_lanes": lanes.reshape(1, 1, 1, CHUNK_ROWS),
+        "arange32_lanes": torch.arange(rows, dtype=torch.int64).reshape(1, 1, tiles, CHUNK_ROWS),
         "block_start_lanes": block_start_lanes.reshape(1, 1, 1, CHUNK_ROWS),
-        "row_index_blocks": rows.expand(1, 1, CHUNK_ROWS, blocks).contiguous(),
+        "row_index_blocks": row_index.expand(1, 1, rows, blocks).contiguous(),
         "arange_blocks_rows": torch.arange(blocks, dtype=torch.int64)
         .reshape(1, 1, 1, blocks)
-        .expand(1, 1, CHUNK_ROWS, blocks)
+        .expand(1, 1, rows, blocks)
         .contiguous(),
-        "row_index_slots": rows.expand(1, 1, CHUNK_ROWS, SPARSE_INDEX_CAPACITY).contiguous(),
+        "row_index_slots": row_index.expand(1, 1, rows, SPARSE_INDEX_CAPACITY).contiguous(),
         "arange_slots_rows": torch.arange(SPARSE_INDEX_CAPACITY, dtype=torch.int64)
         .reshape(1, 1, 1, SPARSE_INDEX_CAPACITY)
-        .expand(1, 1, CHUNK_ROWS, SPARSE_INDEX_CAPACITY)
+        .expand(1, 1, rows, SPARSE_INDEX_CAPACITY)
         .contiguous(),
-        "all_ones_rows": torch.full((1, 1, CHUNK_ROWS, SPARSE_INDEX_CAPACITY), ALL_ONES_U32, dtype=torch.int64),
-        "block_offsets_rows": qsa_row_constants()["block_offsets"].expand(1, 1, CHUNK_ROWS, TOKEN_BUDGET).contiguous(),
+        "all_ones_rows": torch.full((1, 1, rows, SPARSE_INDEX_CAPACITY), ALL_ONES_U32, dtype=torch.int64),
+        "block_offsets_rows": qsa_row_constants()["block_offsets"].expand(1, 1, rows, TOKEN_BUDGET).contiguous(),
         "sentinel_pad_rows": qsa_row_constants()["sentinel_pad"]
-        .expand(1, 1, CHUNK_ROWS, SPARSE_INDEX_CAPACITY - TOKEN_BUDGET)
+        .expand(1, 1, rows, SPARSE_INDEX_CAPACITY - TOKEN_BUDGET)
         .contiguous(),
-        "pool_select": pool_select.reshape(1, 1, CHUNK_ROWS, CHUNK_ROWS),
-        "row_selects": row_selects.reshape(CHUNK_BLOCKS, 1, 1, CHUNK_ROWS, CHUNK_ROWS),
+        "pool_select": pool_select.reshape(1, 1, CHUNK_ROWS, rows),
+        "row_selects": row_selects.reshape(block_count, 1, 1, CHUNK_ROWS, CHUNK_ROWS),
     }
 
 
 @dataclass(frozen=True)
 class Qwen38TTNNQSAChunkConstants:
-    """Replicated constants of the chunk path, one set per model (about 2.3 MB at 8192 resident blocks).
+    """Replicated constants of one chunk form, one set per model per row count (about 2.3 MB at 8192 resident
+    blocks for 32 rows, four times that for 128).
 
-    UINT32 ROW_MAJOR: ``arange32_lanes`` / ``block_start_lanes`` ``[1,1,1,32]`` (lane j = j; lane i = 4i for
-    the eight block starts) added to the position's index row for the RoPE lookups; ``row_index_blocks`` /
-    ``arange_blocks_rows`` ``[1,1,32,blocks]`` and ``row_index_slots`` / ``arange_slots_rows`` /
-    ``all_ones_rows`` ``[1,1,32,2080]``, the same-shape templates of the per-row geometry;
-    ``block_offsets_rows`` ``[1,1,32,2048]`` and ``sentinel_pad_rows`` ``[1,1,32,32]``, the 1-row index rows
-    repeated per row.  BF16 TILE: ``pool_select`` ``[1,1,32,32]``, the eight ``row_selects`` (see
-    :func:`qsa_chunk_constant_rows`) and ``zero_value_half_rows`` ``[1,6,32,256]``, the zero V half of the
-    sparse_sdpa query rows.
+    UINT32 ROW_MAJOR: ``arange32_lanes`` ``[1,1,tiles,32]`` (lane j = j) and ``block_start_lanes`` ``[1,1,1,32]``
+    (lane i = 4i for the rows / 4 block starts) added to the position's index row for the RoPE lookups;
+    ``row_index_blocks`` / ``arange_blocks_rows`` ``[1,1,rows,blocks]`` and ``row_index_slots`` /
+    ``arange_slots_rows`` / ``all_ones_rows`` ``[1,1,rows,2080]``, the same-shape templates of the per-row
+    geometry; ``block_offsets_rows`` ``[1,1,rows,2048]`` and ``sentinel_pad_rows`` ``[1,1,rows,32]``, the 1-row
+    index rows repeated per row.  BF16 TILE: ``pool_select`` ``[1,1,32,rows]``, the rows / 4 ``row_selects``
+    (see :func:`qsa_chunk_constant_rows`) and ``zero_value_half_rows`` ``[1,6,rows,128]``, the zero V half of
+    the sparse_sdpa query rows.
     """
 
     allocated_compressed_blocks: int
+    rows: int
     arange32_lanes: Any
     block_start_lanes: Any
     row_index_blocks: Any
@@ -1036,10 +1051,10 @@ class Qwen38TTNNQSAChunkConstants:
 
     @classmethod
     def build(
-        cls, mesh_device, mesh_contract: Qwen38MeshContract, allocated_compressed_blocks: int
+        cls, mesh_device, mesh_contract: Qwen38MeshContract, allocated_compressed_blocks: int, *, rows: int = CHUNK_ROWS
     ) -> "Qwen38TTNNQSAChunkConstants":
         mesh_contract.validate_mesh(mesh_device)
-        host = qsa_chunk_constant_rows(allocated_compressed_blocks)
+        host = qsa_chunk_constant_rows(allocated_compressed_blocks, rows)
         uploaded: list[Any] = []
 
         def upload_uint32(name: str):
@@ -1064,6 +1079,7 @@ class Qwen38TTNNQSAChunkConstants:
         try:
             return cls(
                 allocated_compressed_blocks=int(host["row_index_blocks"].shape[-1]),
+                rows=rows,
                 arange32_lanes=upload_uint32("arange32_lanes"),
                 block_start_lanes=upload_uint32("block_start_lanes"),
                 row_index_blocks=upload_uint32("row_index_blocks"),
@@ -1076,10 +1092,10 @@ class Qwen38TTNNQSAChunkConstants:
                 pool_select=upload_bf16(host["pool_select"], "QSA chunk pool select"),
                 row_selects=tuple(
                     upload_bf16(host["row_selects"][block], f"QSA chunk row select {block}")
-                    for block in range(CHUNK_BLOCKS)
+                    for block in range(chunk_blocks(rows))
                 ),
                 zero_value_half_rows=upload_bf16(
-                    torch.zeros(1, QUERY_HEADS_PER_DEVICE, CHUNK_ROWS, HEAD_DIM), "QSA chunk zero value half rows"
+                    torch.zeros(1, QUERY_HEADS_PER_DEVICE, rows, HEAD_DIM), "QSA chunk zero value half rows"
                 ),
             )
         except BaseException:
@@ -1107,11 +1123,12 @@ class Qwen38TTNNQSAChunkConstants:
 class Qwen38TTNNQSAChunkInputs:
     """Per-chunk device tensors derived from the position; shared by all QSA layers.
 
-    ``kv_block_start`` UINT32 ``[1,1,1,1]`` (= P), ``block_index_i32`` eight INT32 ``[1]`` (P/4 + i),
-    ``indexer_neg_mask`` BF16 ROW_MAJOR ``[1,1,32,blocks]`` and the UINT32 ROW_MAJOR ``[1,1,32,2080]``
+    ``kv_block_start`` UINT32 ``[1,1,1,1]`` (= P), ``block_index_i32`` rows / 4 INT32 ``[1]`` (P/4 + i),
+    ``indexer_neg_mask`` BF16 ROW_MAJOR ``[1,1,rows,blocks]`` and the UINT32 ROW_MAJOR ``[1,1,rows,2080]``
     ``row_keep_bits`` / ``row_fill``: row j is the 1-row input at position P + j.
     """
 
+    rows: int
     kv_block_start: Any
     block_index_i32: tuple[Any, ...]
     indexer_neg_mask: Any
@@ -1129,13 +1146,13 @@ def derive_qsa_chunk_inputs(
     constants: Qwen38TTNNQSAPositionConstants,
     chunk: Qwen38TTNNQSAChunkConstants,
     *,
-    completed_blocks: int = CHUNK_BLOCKS,
+    completed_blocks: int | None = None,
 ) -> Qwen38TTNNQSAChunkInputs:
-    """:func:`derive_qsa_position_inputs` for the 32 rows of a chunk: the same exact UINT32 ops on the
+    """:func:`derive_qsa_position_inputs` for the rows of a chunk: the same exact UINT32 ops on the
     same-shape templates, with ``P`` the only broadcast operand (``pos = row_index + P``).  The staging
     and ring one-hots have no chunk form: the slab and the compressed blocks are written whole.
-    ``completed_blocks`` is the number of compressed block indices derived (P // 4 + i): the chunk's eight, or
-    the two a verify pass can complete."""
+    ``completed_blocks`` is the number of compressed block indices derived (P // 4 + i): the chunk's (eight at 32
+    rows, 32 at 128 rows: the default), or the two a verify pass can complete."""
 
     _require_shape(position_scalar, (1, 1, 1, 1), "QSA position scalar")
     if position_scalar.dtype != ttnn.uint32 or position_scalar.layout != ttnn.ROW_MAJOR_LAYOUT:
@@ -1143,18 +1160,25 @@ def derive_qsa_chunk_inputs(
     dram = ttnn.DRAM_MEMORY_CONFIG
     u32 = ttnn.uint32
     blocks = chunk.allocated_compressed_blocks
+    rows = chunk.rows
     if blocks != constants.allocated_compressed_blocks:
         raise ValueError(
             f"QSA chunk constants were built for {blocks} blocks, "
             f"the position constants for {constants.allocated_compressed_blocks}"
         )
 
+    # A prefill chunk derives its own block count (8 or 32) on its own templates; the verify rows (R <= 32, not a
+    # chunk form) name theirs and read the 32-row chunk templates clamped to R rows.
+    template_rows = rows if rows in CHUNK_ROW_COUNTS else CHUNK_ROWS
+    max_blocks = chunk_blocks(rows) if rows in CHUNK_ROW_COUNTS else CHUNK_BLOCKS
+    if completed_blocks is None:
+        completed_blocks = max_blocks
     if (
         isinstance(completed_blocks, bool)
         or type(completed_blocks) is not int
-        or not 1 <= completed_blocks <= CHUNK_BLOCKS
+        or not 1 <= completed_blocks <= max_blocks
     ):
-        raise ValueError(f"QSA chunk inputs derive 1..{CHUNK_BLOCKS} block indices, got {completed_blocks!r}")
+        raise ValueError(f"QSA chunk inputs derive 1..{max_blocks} block indices, got {completed_blocks!r}")
     kv_block_start = ttnn.bitwise_and(position_scalar, constants.high27_mask, memory_config=dram)
     block_index = ttnn.bitwise_right_shift(position_scalar, 2, memory_config=dram)
     block_indices_i32 = []
@@ -1215,6 +1239,7 @@ def derive_qsa_chunk_inputs(
         row_sentinel_bits,
     )
     inputs = Qwen38TTNNQSAChunkInputs(
+        rows=template_rows,
         kv_block_start=kv_block_start,
         block_index_i32=tuple(block_indices_i32),
         indexer_neg_mask=indexer_neg_mask,
@@ -1223,9 +1248,9 @@ def derive_qsa_chunk_inputs(
     )
     for name, tensor, shape, dtype, layout in (
         ("kv_block_start", kv_block_start, (1, 1, 1, 1), u32, ttnn.ROW_MAJOR_LAYOUT),
-        ("indexer_neg_mask", indexer_neg_mask, (1, 1, CHUNK_ROWS, blocks), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT),
-        ("row_keep_bits", row_keep_bits, (1, 1, CHUNK_ROWS, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
-        ("row_fill", row_fill, (1, 1, CHUNK_ROWS, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
+        ("indexer_neg_mask", indexer_neg_mask, (1, 1, template_rows, blocks), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT),
+        ("row_keep_bits", row_keep_bits, (1, 1, template_rows, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
+        ("row_fill", row_fill, (1, 1, template_rows, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
         *(
             (f"block_index_i32[{i}]", t, (1,), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
             for i, t in enumerate(block_indices_i32)
@@ -1239,23 +1264,25 @@ def derive_qsa_chunk_inputs(
     return inputs
 
 
-def emulate_qsa_chunk_inputs(position: int, *, allocated_compressed_blocks: int) -> dict[str, torch.Tensor]:
+def emulate_qsa_chunk_inputs(
+    position: int, *, allocated_compressed_blocks: int, rows: int = CHUNK_ROWS
+) -> dict[str, torch.Tensor]:
     """Torch reference of :func:`derive_qsa_chunk_inputs`: row j is :func:`emulate_qsa_position_inputs` at P + j."""
 
     if isinstance(position, bool) or not isinstance(position, int) or position % CHUNK_ROWS:
         raise ValueError(f"QSA chunk position must be an integer multiple of {CHUNK_ROWS}, got {position!r}")
-    rows = [
+    per_row = [
         emulate_qsa_position_inputs(position + row, allocated_compressed_blocks=allocated_compressed_blocks)
-        for row in range(CHUNK_ROWS)
+        for row in range(rows)
     ]
     return {
-        "kv_block_start": rows[0]["kv_block_start"],
+        "kv_block_start": per_row[0]["kv_block_start"],
         "block_index_i32": tuple(
-            torch.tensor([position // COMPRESS_RATIO + block], dtype=torch.int32) for block in range(CHUNK_BLOCKS)
+            torch.tensor([position // COMPRESS_RATIO + block], dtype=torch.int32) for block in range(chunk_blocks(rows))
         ),
-        "indexer_neg_mask": torch.cat([row["indexer_neg_mask"] for row in rows], dim=2),
-        "row_keep_bits": torch.cat([row["row_keep_bits"] for row in rows], dim=2),
-        "row_fill": torch.cat([row["row_fill"] for row in rows], dim=2),
+        "indexer_neg_mask": torch.cat([row["indexer_neg_mask"] for row in per_row], dim=2),
+        "row_keep_bits": torch.cat([row["row_keep_bits"] for row in per_row], dim=2),
+        "row_fill": torch.cat([row["row_fill"] for row in per_row], dim=2),
     }
 
 
@@ -1641,12 +1668,14 @@ class Qwen38TTNNQSAVerifyState:
 
 @dataclass(frozen=True)
 class Qwen38TTNNQSAChunkState:
-    """Per-layer fixed-address sources of the prefill hand-off: the chunk's own ``[v|k]`` slab ``[1,1,32,512]``
-    (the open block's staging when the prompt ends inside it) and its raw index keys ``[1,1,32,128]`` (the
-    ring slots of an incomplete last block).  Written whole by every chunk, read by the eager fix-up."""
+    """Per-layer fixed-address sources of the prefill hand-off: the chunk's own ``[v|k]`` slab ``[1,1,rows,256]``
+    (the open block's staging when the prompt ends inside it) and its raw index keys ``[1,1,rows,128]`` (the
+    ring slots of an incomplete last block).  Written whole by every chunk, read by the eager fix-up (the
+    32-row state's; a prompt ending inside a block always ends in a 32-row chunk)."""
 
     layer_index: int
     epoch: int
+    rows: int
     kept_kv: Any
     kept_raw: Any
 
@@ -3371,15 +3400,17 @@ class Qwen38TTNNQSA:
     # by whole-slab writes (one KV slab, eight complete compressed blocks) and the per-row selection built
     # from the chunk inputs.  The 1-row generic body above is untouched.
 
-    def allocate_chunk_state(self) -> Qwen38TTNNQSAChunkState:
+    def allocate_chunk_state(self, rows: int = CHUNK_ROWS) -> Qwen38TTNNQSAChunkState:
+        chunk_row_tiles(rows)
         epoch = self._next_epoch
         self._next_epoch += 1
         self._live_generic_epochs.add(epoch)
         return Qwen38TTNNQSAChunkState(
             layer_index=self.layer_index,
             epoch=epoch,
-            kept_kv=self._allocate_pair_grouped((1, 1, CHUNK_ROWS, 2 * HEAD_DIM), layout=ttnn.TILE_LAYOUT),
-            kept_raw=self._allocate_replicated_tile_zeros((1, 1, CHUNK_ROWS, INDEX_HEAD_DIM)),
+            rows=rows,
+            kept_kv=self._allocate_pair_grouped((1, 1, rows, 2 * HEAD_DIM), layout=ttnn.TILE_LAYOUT),
+            kept_raw=self._allocate_replicated_tile_zeros((1, 1, rows, INDEX_HEAD_DIM)),
         )
 
     def release_chunk_state(self, state: Qwen38TTNNQSAChunkState) -> None:
@@ -3392,33 +3423,36 @@ class Qwen38TTNNQSA:
             raise ValueError(f"QSA chunk state belongs to layer {state.layer_index}, expected {self.layer_index}")
         if state.epoch not in self._live_generic_epochs:
             raise ValueError(f"QSA chunk state epoch {state.epoch} was not allocated by this module")
-        _require_shape(state.kept_kv, (1, 1, CHUNK_ROWS, 2 * HEAD_DIM), "QSA chunk kept KV slab")
-        _require_shape(state.kept_raw, (1, 1, CHUNK_ROWS, INDEX_HEAD_DIM), "QSA chunk kept raw keys")
+        _require_shape(state.kept_kv, (1, 1, state.rows, 2 * HEAD_DIM), "QSA chunk kept KV slab")
+        _require_shape(state.kept_raw, (1, 1, state.rows, INDEX_HEAD_DIM), "QSA chunk kept raw keys")
         for label, tensor in (("QSA chunk kept KV slab", state.kept_kv), ("QSA chunk kept raw keys", state.kept_raw)):
             if tensor.dtype != ttnn.bfloat16 or tensor.layout != ttnn.TILE_LAYOUT:
                 raise RuntimeError(f"{label} must be BF16 TILE, got {tensor_metadata(tensor)}")
         self.mesh_contract.validate_tensor(state.kept_kv, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=1)
         self.mesh_contract.validate_tensor(state.kept_raw, placement=TensorPlacement.REPLICATED)
 
-    def _validate_chunk_inputs(self, chunk: Qwen38TTNNQSAChunkInputs, *, completed_blocks: int = CHUNK_BLOCKS) -> None:
+    def _validate_chunk_inputs(self, chunk: Qwen38TTNNQSAChunkInputs, *, completed_blocks: int | None = None) -> None:
         blocks = self.allocated_compressed_blocks
+        rows = chunk.rows
+        if completed_blocks is None:
+            completed_blocks = chunk_blocks(rows) if rows in CHUNK_ROW_COUNTS else CHUNK_BLOCKS
         expected = (
             ("kv_block_start", chunk.kv_block_start, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
             (
                 "indexer_neg_mask",
                 chunk.indexer_neg_mask,
-                (1, 1, CHUNK_ROWS, blocks),
+                (1, 1, rows, blocks),
                 ttnn.bfloat16,
                 ttnn.ROW_MAJOR_LAYOUT,
             ),
             (
                 "row_keep_bits",
                 chunk.row_keep_bits,
-                (1, 1, CHUNK_ROWS, SPARSE_INDEX_CAPACITY),
+                (1, 1, rows, SPARSE_INDEX_CAPACITY),
                 ttnn.uint32,
                 ttnn.ROW_MAJOR_LAYOUT,
             ),
-            ("row_fill", chunk.row_fill, (1, 1, CHUNK_ROWS, SPARSE_INDEX_CAPACITY), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
+            ("row_fill", chunk.row_fill, (1, 1, rows, SPARSE_INDEX_CAPACITY), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
             *(
                 (f"block_index_i32[{i}]", tensor, (1,), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
                 for i, tensor in enumerate(chunk.block_index_i32)
@@ -3435,48 +3469,67 @@ class Qwen38TTNNQSA:
                     f"QSA chunk input {name} must be {dtype} {layout} {list(shape)}, got {tensor_metadata(tensor)}"
                 )
 
-    def _validate_rope_rows(self, cos, sin, label: str) -> None:
+    def _validate_rope_rows(self, cos, sin, rows, label: str) -> None:
         for name, tensor in (("cos", cos), ("sin", sin)):
-            _require_shape(tensor, (1, 1, CHUNK_ROWS, ROPE_DIM), f"{label} {name}")
+            _require_shape(tensor, (1, 1, rows, ROPE_DIM), f"{label} {name}")
             if tensor.dtype != ttnn.bfloat16 or tensor.layout != ttnn.TILE_LAYOUT:
                 raise RuntimeError(f"{label} {name} must be BF16 TILE, got {tensor_metadata(tensor)}")
             self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.REPLICATED)
 
-    def _all_gather_hidden_rows(self, hidden_rows):
-        _require_shape(hidden_rows, (1, 1, CHUNK_ROWS, HIDDEN_SIZE // TP_SIZE), "QSA hidden rows")
+    def _all_gather_hidden_rows(self, hidden_rows, constants: Qwen38TTNNQSAChunkConstants):
+        rows = constants.rows
+        # One tile lands in the decode linears' activation shard; the long chunk's four tiles are gathered
+        # interleaved and moved into that shard one tile at a time by every DRAM-sharded linear.
+        _require_shape(hidden_rows, (1, 1, rows, HIDDEN_SIZE // TP_SIZE), "QSA hidden rows")
         self.mesh_contract.validate_tensor(hidden_rows, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         full_hidden = ttnn.all_gather(
             hidden_rows,
             dim=3,
             cluster_axis=TP_AXIS,
-            memory_config=self.hidden_act_memory_config,
+            memory_config=self.hidden_act_memory_config if rows == CHUNK_ROWS else ttnn.DRAM_MEMORY_CONFIG,
         )
-        _require_shape(full_hidden, (1, 1, CHUNK_ROWS, HIDDEN_SIZE), "QSA hidden rows all-gather")
+        _require_shape(full_hidden, (1, 1, rows, HIDDEN_SIZE), "QSA hidden rows all-gather")
         self.mesh_contract.validate_tensor(full_hidden, placement=TensorPlacement.REPLICATED)
         return full_hidden
 
-    def _index_projection_rows(self, full_hidden, cos, sin):
-        index_q_ws = ttnn.linear(
-            full_hidden,
-            self.weights.index_q,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.index_program_config,
-            compute_kernel_config=self.compute_config,
-        )
-        raw_key_ws = ttnn.linear(
-            full_hidden,
-            self.weights.index_k,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.index_program_config,
-            compute_kernel_config=self.compute_config,
-        )
-        index_q = ttnn.to_memory_config(index_q_ws, ttnn.DRAM_MEMORY_CONFIG)
-        raw_key = ttnn.to_memory_config(raw_key_ws, ttnn.DRAM_MEMORY_CONFIG)
-        _deallocate(index_q_ws, raw_key_ws)
+    def _linear_rows(self, full_hidden, weight, program_config, constants: Qwen38TTNNQSAChunkConstants):
+        """A DRAM-sharded decode linear over the chunk rows: one call on the gathered shard at 32 rows, one
+        call per row tile (moved into the activation shard) at 128 rows, the outputs concatenated interleaved."""
+
+        if constants.rows == CHUNK_ROWS:
+            projected_ws = ttnn.linear(
+                full_hidden,
+                weight,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=program_config,
+                compute_kernel_config=self.compute_config,
+            )
+            projected = ttnn.to_memory_config(projected_ws, ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(projected_ws)
+            return projected
+        projected_tiles = []
+        for tile in dram_sharded_row_tiles(full_hidden, self.hidden_act_memory_config):
+            projected_ws = ttnn.linear(
+                tile,
+                weight,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=program_config,
+                compute_kernel_config=self.compute_config,
+            )
+            projected_tiles.append(ttnn.to_memory_config(projected_ws, ttnn.DRAM_MEMORY_CONFIG))
+            _deallocate(tile, projected_ws)
+        projected = ttnn.concat(projected_tiles, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(*projected_tiles)
+        return projected
+
+    def _index_projection_rows(self, full_hidden, cos, sin, constants: Qwen38TTNNQSAChunkConstants):
+        rows = constants.rows
+        index_q = self._linear_rows(full_hidden, self.weights.index_q, self.index_program_config, constants)
+        raw_key = self._linear_rows(full_hidden, self.weights.index_k, self.index_program_config, constants)
         self.mesh_contract.validate_tensor(index_q, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
         self.mesh_contract.validate_tensor(raw_key, placement=TensorPlacement.REPLICATED)
-        _require_shape(index_q, (1, 1, CHUNK_ROWS, INDEX_HEAD_DIM), "local index query rows")
-        _require_shape(raw_key, (1, 1, CHUNK_ROWS, INDEX_HEAD_DIM), "raw index key rows")
+        _require_shape(index_q, (1, 1, rows, INDEX_HEAD_DIM), "local index query rows")
+        _require_shape(raw_key, (1, 1, rows, INDEX_HEAD_DIM), "raw index key rows")
         _retag_tensor(index_q, reference=full_hidden, shard_dim=1)
         normalized = ttnn.rms_norm(
             index_q,
@@ -3490,7 +3543,7 @@ class Qwen38TTNNQSA:
         _deallocate(normalized)
         _retag_tensor(rotated, reference=full_hidden, shard_dim=1)
         self.mesh_contract.validate_tensor(rotated, placement=TensorPlacement.HEAD_SHARDED, shard_dim=1)
-        _require_shape(rotated, (1, 1, CHUNK_ROWS, INDEX_HEAD_DIM), "rotated index query rows")
+        _require_shape(rotated, (1, 1, rows, INDEX_HEAD_DIM), "rotated index query rows")
         return rotated, raw_key
 
     def _write_compressed_index_chunk(
@@ -3506,9 +3559,10 @@ class Qwen38TTNNQSA:
         kept = ttnn.copy(raw_key, chunk_state.kept_raw)
         if kept is not None and _tensor_key(kept) != _tensor_key(chunk_state.kept_raw):
             raise RuntimeError("QSA chunk raw keys were not kept in place")
-        # Block means as one exact selection matmul (rows 0..7; rows 8..31 exact zeros), then the decode's
-        # norm and block-start RoPE on the whole tile; the eight rows are written one per paged_update_cache
-        # call, each picked into row 0 of its own tile by a 0/1 select and viewed as the one-row input.
+        # Block means as one exact selection matmul (rows 0..blocks-1; the other rows exact zeros), then the
+        # decode's norm and block-start RoPE on the whole tile; the block rows are written one per
+        # paged_update_cache call, each picked into row 0 of its own tile by a 0/1 select and viewed as the
+        # one-row input.
         pooled = ttnn.matmul(
             constants.pool_select,
             raw_key,
@@ -3533,7 +3587,7 @@ class Qwen38TTNNQSA:
         _require_shape(rotated, (1, 1, CHUNK_ROWS, INDEX_HEAD_DIM), "rotated chunk index keys")
         one_row = ttnn.Shape((1, 1, 1, INDEX_HEAD_DIM))
         tile = ttnn.Shape((1, 1, CHUNK_ROWS, INDEX_HEAD_DIM))
-        for block in range(CHUNK_BLOCKS):
+        for block in range(len(constants.row_selects)):
             picked = ttnn.matmul(
                 constants.row_selects[block],
                 rotated,
@@ -3557,28 +3611,51 @@ class Qwen38TTNNQSA:
         _deallocate(rotated)
 
     def _score_blocks_chunk(self, index_query, state: Qwen38TTNNQSAGenericState, chunk: Qwen38TTNNQSAChunkInputs):
-        # The 32 query rows are the tile itself; the window past the last resident block ends at the
-        # cache's last row, so every resident column is visible to every row and the per-row additive
-        # mask hides the blocks at or past that row's complete-block count.
-        local_scores = ttnn.experimental.indexer_score_dsa(
-            index_query,
-            state.compressed_index_cache,
-            self.index_gate,
-            chunk_start_idx=self.indexer_chunk_start,
-            compute_kernel_config=self.indexer_compute_config,
-            seq_shard_axes=[STAGING_AXIS],
-        )
-        score_rows = ttnn.slice(
-            local_scores,
-            (0, 0, 0, 0),
-            (1, 1, CHUNK_ROWS, self.allocated_compressed_blocks),
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        _deallocate(local_scores)
+        # The query rows are scored one 32-row tile at a time (the indexer's query window is the cache's one
+        # extra tile); the window past the last resident block ends at the cache's last row, so every
+        # resident column is visible to every row and the per-row additive mask hides the blocks at or past
+        # that row's complete-block count.  The long chunk concatenates its four score tiles.
+        rows = chunk.rows
+        score_tiles = []
+        for start in range(0, rows, CHUNK_ROWS):
+            query_tile = (
+                index_query
+                if rows == CHUNK_ROWS
+                else ttnn.slice(
+                    index_query,
+                    (0, 0, start, 0),
+                    (1, 1, start + CHUNK_ROWS, INDEX_HEAD_DIM),
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+            )
+            local_scores = ttnn.experimental.indexer_score_dsa(
+                query_tile,
+                state.compressed_index_cache,
+                self.index_gate,
+                chunk_start_idx=self.indexer_chunk_start,
+                compute_kernel_config=self.indexer_compute_config,
+                seq_shard_axes=[STAGING_AXIS],
+            )
+            if rows != CHUNK_ROWS:
+                _deallocate(query_tile)
+            score_tiles.append(
+                ttnn.slice(
+                    local_scores,
+                    (0, 0, 0, 0),
+                    (1, 1, CHUNK_ROWS, self.allocated_compressed_blocks),
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+            )
+            _deallocate(local_scores)
+        if rows == CHUNK_ROWS:
+            score_rows = score_tiles[0]
+        else:
+            score_rows = ttnn.concat(score_tiles, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(*score_tiles)
         self.mesh_contract.mark_local_partial(
             score_rows,
             replicated_reference=state.compressed_index_cache,
-            expected_shape=(1, 1, CHUNK_ROWS, self.allocated_compressed_blocks),
+            expected_shape=(1, 1, rows, self.allocated_compressed_blocks),
         )
         scores = ttnn.all_reduce(
             score_rows,
@@ -3595,7 +3672,7 @@ class Qwen38TTNNQSA:
             fast_and_approximate_mode=False,
         )
         _deallocate(scores)
-        _require_shape(masked, (1, 1, CHUNK_ROWS, self.allocated_compressed_blocks), "masked QSA chunk block scores")
+        _require_shape(masked, (1, 1, rows, self.allocated_compressed_blocks), "masked QSA chunk block scores")
         if masked.dtype != ttnn.bfloat16 or masked.layout != ttnn.ROW_MAJOR_LAYOUT:
             raise RuntimeError(f"masked QSA chunk block scores must be BF16 ROW_MAJOR, got {tensor_metadata(masked)}")
         return masked
@@ -3603,9 +3680,10 @@ class Qwen38TTNNQSA:
     def _materialize_rows_chunk(
         self, masked_scores, chunk: Qwen38TTNNQSAChunkInputs, constants: Qwen38TTNNQSAChunkConstants
     ):
+        rows = chunk.rows
         block_ids = ttnn.experimental.topk_large_indices(masked_scores, k=BLOCK_TOPK)
         _deallocate(masked_scores)
-        _require_shape(block_ids, (1, 1, CHUNK_ROWS, BLOCK_TOPK), "top-k QSA chunk block IDs")
+        _require_shape(block_ids, (1, 1, rows, BLOCK_TOPK), "top-k QSA chunk block IDs")
         if block_ids.dtype != ttnn.uint32 or block_ids.layout != ttnn.ROW_MAJOR_LAYOUT:
             raise RuntimeError(
                 f"topk_large_indices must return UINT32 ROW_MAJOR block IDs, got {tensor_metadata(block_ids)}"
@@ -3616,66 +3694,43 @@ class Qwen38TTNNQSA:
         _deallocate(starts)
         expanded = ttnn.add(repeated, constants.block_offsets_rows, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(repeated)
-        _require_shape(expanded, (1, 1, CHUNK_ROWS, TOKEN_BUDGET), "expanded QSA chunk block indices")
+        _require_shape(expanded, (1, 1, rows, TOKEN_BUDGET), "expanded QSA chunk block indices")
         template = ttnn.concat([expanded, constants.sentinel_pad_rows], dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(expanded)
         kept = ttnn.bitwise_and(template, chunk.row_keep_bits, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(template)
         sparse_indices = ttnn.bitwise_or(kept, chunk.row_fill, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(kept)
-        _require_shape(sparse_indices, (1, 1, CHUNK_ROWS, SPARSE_INDEX_CAPACITY), "QSA chunk sparse indices")
+        _require_shape(sparse_indices, (1, 1, rows, SPARSE_INDEX_CAPACITY), "QSA chunk sparse indices")
         if sparse_indices.dtype != ttnn.uint32 or sparse_indices.layout != ttnn.ROW_MAJOR_LAYOUT:
             raise RuntimeError(f"sparse QSA indices must be UINT32 ROW_MAJOR, got {tensor_metadata(sparse_indices)}")
         self.mesh_contract.validate_tensor(sparse_indices, placement=TensorPlacement.REPLICATED)
         return sparse_indices
 
-    def _main_projection_rows(self, full_hidden, cos, sin):
-        qg_ws = ttnn.linear(
-            full_hidden,
-            self.weights.qg,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.qg_program_config,
-            compute_kernel_config=self.compute_config,
-        )
-        k_ws = ttnn.linear(
-            full_hidden,
-            self.weights.k_pair_grouped,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.kv_program_config,
-            compute_kernel_config=self.compute_config,
-        )
-        v_ws = ttnn.linear(
-            full_hidden,
-            self.weights.v_pair_grouped,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.kv_program_config,
-            compute_kernel_config=self.compute_config,
-        )
-        qg = ttnn.to_memory_config(qg_ws, ttnn.DRAM_MEMORY_CONFIG)
-        k = ttnn.to_memory_config(k_ws, ttnn.DRAM_MEMORY_CONFIG)
-        v = ttnn.to_memory_config(v_ws, ttnn.DRAM_MEMORY_CONFIG)
-        _deallocate(qg_ws, k_ws, v_ws)
+    def _main_projection_rows(self, full_hidden, cos, sin, constants: Qwen38TTNNQSAChunkConstants):
+        rows = constants.rows
+        qg = self._linear_rows(full_hidden, self.weights.qg, self.qg_program_config, constants)
+        k = self._linear_rows(full_hidden, self.weights.k_pair_grouped, self.kv_program_config, constants)
+        v = self._linear_rows(full_hidden, self.weights.v_pair_grouped, self.kv_program_config, constants)
         self.mesh_contract.validate_tensor(qg, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
         self.mesh_contract.validate_tensor(k, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=3)
         self.mesh_contract.validate_tensor(v, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=3)
-        _require_shape(qg, (1, 1, CHUNK_ROWS, 2 * LOCAL_QUERY_WIDTH), "local QSA query/gate rows")
-        _require_shape(k, (1, 1, CHUNK_ROWS, HEAD_DIM), "local pair-grouped K rows")
-        _require_shape(v, (1, 1, CHUNK_ROWS, HEAD_DIM), "local pair-grouped V rows")
+        _require_shape(qg, (1, 1, rows, 2 * LOCAL_QUERY_WIDTH), "local QSA query/gate rows")
+        _require_shape(k, (1, 1, rows, HEAD_DIM), "local pair-grouped K rows")
+        _require_shape(v, (1, 1, rows, HEAD_DIM), "local pair-grouped V rows")
         # Head h's [q_h | gate_h] columns are two tile-aligned slices of the row set; the heads stack on
         # dim 1 (whole 32-row tile blocks), so no padded intermediate reaches a reshape or permute.
         q_heads, gate_heads = [], []
         for head in range(QUERY_HEADS_PER_DEVICE):
             start = head * 2 * HEAD_DIM
             q_heads.append(
-                ttnn.slice(
-                    qg, (0, 0, 0, start), (1, 1, CHUNK_ROWS, start + HEAD_DIM), memory_config=ttnn.DRAM_MEMORY_CONFIG
-                )
+                ttnn.slice(qg, (0, 0, 0, start), (1, 1, rows, start + HEAD_DIM), memory_config=ttnn.DRAM_MEMORY_CONFIG)
             )
             gate_heads.append(
                 ttnn.slice(
                     qg,
                     (0, 0, 0, start + HEAD_DIM),
-                    (1, 1, CHUNK_ROWS, start + 2 * HEAD_DIM),
+                    (1, 1, rows, start + 2 * HEAD_DIM),
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 )
             )
@@ -3685,8 +3740,8 @@ class Qwen38TTNNQSA:
         _deallocate(*q_heads, *gate_heads)
         _retag_tensor(q, reference=full_hidden, shard_dim=1)
         _retag_tensor(gate, reference=full_hidden, shard_dim=1)
-        _require_shape(q, (1, QUERY_HEADS_PER_DEVICE, CHUNK_ROWS, HEAD_DIM), "local QSA query head rows")
-        _require_shape(gate, (1, QUERY_HEADS_PER_DEVICE, CHUNK_ROWS, HEAD_DIM), "local QSA gate head rows")
+        _require_shape(q, (1, QUERY_HEADS_PER_DEVICE, rows, HEAD_DIM), "local QSA query head rows")
+        _require_shape(gate, (1, QUERY_HEADS_PER_DEVICE, rows, HEAD_DIM), "local QSA gate head rows")
         _retag_tensor(k, reference=full_hidden, shard_dim=1)
         _retag_tensor(v, reference=full_hidden, shard_dim=1)
 
@@ -3712,8 +3767,8 @@ class Qwen38TTNNQSA:
         _retag_tensor(k_rotated, reference=full_hidden, shard_dim=1)
         for value in (k_rotated, v):
             self.mesh_contract.validate_tensor(value, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=1)
-        _require_shape(q_rotated, (1, QUERY_HEADS_PER_DEVICE, CHUNK_ROWS, HEAD_DIM), "rotated QSA query head rows")
-        _require_shape(k_rotated, (1, 1, CHUNK_ROWS, HEAD_DIM), "rotated pair-grouped K rows")
+        _require_shape(q_rotated, (1, QUERY_HEADS_PER_DEVICE, rows, HEAD_DIM), "rotated QSA query head rows")
+        _require_shape(k_rotated, (1, 1, rows, HEAD_DIM), "rotated pair-grouped K rows")
         return q_rotated, gate, k_rotated, v
 
     def _write_packed_kv_chunk(
@@ -3724,17 +3779,18 @@ class Qwen38TTNNQSA:
         value,
         chunk: Qwen38TTNNQSAChunkInputs,
     ) -> None:
+        rows = chunk.rows
         packed_tiled = ttnn.concat([value, key], dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(value, key)
-        _require_shape(packed_tiled, (1, 1, CHUNK_ROWS, 2 * HEAD_DIM), "packed QSA chunk KV slab")
+        _require_shape(packed_tiled, (1, 1, rows, 2 * HEAD_DIM), "packed QSA chunk KV slab")
         kept = ttnn.copy(packed_tiled, chunk_state.kept_kv)
         if kept is not None and _tensor_key(kept) != _tensor_key(chunk_state.kept_kv):
             raise RuntimeError("QSA chunk KV slab was not kept in place")
-        # The whole 32-row slab, untilized once, lands at row P (the decode's staging write with every row real).
+        # The whole slab, untilized once, lands at row P (the decode's staging write with every row real).
         slab_row_major = ttnn.to_layout(packed_tiled, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(packed_tiled)
         _retag_tensor(slab_row_major, reference=state.packed_kv_cache, shard_dim=1)
-        _require_shape(slab_row_major, (1, 1, CHUNK_ROWS, 2 * HEAD_DIM), "row-major QSA chunk KV slab")
+        _require_shape(slab_row_major, (1, 1, rows, 2 * HEAD_DIM), "row-major QSA chunk KV slab")
         self.mesh_contract.validate_tensor(slab_row_major, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=1)
         result = ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
             state.packed_kv_cache,
@@ -3750,14 +3806,15 @@ class Qwen38TTNNQSA:
         _deallocate(slab_row_major)
 
     def _sparse_value_attention_rows(self, query, gate, sparse_indices, state, constants: Qwen38TTNNQSAChunkConstants):
-        # q = [zeros(256) | Q(256)] per local head over the 32 rows, untilized, 26 zero heads appended.
+        # q = [zeros(256) | Q(256)] per local head over the rows, untilized, 26 zero heads appended.
+        rows = constants.rows
         sparse_query_tiled = ttnn.concat(
             [constants.zero_value_half_rows, query], dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG
         )
         _deallocate(query)
         _retag_tensor(sparse_query_tiled, reference=state.packed_kv_cache, shard_dim=1)
         _require_shape(
-            sparse_query_tiled, (1, QUERY_HEADS_PER_DEVICE, CHUNK_ROWS, 2 * HEAD_DIM), "local sparse QSA query rows"
+            sparse_query_tiled, (1, QUERY_HEADS_PER_DEVICE, rows, 2 * HEAD_DIM), "local sparse QSA query rows"
         )
         sparse_query_row_major = ttnn.to_layout(
             sparse_query_tiled, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
@@ -3771,7 +3828,7 @@ class Qwen38TTNNQSA:
         )
         _deallocate(sparse_query_row_major)
         _retag_tensor(sparse_query, reference=state.packed_kv_cache, shard_dim=1)
-        _require_shape(sparse_query, (1, 32, CHUNK_ROWS, 2 * HEAD_DIM), "padded sparse QSA query rows")
+        _require_shape(sparse_query, (1, 32, rows, 2 * HEAD_DIM), "padded sparse QSA query rows")
         if sparse_query.layout != ttnn.ROW_MAJOR_LAYOUT:
             raise RuntimeError(f"padded sparse QSA query rows must be ROW_MAJOR, got {tensor_metadata(sparse_query)}")
         sparse_output = ttnn.transformer.sparse_sdpa(
@@ -3788,7 +3845,7 @@ class Qwen38TTNNQSA:
         local = ttnn.slice(
             sparse_output,
             (0, 0, 0, 0),
-            (1, QUERY_HEADS_PER_DEVICE, CHUNK_ROWS, HEAD_DIM),
+            (1, QUERY_HEADS_PER_DEVICE, rows, HEAD_DIM),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         _deallocate(sparse_output)
@@ -3798,13 +3855,11 @@ class Qwen38TTNNQSA:
         activated_gate = ttnn.sigmoid(gate, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         gated = ttnn.mul(local_tiled, activated_gate, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(local_tiled, activated_gate, gate)
-        _require_shape(gated, (1, QUERY_HEADS_PER_DEVICE, CHUNK_ROWS, HEAD_DIM), "gated QSA attention head rows")
-        # Head-major -> one [1,1,32,1536] row set: six whole-tile head slices concatenated on the last dim
+        _require_shape(gated, (1, QUERY_HEADS_PER_DEVICE, rows, HEAD_DIM), "gated QSA attention head rows")
+        # Head-major -> one [1,1,rows,1536] row set: six whole-tile head slices concatenated on the last dim
         # (the 1-row path's flatten is a view only at S = 1).
         heads = [
-            ttnn.slice(
-                gated, (0, head, 0, 0), (1, head + 1, CHUNK_ROWS, HEAD_DIM), memory_config=ttnn.DRAM_MEMORY_CONFIG
-            )
+            ttnn.slice(gated, (0, head, 0, 0), (1, head + 1, rows, HEAD_DIM), memory_config=ttnn.DRAM_MEMORY_CONFIG)
             for head in range(QUERY_HEADS_PER_DEVICE)
         ]
         _deallocate(gated)
@@ -3812,29 +3867,42 @@ class Qwen38TTNNQSA:
         _deallocate(*heads)
         _retag_tensor(local_flat, reference=state.packed_kv_cache, shard_dim=3)
         self.mesh_contract.validate_tensor(local_flat, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
-        _require_shape(local_flat, (1, 1, CHUNK_ROWS, LOCAL_QUERY_WIDTH), "flat QSA attention rows")
+        _require_shape(local_flat, (1, 1, rows, LOCAL_QUERY_WIDTH), "flat QSA attention rows")
         return local_flat
 
-    def _project_output_rows(self, local_attention, full_hidden):
-        attention_ws = ttnn.to_memory_config(local_attention, self.out_act_memory_config)
-        _deallocate(local_attention)
-        local_partial_ws = ttnn.linear(
-            attention_ws,
-            self.weights.out,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.out_program_config,
-            compute_kernel_config=self.compute_config,
+    def _project_output_rows(self, local_attention, full_hidden, constants: Qwen38TTNNQSAChunkConstants):
+        rows = constants.rows
+        # The out-proj is a DRAM-sharded decode linear: one row tile per call, the partials concatenated.
+        attention_tiles = (
+            [ttnn.to_memory_config(local_attention, self.out_act_memory_config)]
+            if rows == CHUNK_ROWS
+            else dram_sharded_row_tiles(local_attention, self.out_act_memory_config)
         )
-        _deallocate(attention_ws)
-        local_partial = ttnn.to_memory_config(local_partial_ws, ttnn.DRAM_MEMORY_CONFIG)
-        _deallocate(local_partial_ws)
+        _deallocate(local_attention)
+        partial_tiles = []
+        for attention_ws in attention_tiles:
+            local_partial_ws = ttnn.linear(
+                attention_ws,
+                self.weights.out,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=self.out_program_config,
+                compute_kernel_config=self.compute_config,
+            )
+            _deallocate(attention_ws)
+            partial_tiles.append(ttnn.to_memory_config(local_partial_ws, ttnn.DRAM_MEMORY_CONFIG))
+            _deallocate(local_partial_ws)
+        if rows == CHUNK_ROWS:
+            local_partial = partial_tiles[0]
+        else:
+            local_partial = ttnn.concat(partial_tiles, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(*partial_tiles)
         self.mesh_contract.mark_local_partial(
-            local_partial, replicated_reference=full_hidden, expected_shape=(1, 1, CHUNK_ROWS, HIDDEN_SIZE)
+            local_partial, replicated_reference=full_hidden, expected_shape=(1, 1, rows, HIDDEN_SIZE)
         )
         local_partial_fp32 = ttnn.typecast(local_partial, ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(local_partial)
         self.mesh_contract.mark_local_partial(
-            local_partial_fp32, replicated_reference=full_hidden, expected_shape=(1, 1, CHUNK_ROWS, HIDDEN_SIZE)
+            local_partial_fp32, replicated_reference=full_hidden, expected_shape=(1, 1, rows, HIDDEN_SIZE)
         )
         output_fp32 = ttnn.reduce_scatter(
             local_partial_fp32,
@@ -3848,14 +3916,14 @@ class Qwen38TTNNQSA:
             output_fp32,
             replicated_reference=full_hidden,
             shard_dim=3,
-            expected_local_shape=(1, 1, CHUNK_ROWS, HIDDEN_SIZE // TP_SIZE),
+            expected_local_shape=(1, 1, rows, HIDDEN_SIZE // TP_SIZE),
         )
         if output_fp32.dtype != ttnn.float32:
             raise RuntimeError(f"QSA output reduce_scatter must sum FP32 partials, got {tensor_metadata(output_fp32)}")
         output = ttnn.typecast(output_fp32, ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _retag_tensor(output, reference=output_fp32, shard_dim=3)
         _deallocate(output_fp32)
-        _require_shape(output, (1, 1, CHUNK_ROWS, HIDDEN_SIZE // TP_SIZE), "QSA output projection rows")
+        _require_shape(output, (1, 1, rows, HIDDEN_SIZE // TP_SIZE), "QSA output projection rows")
         if output.dtype != ttnn.bfloat16:
             raise RuntimeError(f"QSA output projection rows must be BF16, got {tensor_metadata(output)}")
         self.mesh_contract.validate_tensor(output, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
@@ -3874,18 +3942,24 @@ class Qwen38TTNNQSA:
         chunk: Qwen38TTNNQSAChunkInputs,
         constants: Qwen38TTNNQSAChunkConstants,
     ):
-        """Prefill the 32 positions P .. P + 31 of one chunk (P % 32 == 0); same op sequence for every chunk.
+        """Prefill the positions P .. P + rows - 1 of one chunk (P % 32 == 0); same op sequence for every chunk
+        of one row count.
 
-        ``state`` is mutated in place (the KV slab at rows P .. P + 31, the eight compressed blocks
-        P/4 .. P/4 + 7; the staging tile and the raw-key ring are left to the eager hand-off, which reads
-        ``chunk_state``).  The RoPE rows are the table lookups at P + j and P + 4i.  Returns the
-        ``[1,1,32,640]`` BF16 TILE hidden-sharded output rows; the input is left for the caller to release.
+        ``state`` is mutated in place (the KV slab at rows P .. P + rows - 1, the rows / 4 compressed blocks
+        from P/4; the staging tile and the raw-key ring are left to the eager hand-off, which reads the
+        32-row ``chunk_state``).  The RoPE rows are the table lookups at P + j and P + 4i.  Returns the
+        ``[1,1,rows,640]`` BF16 TILE hidden-sharded output rows; the input is left for the caller to release.
         """
 
         self._validate_generic_state(state)
         self._validate_chunk_state(chunk_state)
-        self._validate_rope_rows(cos, sin, "QSA chunk RoPE")
-        self._validate_rope_rows(block_start_cos, block_start_sin, "QSA chunk block-start RoPE")
+        rows = constants.rows
+        if chunk_state.rows != rows or chunk.rows != rows:
+            raise ValueError(
+                f"QSA chunk constants ({rows} rows), state ({chunk_state.rows}) and inputs ({chunk.rows}) disagree"
+            )
+        self._validate_rope_rows(cos, sin, rows, "QSA chunk RoPE")
+        self._validate_rope_rows(block_start_cos, block_start_sin, CHUNK_ROWS, "QSA chunk block-start RoPE")
         self._validate_chunk_inputs(chunk)
         if constants.allocated_compressed_blocks != self.allocated_compressed_blocks:
             raise ValueError(
@@ -3893,8 +3967,8 @@ class Qwen38TTNNQSA:
                 f"the layer has {self.allocated_compressed_blocks}"
             )
 
-        full_hidden = self._all_gather_hidden_rows(hidden_rows)
-        index_query, raw_key = self._index_projection_rows(full_hidden, cos, sin)
+        full_hidden = self._all_gather_hidden_rows(hidden_rows, constants)
+        index_query, raw_key = self._index_projection_rows(full_hidden, cos, sin, constants)
         self._write_compressed_index_chunk(
             state, chunk_state, raw_key, block_start_cos, block_start_sin, chunk, constants
         )
@@ -3902,11 +3976,11 @@ class Qwen38TTNNQSA:
         _deallocate(index_query)
         sparse_indices = self._materialize_rows_chunk(masked_scores, chunk, constants)
 
-        query, gate, key, value = self._main_projection_rows(full_hidden, cos, sin)
+        query, gate, key, value = self._main_projection_rows(full_hidden, cos, sin, constants)
         self._write_packed_kv_chunk(state, chunk_state, key, value, chunk)
         local_attention = self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)
         _deallocate(sparse_indices)
-        output = self._project_output_rows(local_attention, full_hidden)
+        output = self._project_output_rows(local_attention, full_hidden, constants)
         _deallocate(full_hidden)
         return output
 
@@ -3930,6 +4004,8 @@ class Qwen38TTNNQSA:
 
         self._validate_generic_state(state)
         self._validate_chunk_state(chunk_state)
+        if chunk_state.rows != CHUNK_ROWS:
+            raise ValueError(f"the QSA hand-off reads the {CHUNK_ROWS}-row chunk state, got {chunk_state.rows} rows")
         _require_shape(ring_select, (1, 1, CHUNK_ROWS, CHUNK_ROWS), "QSA hand-off ring select")
         if ring_select.dtype != ttnn.bfloat16 or ring_select.layout != ttnn.TILE_LAYOUT:
             raise RuntimeError(f"QSA hand-off ring select must be BF16 TILE, got {tensor_metadata(ring_select)}")

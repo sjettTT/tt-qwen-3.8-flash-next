@@ -6,6 +6,7 @@ structure, the guards keep host I/O out of a trace body, and the row helpers rea
 from __future__ import annotations
 
 import inspect
+import math
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Sequence

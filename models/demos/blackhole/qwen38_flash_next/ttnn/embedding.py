@@ -66,6 +66,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     MESH_SHAPE,
     Qwen38MeshContract,
     TensorPlacement,
+    chunk_row_tiles,
     replicate_tensor_2d_mesh_mapper,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
@@ -1383,15 +1384,35 @@ class Qwen38TTNNTokenEmbedding:
 
     @staticmethod
     def host_token_rows(token_ids) -> torch.Tensor:
-        """Host image of a 32-lane token row (lane j = token j) for ``copy_host_to_device_tensor`` into a token row."""
+        """Host image of a token-rows tile (lane j = token j; ``[1,1,tiles,32]`` for 32 or 128 tokens) for
+        ``copy_host_to_device_tensor`` into a chunk state's token rows."""
 
         token_ids = list(token_ids)
-        if len(token_ids) != CHUNK_ROWS:
-            raise ValueError(f"token rows need exactly {CHUNK_ROWS} token ids, got {len(token_ids)}")
+        tiles = chunk_row_tiles(len(token_ids))
         for token_id in token_ids:
             if isinstance(token_id, bool) or type(token_id) is not int or not 0 <= token_id < VOCAB_SIZE:
                 raise ValueError(f"token rows require exact integer tokens in [0,{VOCAB_SIZE}), got {token_id!r}")
-        return torch.tensor(token_ids, dtype=torch.float32).reshape(TOKEN_ROW_SHAPE)
+        return torch.tensor(token_ids, dtype=torch.float32).reshape(1, 1, tiles, TILE_SIZE)
+
+    def validate_token_rows(self, token_rows, *, rows: int, label: str = "device token rows") -> None:
+        expected = (1, 1, chunk_row_tiles(rows), TILE_SIZE)
+        if _shape(token_rows) != expected or token_rows.dtype != ttnn.float32 or token_rows.layout != ttnn.TILE_LAYOUT:
+            raise ValueError(f"{label} must be FP32 TILE {expected}, got {_metadata(token_rows)}")
+        self.mesh_contract.validate_tensor(token_rows, placement=TensorPlacement.REPLICATED)
+
+    def upload_token_rows(self, rows: int):
+        """Upload the zero token-rows tile of a chunk state (``[1,1,tiles,32]``); the host rewrites it per chunk."""
+
+        token_rows = ttnn.from_torch(
+            torch.zeros((1, 1, chunk_row_tiles(rows), TILE_SIZE), dtype=torch.float32),
+            dtype=ttnn.float32,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.mesh_device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=replicate_tensor_2d_mesh_mapper(self.mesh_device),
+        )
+        self.validate_token_rows(token_rows, rows=rows, label="uploaded token rows")
+        return token_rows
 
     @staticmethod
     def host_verify_token_rows(token_ids) -> torch.Tensor:
@@ -1415,24 +1436,26 @@ class Qwen38TTNNTokenEmbedding:
         return host
 
     def embed_device_token_rows(self, token_row):
-        """Hidden-sharded ``[1,1,32,640]`` embedding of the 32 lanes of a token row (one prefill chunk).
+        """Hidden-sharded ``[1,1,rows,640]`` embedding of the lanes of a token-rows tile (one prefill chunk).
 
         :meth:`embed_device_token` without its one-row view: every lane is
-        localized against ``vocab_localize_lanes``, the fused lookup's 32 rows
-        are the 32 tokens, and the owner sum is per row.  Row j is bitwise the
-        1-row path's result for lane j.  No host upload or readback.
+        localized against ``vocab_localize_lanes`` (one row, broadcast over the
+        tile's rows), the fused lookup's rows are the tokens, and the owner sum
+        is per row.  Row j is bitwise the 1-row path's result for lane j.  No
+        host upload or readback.
         """
 
         self._require_healthy()
-        self.validate_token_row(token_row, label="device token rows")
+        rows = _shape(token_row)[2] * TILE_SIZE
+        self.validate_token_rows(token_row, rows=rows, label="device token rows")
         constants = self.weights.token_row
         shifted = ttnn.subtract(token_row, constants.vocab_localize_lanes, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         localized = ttnn.clamp(shifted, min=0.0, max=float(LOCAL_VOCAB_SIZE + 1), memory_config=ttnn.DRAM_MEMORY_CONFIG)
         localized_indices = ttnn.typecast(localized, ttnn.uint32, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         row_major = ttnn.to_layout(localized_indices, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(shifted, localized, localized_indices)
-        indices = ttnn.reshape(row_major, (1, 1, CHUNK_ROWS))
-        expected_indices = (1, 1, CHUNK_ROWS)
+        indices = ttnn.reshape(row_major, (1, 1, rows))
+        expected_indices = (1, 1, rows)
         if (
             _shape(indices) != expected_indices
             or indices.dtype != ttnn.uint32
@@ -1450,7 +1473,7 @@ class Qwen38TTNNTokenEmbedding:
         )
         _deallocate(row_major)
         embedded = ttnn.unsqueeze_to_4D(embedded_base) if len(embedded_base.shape) == 3 else embedded_base
-        expected_partial = (1, 1, CHUNK_ROWS, HIDDEN_SIZE)
+        expected_partial = (1, 1, rows, HIDDEN_SIZE)
         if (
             _shape(embedded) != expected_partial
             or _padded_shape(embedded) != expected_partial
@@ -1471,9 +1494,9 @@ class Qwen38TTNNTokenEmbedding:
             mesh_contract=self.mesh_contract,
             replicated_reference=self.weights.replicated_anchor,
             collective_topology=self.collective_topology,
-            rows=CHUNK_ROWS,
+            rows=rows,
         )
-        expected_hidden = (1, 1, CHUNK_ROWS, LOCAL_HIDDEN_SIZE)
+        expected_hidden = (1, 1, rows, LOCAL_HIDDEN_SIZE)
         if _padded_shape(hidden) != expected_hidden:
             raise RuntimeError(
                 f"device-token embedding rows must be backed by {expected_hidden}, got {_metadata(hidden)}"

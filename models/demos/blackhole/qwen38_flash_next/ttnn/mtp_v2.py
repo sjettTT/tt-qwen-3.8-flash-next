@@ -405,9 +405,10 @@ class Qwen38TTNNVerifyReadback:
 
 def moe_rows_for(rows: int) -> int:
     """The smallest admitted MoE row count that holds ``rows`` (5 for k = 3 and 4; 32 for k = 5 until rows 6 is
-    admitted in ``moe.SUPPORTED_ROWS``)."""
+    admitted in ``moe.SUPPORTED_ROWS``); a verify pass is one 32-row tile, so the 128-row prefill form is not a
+    candidate."""
 
-    admitted = [count for count in SUPPORTED_ROWS if count >= rows]
+    admitted = [count for count in SUPPORTED_ROWS if rows <= count <= CHUNK_ROWS]
     if not admitted:
         raise ValueError(f"no admitted MoE row count holds {rows} rows (SUPPORTED_ROWS = {SUPPORTED_ROWS})")
     return min(admitted)

@@ -55,6 +55,15 @@ def _identity() -> BF4CacheIdentity:
     )
 
 
+def _mesh_shapes(identity: BF4CacheIdentity) -> dict[str, tuple[int, ...]]:
+    """The coordinate-local shard shapes a mesh tensor presents (dim 2 = one device's experts)."""
+
+    return {
+        name: (*shape[:2], identity.experts_per_device, *shape[3:])
+        for name, shape in bf4_module._canonical_packed_shapes(ring_size=identity.ring_size).items()
+    }
+
+
 def _fast_sparse_digest_fd(descriptor: int) -> str:
     """Test-only digest that samples the materialized edges of sparse fixtures."""
 
@@ -445,7 +454,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
             self.assertIs(builder.bf4_cache, builder.expert_streamer.cache)
 
             memory_configs = SimpleNamespace(w0_w1=object(), w2=object())
-            logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+            mesh_shapes = _mesh_shapes(identity)
             retained_paths = []
 
             def load_tensor(path, *, device):
@@ -455,7 +464,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 name = Path(os.readlink(path)).name
                 artifact_name = "w0_w1" if name.startswith("w0_w1_") else "w2"
                 memory_config = getattr(memory_configs, artifact_name)
-                return _FakeBF4Tensor(memory_config, logical_shapes[artifact_name])
+                return _FakeBF4Tensor(memory_config, mesh_shapes[artifact_name])
 
             real_sha256_fd = bf4_module._sha256_fd
             with (
@@ -738,7 +747,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
         mesh = object()
         contract = _TrackingMeshContract(identity.physical_ids, mesh)
         memory_configs = SimpleNamespace(w0_w1=object(), w2=object())
-        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        mesh_shapes = _mesh_shapes(identity)
         retained_paths = []
         with tempfile.TemporaryDirectory() as directory:
             cache = Qwen38BF4Cache(directory, identity, contract)
@@ -750,7 +759,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 retained_paths.append(Path(path))
                 target = Path(os.readlink(path)).name
                 artifact_name = "w0_w1" if target.startswith("w0_w1_") else "w2"
-                return _FakeBF4Tensor(getattr(memory_configs, artifact_name), logical_shapes[artifact_name])
+                return _FakeBF4Tensor(getattr(memory_configs, artifact_name), mesh_shapes[artifact_name])
 
             original_validate = contract.validate_tensor
 
@@ -780,7 +789,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
         mesh = object()
         contract = _TrackingMeshContract(identity.physical_ids, mesh)
         memory_configs = SimpleNamespace(w0_w1=object(), w2=object())
-        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        mesh_shapes = _mesh_shapes(identity)
         loaded = []
         with tempfile.TemporaryDirectory() as directory:
             cache = Qwen38BF4Cache(directory, identity, contract)
@@ -790,7 +799,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 self.assertIs(device, mesh)
                 target = Path(os.readlink(path)).name
                 artifact_name = "w0_w1" if target.startswith("w0_w1_") else "w2"
-                shape = logical_shapes[artifact_name]
+                shape = mesh_shapes[artifact_name]
                 if artifact_name == "w2":
                     shape = (*shape[:-1], shape[-1] + 32)
                 tensor = _FakeBF4Tensor(getattr(memory_configs, artifact_name), shape)
@@ -815,7 +824,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
         identity = _identity()
         mesh = object()
         memory_configs = SimpleNamespace(w0_w1=object(), w2=object())
-        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        mesh_shapes = _mesh_shapes(identity)
         aliases = (
             (7, True, 512, 2, 2688, 128),
             (7, 1, 512.0, 2, 2688, 128),
@@ -832,7 +841,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                     self.assertIs(device, mesh)
                     target = Path(os.readlink(path)).name
                     artifact_name = "w0_w1" if target.startswith("w0_w1_") else "w2"
-                    shape = invalid_shape if artifact_name == "w0_w1" else logical_shapes[artifact_name]
+                    shape = invalid_shape if artifact_name == "w0_w1" else mesh_shapes[artifact_name]
                     tensor = _FakeBF4Tensor(getattr(memory_configs, artifact_name), shape)
                     loaded.append(tensor)
                     return tensor
@@ -856,7 +865,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
         mesh = object()
         contract = _TrackingMeshContract(identity.physical_ids, mesh)
         memory_configs = SimpleNamespace(w0_w1=object(), w2=object())
-        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        mesh_shapes = _mesh_shapes(identity)
         retained_paths = []
         loaded_tensors = []
         with tempfile.TemporaryDirectory() as directory:
@@ -868,7 +877,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 retained_paths.append(Path(path))
                 target = os.readlink(path)
                 artifact_name = "w0_w1" if Path(target).name.startswith("w0_w1_") else "w2"
-                tensor = _FakeBF4Tensor(getattr(memory_configs, artifact_name), logical_shapes[artifact_name])
+                tensor = _FakeBF4Tensor(getattr(memory_configs, artifact_name), mesh_shapes[artifact_name])
                 loaded_tensors.append(tensor)
                 if len(loaded_tensors) == 2:
                     replacement = paths["w0_w1"].with_name("replacement.tensorbin")
@@ -897,7 +906,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
         mesh = object()
         contract = _TrackingMeshContract(identity.physical_ids, mesh)
         memory_configs = SimpleNamespace(w0_w1=object(), w2=object())
-        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        mesh_shapes = _mesh_shapes(identity)
         retained_paths = []
         loaded_tensors = []
         with tempfile.TemporaryDirectory() as directory:
@@ -909,7 +918,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 retained_paths.append(Path(path))
                 target = Path(os.readlink(path)).name
                 artifact_name = "w0_w1" if target.startswith("w0_w1_") else "w2"
-                tensor = _FakeBF4Tensor(getattr(memory_configs, artifact_name), logical_shapes[artifact_name])
+                tensor = _FakeBF4Tensor(getattr(memory_configs, artifact_name), mesh_shapes[artifact_name])
                 loaded_tensors.append(tensor)
                 return tensor
 
@@ -944,9 +953,9 @@ class TTNNBF4StaticTest(unittest.TestCase):
         mesh = object()
         contract = _TrackingMeshContract(identity.physical_ids, mesh)
         memory_configs = SimpleNamespace(w0_w1=object(), w2=object())
-        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        mesh_shapes = _mesh_shapes(identity)
         retained_paths = []
-        first_tensor = _FakeBF4Tensor(memory_configs.w0_w1, logical_shapes["w0_w1"])
+        first_tensor = _FakeBF4Tensor(memory_configs.w0_w1, mesh_shapes["w0_w1"])
         with tempfile.TemporaryDirectory() as directory:
             cache = Qwen38BF4Cache(directory, identity, contract)
             _write_layer(cache, 0)
@@ -979,8 +988,8 @@ class TTNNBF4StaticTest(unittest.TestCase):
         mesh = object()
         contract = _TrackingMeshContract(identity.physical_ids, mesh)
         memory_configs = SimpleNamespace(w0_w1=object(), w2=object())
-        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
-        first_tensor = _FakeBF4Tensor(memory_configs.w0_w1, logical_shapes["w0_w1"])
+        mesh_shapes = _mesh_shapes(identity)
+        first_tensor = _FakeBF4Tensor(memory_configs.w0_w1, mesh_shapes["w0_w1"])
         retained_paths = []
         with tempfile.TemporaryDirectory() as directory:
             cache = Qwen38BF4Cache(directory, identity, contract)
@@ -1281,6 +1290,83 @@ class TTNNBF4StaticTest(unittest.TestCase):
             self.assertRegex(str(raised.exception.cleanup_errors[0]), "synthetic conversion cleanup failure")
             deallocate.assert_called_once_with(first_tensor)
             prepare.assert_called_once_with(weights, ring_size=identity.ring_size)
+
+    def _fresh_conversion(self, cache: Qwen38BF4Cache, mesh, *, uploaded_shapes: dict[str, tuple[int, ...]]):
+        """One layer conversion with an ``as_tensor`` that writes the staged tensorbins and returns tensors of
+        ``uploaded_shapes`` (the shape a mesh tensor presents); the digests sample the sparse fixtures."""
+
+        identity = cache.identity
+        memory_configs = SimpleNamespace(w0_w1=object(), w2=object())
+        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        uploaded = []
+
+        def as_tensor(host, *, dtype, layout, device, memory_config, mesh_mapper, cache_file_name):
+            name = cache_file_name.name
+            self.assertIs(device, mesh)
+            self.assertIs(memory_config, getattr(memory_configs, name))
+            _write_sparse_tensorbin(
+                bf4_module._tensorbin_path(cache_file_name),
+                payload_bytes=bf4_module._packed_payload_bytes(logical_shapes[name]),
+                marker=f"packed:{name}".encode(),
+            )
+            uploaded.append(_FakeBF4Tensor(memory_config, uploaded_shapes[name]))
+            return uploaded[-1]
+
+        with (
+            mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_WORKERS),
+            mock.patch.object(
+                bf4_module, "Qwen38MoEWeights", return_value=SimpleNamespace(expert_ranges=EXPERT_RANGES)
+            ),
+            mock.patch.object(bf4_module.ttnn, "ShardTensor2dMesh", return_value=object()),
+            mock.patch.object(bf4_module.ttnn.experimental, "get_weight_mem_configs", return_value=memory_configs),
+            mock.patch.object(bf4_module, "_prepare_routed_layer_host_tensors", return_value=(object(), object())),
+            mock.patch.object(bf4_module.ttnn, "as_tensor", side_effect=as_tensor),
+            mock.patch.object(bf4_module, "_sha256", side_effect=_fast_sparse_digest),
+            mock.patch.object(bf4_module, "_sha256_fd", side_effect=_fast_sparse_digest_fd),
+            mock.patch.object(bf4_module.ttnn, "deallocate") as deallocate,
+        ):
+            try:
+                tensors = cache._convert_and_upload_locked(
+                    object(), SimpleNamespace(expert_ranges=EXPERT_RANGES), mesh, layer_index=0
+                )
+            except RuntimeError as error:
+                return uploaded, deallocate, error
+        self.assertEqual(list(tensors), uploaded)
+        return uploaded, deallocate, None
+
+    def test_fresh_conversion_records_the_slot_shape_and_accepts_coordinate_local_shards(self):
+        identity = _identity()
+        mesh = SimpleNamespace(shape=(1, 4))
+        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        mesh_shapes = _mesh_shapes(identity)
+        self.assertEqual(mesh_shapes["w0_w1"][2] * 4, logical_shapes["w0_w1"][2])
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Qwen38BF4Cache(directory, identity, _TrackingMeshContract(identity.physical_ids, mesh))
+            uploaded, deallocate, error = self._fresh_conversion(cache, mesh, uploaded_shapes=mesh_shapes)
+            self.assertIsNone(error)
+            deallocate.assert_not_called()
+            with mock.patch.object(bf4_module, "_sha256_fd", side_effect=_fast_sparse_digest_fd):
+                record = cache.verify_layer("backbone", 0)
+            self.assertIsNotNone(record)
+            # The manifest records the slot's global shape; the uploaded tensors present one coordinate's shard.
+            self.assertEqual(record.w0_w1.logical_shape, logical_shapes["w0_w1"])
+            self.assertEqual(record.w2.logical_shape, logical_shapes["w2"])
+            self.assertEqual([tuple(tensor.shape) for tensor in uploaded], [mesh_shapes["w0_w1"], mesh_shapes["w2"]])
+            published = sorted(str(path.relative_to(cache.root)) for path in cache.root.rglob("*") if path.is_file())
+            self.assertEqual(published, sorted([record.w0_w1.relative_path, record.w2.relative_path, "manifest.json"]))
+
+    def test_fresh_conversion_refuses_a_global_shaped_upload_and_publishes_nothing(self):
+        identity = _identity()
+        mesh = SimpleNamespace(shape=(1, 4))
+        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Qwen38BF4Cache(directory, identity, _TrackingMeshContract(identity.physical_ids, mesh))
+            uploaded, deallocate, error = self._fresh_conversion(cache, mesh, uploaded_shapes=logical_shapes)
+            self.assertRegex(str(error), "BF4 conversion w0_w1 loaded shape .* coordinate-local slot shape")
+            self.assertEqual([call.args[0] for call in deallocate.call_args_list], uploaded)
+            # No orphan tensorbin, no manifest: the refused layer is absent, not unadoptable.
+            self.assertEqual([path for path in cache.root.rglob("*") if path.is_file()], [])
+            self.assertIsNone(cache.verify_layer("backbone", 0))
 
     def test_streamer_attempts_both_releases_and_clears_active_slot(self):
         class Tensor(_FakeBackingTensor):

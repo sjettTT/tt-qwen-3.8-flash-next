@@ -877,7 +877,7 @@ def test_verify_token_rows_pad_with_the_zero_embedding_token_and_readback_parses
 
 
 def test_moe_row_admission_and_flags_are_untouched() -> None:
-    assert moe_module.SUPPORTED_ROWS == (1, 5, 32)
+    assert moe_module.SUPPORTED_ROWS == (1, 5, 32, 128)
     assert moe_module.ROWS5_HARDWARE_PROVEN is True and moe_module.ROWS32_HARDWARE_PROVEN is True
     assert [mtp_v2.moe_rows_for(k + 1) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, 32]
     assert mtp_v2.SUPPORTED_DRAFTS == (3, 4, 5) and mtp_v2.DEFAULT_DRAFTS == 4
@@ -1050,7 +1050,7 @@ def test_qsa_verify_methods_are_the_chunk_ops_plus_two_block_writes_without_host
     assert "completed_blocks=1 if single_row else VERIFY_COMPLETED_BLOCKS" in derive
     chunk_derive = _segment(QSA_SOURCE, functions["derive_qsa_chunk_inputs"])
     assert (
-        "completed_blocks: int = CHUNK_BLOCKS" in chunk_derive
+        "completed_blocks: int | None = None" in chunk_derive
         and "for block in range(completed_blocks):" in chunk_derive
     )
     # The 1-row generic and the chunk bodies are untouched (their walks are the pinned ones).

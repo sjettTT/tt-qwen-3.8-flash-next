@@ -686,7 +686,13 @@ def test_moe_dense_linears_share_one_width_sharded_hidden() -> None:
     gathers = _calls_named(ast.parse(textwrap.dedent(gather)), "all_gather")
     assert len(gathers) == 1
     keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in gathers[0].keywords}
-    assert keywords["memory_config"] == "self.hidden_act_memory_config"
+    assert keywords["memory_config"] == "self.hidden_gather_memory_config"
+    init = inspect.getsource(moe_module.Qwen38TTNNMoE.__init__)
+    assert (
+        "self.hidden_gather_memory_config = (\n"
+        "            self.hidden_act_memory_config if self.row_contract.row_tiles == 1 else ttnn.DRAM_MEMORY_CONFIG\n"
+        "        )"
+    ) in init
 
     forward = inspect.getsource(moe_module.Qwen38TTNNMoE.forward)
     assert not _calls_named(ast.parse(textwrap.dedent(forward)), "to_memory_config")
@@ -695,8 +701,10 @@ def test_moe_dense_linears_share_one_width_sharded_hidden() -> None:
     assert 'self._shared_partial(hidden_sharded, temporaries["full_hidden"])' in forward
     # The gathered shard is also the routed untilize's input, so it is released
     # only after the reduce-scatter enqueue.
-    assert forward.index("self._routed_partial(") < forward.index('release_many("local_sum", "full_hidden")')
-    assert forward.index("tt_all_reduce(") < forward.index('release_many("local_sum", "full_hidden")')
+    assert forward.index("self._routed_partial(") < forward.index(
+        'release_many("local_sum", "full_hidden", "routing_tiles")'
+    )
+    assert forward.index("tt_all_reduce(") < forward.index('release_many("local_sum", "full_hidden", "routing_tiles")')
 
     for helper in (moe_module.Qwen38TTNNMoE._route, moe_module.Qwen38TTNNMoE._shared_partial):
         source = inspect.getsource(helper)
@@ -706,7 +714,7 @@ def test_moe_dense_linears_share_one_width_sharded_hidden() -> None:
     shared = inspect.getsource(moe_module.Qwen38TTNNMoE._shared_partial)
     assert "partial = ttnn.linear(" in shared
     assert "to_memory_config(partial" not in shared
-    assert "gated_partial = ttnn.mul(partial, scalar_gate, memory_config=ttnn.DRAM_MEMORY_CONFIG)" in shared
+    assert "gated_partials.append(ttnn.mul(partial, scalar_gate, memory_config=ttnn.DRAM_MEMORY_CONFIG))" in shared
 
 
 def test_qsa_projections_read_the_width_sharded_hidden_the_gather_writes() -> None:

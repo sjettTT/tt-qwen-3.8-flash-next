@@ -107,9 +107,12 @@ the context and the run directory, and starts the server.
 (`<cache-root>/caches/bf4-experts/`, 107 GB: each layer read from the checkpoint, packed on the host, uploaded to the
 mesh and written back as one tensorbin per weight; a `bf4-stage-backbone-NN` phase per layer in the log), then builds
 the component and model I/O caches of the chosen context (a few minutes), compiles the kernels (the JIT cache fills
-during the warm pass, two to four minutes cold) and captures the decode traces and the prefill chunk trace.  A
-machine that bounds a job's wall time can build the expert cache in pieces: `--prepare-only --bf4-stage-limit N`
-converts at most N missing layers and stops; every layer is manifested as it completes, so the next run continues.
+during the warm pass, two to four minutes cold) and captures the decode traces and the prefill chunk trace.  A layer
+takes about 33 s on a 4x p150 host (2.2 GB written; measured 2026-09-05: 25 layers in 812 s), the 49 under half an hour;
+the payload of every tensorbin is byte for byte the CPU-staged corpus's (`tools/stage_full_bf4_cpu.py`), the manifest records the slot's global shape
+(512 experts) while the mesh tensor presents one device's 128.  A machine that bounds a job's wall time can build the
+expert cache in pieces: `--prepare-only --bf4-stage-limit N` converts at most N missing layers and stops; every layer
+is manifested as it completes (a refused layer publishes nothing), so the next run continues.
 **Warm starts** reach `READY` in about five minutes: the weights load, the traces are captured, the acceptance
 prompts (`--acceptance`: the twelve shipped CPU greedy records under `tools/acceptance/greedy-prompts/`) replay
 against the CPU, then the server listens.  `--require-json-96` refuses to serve unless the `json` record matches

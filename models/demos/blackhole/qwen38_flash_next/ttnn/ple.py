@@ -31,6 +31,7 @@ from models.demos.blackhole.qwen38_flash_next.checkpoint import (
 from models.demos.blackhole.qwen38_flash_next.reference import ngram_token_ids
 from models.demos.blackhole.qwen38_flash_next.tt.ple import Qwen38HostPLEEmbedding, Qwen38PLEWeights
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
+    LONG_CHUNK_ROWS,
     MESH_SHAPE,
     Qwen38MeshContract,
     TensorPlacement,
@@ -415,12 +416,20 @@ class Qwen38TTNNPLERowsState:
     normalized: Any
     mesh_contract: Qwen38MeshContract
     token_context: tuple[int, int] | None = None
+    owns_history: bool = (
+        True  # False: ``history`` is another rows state's buffer (the long chunk shares the 32-row one)
+    )
 
     @classmethod
-    def allocate(cls, mesh_device, mesh_contract: Qwen38MeshContract, *, rows: int) -> "Qwen38TTNNPLERowsState":
+    def allocate(
+        cls, mesh_device, mesh_contract: Qwen38MeshContract, *, rows: int, history=None
+    ) -> "Qwen38TTNNPLERowsState":
+        """``history`` hands over another rows state's history buffer: the two row forms then carry one history
+        (and one host context, kept by the caller) and need no sync between them."""
+
         mesh_contract.validate_mesh(mesh_device)
-        if not 1 <= rows <= 32:
-            raise ValueError(f"PLE rows path admits 1..32 rows, got {rows}")
+        if not 1 <= rows <= 32 and rows != LONG_CHUNK_ROWS:
+            raise ValueError(f"PLE rows path admits 1..32 rows or {LONG_CHUNK_ROWS}, got {rows}")
         mapper = ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3))
 
         def upload_zero(token_rows: int):
@@ -433,13 +442,16 @@ class Qwen38TTNNPLERowsState:
                 mesh_mapper=mapper,
             )
 
-        history = upload_zero(CONV_STATE_LENGTH)
+        owns_history = history is None
+        if owns_history:
+            history = upload_zero(CONV_STATE_LENGTH)
         try:
-            state = cls(rows, history, upload_zero(rows), mesh_contract)
+            state = cls(rows, history, upload_zero(rows), mesh_contract, owns_history=owns_history)
             state.validate()
             return state
         except BaseException:
-            _deallocate(history)
+            if owns_history:
+                _deallocate(history)
             raise
 
     def validate(self) -> None:
@@ -491,7 +503,7 @@ class Qwen38TTNNPLERowsState:
         state.validate()
 
     def deallocate(self) -> None:
-        _deallocate(self.history, self.normalized)
+        _deallocate(*((self.history,) if self.owns_history else ()), self.normalized)
 
 
 @dataclass
@@ -962,8 +974,8 @@ class Qwen38TTNNPLE:
     # Assumption to confirm on hardware: rms_norm_post_all_gather applies the [1,1,4,640] per-branch
     # weight per tile row, so it is reused for every token (row 0 must match the 1-row path).
 
-    def allocate_rows_state(self, rows: int) -> Qwen38TTNNPLERowsState:
-        return Qwen38TTNNPLERowsState.allocate(self.mesh_device, self.mesh_contract, rows=rows)
+    def allocate_rows_state(self, rows: int, *, history=None) -> Qwen38TTNNPLERowsState:
+        return Qwen38TTNNPLERowsState.allocate(self.mesh_device, self.mesh_contract, rows=rows, history=history)
 
     def _validate_rows_residual(self, tensor, rows: int, *, label: str) -> None:
         expected = _rows_residual_shape(rows)
@@ -1260,6 +1272,23 @@ class Qwen38TTNNPLE:
         if landed is not None and _tensor_key(landed) != _tensor_key(rows_state.history):
             raise RuntimeError("PLE rows history select did not land in its persistent buffer")
         _deallocate(acc, terms[-1])
+
+    def commit_rows_full(self, rows_state: Qwen38TTNNPLERowsState) -> None:
+        """``history <- normalized[rows - 9 : rows]``: every row committed (the long chunk), one slice and one copy."""
+
+        rows_state.validate()
+        rows = rows_state.rows
+        if rows < CONV_STATE_LENGTH:
+            raise ValueError(f"a full commit needs at least {CONV_STATE_LENGTH} rows, the state has {rows}")
+        history = ttnn.slice(
+            rows_state.normalized,
+            (0, rows - CONV_STATE_LENGTH, 0, 0),
+            (1, rows, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        self._validate_rows_residual(history, CONV_STATE_LENGTH, label="PLE rows full-commit history")
+        _copy_inplace(history, rows_state.history, label="PLE rows history")
+        _deallocate(history)
 
     @staticmethod
     def commit_rows_host(

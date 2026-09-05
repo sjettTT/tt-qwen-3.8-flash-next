@@ -49,13 +49,16 @@ import torch
 import ttnn
 from models.demos.blackhole.qwen38_flash_next.config import CONFIG_SHA256, LAYER_PATTERN, Qwen38Config
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
+from models.demos.blackhole.qwen38_flash_next.ttnn import moe as moe_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import qsa as qsa_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
+    CHUNK_ROW_COUNTS,
     CHUNK_ROWS,
     MESH_SHAPE,
     Qwen38MeshContract,
     Qwen38TTNNDevicePosition,
     TensorPlacement,
+    chunk_row_tiles,
     replicate_tensor_2d_mesh_mapper,
     tensor_metadata,
 )
@@ -65,13 +68,12 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import (
     Qwen38TTNNModelIO,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.final_mixer import Qwen38TTNNFinalMixer
+from models.demos.blackhole.qwen38_flash_next.ttnn.gr import block_rows_shape, residual_rows_shape
 from models.demos.blackhole.qwen38_flash_next.ttnn.layer import (
     BACKBONE_LAYERS,
     BLOCK_LOCAL_SHAPE,
-    BLOCK_ROWS_LOCAL_SHAPE,
     PLE_CHECKPOINT_LAYER,
     RESIDUAL_LOCAL_SHAPE,
-    RESIDUAL_ROWS_LOCAL_SHAPE,
     Qwen38TTNNDecoderLayer,
     Qwen38TTNNDecoderLayerAux,
     Qwen38TTNNDecoderLayerChunkState,
@@ -431,8 +433,8 @@ class Qwen38TTNNRoPETable:
             raise
         return cls(tables[0], tables[1], allocated_context, inverse_frequency, mesh_contract)
 
-    def _lookup_tile(self, indices, table, *, label: str):
-        """The fused lookup of one ``[1,1,32]`` index row as its full 32-row tile ``[1,1,32,64]``."""
+    def _lookup_tile(self, indices, table, *, label: str, row_count: int = ttnn.TILE_SIZE):
+        """The fused lookup of one ``[1,1,row_count]`` index row as its full tile rows ``[1,1,row_count,64]``."""
 
         looked_up = ttnn.embedding(
             indices, table, layout=ttnn.TILE_LAYOUT, dtype=ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG
@@ -442,7 +444,7 @@ class Qwen38TTNNRoPETable:
         # [1,1,32] index row comes back as [1,32,64]; the fused TILE program's
         # 32-row tile is its padded shape.  Same rule as embed_device_token.
         rows = ttnn.unsqueeze_to_4D(looked_up) if len(looked_up.shape) == 3 else looked_up
-        padded = (1, 1, ttnn.TILE_SIZE, QSA_ROPE_DIM)
+        padded = (1, 1, row_count, QSA_ROPE_DIM)
         if (
             _shape(rows) != padded
             or _padded_shape(rows) != padded
@@ -504,34 +506,34 @@ class Qwen38TTNNRoPETable:
         return Qwen38TTNNRoPEInputs(None, *looked_up)
 
     def rows_chunk(self, index_rows, block_start_rows) -> Qwen38TTNNRoPEInputs:
-        """In-trace rows for one prefill chunk from two ``[1,1,1,32]`` UINT32 index rows.
+        """In-trace rows for one prefill chunk from the UINT32 index rows ``[1,1,tiles,32]`` and ``[1,1,1,32]``.
 
-        ``index_rows`` lane j = P + j gives cos/sin ``[1,1,32,64]`` (row j at P + j); ``block_start_rows``
-        lane i = P + 4i (i < 8) gives the block-start rows, whose first eight rows the compressed keys use.
-        The fused lookup's 32 rows are all kept (no one-row view).
+        ``index_rows`` lane j = P + j gives cos/sin ``[1,1,rows,64]`` (row j at P + j; rows = 32 tiles);
+        ``block_start_rows`` lane i = P + 4i (i < rows / 4) gives the block-start rows, whose first rows / 4
+        rows the compressed keys use.  The fused lookup's rows are all kept (no one-row view).
         """
 
-        for name, row in (("index_rows", index_rows), ("block_start_rows", block_start_rows)):
-            if (
-                _shape(row) != (1, 1, 1, ttnn.TILE_SIZE)
-                or row.dtype != ttnn.uint32
-                or row.layout != ttnn.ROW_MAJOR_LAYOUT
-            ):
+        tiles = _shape(index_rows)[2]
+        for name, row, expected in (
+            ("index_rows", index_rows, (1, 1, tiles, ttnn.TILE_SIZE)),
+            ("block_start_rows", block_start_rows, (1, 1, 1, ttnn.TILE_SIZE)),
+        ):
+            if _shape(row) != expected or row.dtype != ttnn.uint32 or row.layout != ttnn.ROW_MAJOR_LAYOUT:
                 raise RuntimeError(
-                    f"RoPE table {name} must be UINT32 ROW_MAJOR [1,1,1,{ttnn.TILE_SIZE}], got {tensor_metadata(row)}"
+                    f"RoPE table {name} must be UINT32 ROW_MAJOR {list(expected)}, got {tensor_metadata(row)}"
                 )
             self.mesh_contract.validate_tensor(row, placement=TensorPlacement.REPLICATED)
-        indices = ttnn.reshape(index_rows, (1, 1, ttnn.TILE_SIZE))
+        indices = ttnn.reshape(index_rows, (1, 1, tiles * ttnn.TILE_SIZE))
         block_indices = ttnn.reshape(block_start_rows, (1, 1, ttnn.TILE_SIZE))
         looked_up: list[Any] = []
         try:
-            for label, table_indices, table in (
-                ("QSA chunk RoPE cos", indices, self.cos_table),
-                ("QSA chunk RoPE sin", indices, self.sin_table),
-                ("QSA chunk block-start RoPE cos", block_indices, self.cos_table),
-                ("QSA chunk block-start RoPE sin", block_indices, self.sin_table),
+            for label, table_indices, table, row_count in (
+                ("QSA chunk RoPE cos", indices, self.cos_table, tiles * ttnn.TILE_SIZE),
+                ("QSA chunk RoPE sin", indices, self.sin_table, tiles * ttnn.TILE_SIZE),
+                ("QSA chunk block-start RoPE cos", block_indices, self.cos_table, ttnn.TILE_SIZE),
+                ("QSA chunk block-start RoPE sin", block_indices, self.sin_table, ttnn.TILE_SIZE),
             ):
-                rows = self._lookup_tile(table_indices, table, label=label)
+                rows = self._lookup_tile(table_indices, table, label=label, row_count=row_count)
                 looked_up.append(rows)
                 self.mesh_contract.validate_tensor(rows, placement=TensorPlacement.REPLICATED)
         except BaseException:
@@ -619,10 +621,13 @@ class Qwen38TTNNTextModelGenericState:
 class Qwen38TTNNTextModelChunkState:
     """Fixed-address buffers of the prefill chunk body, allocated beside the generic state before any capture.
 
-    ``token_row`` (replicated FP32 TILE ``[1,1,1,32]``, lane j = token j) and ``ple_rows`` (the persistent
-    ``[1,1,32,640]`` upload of the 32 n-gram rows) are the host-written inputs of a chunk; ``accepted`` (FP32
+    ``token_row`` (replicated FP32 TILE ``[1,1,tiles,32]``, lane j = token j) and ``ple_rows`` (the persistent
+    ``[1,1,rows,640]`` upload of the n-gram rows) are the host-written inputs of a chunk; ``accepted`` (FP32
     ``[1,1,1,1]``) is 31 for a full chunk and r - 1 for the padded last chunk with r real rows, so one trace
-    serves both.  ``rows_constants`` / ``qsa_chunk_constants`` are the model-lifetime chunk constants.
+    serves both (the 128-row form has none: it always commits every row).  ``rows_constants`` /
+    ``qsa_chunk_constants`` are the model-lifetime chunk constants of this row count; ``local_combine_output``
+    is the MoE combine buffer the 128-row layer instances share.  A 128-row state is allocated beside the
+    32-row state whose GDN and PLE histories it shares.
     """
 
     rows_constants: gdn_module.Qwen38TTNNGDNRowsConstants
@@ -630,8 +635,10 @@ class Qwen38TTNNTextModelChunkState:
     layers: tuple[Qwen38TTNNDecoderLayerChunkState, ...]
     token_row: Any
     ple_rows: Qwen38TTNNPLERowsPreparedInput
-    accepted: Any
+    accepted: Any | None
     _owner: object = field(repr=False, compare=False)
+    rows: int = CHUNK_ROWS
+    local_combine_output: Any | None = None
 
 
 @dataclass
@@ -1302,33 +1309,34 @@ class Qwen38TTNNTextModel:
         return owned[1]
 
     def _embed_residual_rows_from_device_token(self, token_row):
-        """Trace-capturable branch-major ``[1,4,32,640]`` residual rows from a 32-lane token row (prefill chunk)."""
+        """Trace-capturable branch-major ``[1,4,rows,640]`` residual rows from a token-rows tile (prefill chunk)."""
 
+        rows = _shape(token_row)[2] * ttnn.TILE_SIZE
         owned: list[Any | None] = [self.model_io.embedding.embed_device_token_rows(token_row), None]
         try:
             hidden = owned[0]
             if (
-                _shape(hidden) != BLOCK_ROWS_LOCAL_SHAPE
+                _shape(hidden) != block_rows_shape(rows)
                 or hidden.dtype != ttnn.bfloat16
                 or hidden.layout != ttnn.TILE_LAYOUT
             ):
                 raise RuntimeError(
-                    f"device-token embedding rows must be BF16 TILE {list(BLOCK_ROWS_LOCAL_SHAPE)}, "
+                    f"device-token embedding rows must be BF16 TILE {list(block_rows_shape(rows))}, "
                     f"got {tensor_metadata(hidden)}"
                 )
             self.mesh_contract.validate_tensor(hidden, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
-            # Same branch-major construction as _embed_residual_from_device_token, over 32 rows.
+            # Same branch-major construction as _embed_residual_from_device_token, over the rows.
             owned[1] = ttnn.repeat_interleave(
                 hidden, repeats=RESIDUAL_BRANCHES, dim=1, memory_config=ttnn.DRAM_MEMORY_CONFIG
             )
             residual = owned[1]
             if (
-                _shape(residual) != RESIDUAL_ROWS_LOCAL_SHAPE
+                _shape(residual) != residual_rows_shape(rows)
                 or residual.dtype != ttnn.bfloat16
                 or residual.layout != ttnn.TILE_LAYOUT
             ):
                 raise RuntimeError(
-                    f"device-token residual rows must be BF16 TILE {list(RESIDUAL_ROWS_LOCAL_SHAPE)}, "
+                    f"device-token residual rows must be BF16 TILE {list(residual_rows_shape(rows))}, "
                     f"got {tensor_metadata(residual)}"
                 )
             self.mesh_contract.validate_tensor(residual, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
@@ -2211,59 +2219,111 @@ class Qwen38TTNNTextModel:
             guard_attempts=tuple(guard_attempts),
         )
 
-    # ------------------------------------------------------------------ prefill chunk (32 rows)
-    # forward_prefill_chunk_generic is the position-generic body over the 32 positions P .. P + 31 of one
-    # chunk (P % 32 == 0), traced once and replayed per chunk: no final mixer, no LM head, no host ints; the
-    # chunk state carries the GDN/PLE histories and the hand-off sources between chunks, the generic state is
-    # the decode's and is updated in place, and P += 32 is the last op.
+    # ------------------------------------------------------------------ prefill chunk (32 or 128 rows)
+    # forward_prefill_chunk_generic is the position-generic body over the positions P .. P + rows - 1 of one
+    # chunk (P % 32 == 0), traced once per row count and replayed per chunk: no final mixer, no LM head, no
+    # host ints; the chunk state carries the GDN/PLE histories and the hand-off sources between chunks, the
+    # generic state is the decode's and is updated in place, and P += rows is the last op.  The 32-row form
+    # serves full chunks and the padded tail through its accept scalar; the 128-row form (allocated beside the
+    # 32-row state, sharing its histories) serves full chunks only.
 
     def _validate_chunk_state(self, chunk_state: Qwen38TTNNTextModelChunkState) -> None:
         self._require_healthy()
         if not isinstance(chunk_state, Qwen38TTNNTextModelChunkState) or chunk_state._owner is not self._state_owner:
             raise ValueError("text-model chunk state was not allocated by this model owner")
-        if len(chunk_state.layers) != BACKBONE_LAYERS or chunk_state.rows_constants.rows != CHUNK_ROWS:
-            raise ValueError("text-model chunk state must hold 48 layer states over the 32-row constants")
-        self.model_io.embedding.validate_token_row(chunk_state.token_row, label="chunk token row")
-        if _shape(chunk_state.accepted) != (1, 1, 1, 1) or chunk_state.accepted.dtype != ttnn.float32:
+        rows = chunk_state.rows
+        if rows not in CHUNK_ROW_COUNTS:
+            raise ValueError(f"text-model chunk state rows must be one of {CHUNK_ROW_COUNTS}, got {rows!r}")
+        if (
+            len(chunk_state.layers) != BACKBONE_LAYERS
+            or chunk_state.rows_constants.rows != rows
+            or chunk_state.qsa_chunk_constants.rows != rows
+            or any(layer_state.rows != rows for layer_state in chunk_state.layers)
+        ):
+            raise ValueError(f"text-model chunk state must hold 48 layer states over the {rows}-row constants")
+        self.model_io.embedding.validate_token_rows(chunk_state.token_row, rows=rows, label="chunk token rows")
+        if (chunk_state.accepted is None) != (rows != CHUNK_ROWS):
+            raise RuntimeError(
+                f"the {rows}-row chunk state {'carries' if rows != CHUNK_ROWS else 'lacks'} an accept scalar"
+            )
+        if chunk_state.accepted is not None and (
+            _shape(chunk_state.accepted) != (1, 1, 1, 1) or chunk_state.accepted.dtype != ttnn.float32
+        ):
             raise RuntimeError(
                 f"chunk accept scalar must be FP32 [1,1,1,1], got {tensor_metadata(chunk_state.accepted)}"
+            )
+        if (chunk_state.local_combine_output is None) != (rows == CHUNK_ROWS):
+            raise RuntimeError(
+                f"the {rows}-row chunk state's shared MoE combine buffer is {chunk_state.local_combine_output}"
             )
         if not chunk_state.ple_rows.active:
             raise RuntimeError("chunk PLE rows were released")
 
-    def allocate_chunk_state(self, state: Qwen38TTNNTextModelGenericState) -> Qwen38TTNNTextModelChunkState:
-        """Allocate the chunk constants and every layer's chunk buffers (before the decode captures)."""
+    def allocate_chunk_state(
+        self,
+        state: Qwen38TTNNTextModelGenericState,
+        *,
+        rows: int = CHUNK_ROWS,
+        base: Qwen38TTNNTextModelChunkState | None = None,
+    ) -> Qwen38TTNNTextModelChunkState:
+        """Allocate the chunk constants and every layer's chunk buffers (before the decode captures).
+
+        ``rows`` picks the form; the 128-row form needs ``base``, the 32-row chunk state of the same generic
+        state, whose per-layer GDN and PLE histories it shares (one shared MoE combine buffer for its 48 layers).
+        """
 
         self._validate_generic_state(state)
         if self.rope_table is None or self.qsa_position_constants is None:
             raise RuntimeError("generic constants are missing; allocate the generic state through this owner")
+        chunk_row_tiles(rows)
+        if (base is None) != (rows == CHUNK_ROWS):
+            raise ValueError(
+                f"the {rows}-row chunk state {'needs' if rows != CHUNK_ROWS else 'takes no'} base 32-row chunk state"
+            )
+        if base is not None:
+            self._validate_chunk_state(base)
+            if base.rows != CHUNK_ROWS:
+                raise ValueError(f"the base chunk state must be the {CHUNK_ROWS}-row one, got {base.rows} rows")
         gdn = next(layer.attention for layer in self.layers if layer.layer_type is Qwen38TTNNLayerType.GDN)
         qsa = next(layer.attention for layer in self.layers if layer.layer_type is Qwen38TTNNLayerType.QSA)
-        rows_constants = gdn.allocate_rows_constants(CHUNK_ROWS)
+        rows_constants = gdn.allocate_rows_constants(rows)
         qsa_chunk_constants = None
+        local_combine_output = None
         token_row = None
         accepted = None
         ple_rows = None
         allocated: list[Qwen38TTNNDecoderLayerChunkState] = []
         try:
             qsa_chunk_constants = qsa_module.Qwen38TTNNQSAChunkConstants.build(
-                self.mesh_device, self.mesh_contract, qsa.allocated_compressed_blocks
+                self.mesh_device, self.mesh_contract, qsa.allocated_compressed_blocks, rows=rows
             )
-            for layer in self.layers:
-                allocated.append(layer.allocate_chunk_state(rows_constants))
-            token_row = self.model_io.embedding.upload_token_row(0)
-            accepted = ttnn.from_torch(
-                torch.full((1, 1, 1, 1), float(CHUNK_ROWS - 1)),
-                dtype=ttnn.float32,
-                layout=ttnn.TILE_LAYOUT,
-                device=self.mesh_device,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                mesh_mapper=replicate_tensor_2d_mesh_mapper(self.mesh_device),
-            )
+            if base is not None:
+                # The rows-128 instances run the routed stream one 32-row tile per moe_compute call: a 32-row buffer.
+                local_combine_output = moe_module.allocate_local_combine_output(
+                    self.mesh_device, self.mesh_contract, moe_module.PREFILL_CHUNK_ROWS
+                )
+            for index, layer in enumerate(self.layers):
+                allocated.append(
+                    layer.allocate_chunk_state(
+                        rows_constants,
+                        base=None if base is None else base.layers[index],
+                        local_combine_output=local_combine_output,
+                    )
+                )
+            token_row = self.model_io.embedding.upload_token_rows(rows)
+            if rows == CHUNK_ROWS:
+                accepted = ttnn.from_torch(
+                    torch.full((1, 1, 1, 1), float(CHUNK_ROWS - 1)),
+                    dtype=ttnn.float32,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.mesh_device,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=replicate_tensor_2d_mesh_mapper(self.mesh_device),
+                )
             ple_layer, ple_rows_state = self.layers[PLE_CHECKPOINT_LAYER], allocated[PLE_CHECKPOINT_LAYER].ple
             if ple_layer.ple is None or ple_rows_state is None:
                 raise RuntimeError("checkpoint layer 1 PLE owner/rows state is unavailable")
-            ple_rows = ple_layer.ple.prepare_rows_input([0] * CHUNK_ROWS, ple_rows_state)
+            ple_rows = ple_layer.ple.prepare_rows_input([0] * rows, ple_rows_state)
             result = Qwen38TTNNTextModelChunkState(
                 rows_constants=rows_constants,
                 qsa_chunk_constants=qsa_chunk_constants,
@@ -2272,6 +2332,8 @@ class Qwen38TTNNTextModel:
                 ple_rows=ple_rows,
                 accepted=accepted,
                 _owner=self._state_owner,
+                rows=rows,
+                local_combine_output=local_combine_output,
             )
             self._validate_chunk_state(result)
             return result
@@ -2285,7 +2347,11 @@ class Qwen38TTNNTextModel:
             ]
             if ple_rows is not None:
                 actions.append(("chunk PLE rows", ple_rows.release))
-            for label, tensor in (("chunk accept scalar", accepted), ("chunk token row", token_row)):
+            for label, tensor in (
+                ("chunk accept scalar", accepted),
+                ("chunk token row", token_row),
+                ("chunk MoE combine buffer", local_combine_output),
+            ):
                 if tensor is not None:
                     actions.append((label, lambda tensor=tensor: ttnn.deallocate(tensor)))
             if qsa_chunk_constants is not None:
@@ -2297,6 +2363,8 @@ class Qwen38TTNNTextModel:
             raise
 
     def release_chunk_state(self, chunk_state: Qwen38TTNNTextModelChunkState) -> None:
+        """Release a chunk state; a 128-row state goes before the 32-row state whose histories it shares."""
+
         self._validate_chunk_state(chunk_state)
         actions = [
             (
@@ -2306,8 +2374,11 @@ class Qwen38TTNNTextModel:
             for index, (layer, layer_state) in reversed(tuple(enumerate(zip(self.layers, chunk_state.layers))))
         ]
         actions.append(("chunk PLE rows", chunk_state.ple_rows.release))
-        actions.append(("chunk accept scalar", lambda: ttnn.deallocate(chunk_state.accepted)))
+        if chunk_state.accepted is not None:
+            actions.append(("chunk accept scalar", lambda: ttnn.deallocate(chunk_state.accepted)))
         actions.append(("chunk token row", lambda: ttnn.deallocate(chunk_state.token_row)))
+        if chunk_state.local_combine_output is not None:
+            actions.append(("chunk MoE combine buffer", lambda: ttnn.deallocate(chunk_state.local_combine_output)))
         actions.append(("QSA chunk constants", chunk_state.qsa_chunk_constants.deallocate))
         actions.append(("GDN rows constants", chunk_state.rows_constants.deallocate))
         try:
@@ -2320,14 +2391,17 @@ class Qwen38TTNNTextModel:
     ) -> None:
         """Seed the chunk carry from the generic state at fixed addresses: after ``reset_generic_state_inplace``
         (position 0: zero histories) or after decode steps that ended at ``P % 32 == 0`` (the histories from
-        the GDN ring and the PLE slots).  The accept scalar is set to a full chunk; the position is untouched."""
+        the GDN ring and the PLE slots).  The accept scalar is set to a full chunk; the position is untouched.
+        A 128-row state shares its histories with the 32-row state (reset that one too); only its QSA kept
+        buffers are zeroed here."""
 
         self._validate_generic_state(state)
         self._validate_chunk_state(chunk_state)
         try:
             for layer, layer_state, layer_chunk in zip(self.layers, state.layers, chunk_state.layers):
                 layer.reset_chunk_state_inplace(layer_chunk, layer_state)
-            self.write_chunk_accepted(chunk_state, CHUNK_ROWS - 1)
+            if chunk_state.accepted is not None:
+                self.write_chunk_accepted(chunk_state, CHUNK_ROWS - 1)
         except BaseException as error:
             self._mark_poisoned("reset_chunk_state_inplace", 0, error)
 
@@ -2336,6 +2410,8 @@ class Qwen38TTNNTextModel:
 
         if isinstance(accepted, bool) or type(accepted) is not int or not 0 <= accepted < CHUNK_ROWS:
             raise ValueError(f"chunk accept count must be an int in [0,{CHUNK_ROWS}), got {accepted!r}")
+        if chunk_state.accepted is None:
+            raise ValueError(f"the {chunk_state.rows}-row chunk state has no accept scalar")
         host = ttnn.from_torch(
             torch.full((1, 1, 1, 1), float(accepted)),
             dtype=ttnn.float32,
@@ -2347,15 +2423,19 @@ class Qwen38TTNNTextModel:
     def write_chunk_inputs(
         self, chunk_state: Qwen38TTNNTextModelChunkState, token_ids: Sequence[int], *, ple_context
     ) -> tuple[tuple[int, int] | None, ...]:
-        """Host writes of one chunk's inputs (outside any trace): the 32 token ids into the token row and
+        """Host writes of one chunk's inputs (outside any trace): the ``rows`` token ids into the token rows and
         their n-gram rows, looked up from ``ple_context`` in one pass, into the persistent PLE rows.  Returns
-        the 33 contexts of :meth:`Qwen38TTNNPLE.host_rows` (``contexts[r]`` after committing r rows)."""
+        the rows + 1 contexts of :meth:`Qwen38TTNNPLE.host_rows` (``contexts[r]`` after committing r rows)."""
 
         self._validate_chunk_state(chunk_state)
         ple = self.layers[PLE_CHECKPOINT_LAYER].ple
         if ple is None:
             raise RuntimeError("checkpoint layer 1 PLE owner is unavailable")
         token_ids = [int(token) for token in token_ids]
+        if len(token_ids) != chunk_state.rows:
+            raise ValueError(
+                f"the {chunk_state.rows}-row chunk takes {chunk_state.rows} token ids, got {len(token_ids)}"
+            )
         ttnn.copy_host_to_device_tensor(
             ttnn.from_torch(
                 self.model_io.embedding.host_token_rows(token_ids),
@@ -2385,27 +2465,46 @@ class Qwen38TTNNTextModel:
         gdn_step_anchor: bool = False,
         mtp=None,
     ) -> None:
-        """One chunk: selectors, RoPE rows and QSA chunk inputs from the device position, the 32-lane
-        embedding, 48 layers in place, ``P += 32``.  No final mixer or LM head: the first decode replay after
-        the prefill consumes the last prompt token.  ``gdn_step_anchor`` is every GDN layer's state re-anchor (the
-        layer commits through ``commit_rows(step_committed_rows=True)``).  ``mtp`` (the MTP-drafting server's chunk
-        extension) runs the MTP layer's rows on the layer-47 residual rows before they are released.  Any failure
-        poisons this owner."""
+        """One chunk: selectors (the 32-row form), RoPE rows and QSA chunk inputs from the device position, the
+        rows-lane embedding, 48 layers in place, ``P += rows``.  No final mixer or LM head: the first decode
+        replay after the prefill consumes the last prompt token.  ``gdn_step_anchor`` is every GDN layer's state
+        re-anchor (the layer commits through ``commit_rows(step_committed_rows=True)``; a 32-row option).  ``mtp``
+        (the MTP-drafting server's chunk extension) runs the MTP layer's rows on the layer-47 residual rows before
+        they are released.  Any failure poisons this owner."""
+
+        if mtp is not None and chunk_state.rows != CHUNK_ROWS:
+            raise ValueError(
+                f"the MTP chunk extension is the 32-row chunk's option, got a {chunk_state.rows}-row chunk"
+            )
 
         self._validate_generic_state(state)
         self._validate_chunk_state(chunk_state)
+        rows = chunk_state.rows
+        if gdn_step_anchor and rows != CHUNK_ROWS:
+            raise ValueError("the GDN step anchor is a 32-row chunk option")
         processed_layers = 0
         try:
-            selectors = gdn_module.build_rows_selectors(chunk_state.accepted, chunk_state.rows_constants)
+            selectors = (
+                gdn_module.build_rows_selectors(chunk_state.accepted, chunk_state.rows_constants)
+                if rows == CHUNK_ROWS
+                else None
+            )
             index_row = state.position.index_row()
+            # Lane j of the index rows is P + j: one row of 32 lanes, or the same row stacked per row tile
+            # under the [1,1,tiles,32] arange (an exact UINT32 add either way).
+            index_tiles = (
+                index_row
+                if rows == CHUNK_ROWS
+                else ttnn.concat([index_row] * chunk_row_tiles(rows), dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            )
             index_rows = ttnn.add(
-                index_row, chunk_state.qsa_chunk_constants.arange32_lanes, memory_config=ttnn.DRAM_MEMORY_CONFIG
+                index_tiles, chunk_state.qsa_chunk_constants.arange32_lanes, memory_config=ttnn.DRAM_MEMORY_CONFIG
             )
             block_start_rows = ttnn.add(
                 index_row, chunk_state.qsa_chunk_constants.block_start_lanes, memory_config=ttnn.DRAM_MEMORY_CONFIG
             )
             rope = self.rope_table.rows_chunk(index_rows, block_start_rows)
-            _deallocate_unique(index_row, index_rows, block_start_rows)
+            _deallocate_unique(index_row, index_tiles, index_rows, block_start_rows)
             qsa_chunk = qsa_module.derive_qsa_chunk_inputs(
                 state.position.scalar, self.qsa_position_constants, chunk_state.qsa_chunk_constants
             )
@@ -2436,8 +2535,9 @@ class Qwen38TTNNTextModel:
             _deallocate_unique(residual)
             qsa_chunk.deallocate()
             rope.deallocate()
-            selectors.deallocate()
-            state.position.advance_by(CHUNK_ROWS)
+            if selectors is not None:
+                selectors.deallocate()
+            state.position.advance_by(rows)
         except BaseException as error:
             self._mark_poisoned("forward_prefill_chunk_generic", processed_layers, error)
 
@@ -2480,6 +2580,8 @@ class Qwen38TTNNTextModel:
 
         self._validate_generic_state(state)
         self._validate_chunk_state(chunk_state)
+        if chunk_state.rows != CHUNK_ROWS:
+            raise ValueError(f"the hand-off reads the {CHUNK_ROWS}-row chunk state, got {chunk_state.rows} rows")
         if isinstance(prefilled, bool) or type(prefilled) is not int or not 0 <= prefilled <= self.allocated_context:
             raise ValueError(
                 f"prefilled position count must be an int in [0,{self.allocated_context}], got {prefilled!r}"

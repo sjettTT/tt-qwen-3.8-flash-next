@@ -232,7 +232,7 @@ def test_driver_source_pins() -> None:
 
     source = inspect.getsource(driver_module)
     assert source.count("ttnn._ttnn_execute_trace(") == 1 and "ttnn.execute_trace(" not in source
-    assert source.count("UnsafeAllocationTracker(self.mesh).verify_before_replay(self.chunk_trace_id)") == 1
+    assert source.count("UnsafeAllocationTracker(self.mesh).verify_before_replay(trace_id)") == 1
     run = inspect.getsource(Qwen38ChunkPrefill.run)
     order = (
         "self.forced_step(token, ple_context)",
@@ -240,20 +240,20 @@ def test_driver_source_pins() -> None:
         "self.model.reset_chunk_state_inplace(self.state, self.chunk_state)",
         "verify_before_replay",
         "self.model.write_chunk_accepted(self.chunk_state, accepted)",
-        "self.model.write_chunk_inputs(self.chunk_state, rows, ple_context=ple_context)",
+        "self.model.write_chunk_inputs(chunk_state, rows, ple_context=ple_context)",
         "ple_context = contexts[real_rows]",
-        "self._run_chunk(blocking=True)",
-        "self._run_chunk(blocking=False)",
+        "self._run_chunk(blocking=True, long=long)",
+        "self._run_chunk(blocking=False, long=long)",
         "ttnn.event_synchronize(ttnn.record_event(self.mesh, cq_id=0))",
         "self.model.finish_prefill(self.state, self.chunk_state, position)",
     )
     positions = [run.index(fragment) for fragment in order]
     assert positions == sorted(positions)
     chunk = inspect.getsource(Qwen38ChunkPrefill._run_chunk)
-    assert "ttnn._ttnn_execute_trace(self.mesh, self.chunk_trace_id, cq_id=0, blocking=blocking)" in chunk
+    assert "ttnn._ttnn_execute_trace(self.mesh, trace_id, cq_id=0, blocking=blocking)" in chunk
     assert (
         "self.model.forward_prefill_chunk_generic(\n"
-        "            self.chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor, mtp=self.mtp\n"
-        "        )" in chunk
-    )
+        "            chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor and not long, mtp=None if long else self.mtp\n"
+        "        )"
+    ) in chunk
     assert CHUNK_PAD_TOKEN_ID == 0 and driver_module.CHUNK_EVENT_INTERVAL == 4

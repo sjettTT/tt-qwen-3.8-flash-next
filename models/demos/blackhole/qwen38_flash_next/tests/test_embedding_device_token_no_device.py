@@ -484,7 +484,7 @@ def test_one_row_embed_device_token_is_untouched_by_the_rows_path() -> None:
     rows_body = inspect.getsource(Qwen38TTNNTokenEmbedding.embed_device_token_rows)
     for forbidden in ("from_torch(", "to_torch(", "ttnn.slice(", "ttnn.Shape("):
         assert forbidden not in rows_body
-    assert "rows=CHUNK_ROWS" in rows_body and "constants.vocab_localize_lanes" in rows_body
+    assert "rows=rows" in rows_body and "constants.vocab_localize_lanes" in rows_body
     helper = inspect.getsource(embedding_module._all_reduce_owner_select_hidden)
     assert "rows: int = 1" in helper and "(1, 1, rows, HIDDEN_SIZE)" in helper
 
@@ -493,7 +493,7 @@ def test_model_embeds_residual_rows_from_the_device_token_rows() -> None:
     embed = " ".join(inspect.getsource(model_module.Qwen38TTNNTextModel._embed_residual_rows_from_device_token).split())
     assert "embed_device_token_rows(token_row)" in embed
     assert "ttnn.repeat_interleave( hidden, repeats=RESIDUAL_BRANCHES, dim=1" in embed
-    assert "RESIDUAL_ROWS_LOCAL_SHAPE" in embed and "BLOCK_ROWS_LOCAL_SHAPE" in embed
+    assert "residual_rows_shape(rows)" in embed and "block_rows_shape(rows)" in embed
     from models.demos.blackhole.qwen38_flash_next.ttnn.layer import BLOCK_ROWS_LOCAL_SHAPE, RESIDUAL_ROWS_LOCAL_SHAPE
 
     assert RESIDUAL_ROWS_LOCAL_SHAPE == (1, 4, 32, 640) and BLOCK_ROWS_LOCAL_SHAPE == (1, 1, 32, 640)
