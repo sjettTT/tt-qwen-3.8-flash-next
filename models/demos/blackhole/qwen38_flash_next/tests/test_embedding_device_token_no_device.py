@@ -413,9 +413,18 @@ def test_host_token_rows_localize_per_lane_like_the_host_localizer() -> None:
         assert [int(host[0, shard, lane]) for shard in range(TP_SIZE)] == _device_localized_indices(token)
 
 
-@pytest.mark.parametrize("ids", [[0] * 31, [0] * 33, [0] * 31 + [VOCAB_SIZE], [0] * 31 + [True], [0] * 31 + [1.0]])
-def test_host_token_rows_reject_wrong_counts_and_out_of_range_ids(ids, expect_error) -> None:
-    with expect_error(ValueError, "token rows"):
+@pytest.mark.parametrize(
+    "ids, message",
+    [
+        ([0] * 31, "chunk rows must be one of"),
+        ([0] * 33, "chunk rows must be one of"),
+        ([0] * 31 + [VOCAB_SIZE], "token rows"),
+        ([0] * 31 + [True], "token rows"),
+        ([0] * 31 + [1.0], "token rows"),
+    ],
+)
+def test_host_token_rows_reject_wrong_counts_and_out_of_range_ids(ids, message, expect_error) -> None:
+    with expect_error(ValueError, message):
         Qwen38TTNNTokenEmbedding.host_token_rows(ids)
 
 
