@@ -134,7 +134,7 @@ MTP_EXPECTED_CACHE_LOADS = resident_decode.EXPECTED_CACHE_LOADS + 1
 # The MTP chain's DRAM per bank beyond the 49th BF4 pair and the MTP layer's QSA state: the layer's non-expert weights,
 # the verify / draft states, the step inputs, the chunk extension and the three traces (8.2 MB of states and traces
 # measured at 32,768; the open checks the measured growth against this bound).  The free bytes per bank a resident build
-# leaves after its captures without MTP (lab, 2026-09-04, head 4149197252, 8 banks of 4,272,341,376 bytes; free and
+# leaves after its captures without MTP (measured 2026-09-04, head 4149197252, 8 banks of 4,272,341,376 bytes; free and
 # largest contiguous) are the admission table --mtp is refused against.  A resident BF4 payload is interleaved over
 # the banks one 576-byte tile page at a time, and the resident loader needs 128 MB contiguous per bank.
 MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND = 24 << 20

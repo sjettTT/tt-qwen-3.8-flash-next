@@ -93,7 +93,7 @@ QUIETBOX = ResidentHardwareProfile(
 
 
 # Blackhole LoudBox: 4x p150 in one host, KMD nodes 0-3, the chips in an ethernet line opened as the 1x4 with
-# ttnn's default mesh descriptor (the same mesh as one four-chip half of the lab's eight-chip hosts); the route is
+# ttnn's default mesh descriptor (the same 1x4 mesh); the route is
 # derived at start and recorded.  ``--device-nodes`` moves it to another four nodes.
 LOUDBOX = ResidentHardwareProfile(
     host="bh-loudbox",

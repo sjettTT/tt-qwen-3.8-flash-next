@@ -13,7 +13,7 @@ mode; ``temperature 0`` or ``greedy`` is the bitwise greedy loop.  Without
 ``--sampling`` (the default, ``--no-sampling`` the explicit form) TAIL captures
 no candidate row, the loop is the greedy one at its measured period and explicit
 sampling fields are refused.  Runs under ``tools/run_qwen38_chat_server.sh``
-(or a lab launcher holding its lane's locks): the server admits the runtime it
+(or a development launcher): the server admits the runtime it
 imports (the ttnn built from this checkout, ``runtime_admission``), prepares the
 model inputs on the CPU, opens the mesh, converts the routed experts on the
 first start, replays the CPU acceptance records after the captures
@@ -1129,7 +1129,7 @@ def _parser() -> argparse.ArgumentParser:
         "--hardware-profile",
         choices=tuple(hardware_profiles.hardware_profile_table()),
         default=None,
-        help="tt-quietbox | bh-loudbox | tt-quietbox-2[-instance-1] (a private table adds the lab lanes)",
+        help="tt-quietbox | bh-loudbox | tt-quietbox-2[-instance-1] (a private table adds development hosts)",
     )
     parser.add_argument("--validate-only", action="store_true", help="provenance and CPU preparation, no mesh")
     parser.add_argument(

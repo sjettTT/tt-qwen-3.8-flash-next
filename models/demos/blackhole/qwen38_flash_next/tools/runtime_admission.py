@@ -2,8 +2,8 @@
 
 The interpreter's ``ttnn`` must import from this repository (the ``ttnn`` package and its compiled extension under
 the checkout); the checkout's git head and tree and the extension's SHA-256 are the runtime identity the run
-records (the result document, ``READY``, ``/health``).  "Built from this checkout" replaces the lab's sealed
-archives.  The lab launchers keep their archive seal through ``QWEN38_RUNTIME_SEAL_MODULE`` (a module with
+records (the result document, ``READY``, ``/health``).  "Built from this checkout" replaces the development team's sealed
+archives.  The development launchers keep their archive seal through ``QWEN38_RUNTIME_SEAL_MODULE`` (a module with
 ``add_arguments`` and ``identity``; its code lives outside the public tree).  ``prepare_cpu`` then binds the
 checkpoint, the caches and the optional CPU-staged BF4 corpus through ``live_decode_diagnostic``.
 """
@@ -91,7 +91,7 @@ def git_identity(root: Path = REPO_ROOT) -> dict[str, Any]:
 
 
 def source_proof(expected_head: str, expected_tree: str) -> dict[str, Any]:
-    """The lab's source contract: this checkout is clean at exactly the expected head and tree."""
+    """The development source contract: this checkout is clean at exactly the expected head and tree."""
 
     for value, label in ((expected_head, "source head"), (expected_tree, "source tree")):
         if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
@@ -128,7 +128,7 @@ def checkout_identity() -> dict[str, Any]:
 
 
 def admit_runtime(args: argparse.Namespace) -> dict[str, Any]:
-    """The runtime identity this run records: the checkout's build, or (a configured seal module) the lab's sealed
+    """The runtime identity this run records: the checkout's build, or (a configured seal module) the development team's sealed
     archive with the checkout as the model source.  Every expected value given must match."""
 
     seal = _seal_module()
@@ -164,7 +164,7 @@ def admit_runtime(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def declared_runtime(args: argparse.Namespace) -> dict[str, Any]:
-    """A runtime a lab runner names outright (``--tt-metal-sha``, ``--runtime-extension``, ``--runtime-sha256``):
+    """A runtime a development runner names outright (``--tt-metal-sha``, ``--runtime-extension``, ``--runtime-sha256``):
     the loaded extension is proven to be that file with that digest; the checkout is the model source."""
 
     proof = runtime_proof(args.runtime_extension, args.runtime_sha256)

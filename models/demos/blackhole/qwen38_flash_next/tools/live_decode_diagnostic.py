@@ -332,7 +332,7 @@ class Qwen38BF4ConsumerCompatibility:
     """A CPU-staged corpus consumed by this checkout's runtime: the producer identity the corpus records, the
     consumer identity as prepared, and the topology both sides must share (mesh shape, ring size, expert ranges).
     The corpus's bytes are position-keyed by mesh coordinate, so the consumer's physical order may differ from
-    the producer's (the QuietBox opens 0, 2, 1, 3; a lab half 1, 0, 2, 3)."""
+    the producer's (the QuietBox opens 0, 2, 1, 3; a four-chip host 1, 0, 2, 3)."""
 
     producer_source_head: str
     producer_runtime: Mapping[str, Any]
@@ -695,7 +695,7 @@ class Qwen38DiagnosticBF4Cache:
                 int(self.mesh_device.get_device_id(ttnn.MeshCoordinate(*coordinate))) for coordinate in coordinates
             )
             # Shards land by mesh coordinate (the corpus's); the device at each coordinate is the
-            # consumer platform's (the producer's order on the lab).
+            # consumer platform's (the producer's order).
             expected_physical_ids = self.compatibility.consumer_physical_ids
             if coordinates != self.corpus.identity.mesh_coordinates or physical_ids != expected_physical_ids:
                 raise LiveDecodeDiagnosticError(
