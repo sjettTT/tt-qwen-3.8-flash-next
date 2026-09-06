@@ -24,9 +24,9 @@ This was implemented with the intention of the n-gram model residing in system m
 
 | path | measured | notes |
 |---|---|---|
-| prompt prefill | 300 tok/s (and climbing); 380 tok/s with `--long-chunks` | 32-token chunk trace, 3.0-3.5 ms per prompt token, flat from 2k to 261k tokens; 128- and 256-token chunks are in progress |
+| prompt prefill | 300 tok/s (and climbing); 500 tok/s with `--long-chunks` | 32-token chunk trace, 3.0-3.5 ms per prompt token, flat from 2k to 261k tokens; 128-token chunks at 1.9-2.0 ms per prompt token (`--long-chunks`, one routed-expert stream per 128 rows since 2026-09-06); 256-token chunks are in progress |
 | decode, one stream | 19.9 tok/s | position-generic traced decode, 50 ms per token, flat with depth |
-| decode with MTP (`--mtp 4`) | 37 tok/s aggregate, 55 tok/s on structured output | speculative drafting with exact acceptance: the committed stream equals greedy decode on 10 of the 12 acceptance prompts and stays on the CPU reference longer on the other 2 (section 6) |
+| decode with MTP (`--mtp 4`) | 37 tok/s aggregate, 55 tok/s on structured output | speculative drafting with exact acceptance: the committed stream leaves the CPU reference at the same token as greedy decode on 8 of the 12 acceptance prompts and at a different token on the other 4 (section 6) |
 | contexts | 32k, 64k, 128k, 256k | 256k is single-user; MTP fits at 32k, 64k and 128k |
 | correctness | bitwise repeatable; 96/96 greedy token match against the CPU reference on the acceptance prompt | chunked prefill is tolerance-class against the CPU reference on all 48 layers |
 
@@ -143,6 +143,23 @@ the CPU 96/96 (the other records diverge from the CPU after 6-75 tokens, the kno
 divergence index is in `acceptance.json`).  The records were rendered by the CPU study with the system prompt
 `You are a helpful assistant.`; that system turn is inside their recorded prompt ids, which the replay feeds to the
 device as they are.  The server itself adds no system prompt to a client's request (section 5).
+
+The pinned table (`tools/ci/baselines/A3-chunked-32k-divergence_index.json`), measured 2026-09-06 on 4x p150 with
+the chunked prefill, is the first index where each record leaves the CPU greedy stream; a start whose replay leaves
+earlier is a regression:
+
+| json | chat | code | fact | list | math | multilingual | prose | refactor | sky | story | summary |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| none (96/96) | 43 | 32 | 15 | 56 | 61 | 9 | 13 | 24 | 19 | 6 | 75 |
+
+Before 2026-09-06 the table read chat 8, code 24, list 46, refactor 22 (the other eight as above).  The change is the
+GDN decay gate: the fused `add + softplus` activation the gate used returned exactly 0 wherever its input was below
+-5.02 (and was 1.5e-3 off elsewhere); the gate now runs `ttnn.add` then `ttnn.softplus`, which follows the reference
+everywhere (4e-5 absolute).  Against the CPU oracle the device's GDN state error on a decode step fell from 0.29 to
+0.013; with the chunked prefill the device stays on the CPU stream longer on 4 of the 12 prompts and no prompt leaves
+earlier (the teacher-forced table, `A3-forced-32k-divergence_index.json`, moved later on four prompts and earlier on
+three); the cost is one more program per layer, about 0.4 ms per decoded token (50.0 -> 50.4 ms).  The proofs of
+section 9a predate this fix where they quote the old indices.
 
 **Reference corpus.**  `tools/reference/` freezes `Q38-REF-v1`: 36 teacher-forced items (the twelve acceptance
 prompts as their records render them and as the server renders a request today, four requests with tools, the first
@@ -269,15 +286,17 @@ The command-line client:
   through the chunk trace at about 3.2-3.5 ms per token (a 40k prompt: 125 s to the first token; 200k: 671 s), decode
   stays at 17-19 tokens/s to 256k.  Each context has its own component and model I/O caches under `--cache-root`
   (the BF4 expert cache is shared); 256k leaves about 750 MB per device free and is single-user.
-- `--long-chunks` prefills in 128-row chunks where the prompt allows (the remainder in 32-row chunks): 2.6 ms per prompt
-  token through the server against 3.3 with 32-row chunks alone, the same tokens (bitwise on all 48 layers); off by default and
-  not combined with `--mtp`, whose chain prefills in 32-row chunks.
+- `--long-chunks` prefills in 128-row chunks where the prompt allows (the remainder in 32-row chunks): 2.0 ms per prompt
+  token through the server (a 6942-token prompt in 13.6 s) against 3.3 with 32-row chunks alone, the same tokens (bitwise on
+  all 48 layers); off by default and not combined with `--mtp`, whose chain prefills in 32-row chunks.
 - MTP drafting (`--mtp 3|4`, 31-37 tokens/s on 4x p150) is off by default; greedy requests in the chunked prefill
-  mode draft K tokens per pass with exact acceptance.  The MTP path is not bitwise with plain decode on 2 of the 12
-  acceptance prompts: on `code` it first differs from the CPU reference at token 44 where plain decode differed at
-  24, on `fact` at 16 against 15, so MTP stayed on the reference longer; the other 10 records are identical.  This is
-  the numerics class of difference (the verify rows and the 1-row loop round differently), not an acceptance defect;
-  every gate passes, the `json` record 96/96 included.  `--mtp-gdn-anchor layer0` (server flag) re-anchors the
+  mode draft K tokens per pass with exact acceptance.  The MTP path is not bitwise with plain decode on 4 of the 12
+  acceptance prompts (measured 2026-09-06 with the GDN gate fix of section 4; the verify rows and the 1-row loop
+  round differently): the committed stream leaves the CPU reference on `chat` at token 56 where plain decode leaves
+  at 43, on `list` at 46 against 56, on `math` at 56 against 61 and on `summary` at 1 against 75 (`In 1947,` becomes
+  `Invented at Bell Labs in`); the other eight records leave the reference at the plain-decode token (`json` 96/96,
+  `code` and `refactor` bitwise the plain streams), and every gate passes.  Before the gate fix the two paths differed
+  on `code` (44 against 24) and `fact` (16 against 15) only.  `--mtp-gdn-anchor layer0` (server flag) re-anchors the
   layer-0 GDN state from the 1-row recurrence.  MTP does not fit at 256k (94 MB free per bank against the 128 MiB
   contiguous it needs); 32k, 64k and 128k fit.
 
@@ -394,14 +413,16 @@ at `cadebdff7c1c`, following sections 2-5 as written (the deviations found on th
   17:19:30Z, `READY` 17:54:33Z); 474,261,568 bytes free per bank after the captures.
 - acceptance: `json` 96/96 (the gate passed); the other eleven records leave the CPU stream at the same indices as the
   4x p150 hosts did (chat 8, code 24, fact 15, list 46, math 61, multilingual 9, prose 13, refactor 22, sky 19, story
-  6, summary 75); 19.4-19.6 tokens/s in the replays.
+  6, summary 75: the table before the GDN gate fix of 2026-09-06, section 4 has the current one); 19.4-19.6 tokens/s
+  in the replays.
 - requests over the LAN: a 36-token answer at 19.1 tokens/s (first token 0.30 s after a 33-token prompt), a 128-token
   generation at 19.6 tokens/s (first token 0.39 s, 47-token prompt in 2 chunks); the CLI's question answered.  SIGTERM
   stopped it cleanly (`result.json` status `stopped`, mesh closed, launcher exit 0).
 - the same launcher line with `--mtp 4` (warm caches; the MTP kernels compiled on this start): `READY` 225 s after the
   launch (MTP warm pass 40 s, acceptance replay 48 s); `json` 96/96 through MTP at 55.0 tokens/s (4.8 tokens per
-  pass), the split hand-off gate passed in both orders; `code` left the CPU stream at 44 and `fact` at 16 (section 6),
-  the other nine records at the plain-decode indices; 375,594,496 bytes free per bank (98.7 MB less than without MTP).
+  pass), the split hand-off gate passed in both orders; `code` left the CPU stream at 44 and `fact` at 16, the other
+  nine records at the plain-decode indices of that day (before the GDN gate fix of 2026-09-06; section 6 has the
+  current MTP indices); 375,594,496 bytes free per bank (98.7 MB less than without MTP).
   Requests: the `json` prompt as a chat request reproduced the CPU record's 96 tokens at 55.2 tokens/s; a 6942-token
   prompt prefilled in 23.4 s (3.37 ms per prompt token, 217 chunks of 32 rows) then decoded at 31.3 tokens/s (3.0 per
   pass), its follow-up turn reused the 6980 committed tokens (first token 1.6 s, 43.1 tokens/s); a 128-token generation

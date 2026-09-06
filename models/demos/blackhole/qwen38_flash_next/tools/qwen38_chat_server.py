@@ -22,7 +22,9 @@ as the template re-renders it, never the recorded reasoning.  Runs under
 imports (the ttnn built from this checkout, ``runtime_admission``), prepares the
 model inputs on the CPU, opens the mesh, converts the routed experts on the
 first start, replays the CPU acceptance records after the captures
-(``--sampling-discriminator`` then runs the sampling chain arms and stops),
+(``--sampling-discriminator`` then runs the sampling chain arms and stops;
+``--agreement-reference`` teacher-forces the reference corpus and writes the
+agreement records, the device column and its score against the HF reference),
 writes READY, serves until SIGTERM, then releases the chain and the mesh in the
 timing runner's order.  ``--host`` is loopback unless the profile serves the
 LAN (the QuietBox, the LoudBox) or ``--allow-lan`` is given.
@@ -58,6 +60,7 @@ from models.demos.blackhole.qwen38_flash_next.chat import (
 )
 from models.demos.blackhole.qwen38_flash_next.tools import hardware_profiles
 from models.demos.blackhole.qwen38_flash_next.tools import qwen38_chat_protocol as protocol
+from models.demos.blackhole.qwen38_flash_next.tools import qwen38_reference_corpus as reference_corpus
 from models.demos.blackhole.qwen38_flash_next.tools import qwen38_sampling_step as sampling_step
 from models.demos.blackhole.qwen38_flash_next.tools import resident_decode, runtime_admission
 from models.demos.blackhole.qwen38_flash_next.tools.evidence_records import (
@@ -1254,6 +1257,96 @@ def replay_acceptance(
     }
 
 
+def record_agreement(
+    session: Qwen38ChatSession,
+    *,
+    reference: Path,
+    corpus_dir: Path,
+    parts: Sequence[str],
+    out_dir: Path,
+    producer: dict[str, Any],
+) -> dict[str, Any]:
+    """A1's device column: every corpus item teacher-forced through the session (a prompt followed by the HF
+    reference's argmax chain), the resolved argmax and the candidate row (every shard's top-32) per scored position as
+    agreement records (``agreement-records/<item>.json``), then the column (``agreement-device.json``) and its score against
+    the HF reference (``agreement-score.json``), the files the corpus tool's ``device`` and ``score`` modes write.
+
+    The chunked mode scores what its path produces rows for: a prompt item's continuation (the prompt goes through
+    the chunk trace), a long item's windows, and for a text item without windows the 32 positions at its end.
+    """
+
+    manifest, items = reference_corpus.load_corpus(corpus_dir)
+    _document, hf = reference_corpus.load_reference(reference, manifest=manifest)
+    records_dir = out_dir / "agreement-records"
+    records_dir.mkdir(exist_ok=True)
+    started = time.perf_counter()
+    recorded = []
+    for item in reference_corpus.select_items(items, parts, ()):
+        if item.item_id not in hf:
+            raise Qwen38ChatChainError(f"{item.item_id}: not in the HF reference {reference}")
+        stream = list(item.token_ids)
+        if item.continuation_tokens:
+            teacher = dict(zip(hf[item.item_id].positions, hf[item.item_id].teacher_ids))
+            stream += [teacher[p] for p in range(item.prompt_tokens - 1, item.positions)]
+        scored = item.scored_positions()
+        if session.prefill_mode == "chunked" and not item.windows:
+            scored = (
+                [p for p in scored if p >= item.prompt_tokens - 1]
+                if item.continuation_tokens
+                else scored[-reference_corpus.LONG_WINDOW :]
+            )
+        replay = session.teacher_force(stream[: item.positions], positions=scored)
+        document = {
+            "schema": reference_corpus.AGREEMENT_RECORDS_SCHEMA,
+            "item_id": item.item_id,
+            "part": item.part,
+            "prefill_mode": replay.prefill_mode,
+            "chunks": replay.chunks,
+            "forced_tokens": replay.forced_tokens,
+            "seconds": round(replay.seconds, 3),
+            "positions": [
+                {
+                    "position": position,
+                    "teacher_id": stream[position + 1],
+                    "argmax": argmax,
+                    "candidate_ids": row.ids.reshape(-1).tolist(),
+                    "candidate_logits": row.values.reshape(-1).tolist(),
+                }
+                for position, (argmax, row) in sorted(replay.rows.items())
+            ],
+        }
+        (records_dir / f"{item.item_id}.json").write_text(json.dumps(document) + "\n", encoding="utf-8")
+        recorded.append(item.item_id)
+        _log(
+            "agreement_item",
+            **{key: value for key, value in document.items() if key != "positions"},
+            rows=len(document["positions"]),
+        )
+    session.reset()
+    column = reference_corpus.device_reference_items(records_dir, items)
+    reference_corpus.write_reference(
+        out_dir / "agreement-device.json", manifest=manifest, producer=producer, items=column
+    )
+    score = reference_corpus.score_references(
+        hf, {entry.item_id: entry for entry in column}, items, clear_margin=reference_corpus.CLEAR_MARGIN
+    )
+    score["column"] = producer
+    (out_dir / "agreement-score.json").write_text(json.dumps(score, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    summary = {
+        "reference": str(reference),
+        "reference_sha256": hashlib.sha256(reference.read_bytes()).hexdigest(),
+        "records": str(records_dir),
+        "items": recorded,
+        "positions": score["corpus"]["positions"],
+        "prefill_mode": session.prefill_mode,
+        "seconds": round(time.perf_counter() - started, 1),
+        "corpus": score["corpus"],
+        "parts": score["parts"],
+    }
+    _log("agreement_score", **{key: value for key, value in summary.items() if key != "items"})
+    return summary
+
+
 # -- main --------------------------------------------------------------------------------------
 
 # The launcher's ``common`` block: the model inputs and caches; the runtime identity's arguments are ``runtime_admission``'s.
@@ -1312,6 +1405,27 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--acceptance-prompts", type=Path, default=None, help="the CPU study's prompt-*-greedy.json")
     parser.add_argument("--require-json-96", action="store_true", help="refuse to serve unless json matches 96/96")
+    parser.add_argument(
+        "--agreement-reference",
+        type=Path,
+        default=None,
+        help="the HF reference file of the corpus (tools/qwen38_reference_corpus.py hf): before serving, teacher-force "
+        "the corpus through this chain and write the agreement records, the device column and its score against the "
+        "reference into the evidence directory (needs --sampling: the candidate row)",
+    )
+    parser.add_argument(
+        "--agreement-parts",
+        nargs="*",
+        choices=reference_corpus.PARTS,
+        default=list(reference_corpus.PARTS),
+        help="the corpus parts the agreement records cover (default: all)",
+    )
+    parser.add_argument(
+        "--agreement-corpus",
+        type=Path,
+        default=reference_corpus.REFERENCE_DIR,
+        help="the corpus directory (default: the committed Q38-REF-v1)",
+    )
     parser.add_argument(
         "--prefill-mode",
         choices=PREFILL_MODES,
@@ -1432,6 +1546,10 @@ def main() -> int:
         raise SystemExit("--device-sampler needs --sampling (the composite reads the candidate row)")
     if args.sampling_discriminator and (not args.sampling or args.acceptance_prompts is None):
         raise SystemExit("--sampling-discriminator needs --sampling and the acceptance prompt records")
+    if args.agreement_reference is not None and not args.sampling:
+        raise SystemExit("--agreement-reference needs --sampling (the records read the candidate row)")
+    if args.agreement_reference is not None and not args.agreement_reference.is_file():
+        raise SystemExit(f"--agreement-reference {args.agreement_reference}: not a file")
     if args.bf4_stage_limit is not None and args.bf4_stage_limit <= 0:
         raise SystemExit(f"--bf4-stage-limit must be positive, got {args.bf4_stage_limit}")
     if args.device_nodes is not None:
@@ -1522,6 +1640,15 @@ def main() -> int:
             else "greedy"
         ),
         "sampling_discriminator": bool(args.sampling_discriminator),
+        "agreement": (
+            None
+            if args.agreement_reference is None
+            else {
+                "reference": str(args.agreement_reference),
+                "corpus": str(args.agreement_corpus),
+                "parts": list(args.agreement_parts),
+            }
+        ),
         "mtp": {
             "k": args.mtp,
             "anchor": args.mtp_gdn_anchor if args.mtp is not None else None,
@@ -1675,6 +1802,27 @@ def main() -> int:
                 json.dumps(report["acceptance"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
             marker("after-chat-acceptance-replay")
+        if args.agreement_reference is not None:
+            marker("before-agreement-records")
+            report["agreement"] = record_agreement(
+                session,
+                reference=args.agreement_reference,
+                corpus_dir=args.agreement_corpus,
+                parts=args.agreement_parts,
+                out_dir=evidence,
+                producer={
+                    "kind": "device",
+                    "label": f"served chain, {session.prefill_mode} prefill, {summary['system_fingerprint']}",
+                    "prefill_mode": session.prefill_mode,
+                    "sampling": summary["sampling"],
+                    "mtp": args.mtp,
+                    "allocated_context": chain.allocated_context,
+                    "source_head": runtime["head"],
+                    "runtime_sha256": runtime["extension_sha256"],
+                    "normalisation": "log-softmax over the candidate row",
+                },
+            )
+            marker("after-agreement-records")
         if args.sampling_discriminator:
             # The chain arms (arm b is the replay above) on the creative record, whose distribution is flat enough
             # for a sampled stream to leave the greedy one (the json gate prompt is near-deterministic), then a

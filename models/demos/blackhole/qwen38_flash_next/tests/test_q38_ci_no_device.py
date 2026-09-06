@@ -174,7 +174,7 @@ def timing_document(median_ms=50.0, delta=0):
 def write_perf_artifacts(job_dir, *, median_ms=50.0, ledger_rows=None):
     ci._write_json(job_dir / "timing.json", timing_document(median_ms))
     ci._write_json(
-        job_dir / "result.json",
+        job_dir / "server-result.json",
         {
             "runtime": {"sha256": "ea" * 32},
             "source": {"head": "cd" * 20},
@@ -252,7 +252,39 @@ def test_perf_metric_gathers_timing_ledger_ready_and_probes(tmp_path):
     assert observed["ttft_seconds/128"] == 0.61 and observed["ttft_prompt_tokens/1024"] == 1030
     assert observed["program_cache_entries_at_ready"] == 271
     assert items == ["single-trace-timing", "ledger", "ttft/128", "ttft/1024"]
-    assert ci._runtime_identity(tmp_path) == {"sha256": "ea" * 32, "source_head": "cd" * 20}
+    assert ci._runtime_identity(tmp_path) == {
+        "sha256": "ea" * 32,
+        "archive_sha256": None,
+        "tt_metal_sha": None,
+        "source_head": "cd" * 20,
+    }
+    # the server's newer result nests the extension and the bundle
+    ci._write_json(
+        tmp_path / "server-result.json",
+        {
+            "runtime": {
+                "extension": {"sha256": "ab" * 32},
+                "bundle": {"archive_sha256": "cd" * 32, "binary_base_tt_metal_sha": "f0" * 20},
+            },
+            "source": {"head": "ef" * 20},
+            "chain": {},
+        },
+    )
+    assert ci._runtime_identity(tmp_path) == {
+        "sha256": "ab" * 32,
+        "archive_sha256": "cd" * 32,
+        "tt_metal_sha": "f0" * 20,
+        "source_head": "ef" * 20,
+    }
+    ci._write_json(tmp_path / "server-result.json", {"runtime": {"bundle": {"archive_sha256": "cd" * 32}}, "chain": {}})
+    merged = ci._runtime_identity(tmp_path)  # the server's bundle plus the timing runner's extension sha
+    assert (
+        merged["sha256"] == "ea" * 32 and merged["archive_sha256"] == "cd" * 32 and merged["source_head"] == "ab" * 20
+    )
+    (tmp_path / "server-result.json").unlink()
+    assert ci._runtime_identity(tmp_path)["sha256"] == "ea" * 32
+    ci._write_json(tmp_path / "timing.json", {"runtime": "none"})
+    assert ci._runtime_identity(tmp_path) is None
 
 
 def test_perf_metric_tolerates_absent_files(tmp_path):
@@ -702,7 +734,7 @@ evidence = sys.argv[1]
 os.makedirs(evidence, exist_ok=True)
 acceptance = json.loads(sys.argv[2])
 json.dump(acceptance, open(os.path.join(evidence, "acceptance.json"), "w"))
-json.dump({"chain": {"capture_ms": 4900.0, "program_cache_entries": 271}, "runtime": {"sha256": "ea" * 32}, "source": {"head": "ab" * 20}}, open(os.path.join(evidence, "result.json"), "w"))
+json.dump({"chain": {"capture_ms": 4900.0, "program_cache_entries": 271}, "runtime": {"sha256": "ea" * 32}, "source": {"head": "ab" * 20}}, open(os.path.join(evidence, "server-result.json"), "w"))
 open(os.path.join(evidence, "requests.jsonl"), "w").write(json.dumps({"phase": "chat-request", "reset": True, "prefill_tokens": 100, "prefill_ms_per_prompt_token": 5.0, "completion_tokens": 100, "tokens_per_second": 19.6}) + "\n")
 
 
@@ -767,7 +799,7 @@ def test_runner_drives_a_server_job_through_ready_probes_and_stop(tmp_path):
                 "probes": {"echo": True, "completion_requests": 2, "ttft_prompt_tokens": [128, 1024]},
                 "artifacts": {
                     name: str(tmp_path / "evidence" / "q38-chat-server-x-*" / name)
-                    for name in ("acceptance.json", "result.json", "requests.jsonl", "READY", "STOPPED")
+                    for name in ("acceptance.json", "server-result.json", "requests.jsonl", "READY", "STOPPED")
                 },
             },
             {
@@ -775,7 +807,7 @@ def test_runner_drives_a_server_job_through_ready_probes_and_stop(tmp_path):
                 "metric": "perf",
                 "artifacts": {
                     name: f"$Q38_CI_RUN_DIR/A3/{name}"
-                    for name in ("result.json", "requests.jsonl", "READY", "probes.json")
+                    for name in ("server-result.json", "requests.jsonl", "READY", "probes.json")
                 },
             },
         ],
@@ -860,11 +892,29 @@ def test_load_jobs_checks_the_schema_metrics_kinds_and_ids(tmp_path):
     good = jobs_document(tmp_path, [{"id": "A", "metric": "perf"}])
     ci._write_json(tmp_path / "jobs.json", good)
     assert ci.load_jobs(tmp_path / "jobs.json")["lane"] == "a"
+    ci._write_json(
+        tmp_path / "jobs.json",
+        {**good, "jobs": [{"id": "A", "metric": "perf", "artifacts": {"probes.json": "/x/A3/probes.json"}}]},
+    )
+    assert ci.load_jobs(tmp_path / "jobs.json")["jobs"][0]["artifacts"] == {"probes.json": "/x/A3/probes.json"}
     for bad in (
         {**good, "schema": "x"},
         {**good, "jobs": [{"id": "A", "metric": "nope"}]},
         {**good, "jobs": [{"id": "A", "metric": "perf", "kind": "daemon"}]},
         {**good, "jobs": [{"id": "A", "metric": "perf", "kind": "server"}]},
+        {**good, "jobs": [{"id": "A", "metric": "perf", "artifacts": {"result.json": "/x/*/result.json"}}]},
+        {
+            **good,
+            "jobs": [
+                {
+                    "id": "A",
+                    "metric": "perf",
+                    "kind": "server",
+                    "ready": "/x/READY",
+                    "artifacts": {"probes.json": "/x/p"},
+                }
+            ],
+        },
         {**good, "jobs": [{"id": "A", "metric": "perf"}, {"id": "A", "metric": "perf"}]},
         {k: v for k, v in good.items() if k != "lane"},
     ):
@@ -995,16 +1045,16 @@ def test_committed_baselines_belong_to_baseline_pins_and_carry_their_source():
         }
     )
     assert chunked["json"] is None and forced["json"] is None
-    assert chunked == {
+    assert chunked == {  # the 2026-09-06 replay: the GDN decay gate through ttnn.softplus
         "json": None,
-        "chat": 8,
-        "code": 24,
+        "chat": 43,
+        "code": 32,
         "fact": 15,
-        "list": 46,
+        "list": 56,
         "math": 61,
         "multilingual": 9,
         "prose": 13,
-        "refactor": 22,
+        "refactor": 24,
         "sky": 19,
         "story": 6,
         "summary": 75,

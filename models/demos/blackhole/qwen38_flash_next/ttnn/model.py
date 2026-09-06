@@ -2013,7 +2013,9 @@ class Qwen38TTNNTextModel:
                 pairs.append((f"{name} QSA raw-key ring", attention.raw_key_ring, None))
             if layer_state.ple is not None:
                 ple_states.append(layer_state.ple)
-                pairs.extend((f"{name} PLE conv[{slot}]", tensor, None) for slot, tensor in enumerate(layer_state.ple.conv))
+                pairs.extend(
+                    (f"{name} PLE conv[{slot}]", tensor, None) for slot, tensor in enumerate(layer_state.ple.conv)
+                )
         allocated: list[Any] = []
         try:
             for index, (label, source, _) in enumerate(pairs):
@@ -2417,9 +2419,9 @@ class Qwen38TTNNTextModel:
                 self.mesh_device, self.mesh_contract, qsa.allocated_compressed_blocks, rows=rows
             )
             if base is not None:
-                # The rows-128 instances run the routed stream one 32-row tile per moe_compute call: a 32-row buffer.
+                # The rows-128 instances' shared combine buffer holds one moe_compute call's rows (128: the whole chunk).
                 local_combine_output = moe_module.allocate_local_combine_output(
-                    self.mesh_device, self.mesh_contract, moe_module.PREFILL_CHUNK_ROWS
+                    self.mesh_device, self.mesh_contract, moe_module.routed_tokens_per_call_for(rows)
                 )
             for index, layer in enumerate(self.layers):
                 allocated.append(

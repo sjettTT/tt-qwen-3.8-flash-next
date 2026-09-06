@@ -62,6 +62,7 @@ VERDICTS = ("pass", "fail", "warn", "missing", "not_gated", "todo")
 DEFAULT_TOLERANCE = 0.15
 DEFAULT_IDLE_LOADAVG = 16.0
 SEED_RUNS = 3
+RESERVED_JOB_FILES = {"result.json", "verdicts.txt", "command.log", "launcher.log"}  # plus probes.json on server jobs
 
 ECHO_SENTENCE = "The quick brown fox jumps over the lazy dog."
 ECHO_PROMPT = (
@@ -361,7 +362,7 @@ def _ledger_rows(path: Path) -> list[dict[str, Any]]:
 
 
 def extract_perf(job_dir: Path, _job: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """D1: the timing runner's ``timing.json``, the server's ``result.json``, ``READY``, ``requests.jsonl`` and the
+    """D1: the timing runner's ``timing.json``, the server's ``server-result.json``, ``READY``, ``requests.jsonl`` and the
     runner's probes; every file is optional, the pins over absent files come out ``missing``."""
 
     observed: dict[str, Any] = {}
@@ -379,7 +380,7 @@ def extract_perf(job_dir: Path, _job: dict[str, Any]) -> tuple[dict[str, Any], l
             timing_capture_ms=chain["capture_ms"],
         )
         items.append("single-trace-timing")
-    result_path = job_dir / "result.json"
+    result_path = job_dir / "server-result.json"
     if result_path.exists():
         chain = _read_json(result_path).get("chain") or {}
         if chain:
@@ -656,6 +657,11 @@ def load_jobs(path: Path) -> dict[str, Any]:
             raise CIError(f"job {job['id']}: kind {job.get('kind')!r}")
         if job.get("kind", "command") == "server" and "ready" not in job:
             raise CIError(f"job {job['id']}: a server job needs the READY glob")
+        reserved = RESERVED_JOB_FILES & set(job.get("artifacts") or {})
+        if job.get("kind", "command") == "server" and "probes.json" in (job.get("artifacts") or {}):
+            reserved.add("probes.json")
+        if reserved:
+            raise CIError(f"job {job['id']}: artifact names {sorted(reserved)} are the runner's own files")
     return document
 
 
@@ -911,14 +917,26 @@ class Runner:
 
 
 def _runtime_identity(job_dir: Path) -> dict[str, Any] | None:
-    for name in ("result.json", "timing.json"):
+    """The runtime the artifacts were made with, merged over the server's and the timing runner's results: the
+    extension's sha (``runtime.sha256`` or ``runtime.extension.sha256``), the bundle's archive sha and tt-metal base."""
+
+    identity: dict[str, Any] = {"sha256": None, "archive_sha256": None, "tt_metal_sha": None, "source_head": None}
+    for name in ("server-result.json", "timing.json"):
         path = job_dir / name
-        if path.exists():
-            document = _read_json(path)
-            runtime = document.get("runtime")
-            if isinstance(runtime, dict) and runtime.get("sha256"):
-                return {"sha256": runtime["sha256"], "source_head": (document.get("source") or {}).get("head")}
-    return None
+        if not path.exists():
+            continue
+        document = _read_json(path)
+        runtime = document.get("runtime") if isinstance(document.get("runtime"), dict) else {}
+        extension = runtime.get("extension") if isinstance(runtime.get("extension"), dict) else {}
+        bundle = runtime.get("bundle") if isinstance(runtime.get("bundle"), dict) else {}
+        found = {
+            "sha256": runtime.get("sha256") or extension.get("sha256"),
+            "archive_sha256": bundle.get("archive_sha256"),
+            "tt_metal_sha": bundle.get("binary_base_tt_metal_sha"),
+            "source_head": (document.get("source") or {}).get("head"),
+        }
+        identity = {key: identity[key] if identity[key] is not None else value for key, value in found.items()}
+    return identity if identity["sha256"] or identity["archive_sha256"] else None
 
 
 # -- HTTP probes -----------------------------------------------------------------------------------------------------

@@ -21,8 +21,9 @@ Modes (``python -m ...tools.qwen38_reference_corpus MODE``):
              LM head, fp32 log-softmax; per scored position the top-32 ids and log-probs and the teacher's log-prob
     oracle   the same through the CPU oracle ``tt/`` (never edited), with bf16 experts or BF4-emulated experts
              (``--experts bf4``: the host packer's shared-exponent rounding applied to every routed expert)
-    device   a served chain's ``--agreement-records`` directory (argmax + the 32-candidate row per position) as a
-             column; its log-probs are normalised over the row, so only the shared-support metrics apply
+    device   a served chain's agreement records (the chat server's ``--agreement-reference`` run: argmax + the
+             32-candidate row per position, one file per item) as a column; its log-probs are normalised over the
+             row, so only the shared-support metrics apply (the server writes this column and its score itself)
     score    two columns: top-1 / top-5 / top-32 agreement, clear-margin top-1 (the reference's top-2 margin above
              ``--clear-margin`` logits), truncated KL over the shared top-32 support, first divergence per item,
              per-100-token segments of the text items
@@ -751,31 +752,34 @@ class OracleRunner(_Runner):
         self.rss_limit_gib = rss_limit_gib
         self.experts = experts
         self.quantised: dict[tuple[int, int], Any] = {}
-        if experts == "bf4":
-            original_layer = self.oracle.layer
+        # The checkpoint's expert slices alias their shard's mmap: a cache of them holds one 3.5 GB mapping per
+        # slice, and the address space runs out near 16k experts (ENOMEM from mmap, 45k mappings).  The cache
+        # holds copies: BF4-rounded, or the bf16 values cloned off the mapping.
+        original_layer = self.oracle.layer
+        rounding = bfp4_round if experts == "bf4" else (lambda weight: weight.clone())
 
-            def layer(layer_index: int):
-                created = original_layer(layer_index)
-                weights = created.mlp.weights
-                if not getattr(weights, "_bf4_wrapped", False):
-                    original_expert = weights.expert
+        def layer(layer_index: int):
+            created = original_layer(layer_index)
+            weights = created.mlp.weights
+            if not getattr(weights, "_copy_wrapped", False):
+                original_expert = weights.expert
 
-                    def expert(expert_index: int, _index=layer_index, _original=original_expert):
-                        cached = self.quantised.get((_index, expert_index))
-                        if cached is None:
-                            exact = _original(expert_index)
-                            cached = Qwen38ExpertWeights(
-                                bfp4_round(exact.gate_up), bfp4_round(exact.down), exact.intermediate_size
-                            )
-                            self.quantised[(_index, expert_index)] = cached
-                            weights._expert_cache.pop(expert_index, None)  # only the rounded copy is used
-                        return cached
+                def expert(expert_index: int, _index=layer_index, _original=original_expert):
+                    cached = self.quantised.get((_index, expert_index))
+                    if cached is None:
+                        exact = _original(expert_index)
+                        cached = Qwen38ExpertWeights(
+                            rounding(exact.gate_up), rounding(exact.down), exact.intermediate_size
+                        )
+                        self.quantised[(_index, expert_index)] = cached
+                        weights._expert_cache.pop(expert_index, None)  # only the copy is kept
+                    return cached
 
-                    weights.expert = expert  # type: ignore[method-assign]
-                    weights._bf4_wrapped = True  # type: ignore[attr-defined]
-                return created
+                weights.expert = expert  # type: ignore[method-assign]
+                weights._copy_wrapped = True  # type: ignore[attr-defined]
+            return created
 
-            self.oracle.layer = layer  # type: ignore[method-assign]
+        self.oracle.layer = layer  # type: ignore[method-assign]
         self.description = {
             "kind": "oracle",
             "model_class": type(self.oracle).__name__,

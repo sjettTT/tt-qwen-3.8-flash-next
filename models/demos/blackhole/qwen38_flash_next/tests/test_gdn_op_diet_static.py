@@ -8,7 +8,10 @@ enqueues a second op (fill of the implicit tile padding), every other listed cal
 is one device op, and the mac loop unrolls to ``CONV_KERNEL_SIZE - 1`` calls.
 The block went from 76 device ops per layer (perf-integration-3) to 54, then to
 52 once the hidden all-gather wrote the in-projection's activation shard and the
-output reduce-scatter read the out-projection's partial shard directly.
+output reduce-scatter read the out-projection's partial shard directly, and to 53
+when the decay gate's softplus became its own program (``softplus_gate``: the
+fused SOFTPLUS activation of ``ttnn.add`` flushed to 0 below about -5).  Calls to
+module-level helpers on the walked path are expanded into their ``ttnn`` calls.
 """
 
 from __future__ import annotations
@@ -42,12 +45,15 @@ DEVICE_OPS = {
     "sigmoid",
     "silu",
     "slice",
+    "softplus",
     "subtract",
     "to_memory_config",
     "transpose",
     "typecast",
 }
 HOST_ONLY_TTNN_CALLS = {"UnaryWithParam"}
+# Module-level helpers on the walked path whose bodies enqueue device ops (expanded in place by the walk).
+DEVICE_HELPERS = {"softplus_gate"}
 
 EXPECTED_DEVICE_OPS = {
     "_all_gather_hidden": ["all_gather"],
@@ -68,6 +74,7 @@ EXPECTED_DEVICE_OPS = {
         "reshape",
         "typecast",
         "add",
+        "softplus",
         "multiply",
         "reshape",
     ],
@@ -100,7 +107,7 @@ EXPECTED_DEVICE_OPS = {
         "reduce_scatter",
     ],
 }
-EXPECTED_DEVICE_OPS_PER_LAYER = 52
+EXPECTED_DEVICE_OPS_PER_LAYER = 53
 
 
 def _module() -> ast.Module:
@@ -150,25 +157,34 @@ def _loop_trip_count(loop: ast.For, constants: dict[str, int]) -> int:
     return bounds[0] if len(bounds) == 1 else bounds[1] - bounds[0]
 
 
-def _device_ops(method: ast.FunctionDef, constants: dict[str, int]) -> list[str]:
+def _module_functions(module: ast.Module) -> dict[str, ast.FunctionDef]:
+    return {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
+
+
+def _device_ops(method: ast.FunctionDef, constants: dict[str, int], helpers: dict[str, ast.FunctionDef]) -> list[str]:
     loops = [node for node in ast.walk(method) if isinstance(node, ast.For)]
     calls = sorted(
         (
             node
             for node in ast.walk(method)
-            if isinstance(node, ast.Call) and ast.unparse(node.func).startswith("ttnn.")
+            if isinstance(node, ast.Call)
+            and (ast.unparse(node.func).startswith("ttnn.") or ast.unparse(node.func) in helpers)
         ),
         key=lambda node: (node.lineno, node.col_offset),
     )
     sequence: list[str] = []
     for call in calls:
-        name = ast.unparse(call.func).split(".", 1)[1]
-        if name in HOST_ONLY_TTNN_CALLS:
-            continue
-        assert name in DEVICE_OPS, f"{method.name} enqueues an unlisted ttnn call: ttnn.{name}"
-        ops = [name]
-        if name == "reshape" and any(keyword.arg == "pad_value" for keyword in call.keywords):
-            ops.append("fill_pad")
+        target = ast.unparse(call.func)
+        if target in helpers:
+            ops = _device_ops(helpers[target], constants, helpers)
+        else:
+            name = target.split(".", 1)[1]
+            if name in HOST_ONLY_TTNN_CALLS:
+                continue
+            assert name in DEVICE_OPS, f"{method.name} enqueues an unlisted ttnn call: ttnn.{name}"
+            ops = [name]
+            if name == "reshape" and any(keyword.arg == "pad_value" for keyword in call.keywords):
+                ops.append("fill_pad")
         repeats = 1
         for loop in loops:
             if loop.lineno < call.lineno <= loop.end_lineno:
@@ -194,7 +210,8 @@ def test_device_op_sequence_per_method_is_pinned() -> None:
     constants = _module_constants(module)
     assert constants["CONV_KERNEL_SIZE"] == 4
     cls = _layer_class(module)
-    walked = {name: _device_ops(_method(cls, name), constants) for name in EXPECTED_DEVICE_OPS}
+    helpers = {name: fn for name, fn in _module_functions(module).items() if name in DEVICE_HELPERS}
+    walked = {name: _device_ops(_method(cls, name), constants, helpers) for name in EXPECTED_DEVICE_OPS}
     assert walked == EXPECTED_DEVICE_OPS
     assert sum(len(ops) for ops in walked.values()) == EXPECTED_DEVICE_OPS_PER_LAYER
 
@@ -258,6 +275,29 @@ def test_gdn_module_owns_its_recurrent_step_and_leaves_the_shared_fla_module_alo
     assert "gated_attention_gated_deltanet" not in source
     digest = hashlib.sha256(SHARED_DELTA_RULE_SOURCE.read_bytes()).hexdigest()
     assert digest == SHARED_DELTA_RULE_SHA256
+
+
+def test_decay_gate_softplus_is_its_own_program_on_every_gate_path() -> None:
+    """The fused SOFTPLUS activation of ``ttnn.add`` returns exactly 0 for a + dt_bias <= -5.02 on 4x p150
+    (469 of 1024 probe points in [-16, 8]; 1.5e-3 off elsewhere); ``ttnn.softplus`` never flushes and is
+    4.7e-4-accurate.  The 1-row step and the chunk/rows path build the gate through the same helper."""
+
+    source = GDN_SOURCE.read_text(encoding="utf-8")
+    assert "UnaryOpType.SOFTPLUS" not in source
+    gate = _module_functions(_module())["softplus_gate"]
+    calls = [
+        node for node in ast.walk(gate) if isinstance(node, ast.Call) and ast.unparse(node.func).startswith("ttnn.")
+    ]
+    assert [ast.unparse(call.func) for call in calls] == ["ttnn.add", "ttnn.softplus"]
+    add, softplus = calls
+    assert {keyword.arg for keyword in add.keywords} == {"memory_config"}
+    assert {keyword.arg: ast.unparse(keyword.value) for keyword in softplus.keywords} == {
+        "beta": "1.0",
+        "threshold": "20.0",
+        "memory_config": "memory_config",
+    }
+    for method in ("_make_recurrent_inputs", "_make_chunk_inputs"):
+        assert _method_source(method).count("softplus_gate(a_fp32, self.weights.dt_bias, memory_config=") == 1
 
 
 def test_static_contract_pins_the_tile_aligned_projection_columns() -> None:

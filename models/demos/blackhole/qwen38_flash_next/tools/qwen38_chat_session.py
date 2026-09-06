@@ -261,6 +261,18 @@ class Qwen38PromptSnapshot:
     ple_context: tuple[int, int] | None
 
 
+@dataclass(frozen=True)
+class Qwen38TeacherForcedRows:
+    """:meth:`Qwen38ChatSession.teacher_force`'s result: per wanted position p the resolved argmax and the candidate
+    row of the TAIL that consumed tokens 0..p, and the path the replay took."""
+
+    rows: dict[int, tuple[int, Any]]
+    prefill_mode: str
+    chunks: int
+    forced_tokens: int
+    seconds: float
+
+
 @dataclass
 class Qwen38MTPPassRun:
     """The pass loop's last pass until :meth:`Qwen38ChatSession._mtp_settle` commits it: the position it started at,
@@ -987,6 +999,82 @@ class Qwen38ChatSession:
                 )
             ),
         )
+
+    # -- teacher forcing with rows (the agreement records) -----------------------------------------
+
+    def teacher_force(
+        self, token_ids: Sequence[int], *, positions: Sequence[int], prefill_mode: str | None = None
+    ) -> Qwen38TeacherForcedRows:
+        """From position 0 through ``token_ids``: at every wanted position p the resolved argmax and the candidate
+        row of the TAIL that consumed tokens 0..p, so p's row must be a forced step.  In the chunked mode a stretch of
+        unwanted positions goes through the chunk driver when enough rows remain after its alignment steps (the
+        chunk rows yield no logits row); the forced mode forces every token.  Feeds up to the last wanted position
+        and leaves the row unconsumed, like a ``length`` finish.  Needs the candidate row (``--sampling``)."""
+
+        if self.sampling is None:
+            raise Qwen38ChatRequestError("teacher forcing with rows needs the candidate row: this chain captured none")
+        wanted_set = set(positions)
+        wanted = sorted(wanted_set)
+        if not wanted or wanted[0] < 0 or wanted[-1] >= len(token_ids):
+            raise Qwen38ChatRequestError(
+                f"wanted positions must lie in [0, {len(token_ids)}), got {wanted[:1]}..{wanted[-1:]}"
+            )
+        token_ids = list(token_ids[: wanted[-1] + 1])
+        if any(type(value) is not int or not 0 <= value < VOCAB_SIZE for value in token_ids):
+            raise Qwen38ChatRequestError("token ids must be vocabulary ids")
+        mode = self.resolve_prefill_mode(prefill_mode)
+        if self.poisoned:
+            raise Qwen38ChatChainError("session is poisoned by an earlier device failure")
+        started_ns = self.clock_ns()
+        rows: dict[int, tuple[int, Any]] = {}
+        chunks = forced = 0
+        if getattr(self.sampling, "sampler", None) is not None:
+            self.sampling.begin_request(
+                None
+            )  # the device sampler under the greedy flag: TAIL's token row is the argmax
+        try:
+            self.reset()
+            next_wanted = 0  # wanted[next_wanted] is the first wanted position at or after the committed length
+            while len(self.committed) < len(token_ids):
+                index = len(self.committed)
+                gap = wanted[next_wanted] - index
+                if mode == "chunked" and self.chunk_prefill_rows(gap) >= CHUNK_PREFILL_MIN_ROWS:
+                    result = self._prefill_chunked(
+                        token_ids[index : wanted[next_wanted]], token_ids[wanted[next_wanted]], None
+                    )
+                    chunks += result.timing.chunks
+                    forced += result.timing.alignment_steps
+                    continue
+                # A forced run: through this wanted position and every later one until a stretch the chunk path takes.
+                end = wanted[next_wanted]
+                next_wanted += 1
+                while next_wanted < len(wanted):
+                    gap = wanted[next_wanted] - (end + 1)
+                    if mode == "chunked" and gap - alignment_steps(end + 1, gap) >= CHUNK_PREFILL_MIN_ROWS:
+                        break
+                    end = wanted[next_wanted]
+                    next_wanted += 1
+                with self.chain.loop_guard():
+                    for position in range(index, end + 1):
+                        following = token_ids[position + 1] if position + 1 < len(token_ids) else None
+                        self._forced_step(token_ids[position], following)
+                        forced += 1
+                        if position in wanted_set:
+                            rows[position] = (self.chain.read_token_row(), self.sampling.read_candidate_row())
+                        elif forced % PREFILL_EVENT_INTERVAL == 0:
+                            self.chain.event_synchronize(self.chain.record_event())
+            position = self.chain.position()
+            if position != len(self.committed):
+                raise Qwen38ChatChainError(
+                    f"device position {position} vs committed input sequence length {len(self.committed)}"
+                )
+        except BaseException:
+            self.poisoned = True
+            raise
+        self.last_finish = "length"
+        self.row_unconsumed = True
+        self.row_token = None
+        return Qwen38TeacherForcedRows(rows, mode, chunks, forced, (self.clock_ns() - started_ns) / 1e9)
 
 
 class Qwen38TextStream:

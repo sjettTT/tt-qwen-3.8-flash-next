@@ -212,6 +212,18 @@ def _require_shape(tensor, expected: tuple[int, ...], *, label: str) -> None:
         raise RuntimeError(f"{label} local shape must be {expected}, got {actual}")
 
 
+def softplus_gate(a_fp32, dt_bias, *, memory_config):
+    """``softplus(a + dt_bias)`` in FP32 as two programs: the add, then ``ttnn.softplus``.
+
+    Not the fused ``SOFTPLUS`` activation of ``ttnn.add``: it returns exactly 0 below about -5 and
+    is 1.5e-3 off elsewhere; the standalone op never flushes and is 4.7e-4-accurate.
+    """
+    shifted = ttnn.add(a_fp32, dt_bias, memory_config=memory_config)
+    softplus = ttnn.softplus(shifted, beta=1.0, threshold=20.0, memory_config=memory_config)
+    _deallocate(shifted)
+    return softplus
+
+
 def _retag_head_shard_after_reshape(tensor, *, reference, shard_dim: int) -> None:
     """Record the new logical head axis after a local-only reshape.
 
@@ -1253,12 +1265,7 @@ class Qwen38TTNNGDN:
 
         a_fp32 = ttnn.typecast(a, ttnn.float32, memory_config=ttnn.L1_MEMORY_CONFIG)
         _deallocate(a)
-        softplus = ttnn.add(
-            a_fp32,
-            self.weights.dt_bias,
-            activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.SOFTPLUS, 1.0, 20.0)],
-            memory_config=ttnn.L1_MEMORY_CONFIG,
-        )
+        softplus = softplus_gate(a_fp32, self.weights.dt_bias, memory_config=ttnn.L1_MEMORY_CONFIG)
         _deallocate(a_fp32)
         log_decay_raw = ttnn.multiply(
             self.weights.neg_exp_A,
@@ -1736,12 +1743,7 @@ class Qwen38TTNNGDN:
 
         a_fp32 = ttnn.typecast(a, ttnn.float32, memory_config=l1)
         _deallocate(a)
-        softplus = ttnn.add(
-            a_fp32,
-            self.weights.dt_bias,
-            activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.SOFTPLUS, 1.0, 20.0)],
-            memory_config=l1,
-        )
+        softplus = softplus_gate(a_fp32, self.weights.dt_bias, memory_config=l1)
         _deallocate(a_fp32)
         log_decay = ttnn.multiply(self.weights.neg_exp_A, softplus, memory_config=l1)
         _deallocate(softplus)

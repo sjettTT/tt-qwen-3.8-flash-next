@@ -76,11 +76,30 @@ def moe_compute_output_height_shard_dim(rows: int, *, matmul_ring_size: int) -> 
 # bitwise (the rows-1 path is the production decode; 5 = the MTP verifier, 32 = the prefill chunk share
 # one code path past rows == 1): rows 32 vs 32 one-row calls on all 48 real layers, 1536/1536 rows
 # (2026-09-03, prefill stage-1 chunk discriminator); rows 5 vs one-row in the MTP-v2 step-1
-# discriminator and 245/245 rows in the MTP-v2 numerics gates (2026-09-03/04).  The 128-row form has
-# not run on silicon yet.
+# discriminator and 245/245 rows in the MTP-v2 numerics gates (2026-09-03/04).  The 128-row form ran on
+# silicon 2026-09-05/06: its per-tile routed stream (four moe_compute calls of 32 tokens) bitwise the 32-row
+# chunk on 48 layers, and one moe_compute call of 128 tokens bitwise the per-tile calls page for page (the
+# moe_compute 128 micro-test, 2026-09-06).
 ROWS5_HARDWARE_PROVEN = True
 ROWS32_HARDWARE_PROVEN = True
-ROWS128_HARDWARE_PROVEN = False
+ROWS128_HARDWARE_PROVEN = True
+# The 128-row chunk's routed stream: one moe_compute call of 128 tokens, so the union of the chunk's experts
+# streams from DRAM once instead of once per row tile.  32 selects the per-tile form (four calls of the 32-row
+# program; the micro-tests' oracle).  Until 2026-09-06 the 128-token call's rows past the first tile came back
+# wrong: the fault was the weighted reduce (deepseek_moe_fast_reduce_nc_fused built one score tile for token
+# rows 0..31 and scaled every row tile with it), fixed in this tree's tt-metal sources; moe_compute itself was right.
+LONG_CHUNK_ROUTED_TOKENS_PER_CALL = LONG_PREFILL_CHUNK_ROWS
+
+
+def routed_tokens_per_call_for(rows: int) -> int:
+    """The token count of one ``moe_compute`` call of a ``rows``-row instance by default: the rows themselves up to
+    32 and for the 128-row chunk (``LONG_CHUNK_ROUTED_TOKENS_PER_CALL``)."""
+
+    if rows == LONG_PREFILL_CHUNK_ROWS:
+        return LONG_CHUNK_ROUTED_TOKENS_PER_CALL
+    return min(rows, CHUNK_ROWS)
+
+
 BLACKHOLE_MOE_NUMERIC_ISSUE = "https://github.com/tenstorrent/tt-metal/issues/50038"
 MOE_STAGE_FENCES = (
     "all-gather-hidden",
@@ -394,10 +413,11 @@ class Qwen38TTNNMoE:
         routed_tokens_per_call: int | None = None,
         admitted_rows: tuple[int, ...] = SUPPORTED_ROWS,
     ) -> None:
-        """``routed_tokens_per_call`` is the token count of one ``moe_compute`` call: the rows themselves up to 32
-        (the default), and for the 128-row form 32 (the default: four calls of the 32-row program, bitwise the
-        32-row chunk per tile) or 128 (one call; on the pinned runtime its rows past the first tile came back
-        wrong on silicon, 2026-09-04, so it is a micro-test form only).  ``local_combine_output`` hands in a shared
+        """``routed_tokens_per_call`` is the token count of one ``moe_compute`` call: the rows themselves up to 32,
+        and for the 128-row form 128 (the default, ``routed_tokens_per_call_for``: one call, the chunk's expert
+        union streamed once; bitwise the per-tile form page for page since the weighted reduce's one-tile score
+        table was fixed) or 32 (four calls of the 32-row program, bitwise the 32-row chunk per tile; the
+        micro-tests' oracle).  ``local_combine_output`` hands in a shared
         ``[10, routed_tokens_per_call, 2560]`` ROW_MAJOR BF16 combine buffer (the 48 long-chunk instances share one:
         the layers run one after another and every call fills it first); it is borrowed, so
         ``release_owned_buffers`` leaves it to its owner."""
@@ -419,7 +439,9 @@ class Qwen38TTNNMoE:
         self.collective_topology = collective_topology or ttnn.Topology.Linear
         self.row_contract = row_contract
         self.rows = self.row_contract.rows
-        self.routed_tokens = min(self.rows, CHUNK_ROWS) if routed_tokens_per_call is None else routed_tokens_per_call
+        self.routed_tokens = (
+            routed_tokens_per_call_for(self.rows) if routed_tokens_per_call is None else routed_tokens_per_call
+        )
         if self.routed_tokens not in (self.rows, CHUNK_ROWS) or self.rows % self.routed_tokens:
             raise ValueError(
                 f"routed tokens per call must be the rows ({self.rows}) or {CHUNK_ROWS}, got {routed_tokens_per_call!r}"

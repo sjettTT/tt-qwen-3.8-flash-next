@@ -513,7 +513,7 @@ def test_long_chunk_source_pins() -> None:
     allocate = inspect.getsource(model_module.Qwen38TTNNTextModel.allocate_chunk_state)
     assert (
         "moe_module.allocate_local_combine_output(" in allocate
-        and "self.mesh_device, self.mesh_contract, moe_module.PREFILL_CHUNK_ROWS" in allocate
+        and "self.mesh_device, self.mesh_contract, moe_module.routed_tokens_per_call_for(rows)" in allocate
     )
     # The DRAM-sharded linears run one row tile per call on every 128-row body.
     for function in (

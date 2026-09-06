@@ -139,6 +139,16 @@ def _unary(fn, dtype_keep=True):
     return op
 
 
+def _softplus(tensor, *, beta, threshold, memory_config=None):
+    """``ttnn.softplus`` as fp32 torch softplus; the device op's SFPU error (4.7e-4 relative, never a flush to 0 on
+    4x p150) is below the 1e-3 envelope the gate probe asserts, so the fake stands in for it honestly."""
+
+    assert tensor.dtype is FP32 and (beta, threshold) == (1.0, 20.0), (tensor.dtype, beta, threshold)
+    return FakeTensor(
+        [_rowwise(lambda row: F.softplus(row, beta, threshold), t) for t in tensor.torch_shards()], FP32, tensor.layout
+    )
+
+
 def _binary(torch_op):
     def op(
         a,
@@ -165,10 +175,8 @@ def _binary(torch_op):
                     y = torch.exp(y)
                 x, y = x.to(compute.torch), y.to(compute.torch)
             result = torch_op(x, y).to(out_dtype.torch)
-            if activations:
-                (activation,) = activations
-                assert activation == ("SOFTPLUS", 1.0, 20.0)
-                result = _rowwise(lambda row: F.softplus(row, 1.0, 20.0), result)
+            # No fused output activation is modeled: the device's fused SOFTPLUS flushed to 0 below about -5.
+            assert not activations, activations
             results.append(result)
         if output_tensor is not None:
             assert output_tensor.dtype is out_dtype and output_tensor.shape == tuple(results[0].shape), (
@@ -495,7 +503,7 @@ def make_fake_ttnn(chunk: FakeChunk) -> SimpleNamespace:
         L1_MEMORY_CONFIG="L1",
         L1_WIDTH_SHARDED_MEMORY_CONFIG="L1WS",
         Topology=SimpleNamespace(Linear="linear"),
-        UnaryOpType=SimpleNamespace(SOFTPLUS="SOFTPLUS", EXP="EXP"),
+        UnaryOpType=SimpleNamespace(EXP="EXP"),
         UnaryWithParam=lambda op, a, b: (op, a, b),
         MathFidelity=SimpleNamespace(HiFi4="HiFi4", HiFi2="HiFi2"),
         WormholeComputeKernelConfig=lambda **fields: ("compute_kernel_config", tuple(sorted(fields.items()))),
@@ -537,6 +545,7 @@ def make_fake_ttnn(chunk: FakeChunk) -> SimpleNamespace:
         le=_compare(torch.le),
         eq=_compare(torch.eq),
         sigmoid=_unary(torch.sigmoid),
+        softplus=_softplus,
         silu=_unary(F.silu),
         sqrt=_unary(torch.sqrt),
         abs=_unary(torch.abs),
@@ -652,6 +661,21 @@ def fake(monkeypatch):
         monkeypatch.setattr(module, "ttnn", fake_ttnn)
         monkeypatch.setattr(module, "replicate_tensor_2d_mesh_mapper", lambda device: "replicate", raising=False)
     return SimpleNamespace(ttnn=fake_ttnn, chunk=chunk)
+
+
+def test_softplus_gate_never_flushes_to_zero_and_tracks_torch_softplus(fake) -> None:
+    """The decay gate over a + dt_bias in [-8, 0] (the served range; layer-0 heads reach -5.5): no exact 0,
+    within 1e-3 of torch softplus, FP32 out.  The fused SOFTPLUS activation it replaced returned 0 below -5.02."""
+
+    xs = torch.linspace(-8.0, 0.0, 4 * 32, dtype=torch.float32).reshape(1, 1, 4, 32)
+    a_fp32 = FakeTensor([xs.clone() for _ in range(TP)], FP32)
+    dt_bias = FakeTensor([torch.zeros(1, 1, 1, 32) for _ in range(TP)], FP32)
+    gate = gdn_module.softplus_gate(a_fp32, dt_bias, memory_config="L1")
+    assert gate.dtype is FP32 and gate.shape == (1, 1, 4, 32)
+    for local in gate.torch_shards():
+        assert bool((local > 0.0).all()), float(local.min())
+        assert float((local - F.softplus(xs)).abs().max()) <= 1e-3
+    assert a_fp32.alive and dt_bias.alive  # the helper frees only its own intermediate (the add's output)
 
 
 @pytest.fixture(scope="module")
