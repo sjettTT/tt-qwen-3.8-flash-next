@@ -13,7 +13,8 @@
 target minus slack; ``ceiling`` = target times 1 + tolerance; ``not_earlier`` for divergence indices, null being the
 largest; ``exact``; ``at_most``; ``flips`` for per-item eval answers), a status (``todo`` warns only; ``active``
 gates) and its seeds.  A pin with ``baseline: true`` compares a per-key map (per prompt, item or task) against
-``baselines/<pin id with - for />.json``.  ``todo`` pins are promoted by ``seed`` once three idle runs agree within
+``baselines/<pin id with - for />.json``.  A job may name the pin family it belongs to (``pin_job``, default
+its id) so one run can carry a family's columns as separate jobs (A2 over two oracle columns).  ``todo`` pins are promoted by ``seed`` once three idle runs agree within
 the pin's tolerance: the target is the median (``band``, ``ceiling``), the minimum (``floor``) or the common value.
 
 A job result (``qwen38-ci-result/v1``) records the host, lane, head, runtime identity, the load average, the item
@@ -488,7 +489,7 @@ def validate(result: dict[str, Any], pins: dict[str, Any], baselines_dir: Path =
     verdicts = []
     for pin_id, pin in sorted(pins["pins"].items()):
         job, configuration, metric = split_pin_id(pin_id)
-        if job != result["job"] or configuration != result["configuration"]:
+        if job != result.get("pin_job", result["job"]) or configuration != result["configuration"]:
             continue
         observed = result["observed"].get(metric, MISSING)
         if observed is MISSING and pin.get("optional"):
@@ -594,7 +595,7 @@ def seed(
         rows = [
             r
             for r in results
-            if r["job"] == job
+            if r.get("pin_job", r["job"]) == job
             and r["configuration"] == configuration
             and r["gated"]
             and metric in r["observed"]
@@ -655,6 +656,8 @@ def load_jobs(path: Path) -> dict[str, Any]:
             raise CIError(f"job {job['id']}: metric {job['metric']!r} not in {sorted(METRICS)}")
         if job.get("kind", "command") not in ("command", "server"):
             raise CIError(f"job {job['id']}: kind {job.get('kind')!r}")
+        if not isinstance(job.get("pin_job", job["id"]), str) or not job.get("pin_job", job["id"]):
+            raise CIError(f"job {job['id']}: pin_job must name a pin family")
         if job.get("kind", "command") == "server" and "ready" not in job:
             raise CIError(f"job {job['id']}: a server job needs the READY glob")
         reserved = RESERVED_JOB_FILES & set(job.get("artifacts") or {})
@@ -745,7 +748,9 @@ class Runner:
             "status": (
                 "fail"
                 if any(r["status"] in ("fail", "error") for r in results)
-                else "warn" if any(r["status"] == "warn" for r in results) else "pass"
+                else "warn"
+                if any(r["status"] == "warn" for r in results)
+                else "pass"
             ),
             "utc": utc_now(),
         }
@@ -764,6 +769,7 @@ class Runner:
             "schema": RESULT_SCHEMA,
             "run": self.run_id,
             "job": job["id"],
+            "pin_job": job.get("pin_job", job["id"]),  # the pin family: two columns of one job in one run
             "metric": job["metric"],
             "configuration": job.get("configuration", self.jobs["configuration"]),
             "host": self.host,

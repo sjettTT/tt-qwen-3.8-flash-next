@@ -493,6 +493,13 @@ def test_validate_matches_pins_by_job_and_configuration_and_sets_the_result_stat
     assert "chat: observed 7 expected 8" in ci.format_verdicts(result)
     errored = ci.validate({**result_document("D1", {}), "error": "CIError: boom"}, pins, tmp_path)
     assert errored["status"] == "error"
+    # a job of another id validates against the pin family it names
+    named = ci.validate(
+        {**result_document("D1-second", {"decode_ms_per_token": 50.5, "program_cache_delta": 0}), "pin_job": "D1"},
+        pins,
+        tmp_path,
+    )
+    assert [v["pin"] for v in named["verdicts"]][:2] == ["D1/cfg/decode_ms_per_token", "D1/cfg/program_cache_delta"]
 
 
 def test_load_pins_rejects_unknown_rules_statuses_and_configurations(tmp_path):
@@ -637,7 +644,9 @@ def test_runner_executes_command_jobs_collects_artifacts_and_writes_results(tmp_
     evidence.mkdir()
     score = score_document({"acceptance-json": (0.97, 1.0, 0.01, None)})
     writer = tmp_path / "write_score.py"
-    writer.write_text(textwrap.dedent(f"""
+    writer.write_text(
+        textwrap.dedent(
+            f"""
             import json, os, sys
             score = json.loads({json.dumps(json.dumps(score))})
             json.dump(score, open(os.path.join(os.environ["Q38_CI_JOB_DIR"], "score.json"), "w"))
@@ -645,7 +654,9 @@ def test_runner_executes_command_jobs_collects_artifacts_and_writes_results(tmp_
             timing = json.loads({json.dumps(json.dumps(timing_document(50.3)))})
             json.dump(timing, open({str(evidence)!r} + "/run-1/result.json", "w"))
             print("ok")
-            """))
+            """
+        )
+    )
     jobs = jobs_document(
         tmp_path,
         [
@@ -1004,7 +1015,7 @@ def test_committed_pins_load_and_cover_the_four_metric_families():
     }
     for pin_id, pin in pins["pins"].items():
         if pin["status"] == "todo" and pin.get("target") is not None and not pin.get("baseline"):
-            assert pin["rule"] in ("floor", "band") and "note" in pin, pin_id  # a proposal says where it comes from
+            assert pin["rule"] in ("floor", "band", "ceiling") and "note" in pin, pin_id  # a proposal says its source
         if pin["rule"] == "band":
             assert pin.get("better") in ("lower", "higher"), pin_id
         if pin["rule"] == "flips":
