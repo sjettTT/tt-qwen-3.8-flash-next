@@ -220,9 +220,14 @@ always 0).  The device keeps its committed prefix when the render extends it and
 (`qwen38.reset` false, `prefix_reused` the reused count): with thinking off, the template renders the past reply as
 the generation prompt plus its text, so a conversation continues at the cost of the new turn.  With thinking on, the
 template renders the past turn's think block empty (`<think>\n\n</think>`), which the tokenizer merges differently
-from the `<think>\n` the model generated after, so the render never extends the committed ids and every follow-up
-turn prefills the whole conversation (3.3 ms per token of history, `qwen38.reset` true).  A stop string, a reply
-cut inside its think block or an `<|endoftext|>` ending also re-prefill.
+from the `<think>\n` the model generated after, so the render never extends the committed ids; the server then
+restores the prompt-end snapshot instead (`qwen38.prefix_restored` true, `prefix_reused` = the prompt length less
+one): before the last prompt token of every request the chain copies the recurrent part of the device state (GDN
+states and ring slots, PLE slots, QSA staging and raw-key rings, ~53 MB per device; the KV and compressed caches are
+positional and rewritten by the tail) into a resident snapshot, and a follow-up whose render extends those ids
+copies it back and prefills only the rendered tail (the re-rendered reply and the new turn) from that position.  An
+exact repeat of a prompt restores the same way.  A history that diverges earlier (an edited turn) still resets and
+prefills the whole conversation (3.3 ms per token of history, `qwen38.reset` true).
 
 A client that hangs up is noticed at the next device step (or prefill event) whether or not anything was being
 streamed to it, and a queued request whose client left gives up its place: the device never runs a request for

@@ -20,6 +20,13 @@ event wait, PLE refresh, TAIL).  Multi-turn requests reuse the device state when
 the new prompt extends the committed input sequence (the suffix is prefilled
 from the committed position); otherwise the generic state is reset in place.
 
+The prompt-end snapshot (``REPLY-TAIL-SPLICE-DESIGN-20260906.md``): before the last prompt token's forced step
+the chain copies the generic state's recurrent buffers (GDN recurrent states and ring slots, PLE slots, QSA staging
+and raw-key rings; the caches are positional) into a resident snapshot and the session records the ids consumed so
+far.  A later request whose render extends those ids but not the committed ones (a thinking conversation: the
+template renders the past turn's think block as ``<think>\n\n</think>``, one token off the device's ``<think>\n``)
+restores the snapshot and prefills only the rendered tail instead of resetting.
+
 Sampling is an optional tail of the same chain (``tools/qwen38_sampling_step.py``):
 TAIL's epilogue also writes a candidate row, and a request with ``temperature > 0``
 runs the sampled loop (read the row after TAIL, sample on the host, write the token
@@ -219,11 +226,14 @@ class Qwen38ChatCompletion:
     # MTP drafting when the request generated through the pass loop: {k, passes, accepted_drafts, tokens_per_pass,
     # anchor}; None for the 1-row and sampled loops.
     mtp: dict[str, Any] | None = None
+    # The prompt-end snapshot was restored: prefix_reused is the snapshot's length, the rest of the prompt the tail.
+    restored: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "prefix_reused": self.prefix_reused,
             "reset": self.reset,
+            "prefix_restored": self.restored,
             "prefill_tokens": self.prefill_tokens,
             "prefill_seconds": round(self.prefill_seconds, 4),
             "prefill_mode": self.prefill_mode,
@@ -240,6 +250,15 @@ class Qwen38ChatCompletion:
             "position": self.position,
             "mtp": self.mtp,
         }
+
+
+@dataclass(frozen=True)
+class Qwen38PromptSnapshot:
+    """The host record of the chain's prompt-end snapshot: the ids consumed when it was taken (the prompt without
+    its last token) and the n-gram context after them."""
+
+    ids: tuple[int, ...]
+    ple_context: tuple[int, int] | None
 
 
 @dataclass
@@ -291,6 +310,9 @@ class Qwen38ChatSession:
         self.prefill_mode = prefill_mode if self.chunk_trace_available else "teacher_forced"
         self.sampling = getattr(chain, "sampling", None)  # the candidate-row extension, or None: greedy only
         self.mtp = getattr(chain, "mtp", None)  # the MTP drafting extension (verify / draft / commit traces), or None
+        # A chain without the snapshot primitives (an older scripted chain) resets where a restore would apply.
+        self.snapshot_available = callable(getattr(chain, "capture_prompt_snapshot", None))
+        self.snapshot: Qwen38PromptSnapshot | None = None
         self.committed: list[int] = []
         self.ple_context: tuple[int, int] | None = None
         self.last_finish: str | None = None
@@ -377,10 +399,18 @@ class Qwen38ChatSession:
         self.chain.execute_tail(residue)
         self.committed.append(token_id)
 
-    def _prefill(self, token_ids: Sequence[int], should_stop: Callable[[], str | None] | None) -> str | None:
-        """Forced steps; at every event sync the hook may end the request (the row then holds an unconsumed token)."""
+    def _prefill(
+        self,
+        token_ids: Sequence[int],
+        should_stop: Callable[[], str | None] | None,
+        before_last: Callable[[], None] | None = None,
+    ) -> str | None:
+        """Forced steps; at every event sync the hook may end the request (the row then holds an unconsumed token).
+        ``before_last`` runs before the last token's step (the prompt-end snapshot)."""
 
         for index, token_id in enumerate(token_ids, start=1):
+            if index == len(token_ids) and before_last is not None:
+                before_last()
             self._forced_step(token_id, token_ids[index] if index < len(token_ids) else None)
             if index % PREFILL_EVENT_INTERVAL == 0:
                 # Bounds the host run-ahead and surfaces a device error at a known token.
@@ -716,6 +746,43 @@ class Qwen38ChatSession:
         self.row_unconsumed = False
         self.row_token = None
 
+    def reusable_prefix(self, token_ids: Sequence[int]) -> tuple[int, str]:
+        """How the device meets ``token_ids``: ``(n, "extends")`` when they extend the committed ``n`` ids (or repeat
+        them exactly while the unconsumed next token is still in the row; a partial match cannot be rewound),
+        ``(n, "snapshot")`` when they extend the ``n`` ids of the prompt-end snapshot instead, else ``(0, "reset")``."""
+
+        common = 0
+        while common < len(self.committed) and common < len(token_ids) and self.committed[common] == token_ids[common]:
+            common += 1
+        if common == len(self.committed) and (common < len(token_ids) or self.row_unconsumed):
+            return common, "extends"
+        snapshot = self.snapshot
+        if (
+            snapshot is not None
+            and len(token_ids) > len(snapshot.ids)
+            and tuple(token_ids[: len(snapshot.ids)]) == snapshot.ids
+        ):
+            return len(snapshot.ids), "snapshot"
+        return 0, "reset"
+
+    def _restore_prompt_snapshot(self) -> None:
+        """The chain's snapshot back on device (position and phases included); the host follows its record."""
+
+        self.chain.restore_prompt_snapshot()
+        self.committed = list(self.snapshot.ids)
+        self.ple_context = self.snapshot.ple_context
+        self.last_finish = None
+        self.row_unconsumed = False
+
+    def _capture_prompt_snapshot(self) -> None:
+        """The device state after the committed ids (every prompt token but the last), copied on the chain; the
+        record makes a later render that extends these ids a restore instead of a reset."""
+
+        if not self.snapshot_available or not self.committed:
+            return
+        self.chain.capture_prompt_snapshot(len(self.committed))
+        self.snapshot = Qwen38PromptSnapshot(tuple(self.committed), self.ple_context)
+
     def complete(
         self,
         token_ids: Sequence[int],
@@ -765,24 +832,27 @@ class Qwen38ChatSession:
         # 1-row loops (speculative=False is the diagnostic form: a greedy request on the 1-row loop of an MTP chain).
         drafting = self.mtp is not None and speculative and sampling is None and mode == "chunked"
         started_ns = self.clock_ns()
-        common = 0
-        while common < len(self.committed) and common < len(token_ids) and self.committed[common] == token_ids[common]:
-            common += 1
-        # The device continues an exact repeat only while the unconsumed next token
-        # is still in the row; a partial match cannot be rewound.
-        extends = common == len(self.committed) and (common < len(token_ids) or self.row_unconsumed)
+        common, reuse = self.reusable_prefix(token_ids)
         try:
             self.row_token = None
-            if not extends:
+            if reuse == "snapshot":
+                self._restore_prompt_snapshot()
+            elif reuse == "reset":
                 self.reset()
-                common = 0
+            # The snapshot stays valid until a prefill reaching its last token replaces it (its buffers change on no
+            # other path), so a reset or a stopped prefill leaves the earlier one restorable.
             suffix = token_ids[common:]
             chunked: Qwen38PrefillResult | None = None
             # All but the last prompt token through the chunk trace when enough rows remain after the alignment
-            # steps; the last one is the first decode replay and is always teacher-forced inside the guard.
+            # steps; the last one is the first decode replay and is always teacher-forced inside the guard.  The
+            # prompt-end snapshot is taken before that last token: after the hand-off, or inside the forced prefill.
+            before_last: Callable[[], None] | None = self._capture_prompt_snapshot
             if mode == "chunked" and self.chunk_prefill_rows(len(suffix) - 1) >= CHUNK_PREFILL_MIN_ROWS:
                 chunked = self._prefill_chunked(suffix[:-1], suffix[-1], should_stop)
                 suffix = suffix[-1:]
+                before_last = None
+                if chunked.stopped is None:
+                    self._capture_prompt_snapshot()
             # A stop inside the chunk driver ended the request at its hand-off: nothing more runs on the device.
             chunk_stopped = chunked is not None and chunked.stopped is not None
             generated: list[int] = []
@@ -817,7 +887,7 @@ class Qwen38ChatSession:
             elif drafting:
                 # The pass loop takes the guard per pass (its mode switches synchronize) and settles outside it.
                 with self.chain.loop_guard():
-                    finish = self._prefill(suffix, should_stop)
+                    finish = self._prefill(suffix, should_stop, before_last)
                 hook_stopped = finish is not None
                 prefill_done_ns = self.clock_ns()
                 first_ns = last_ns = prefill_done_ns
@@ -827,7 +897,7 @@ class Qwen38ChatSession:
                     self._mtp_settle(finish)
             else:
                 with self.chain.loop_guard():
-                    finish = self._prefill(suffix, should_stop)
+                    finish = self._prefill(suffix, should_stop, before_last)
                     hook_stopped = finish is not None
                     prefill_done_ns = self.clock_ns()
                     first_ns = last_ns = prefill_done_ns
@@ -870,7 +940,8 @@ class Qwen38ChatSession:
             finish_reason=finish,
             prompt_tokens=len(token_ids),
             prefix_reused=common,
-            reset=not extends,
+            reset=reuse == "reset",
+            restored=reuse == "snapshot",
             prefill_tokens=prefill_tokens,
             prefill_seconds=(prefill_done_ns - started_ns) / 1e9,
             ttft_seconds=(first_ns - started_ns) / 1e9,
@@ -1112,6 +1183,9 @@ class Qwen38TracedChain:
     verify_each_prefill: bool = False
     sampling: sampling_step.Qwen38SamplingChainExtension | None = None
     mtp: Qwen38ChainMTP | None = None
+    # The prompt-end snapshot buffers (model.allocate_generic_snapshot over the generic state and the MTP alignment
+    # layer's), allocated before the warm pass; the session captures and restores through the two methods below.
+    snapshot: Any = None
     closed: bool = field(default=False, repr=False)
 
     @property
@@ -1196,6 +1270,26 @@ class Qwen38TracedChain:
         resident_decode.require_token_row_holds(
             self.token_row_io, resident_decode.host_token_row(token_id), label="reset seed token row"
         )
+
+    def capture_prompt_snapshot(self, position: int) -> None:
+        """The generic state's recurrent buffers into the resident snapshot: device copies queued behind the TAIL
+        whose state they record (nothing allocated, no synchronize: callable under the loop guard)."""
+
+        self.built_target.model.capture_generic_snapshot(self.state, self.snapshot, position=position)
+
+    def restore_prompt_snapshot(self) -> None:
+        """The snapshot back into the generic state (its position and GDN phases included), then the device
+        position read back against it."""
+
+        self.built_target.model.restore_generic_snapshot(self.snapshot, self.state)
+        if self.mtp is not None:
+            self.mtp.step_written = False
+        ttnn.synchronize_device(self.mesh)
+        position = self.state.position.read()
+        if position != self.snapshot.position:
+            raise Qwen38ChatChainError(
+                f"restore left the device position at {position}, expected {self.snapshot.position}"
+            )
 
     def chunk_prefill(
         self,
@@ -1434,6 +1528,12 @@ class Qwen38TracedChain:
             )
             synchronize()
             mtp_dram_bytes_per_bank["states"] = dram_allocated_per_bank() - allocated_before_mtp_states
+        # The prompt-end snapshot buffers beside the states, before any capture (the tracker's post-capture check
+        # then sees no later allocation); with MTP the alignment layer's generic state is a 49th layer of it.
+        snapshot = model.allocate_generic_snapshot(
+            state,
+            extra_layers=() if chain_mtp is None else ((chain_mtp.alignment.layer, chain_mtp.alignment.generic_state),),
+        )
         token_row_io = model.model_io.embedding.upload_token_row(SEED_TOKEN_ID)
         prepared = model.prepare_generic_decode_inputs(SEED_TOKEN_ID, state, device_token=token_row_io)
         ple_row_mapper = ttnn.ShardTensor2dMesh(mesh, mesh_shape=MESH_SHAPE, dims=(None, 3))
@@ -1458,6 +1558,7 @@ class Qwen38TracedChain:
             sampling=sampling_step.Qwen38SamplingChainExtension(lm_head, mesh) if sampling else None,
             chunk_gdn_step_anchor=chunk_gdn_step_anchor,
             mtp=chain_mtp,
+            snapshot=snapshot,
         )
 
         def warm_step(position: int, warm_token_id: int, ple_context, *, mtp_next: int | None):
@@ -1631,6 +1732,34 @@ class Qwen38TracedChain:
             if actual != CHUNK_ROWS - 1:
                 raise Qwen38ChatChainError(f"warm hand-off position counter {actual} vs expected {CHUNK_ROWS - 1}")
             marker("after-chat-chunk-warm-pass")
+
+        # The snapshot round trip (its copy programs compile here; the raw-key ring copy has no other warm form):
+        # capture at the warm position, read every recurrent buffer, reset the state, restore, read again: the
+        # restored buffers must be the captured ones bitwise and the position the captured one.
+        marker("before-chat-snapshot-warm-pass")
+
+        def snapshot_rows() -> dict[str, list[torch.Tensor]]:
+            return {
+                label: [ttnn.to_torch(local) for local in ttnn.get_device_tensors(source)]
+                for label, source, _ in snapshot.pairs
+            }
+
+        snapshot_position = state.position.read()
+        chain.capture_prompt_snapshot(snapshot_position)
+        synchronize()
+        expected_rows = snapshot_rows()
+        model.reset_generic_state_inplace(state)
+        synchronize()
+        chain.restore_prompt_snapshot()
+        for label, expected_locals in snapshot_rows().items():
+            for device, (expected, actual) in enumerate(zip(expected_rows[label], expected_locals, strict=True)):
+                bits = torch.int16 if expected.dtype == torch.bfloat16 else torch.int32
+                if not torch.equal(expected.view(bits), actual.view(bits)):
+                    raise Qwen38ChatChainError(
+                        f"snapshot round trip: {label} on device {device} differs after the restore at position "
+                        f"{snapshot_position}: max abs {float((actual.float() - expected.float()).abs().max())}"
+                    )
+        marker("after-chat-snapshot-warm-pass")
 
         # Pre-capture reset (the in-place reset programs compile here), the
         # allocation tracker's acknowledgements of every host- or trace-written
@@ -1920,6 +2049,9 @@ class Qwen38TracedChain:
         if self.chunk_state is not None:
             self.built_target.model.release_chunk_state(self.chunk_state)
             self.chunk_state = None
+        if self.snapshot is not None:
+            self.built_target.model.release_generic_snapshot(self.snapshot)
+            self.snapshot = None
         self.built_target.model.release_generic_state(self.state)
         ttnn.synchronize_device(mesh)
         self.built_target.components.close_resident_experts()

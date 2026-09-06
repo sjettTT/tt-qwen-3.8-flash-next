@@ -1422,6 +1422,79 @@ def test_generic_model_prologue_is_a_position_reset_plus_in_place_layer_resets(m
         assert forbidden not in reset
 
 
+def test_generic_model_snapshot_copies_the_recurrent_buffers_and_restores_position_and_phases(monkeypatch) -> None:
+    """The prompt-end snapshot (REPLY-TAIL-SPLICE-DESIGN-20260906): one buffer per GDN recurrent state and ring
+    slot, PLE slot, QSA staging tile and raw-key ring (213 for the 48 layers; the caches are positional and not
+    copied); the capture copies state -> snapshot, the restore copies back, resets the position and sets every GDN
+    phase to position mod 4."""
+
+    log: list = []
+    owner, state, _ = _generic_model(monkeypatch, log)
+    layers = []
+    for index, layer_state in enumerate(state.layers):
+        if owner.layers[index].layer_type is Qwen38TTNNLayerType.GDN:
+            attention = SimpleNamespace(
+                recurrent=f"recurrent-{index}", conv=tuple(f"conv-{index}-{slot}" for slot in range(4)), conv_phase=0
+            )
+        else:
+            attention = SimpleNamespace(kv_staging=f"staging-{index}", raw_key_ring=f"ring-{index}")
+        ple = SimpleNamespace(conv=tuple(f"ple-{slot}" for slot in range(9)), token_context="stale") if index == 1 else None
+        layers.append(SimpleNamespace(namespace=layer_state.namespace, layer_index=index, attention=attention, ple=ple))
+    state = Qwen38TTNNTextModelGenericState(state.position, tuple(layers), owner._state_owner)
+    monkeypatch.setattr(
+        model_module.ttnn,
+        "empty_like",
+        lambda tensor, **kwargs: log.append(("empty_like", tensor, tuple(kwargs))) or f"snapshot:{tensor}",
+        raising=False,
+    )
+    monkeypatch.setattr(model_module.ttnn, "copy", lambda source, target: log.append(("copy", source, target)))
+
+    snapshot = owner.allocate_generic_snapshot(state)
+    labels = [label for label, _, _ in snapshot.pairs]
+    assert len(snapshot.pairs) == 36 * 5 + 12 * 2 + 9 == 213 and len(set(labels)) == 213
+    assert [entry for entry in log if entry[0] == "empty_like"] == [
+        ("empty_like", source, ("memory_config",)) for _, source, _ in snapshot.pairs
+    ]
+    assert labels[:7] == [
+        "layer 0 GDN recurrent",
+        *(f"layer 0 GDN conv[{slot}]" for slot in range(4)),
+        "layer 1 GDN recurrent",
+        "layer 1 GDN conv[0]",
+    ]
+    assert labels[10:19] == [f"layer 1 PLE conv[{slot}]" for slot in range(9)]
+    assert labels[24:26] == ["layer 3 QSA KV staging", "layer 3 QSA raw-key ring"]
+    assert all(target == f"snapshot:{source}" for _, source, target in snapshot.pairs)
+    assert len(snapshot.gdn_states) == 36 and len(snapshot.ple_states) == 1 and not snapshot.captured
+    with pytest.raises(RuntimeError, match="never captured"):
+        owner.restore_generic_snapshot(snapshot, state)
+
+    log.clear()
+    owner.capture_generic_snapshot(state, snapshot, position=37)
+    assert log == [("copy", source, target) for _, source, target in snapshot.pairs]
+    assert snapshot.position == 37 and snapshot.captured
+
+    log.clear()
+    owner.restore_generic_snapshot(snapshot, state)
+    assert log == [*(("copy", target, source) for _, source, target in snapshot.pairs), ("position-reset", 37)]
+    assert {gdn.conv_phase for gdn in snapshot.gdn_states} == {37 % 4} and layers[1].ple.token_context is None
+    with pytest.raises(ValueError, match="snapshot position must be an int"):
+        owner.capture_generic_snapshot(state, snapshot, position=owner.allocated_context + 1)
+    with pytest.raises(ValueError, match="not allocated by this model owner"):
+        owner.restore_generic_snapshot(dataclasses.replace(snapshot, _owner=object()), state)
+
+    # An MTP alignment layer's generic state rides along as an extra (QSA) layer.
+    extra = owner.allocate_generic_snapshot(state, extra_layers=((owner.layers[3], layers[3]),))
+    assert len(extra.pairs) == 215 and [label for label, _, _ in extra.pairs][-2:] == labels[24:26]
+    log.clear()
+    owner.release_generic_snapshot(snapshot)
+    assert log == [("deallocate", tuple(target for _, _, target in snapshot.pairs))] and not snapshot.captured
+    source = inspect.getsource(Qwen38TTNNTextModel.capture_generic_snapshot) + inspect.getsource(
+        Qwen38TTNNTextModel.restore_generic_snapshot
+    )
+    for forbidden in ("synchronize", "to_torch", "from_torch", "empty_like", "deallocate"):
+        assert forbidden not in source
+
+
 def test_generic_model_body_source_has_no_host_position_and_advances_as_its_last_device_op() -> None:
     # The body is HEAD then TAIL; the pins below read the two halves in body order.
     fused = inspect.getsource(Qwen38TTNNTextModel.forward_decode_generic)

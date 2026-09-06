@@ -157,6 +157,17 @@ def _deallocate_unique(*tensors) -> None:
     _release_tensor_slots(slots, label="TTNN tensor")
 
 
+def _copy_inplace(source, target, *, label: str) -> None:
+    """Copy into a persistent target and reject an address-changing result (gdn.py's rule)."""
+
+    target_id = _tensor_key(target)
+    copied = ttnn.copy(source, target)
+    if _tensor_key(target) != target_id:
+        raise RuntimeError(f"{label} target address changed during ttnn.copy")
+    if copied is not None and _tensor_key(copied) != target_id:
+        raise RuntimeError(f"{label} ttnn.copy returned a different tensor")
+
+
 def _release_tensor_slot_indices(
     slots: list[Any | None],
     indices: Sequence[int],
@@ -639,6 +650,26 @@ class Qwen38TTNNTextModelChunkState:
     _owner: object = field(repr=False, compare=False)
     rows: int = CHUNK_ROWS
     local_combine_output: Any | None = None
+
+
+@dataclass
+class Qwen38TTNNTextModelGenericSnapshot:
+    """Device-resident copy of the generic state's recurrent buffers at one position (the chat server's prompt-end
+    snapshot).
+
+    ``pairs`` is ``(label, state tensor, snapshot tensor)`` for every GDN recurrent state and conv ring slot, every
+    PLE conv slot and every QSA staging tile and raw-key ring of the state's layers (and of ``extra_layers``: an
+    MTP alignment layer's generic state).  The QSA KV and compressed caches are positional (rows and blocks past the
+    position are rewritten before they are read) and are not copied.  ``gdn_states`` take ``position mod 4`` as
+    their conv phase on a restore; ``ple_states`` drop their host context (the generic body's caller owns it).
+    """
+
+    pairs: tuple[tuple[str, Any, Any], ...]
+    gdn_states: tuple[Any, ...]
+    ple_states: tuple[Any, ...]
+    _owner: object = field(repr=False, compare=False)
+    position: int = 0
+    captured: bool = False
 
 
 @dataclass
@@ -1954,6 +1985,94 @@ class Qwen38TTNNTextModel:
         except BaseException as error:
             self._mark_poisoned("release_generic_state", 0, error)
 
+    # -- the prompt-end snapshot: the recurrent buffers of the generic state, copied on device ---------------------
+
+    def allocate_generic_snapshot(
+        self,
+        state: Qwen38TTNNTextModelGenericState,
+        *,
+        extra_layers: Sequence[tuple[Qwen38TTNNDecoderLayer, Qwen38TTNNDecoderLayerGenericState]] = (),
+    ) -> Qwen38TTNNTextModelGenericSnapshot:
+        """One ``empty_like`` buffer per recurrent tensor of ``state`` (and of ``extra_layers``); allocate it before
+        any capture so the traces' tracker sees no later allocation."""
+
+        self._validate_generic_state(state)
+        pairs: list[tuple[str, Any, Any]] = []
+        gdn_states: list[Any] = []
+        ple_states: list[Any] = []
+        for layer, layer_state in (*zip(self.layers, state.layers), *extra_layers):
+            layer.validate_generic_state(layer_state)
+            attention = layer_state.attention
+            name = f"layer {layer.layer_index}"
+            if layer.layer_type is Qwen38TTNNLayerType.GDN:
+                gdn_states.append(attention)
+                pairs.append((f"{name} GDN recurrent", attention.recurrent, None))
+                pairs.extend((f"{name} GDN conv[{slot}]", tensor, None) for slot, tensor in enumerate(attention.conv))
+            else:
+                pairs.append((f"{name} QSA KV staging", attention.kv_staging, None))
+                pairs.append((f"{name} QSA raw-key ring", attention.raw_key_ring, None))
+            if layer_state.ple is not None:
+                ple_states.append(layer_state.ple)
+                pairs.extend((f"{name} PLE conv[{slot}]", tensor, None) for slot, tensor in enumerate(layer_state.ple.conv))
+        allocated: list[Any] = []
+        try:
+            for index, (label, source, _) in enumerate(pairs):
+                target = ttnn.empty_like(source, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                allocated.append(target)
+                pairs[index] = (label, source, target)
+        except BaseException:
+            _deallocate_unique(*allocated)
+            raise
+        return Qwen38TTNNTextModelGenericSnapshot(tuple(pairs), tuple(gdn_states), tuple(ple_states), self._state_owner)
+
+    def _validate_generic_snapshot(self, snapshot: Qwen38TTNNTextModelGenericSnapshot) -> None:
+        if not isinstance(snapshot, Qwen38TTNNTextModelGenericSnapshot) or snapshot._owner is not self._state_owner:
+            raise ValueError("generic text-model snapshot was not allocated by this model owner")
+
+    def capture_generic_snapshot(
+        self, state: Qwen38TTNNTextModelGenericState, snapshot: Qwen38TTNNTextModelGenericSnapshot, *, position: int
+    ) -> None:
+        """Copy every recurrent buffer into the snapshot: device ops only, nothing allocated, no host sync (enqueued
+        behind the step whose state they record).  ``position`` is the host's count of consumed positions."""
+
+        self._validate_generic_state(state)
+        self._validate_generic_snapshot(snapshot)
+        if isinstance(position, bool) or type(position) is not int or not 0 <= position <= self.allocated_context:
+            raise ValueError(f"snapshot position must be an int in [0,{self.allocated_context}], got {position!r}")
+        try:
+            for label, source, target in snapshot.pairs:
+                _copy_inplace(source, target, label=f"{label} snapshot capture")
+        except BaseException as error:
+            self._mark_poisoned("capture_generic_snapshot", 0, error)
+        snapshot.position = position
+        snapshot.captured = True
+
+    def restore_generic_snapshot(
+        self, snapshot: Qwen38TTNNTextModelGenericSnapshot, state: Qwen38TTNNTextModelGenericState
+    ) -> None:
+        """The snapshot's buffers back into the state, the position to the snapshot's, the GDN conv phases to
+        ``position mod 4`` and the PLE host context cleared: the state of ``position`` consumed positions."""
+
+        self._validate_generic_state(state)
+        self._validate_generic_snapshot(snapshot)
+        if not snapshot.captured:
+            raise RuntimeError("cannot restore a generic snapshot that was never captured")
+        try:
+            for label, source, target in snapshot.pairs:
+                _copy_inplace(target, source, label=f"{label} snapshot restore")
+            state.position.reset(snapshot.position)
+        except BaseException as error:
+            self._mark_poisoned("restore_generic_snapshot", 0, error)
+        for gdn_state in snapshot.gdn_states:
+            gdn_state.conv_phase = snapshot.position % gdn_module.CONV_KERNEL_SIZE
+        for ple_state in snapshot.ple_states:
+            ple_state.token_context = None
+
+    def release_generic_snapshot(self, snapshot: Qwen38TTNNTextModelGenericSnapshot) -> None:
+        self._validate_generic_snapshot(snapshot)
+        _deallocate_unique(*(target for _, _, target in snapshot.pairs))
+        snapshot.captured = False
+
     def prepare_generic_decode_inputs(
         self,
         token_id: int | torch.Tensor,
@@ -2676,6 +2795,7 @@ __all__ = [
     "Qwen38TTNNRoPEInputs",
     "Qwen38TTNNRoPETable",
     "Qwen38TTNNTextModel",
+    "Qwen38TTNNTextModelGenericSnapshot",
     "Qwen38TTNNTextModelGenericState",
     "Qwen38TTNNTextModelOutput",
     "Qwen38TTNNTextModelSnapshot",
