@@ -11,7 +11,7 @@ its caches.  Nothing else is required: no prebuilt archive, no pinned binary, no
 
 | hardware | profile | status |
 |---|---|---|
-| QuietBox, 4x p150c (fw 19.4.1.0) | `tt-quietbox` | verified 2026-09-04: startup acceptance 96/96 tokens against the CPU, 19.6 tokens/s at 32k context |
+| QuietBox, 4x p150c (fw 19.4.1.0) | `tt-quietbox` | verified 2026-09-04: startup acceptance 96/96 tokens against the CPU, 19.6 tokens/s at 32k context; section 9a: the fresh-clone proof of 2026-09-06 |
 | Blackhole LoudBox, 4x p150 (one line) | `bh-loudbox` | section 9: what was verified and where |
 | QuietBox 2, 2x p300c (4 dies) | `qb2` | **untested**: designed from the p300 ring topology, should run fine |
 
@@ -62,10 +62,11 @@ This was implemented with the intention of the n-gram model residing in system m
 
 ## 2. Build
 
-From a fresh clone, the standard tt-metal flow (about 10 minutes on 64 cores, longer on fewer):
+From a fresh clone, the standard tt-metal flow (about 10 minutes on 64 cores; on the QuietBox's 32 cores `build_metal.sh`
+took 684 s and `create_venv.sh` 95 s, measured 2026-09-06):
 
-    git clone --branch release/qwen38-preview git@github.com:sjettTT/qwen-3.8-flash-next.git
-    cd qwen-3.8-flash-next
+    git clone https://github.com/sjettTT/tt-qwen-3.8-flash-next.git
+    cd tt-qwen-3.8-flash-next
     git submodule update --init tt_metal/third_party/umd tt_metal/third_party/tracy tt_metal/third_party/tt-cluster-descriptors
     ./build_metal.sh
     ./create_venv.sh
@@ -87,11 +88,24 @@ weights, config, tokenizer and chat template are byte-identical to the release c
 digest (every shard's header, the index, the file and tensor manifests, `config.json`, the tokenizer,
 `chat_template.jinja`) and refuses a checkpoint that differs, with the digests printed.
 
-`tools/verify_checkpoint_files.py --checkpoint DIR --modelscope-tree <out>/.download/files.json` re-hashes a
-download later; `tools/checkpoint_budget.py` prints the per-device residency budget; `tools/safetensors_metadata.py`
-lists tensors.
+A copy that is already on the host (another download, a relay from another machine) is checked the same way with
+`--verify-only`: every file present is hashed against the listing, a marker is written per verified file and nothing is
+fetched; a following run without `--verify-only` then fetches only the files that are absent or differ.
+`tools/verify_checkpoint_files.py --checkpoint DIR --modelscope-tree <out>/.download/files.json --output report.json`
+re-hashes a download later (standard library only, any `python3`); `tools/checkpoint_budget.py` prints the per-device
+residency budget; `tools/safetensors_metadata.py` lists tensors.
 
 ## 4. Start the server
+
+First the n-gram table.  Every decode token reads sixteen 320-byte rows of the PLE n-gram table, which stays in the
+checkpoint (104 GB in 33 shards of layer 1) and is read by the host through the page cache; on a cold cache each row
+is an NVMe page-in, so on a host whose RAM holds the table (the QuietBox has 503 GB) read it once before the start:
+
+    python_env/bin/python -m models.demos.blackhole.qwen38_flash_next.tools.prewarm_ple_table --checkpoint /data/Qwen3.8-Flash-Next
+
+It prints the residency before and after (`fincore`, util-linux) and the read rate; nothing is written.  On the
+QuietBox the pass over the 104 GB took 13 s from a warm cache (7.8 GB/s); a cold NVMe cache is 35-60 s at 2-3 GB/s.
+`--report-only` only prints the residency.  Then the server:
 
     tools/run_qwen38_chat_server.sh --profile tt-quietbox \
         --checkpoint /data/Qwen3.8-Flash-Next --cache-root /data/qwen38-cache --acceptance
@@ -108,7 +122,8 @@ the context and the run directory, and starts the server.
 mesh and written back as one tensorbin per weight; a `bf4-stage-backbone-NN` phase per layer in the log), then builds
 the component and model I/O caches of the chosen context (a few minutes), compiles the kernels (the JIT cache fills
 during the warm pass, two to four minutes cold) and captures the decode traces and the prefill chunk trace.  A layer
-takes about 33 s on a 4x p150 host (2.2 GB written; measured 2026-09-05: 25 layers in 812 s), the 49 under half an hour;
+takes about 33 s on a 4x p150 host (2.2 GB written; measured 2026-09-05: 25 layers in 812 s; on the QuietBox 2026-09-06:
+49 layers in 1772 s, 35.9-36.9 s each, 100 GB), the 49 under half an hour;
 the payload of every tensorbin is byte for byte the CPU-staged corpus's (`tools/stage_full_bf4_cpu.py`), the manifest records the slot's global shape
 (512 experts) while the mesh tensor presents one device's 128.  A machine that bounds a job's wall time can build the
 expert cache in pieces: `--prepare-only --bf4-stage-limit N` converts at most N missing layers and stops; every layer
@@ -297,7 +312,8 @@ Run the tests from the repository root:
 ## 9. What is verified, and the known limits
 
 - `tt-quietbox`: a QuietBox (4x p150c, fw 19.4.1.0) served the model on 2026-09-04 from a pinned build: startup
-  acceptance 96/96 against the CPU, 19.6 tokens/s at 32k.  The launcher and profile are the ones here.
+  acceptance 96/96 against the CPU, 19.6 tokens/s at 32k.  The launcher and profile are the ones here; section 9a
+  is the same box served from a fresh clone of this repository.
 - The checkout build and `bh-loudbox`: section 9a records the fresh-clone proof of this release (built with
   `build_metal.sh` + `create_venv.sh`, the checkpoint by digest, the first-start expert conversion, the acceptance
   replay) and the hardware it ran on.
@@ -310,4 +326,45 @@ Run the tests from the repository root:
 
 ### 9a. Release proof
 
-Filled in by the proof run of the release branch.
+The QuietBox (`tt-quietbox`: 4x p150c, which `tt-smi` reports as p150b; firmware bundle 19.4.1.0, tt-kmd 2.6.0-rc1, 32 cores, 503 GB RAM, Ubuntu
+22.04, clang-20, Python 3.10.19 through `uv`) served the model on 2026-09-06 from a fresh clone of the public repository
+at `cadebdff7c1c`, following sections 2-5 as written (the deviations found on the way are folded into the text above):
+
+- clone 53 s, the three submodules 15 s, `build_metal.sh` 684 s with its defaults, `create_venv.sh` 95 s; the
+  runtime identity of every run: head `cadebdff7c1c`, tree `dd25966f522c`, clean, extension
+  `f3d1fb4c3ab4...`.
+- the checkpoint copy already on the host: `download_checkpoint.py --verify-only` verified 142 of the 145 listed files
+  in 13 s (LICENSE differed, `.gitattributes` and `configuration.json` were absent), the plain run fetched those three in
+  17 s (145/145); `verify_checkpoint_files.py`: 131/131 shards, 360,000,192,888 bytes, every SHA-256 equal to the
+  ModelScope listing (176 s, 4 workers).
+- `prewarm_ple_table.py`: the 104,298,732,704 B of the n-gram table in 13.4 s (already resident), 33/33 files resident.
+- the first start (`--profile tt-quietbox --acceptance --require-json-96`, 32k): mesh open 9.6 s; the 49 BF4 layers
+  1772.5 s (35.9-36.9 s each, 100 GB written); target build 41.4 s; warm pass with a cold JIT cache 150.2 s; captures
+  5.1 s and the chunk capture 1.7 s; acceptance replay 59.2 s; `READY` 2096.6 s after the mesh open (launched
+  17:19:30Z, `READY` 17:54:33Z); 474,261,568 bytes free per bank after the captures.
+- acceptance: `json` 96/96 (the gate passed); the other eleven records leave the CPU stream at the same indices as the
+  4x p150 hosts did (chat 8, code 24, fact 15, list 46, math 61, multilingual 9, prose 13, refactor 22, sky 19, story
+  6, summary 75); 19.4-19.6 tokens/s in the replays.
+- requests over the LAN: a 36-token answer at 19.1 tokens/s (first token 0.30 s after a 33-token prompt), a 128-token
+  generation at 19.6 tokens/s (first token 0.39 s, 47-token prompt in 2 chunks); the CLI's question answered.  SIGTERM
+  stopped it cleanly (`result.json` status `stopped`, mesh closed, launcher exit 0).
+- the same launcher line with `--mtp 4` (warm caches; the MTP kernels compiled on this start): `READY` 225 s after the
+  launch (MTP warm pass 40 s, acceptance replay 48 s); `json` 96/96 through MTP at 55.0 tokens/s (4.8 tokens per
+  pass), the split hand-off gate passed in both orders; `code` left the CPU stream at 44 and `fact` at 16 (section 6),
+  the other nine records at the plain-decode indices; 375,594,496 bytes free per bank (98.7 MB less than without MTP).
+  Requests: the `json` prompt as a chat request reproduced the CPU record's 96 tokens at 55.2 tokens/s; a 6942-token
+  prompt prefilled in 23.4 s (3.37 ms per prompt token, 217 chunks of 32 rows) then decoded at 31.3 tokens/s (3.0 per
+  pass), its follow-up turn reused the 6980 committed tokens (first token 1.6 s, 43.1 tokens/s); a 128-token generation
+  36.7 tokens/s (27.0 ms per token); a 220-token prose answer 31.0 tokens/s (2.6 per pass).
+- the same line with `--long-chunks` (warm caches; the 128-row chunk kernels compiled on this start): `READY` 214 s
+  after the launch; acceptance identical to the plain start (`json` 96/96, the same eleven divergence indices, 19.4-19.6
+  tokens/s); 439,384,896 bytes free per bank (34.9 MB less than without).  The 6942-token prompt prefilled in 18.8 s =
+  2.71 ms per prompt token (first token 18.9 s; 3.37 with 32-row chunks on the MTP start above), hand-off 805 ms, the
+  same answer; decode 50.6 ms per token (19.6 tokens/s on a 128-token generation).  The `json` chat request again
+  reproduced the CPU record's 96 tokens.
+- `--allocated-context 65536` (the 64k component and model I/O caches built on this start, 9.8 GB): `READY` 220 s after
+  the launch (target build 41 s, warm pass 13.5 s, acceptance replay 60 s); `json` 96/96, the same divergence indices;
+  `/health` `context_limit` 65472; 419,440,704 bytes free per bank.  Left serving the LAN on port 8000
+  (`--serve-seconds 86400`); a client on the LAN got its first token 0.30 s after a 33-token prompt.
+- Every start above was stopped with SIGTERM between runs and closed its mesh (`result.json` status `stopped`,
+  launcher exit 0); no board needed a reset.

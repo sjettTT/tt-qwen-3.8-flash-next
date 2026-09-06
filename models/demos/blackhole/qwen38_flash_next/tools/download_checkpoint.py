@@ -6,8 +6,11 @@ The file listing of the revision (path, size, SHA-256 per file) comes from the M
 the download (``<out>/.download/files.json``; ``tools/verify_checkpoint_files.py`` takes it).  Every file is fetched
 as 128 MiB range segments by a pool of threads, written in place into a pre-sized file; a marker per finished
 segment makes a restart skip what is done.  A complete file is hashed and compared with the listing; a mismatch
-discards its markers so it is fetched again.  Resumable, parallel, 360 GB.
+discards its markers so it is fetched again.  Resumable, parallel, 360 GB.  ``--verify-only`` hashes a copy
+that is already in place (fetching nothing) and writes the markers, so the next plain run fetches only what is
+absent or differs.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -113,19 +116,48 @@ class Download:
                 time.sleep(min(60, 2**attempt))
         raise RuntimeError(f"segment failed {name} {index}")
 
-    def finish_file(self, name: str) -> bool:
+    def check_file(self, name: str) -> bool:
+        """Hash a complete file against the listing; a match writes its marker."""
         path = self.out / name
         item = self.files[name]
-        digest = sha256_file(path)
-        if path.stat().st_size == item["Size"] and digest == item["Sha256"]:
+        size = path.stat().st_size
+        digest = sha256_file(path) if size == item["Size"] else None
+        if digest == item["Sha256"]:
             self.verified(name).parent.mkdir(parents=True, exist_ok=True)
             self.verified(name).write_text(f"{digest}  {name}\n")
             self.say(f"VERIFIED {name} {item['Size']}")
             return True
-        self.say(f"BAD {name} size={path.stat().st_size} sha256={digest} expected {item['Sha256']}; fetching again")
-        for index in range(self.segments(item["Size"])):
+        self.say(f"BAD {name} size={size} expected {item['Size']} sha256={digest} expected {item['Sha256']}")
+        return False
+
+    def finish_file(self, name: str) -> bool:
+        if self.check_file(name):
+            return True
+        self.say(f"{name}: fetching again")
+        for index in range(self.segments(self.files[name]["Size"])):
             self.marker(name, index).unlink(missing_ok=True)
         return False
+
+    def verify_only(self) -> int:
+        """Hash the files already in place against the listing and write their markers; fetch nothing.
+
+        For a copy that was not made by this tool: a following run without
+        ``--verify-only`` then fetches only the files that are absent or differ.
+        """
+        started = time.time()
+        present = [name for name in self.files if not self.verified(name).exists() and (self.out / name).is_file()]
+        absent = sorted(name for name in self.files if not (self.out / name).is_file())
+        self.say(
+            f"verify-only revision={self.revision} files={len(present)} to hash, absent={absent}, threads={self.threads}"
+        )
+        outcomes = list(self.pool.map(self.check_file, present))
+        self.pool.shutdown(wait=True)
+        verified = sum(1 for name in self.files if self.verified(name).exists())
+        bad = sorted(name for name, ok in zip(present, outcomes) if not ok)
+        self.say(
+            f"end verified {verified}/{len(self.files)} in {time.time() - started:.0f} s; bad {bad}; absent {absent}"
+        )
+        return 0 if verified == len(self.files) else 1
 
     def submit(self, name: str, index: int, size: int) -> None:
         with self.lock:
@@ -202,6 +234,11 @@ def main() -> int:
     parser.add_argument("--threads", type=int, default=32, help="parallel range requests (default 32)")
     parser.add_argument("--work", type=Path, default=None, help="markers and log (default <out>/.download)")
     parser.add_argument("--listing-only", action="store_true", help="save the file listing and stop")
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="hash the files already in --out against the listing and write their markers; fetch nothing",
+    )
     args = parser.parse_args()
     out = args.out.resolve()
     work = (args.work or out / ".download").resolve()
@@ -213,7 +250,8 @@ def main() -> int:
     )
     if args.listing_only:
         return 0
-    return Download(args.revision, files, out, work, args.threads).run()
+    download = Download(args.revision, files, out, work, args.threads)
+    return download.verify_only() if args.verify_only else download.run()
 
 
 if __name__ == "__main__":
