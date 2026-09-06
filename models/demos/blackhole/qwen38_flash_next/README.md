@@ -295,8 +295,13 @@ The command-line client:
   round differently): the committed stream leaves the CPU reference on `chat` at token 56 where plain decode leaves
   at 43, on `list` at 46 against 56, on `math` at 56 against 61 and on `summary` at 1 against 75 (`In 1947,` becomes
   `Invented at Bell Labs in`); the other eight records leave the reference at the plain-decode token (`json` 96/96,
-  `code` and `refactor` bitwise the plain streams), and every gate passes.  Before the gate fix the two paths differed
-  on `code` (44 against 24) and `fact` (16 against 15) only.  `--mtp-gdn-anchor layer0` (server flag) re-anchors the
+  `code` and `refactor` bitwise the plain streams), and every gate passes.  At each of the three earlier tokens the
+  device's own 1-row logits hold the CPU's token and the MTP token within one bf16 step (an exact tie on `summary` and
+  `list`, which the 1-row loop breaks toward the lower id), the verify row lands one step the other way, and the CPU
+  oracle rates the two 0.4-1.0 logits apart: near-ties, not a defect (the rows-path gate is the 1-row gate bitwise on
+  the same row; the pinned MTP table is `tools/ci/baselines/A3-mtp4-32k-divergence_index.json`).  Before the gate
+  fix the two paths differed on `code` (44 against 24) and `fact` (16 against 15) only.  `--mtp-gdn-anchor layer0`
+  (server flag) re-anchors the
   layer-0 GDN state from the 1-row recurrence.  MTP does not fit at 256k (94 MB free per bank against the 128 MiB
   contiguous it needs); 32k, 64k and 128k fit.
 

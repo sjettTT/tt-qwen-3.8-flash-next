@@ -1,0 +1,25 @@
+{
+ "expected": {
+  "chat": "234fc9e9abd073f1c40c21b48b02bbc7c54c4216f32d7106d55b36c5b489aebe",
+  "code": "0234032be259edb09c5a14223164516548a972e013dc66d2e6452ee9c14d5c08",
+  "fact": "d165f2fd536c951e30a81542d4da983cb6d9034183d4d497e4dd9a07c924c53e",
+  "json": "a5b4defa72fae270391869377862fe60b95d893a6c2cfd24ea265bb59de6d16f",
+  "list": "181bcc466a67a153a4459ba0b01a8f06328f72ae1f8fc554e51f6df60d6ad546",
+  "math": "96290ed7ae52dd7c2c04922955aa1820d9a969045b3909188572a1754c199550",
+  "multilingual": "165f53e14cf16b09a63fc33bfac0e646e9c4dcb3f89327cccabca81361916514",
+  "prose": "21240e5ba97f52b0b819cae6ef3c1516020dec546393d3f9748723bf750336f6",
+  "refactor": "8a812a8ea01b3d7da9da5788d0d03034082562b5c5e7208ab7efc74ac301ee3d",
+  "sky": "93ed923f4b8f69581cf95e0d933eadd1bb4ef371482c4dc6f37dcf0dcf795f46",
+  "story": "e5371ee8a64c72e970d087bae60a3ccc67e6bb8fde6f0abca2e686ad46b33ba3",
+  "summary": "459dc8c7a5c8049af0ebb801e69709bec48973a62e6e30772aebe5a4d72b1c8e"
+ },
+ "pin": "A3/mtp4-32k/device_token_ids_sha256",
+ "schema": "qwen38-ci-baseline/v1",
+ "source": {
+  "date": "2026-09-06",
+  "evidence": "chat server startup replay, chunked prefill with MTP drafting k=4 (--mtp 4), one lane of a 4x p150 host, 2026-09-06 (the GDN decay gate through ttnn.softplus, the fused weighted reduce fixed); json, code and refactor are bitwise the plain streams of the same day",
+  "head": "b98fc47541d192c16d32912111901fc188195e8a",
+  "sku": "p150x4"
+ },
+ "status": "proposal"
+}

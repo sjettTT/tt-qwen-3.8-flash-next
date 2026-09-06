@@ -1070,6 +1070,11 @@ def test_committed_baselines_belong_to_baseline_pins_and_carry_their_source():
         "story": 6,
         "summary": 75,
     }
+    mtp4 = ci.load_baseline("A3/mtp4-32k/divergence_index")["expected"]
+    assert set(mtp4) == set(chunked) and mtp4["json"] is None
+    # the same replay through the MTP pass loop: later on chat, earlier on list, math and summary, where the device's
+    # own logits hold the two candidates within one bf16 step (the verify row and the 1-row TAIL break the tie apart)
+    assert mtp4 == {**chunked, "chat": 56, "list": 46, "math": 56, "summary": 1}
     items = ci.load_baseline("C2/greedy-nothink/item_pass")["expected"]
     per_task = {}
     for key, flag in items.items():
