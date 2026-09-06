@@ -1,17 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
-"""OpenAI chat protocol for the Qwen3.8 server: request normalisation, tool-aware rendering, reply assembly, prefix splice.
+"""OpenAI chat protocol for the Qwen3.8 server: request normalisation, tool-aware rendering, reply assembly.
 
 Request side: the client's messages and tools are changed only where the
 reference (``tokenizer.apply_chat_template`` on the raw request) needs help,
 ``arguments`` sent as a JSON string and ``content: null``; the tools render in
-the client's key order, which ``tojson`` follows.  Reply side: generated token
-ids become ``reasoning_content``, ``content`` and ``tool_calls`` pieces in the
-order the model emitted them, with the whitespace the template trims held back,
-so the streamed and the non-streamed message agree.  Prefix side: a request
-that continues the server's own reply reuses the committed ids instead of the
-template's re-rendering of that reply (Hermes does not echo the reasoning).
+the client's key order, which ``tojson`` follows.  The device prompt of every
+request is that reference render: a follow-up turn holds the served reply as
+the template re-renders it (its content and tool calls, an empty think block),
+never the recorded reasoning ids.  Reply side: generated token ids become
+``reasoning_content``, ``content`` and ``tool_calls`` pieces in the order the
+model emitted them, with the whitespace the template trims held back, so the
+streamed and the non-streamed message agree.
 """
 
 from __future__ import annotations
@@ -20,13 +21,11 @@ import json
 import re
 import secrets
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from typing import Any, Callable
 
 import jinja2
 from models.demos.blackhole.qwen38_flash_next.chat import (
     EOS_TOKEN_IDS,
-    IM_END_ID,
     VOCAB_SIZE,
     Qwen38ChatFormatError,
     parse_tool_calls,
@@ -37,7 +36,6 @@ THINK_START_ID = 248_068
 THINK_END_ID = 248_069
 TOOL_CALL_START_ID = 248_058
 TOOL_CALL_END_ID = 248_059
-TURN_END = "<|im_end|>\n"
 ROLES = ("system", "user", "assistant", "tool")
 TOOL_CHOICES = ("auto", "none")
 MAX_STOP_STRINGS = 4
@@ -277,67 +275,6 @@ def render_prompt(
     return encode_chat(tokenizer, text)
 
 
-# -- prefix side ---------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Qwen38ServedTurn:
-    """What the device holds after a served request: the normalised request, the reply as the client will echo
-    it (trimmed content, tool calls, reasoning), the committed ids (prompt + generated, EOS included when consumed)."""
-
-    messages: list[dict[str, Any]]
-    tools: list[dict[str, Any]]
-    enable_thinking: bool
-    reasoning_effort: str
-    reply: dict[str, Any]
-    committed: list[int]
-
-
-def splice_prompt(
-    tokenizer: Any,
-    served: Qwen38ServedTurn | None,
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]],
-    *,
-    enable_thinking: bool,
-    reasoning_effort: str,
-) -> list[int] | None:
-    """Committed ids + the encoded remainder when ``messages`` continue the served turn under the same tools
-    and thinking flags: same request messages, then the reply echoed (content and tool calls equal, reasoning
-    absent or equal), then at least one more message.  ``None`` means: render the reference prompt."""
-
-    if served is None:
-        return None
-    count = len(served.messages)
-    if (
-        (served.enable_thinking, served.reasoning_effort, served.tools) != (enable_thinking, reasoning_effort, tools)
-        or len(messages) <= count + 1
-        or messages[:count] != served.messages
-    ):
-        return None
-    echo = messages[count]
-    content = echo["content"]
-    if isinstance(content, list):  # text parts render as their concatenation
-        content = "".join(item["text"] for item in content)
-    if (
-        echo["role"] != "assistant"
-        or content.strip() != served.reply["content"]
-        or echo.get("tool_calls", []) != served.reply.get("tool_calls", [])
-        or echo.get("reasoning_content", "").strip() not in ("", served.reply["reasoning_content"])
-    ):
-        return None
-    flags = {"enable_thinking": enable_thinking, "reasoning_effort": reasoning_effort}
-    history = render_chat(tokenizer, messages[: count + 1], tools, add_generation_prompt=False, **flags)
-    full = render_chat(tokenizer, messages, tools, **flags)
-    last = served.committed[-1]
-    if not history.endswith(TURN_END) or not full.startswith(history) or (last in EOS_TOKEN_IDS and last != IM_END_ID):
-        return None  # <|endoftext|> closed the reply where the template puts <|im_end|>: no exact continuation
-    # The committed ids already carry the reply's terminator when <|im_end|> was consumed; otherwise the
-    # template's <|im_end|> closes the partial reply.
-    cut = len(history) - (1 if last == IM_END_ID else len(TURN_END))
-    return served.committed + encode_chat(tokenizer, full[cut:])
-
-
 # -- reply side ----------------------------------------------------------------------------------
 
 
@@ -445,27 +382,6 @@ class Qwen38ReplyAssembler:
                 {key: value for key, value in call.items() if key != "index"} for call in self.calls
             ]
         return message
-
-    def echo_reply(self) -> dict[str, Any]:
-        """The reply in the template's schema, as a client echoes it back (for the prefix splice)."""
-
-        reply: dict[str, Any] = {
-            "role": "assistant",
-            "content": "".join(self.content),
-            "reasoning_content": "".join(self.reasoning),
-        }
-        if self.calls:
-            reply["tool_calls"] = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": call["function"]["name"],
-                        "arguments": json.loads(call["function"]["arguments"]),
-                    },
-                }
-                for call in self.calls
-            ]
-        return reply
 
     def _enter(self, phase: str) -> list[dict[str, Any]]:
         deltas = self._flush()

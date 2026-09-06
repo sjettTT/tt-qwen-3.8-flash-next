@@ -76,7 +76,6 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_prefill_driver import
     Qwen38PrefillResult,
     alignment_steps,
 )
-from models.demos.blackhole.qwen38_flash_next.tools.run_full_cpu_oracle import OFFICIAL_CHAT_SYSTEM_PROMPT
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2
 from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import (
@@ -122,9 +121,9 @@ WARM_CHUNK_TOKEN_IDS = tuple(
 WARM_LONG_CHUNK_TOKEN_IDS = tuple(
     resident_decode.SEQUENTIAL_TRACE_WARM_EMBEDDING_TOKEN_IDS[index % TP_SIZE] for index in range(LONG_CHUNK_ROWS)
 )
-# The CPU acceptance study's rendering (mtp_acceptance_cpu_v2 at a97cb9e6b0): the
-# 12 prompt records render identically only with these.
-SYSTEM_PROMPT = OFFICIAL_CHAT_SYSTEM_PROMPT
+# The CPU acceptance study's template flags (mtp_acceptance_cpu_v2 at a97cb9e6b0): the 12 prompt records render
+# identically only with these.  The records carry their own system turn inside their prompt ids; the session adds no
+# system prompt of its own.
 ENABLE_THINKING = False
 PRESERVE_THINKING = True
 REASONING_EFFORT = "low"
@@ -312,15 +311,14 @@ class Qwen38ChatSession:
         reasoning_effort: str = REASONING_EFFORT,
         tools: Sequence[Mapping[str, Any]] = (),
     ) -> list[int]:
-        """Prompt token ids of ``messages`` (and the client's ``tools``) under the acceptance study's flags; the
-        study's system prompt when none.  The protocol module renders: bitwise the reference template."""
+        """Prompt token ids of exactly ``messages`` (and the client's ``tools``) under the acceptance study's flags;
+        no system turn is added when the client sends none.  The protocol module renders: bitwise the reference
+        template."""
 
         if isinstance(messages, (str, bytes)) or not isinstance(messages, Sequence) or not messages:
             raise Qwen38ChatRequestError("messages must be a nonempty list")
         if not all(isinstance(message, Mapping) for message in messages):
             raise Qwen38ChatRequestError("every message must be an object")
-        if messages[0].get("role") != "system":
-            messages = ({"role": "system", "content": SYSTEM_PROMPT}, *messages)
         if reasoning_effort not in REASONING_EFFORTS:
             raise Qwen38ChatRequestError(
                 f"reasoning_effort must be one of {REASONING_EFFORTS}, got {reasoning_effort!r}"

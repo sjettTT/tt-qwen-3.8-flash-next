@@ -8,12 +8,17 @@
 ``--sampling`` also sampling with the OpenAI fields plus ``top_k``, ``min_p``,
 ``repetition_penalty`` and ``greedy``, ``seed`` echoed, ``logprobs`` from the
 candidate row), ``GET /v1/models``, ``GET /health``.  On a sampling server a
-request without ``temperature`` takes the model card's profile for its thinking
-mode; ``temperature 0`` or ``greedy`` is the bitwise greedy loop.  Without
-``--sampling`` (the default, ``--no-sampling`` the explicit form) TAIL captures
-no candidate row, the loop is the greedy one at its measured period and explicit
-sampling fields are refused.  Runs under ``tools/run_qwen38_chat_server.sh``
-(or a development launcher): the server admits the runtime it
+request naming no sampling field, ``temperature 0`` or ``greedy`` is the bitwise
+greedy loop (the argmax the TAIL resolves; the candidate row is never read); a
+request with ``temperature > 0`` samples with it and one naming another sampling
+field without a temperature takes the model card's profile for its thinking
+mode.  Without ``--sampling`` (``--no-sampling``, the argparse default) TAIL
+captures no candidate row, the loop is the greedy one at its measured period and
+explicit sampling fields are refused; the launchers pass ``--sampling``.  The
+device prompt of every request is the reference render of the client's
+messages: no system prompt is added, and a follow-up turn holds the served reply
+as the template re-renders it, never the recorded reasoning.  Runs under
+``tools/run_qwen38_chat_server.sh`` (or a development launcher): the server admits the runtime it
 imports (the ttnn built from this checkout, ``runtime_admission``), prepares the
 model inputs on the CPU, opens the mesh, converts the routed experts on the
 first start, replays the CPU acceptance records after the captures
@@ -73,7 +78,6 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     MTP_GDN_ANCHORS,
     PREFILL_MODES,
     Qwen38ChatChainError,
-    Qwen38ChatRequestError,
     Qwen38ChatSession,
     construct_chain,
     mtp_capacity_admission,
@@ -318,17 +322,21 @@ def _extension(
     assembler: protocol.Qwen38ReplyAssembler,
     *,
     queue_wait: float,
-    spliced: bool,
     think_budget: int | None,
     sampling: sampling_step.Qwen38SamplingRequest | None,
 ) -> dict[str, Any]:
-    """The ``qwen38`` object of a response (and the ledger's per-request fields)."""
+    """The ``qwen38`` object of a response (and the ledger's per-request fields).  ``decode_loop`` records which
+    loop produced the tokens: ``greedy`` (the TAIL's argmax, bitwise the reference; a request without sampling
+    fields on any server) or ``sampled`` (the candidate-row sampler).  ``served_reasoning_tokens`` is the reasoning
+    of earlier turns held in the device prompt beyond the client's history: always 0, the prompt is the reference
+    render; kept as a field."""
 
     return {
         **completion.as_dict(),
         "finish": completion.finish_reason,
         "queue_wait_seconds": round(queue_wait, 4),
-        "prompt_spliced": spliced,
+        "decode_loop": "greedy" if sampling is None else "sampled",
+        "served_reasoning_tokens": 0,
         "sampling": None if sampling is None else sampling.as_dict(),
         "seed": None if sampling is None else sampling.parameters.seed,
         "reasoning_tokens": assembler.reasoning_tokens,
@@ -432,7 +440,6 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
         self.tickets = itertools.count()
         self.busy = False
         self.stopping = False  # the stop signal came: new and queued requests get 503, the in-flight one ends
-        self.served: protocol.Qwen38ServedTurn | None = None
         self.last_prefill_ms_per_token: float | None = None
         self.fatal: BaseException | None = None
 
@@ -670,6 +677,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                     "defaults": {
                         "enable_thinking": ENABLE_THINKING_DEFAULT,
                         "reasoning_effort": REASONING_EFFORT_DEFAULT,
+                        "system_prompt": None,  # the client's messages render as sent; none is added
                         "thinking_token_caps": protocol.THINKING_TOKEN_CAPS,
                         "answer_reserve_tokens": protocol.ANSWER_RESERVE_TOKENS,
                     },
@@ -717,16 +725,21 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             )
             return
         session = self.server.session
-        flags: dict[str, Any] = {}
         try:
             request = parse_chat_request(
                 json.loads(self.rfile.read(int(length)).decode("utf-8")),
                 sampling_available=session.sampling is not None,
             )
-            flags = {"enable_thinking": request["enable_thinking"], "reasoning_effort": request["reasoning_effort"]}
-            # The reference render: validates the whole request and bounds the budget before any queueing.
-            rendered_ids = session.render(request["messages"], tools=request["tools"], **flags)
-            session.require_budget(len(rendered_ids), request["max_tokens"])
+            # The reference render is the device prompt (usage.prompt_tokens is the client's own count); it validates
+            # the whole request and resolves the budget (the remaining context when max_tokens is absent) before any
+            # queueing.  The thinking budget is carved out of that.
+            prompt_ids = session.render(
+                request["messages"],
+                tools=request["tools"],
+                enable_thinking=request["enable_thinking"],
+                reasoning_effort=request["reasoning_effort"],
+            )
+            max_tokens = session.require_budget(len(prompt_ids), request["max_tokens"])
         except (ValueError, UnicodeDecodeError) as error:
             code = getattr(error, "code", None)
             if code is None:
@@ -743,6 +756,16 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             return
         if request["ignored"]:
             _log("ignored_request_fields", fields=request["ignored"])
+        request = {
+            **request,
+            "max_tokens_requested": request["max_tokens"],
+            "max_tokens": max_tokens,
+            "think_budget": (
+                protocol.thinking_budget(request["reasoning_effort"], max_tokens, request["thinking_budget"])
+                if request["enable_thinking"]
+                else None
+            ),
+        }
         received_utc = utc_now()
         request_id = _completion_id()
         created = int(time.time())
@@ -834,17 +857,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 self._answer_error(wire, 503, str(error), "server_busy", Retry_After=str(RETRY_AFTER_SECONDS))
                 return
             self._serve(
-                session,
-                request,
-                flags,
-                rendered_ids,
-                request_id,
-                received_utc,
-                wire,
-                chunk,
-                assembler,
-                heartbeats,
-                queue_wait,
+                session, request, prompt_ids, request_id, received_utc, wire, chunk, assembler, heartbeats, queue_wait
             )
         finally:
             heartbeat_stop.set()
@@ -853,8 +866,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
         self,
         session: Qwen38ChatSession,
         request: dict[str, Any],
-        flags: Mapping[str, Any],
-        rendered_ids: list[int],
+        prompt_ids: list[int],
         request_id: str,
         received_utc: str,
         wire: _ClientWire,
@@ -863,47 +875,10 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
         heartbeats: list[int],
         queue_wait: float,
     ) -> None:
-        """The device turn: the prompt (spliced onto the served turn or the reference render), the run, the served
-        turn, the reply, the ledger.  The device is released before anything is written to the client."""
+        """The device turn: the run over the reference render (the session continues its committed prefix where
+        the render extends it and resets otherwise), the reply, the ledger.  The device is released before anything
+        is written to the client."""
 
-        try:
-            prompt_ids = protocol.splice_prompt(
-                session.template.tokenizer, self.server.served, request["messages"], request["tools"], **flags
-            )
-            spliced = prompt_ids is not None
-            # The budget is known only now: the served prompt's remaining context when the client sent no
-            # max_tokens; the thinking budget is carved out of it.
-            if spliced:
-                try:
-                    max_tokens = session.require_budget(len(prompt_ids), request["max_tokens"])
-                except Qwen38ChatRequestError as error:
-                    # The spliced prompt carries the served turns' reasoning, which the client's history does not;
-                    # when it no longer fits, the reference render (within the budget above) resets the device.
-                    _log(
-                        "splice_over_budget",
-                        request_id=request_id,
-                        spliced_tokens=len(prompt_ids),
-                        rendered_tokens=len(rendered_ids),
-                        error=str(error),
-                    )
-                    spliced = False
-            if not spliced:
-                prompt_ids = rendered_ids
-                max_tokens = session.require_budget(len(prompt_ids), request["max_tokens"])
-        except ValueError as error:
-            self.server.release_device()
-            self._answer_error(wire, 400, str(error), "invalid_request_error", code="context_length_exceeded")
-            return
-        request = {
-            **request,
-            "max_tokens_requested": request["max_tokens"],
-            "max_tokens": max_tokens,
-            "think_budget": (
-                protocol.thinking_budget(request["reasoning_effort"], max_tokens, request["thinking_budget"])
-                if request["enable_thinking"]
-                else None
-            ),
-        }
         started = time.perf_counter()
         deadline = self.server.request_deadline_seconds
         progress = {
@@ -938,12 +913,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             else sampling_step.Qwen38SamplingRequest(request["sampling"], top_logprobs=request["top_logprobs"])
         )
         extension_of = lambda completion: _extension(  # noqa: E731
-            completion,
-            assembler,
-            queue_wait=queue_wait,
-            spliced=spliced,
-            think_budget=request["think_budget"],
-            sampling=sampling,
+            completion, assembler, queue_wait=queue_wait, think_budget=request["think_budget"], sampling=sampling
         )
         # One logprobs item per token the client sees (the sampled loop appends its sample before yielding).
         decode_one = lambda token_id: template_decoder(session.template)([token_id])  # noqa: E731
@@ -993,7 +963,6 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 error=f"{type(error).__name__}: {error}",
                 traceback=traceback.format_exc(),
             )
-            self.server.served = None
             if session.poisoned:
                 self.server.fatal = error
         finally:
@@ -1003,28 +972,6 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             self._answer_error(wire, 500, f"{type(failure).__name__}: {failure}", "server_error")
             return
         finish_reason = _finish_reason(completion.finish_reason, assembler)
-        # The next request continues this turn from the committed ids only when they are the reply the client will
-        # echo: the prompt fully prefilled, no stop-string tail (the match's tokens are committed), the think block
-        # closed, no tool block cut open.  A length finish leaves the reply's last token unconsumed in the row.
-        continuable = (
-            completion.finish_reason != "error"
-            and len(session.committed) >= len(prompt_ids)
-            and not assembler.stop_hit
-            and assembler.phase == "content"
-            and not assembler.truncated_tool_call
-        )
-        self.server.served = (
-            protocol.Qwen38ServedTurn(
-                messages=request["messages"],
-                tools=request["tools"],
-                enable_thinking=request["enable_thinking"],
-                reasoning_effort=request["reasoning_effort"],
-                reply=assembler.echo_reply(),
-                committed=list(session.committed) + ([] if session.row_token is None else [session.row_token]),
-            )
-            if continuable
-            else None
-        )
         if completion.prefill_tokens:
             self.server.last_prefill_ms_per_token = round(
                 1e3 * completion.prefill_seconds / completion.prefill_tokens, 3
@@ -1391,8 +1338,10 @@ def _parser() -> argparse.ArgumentParser:
         "--stall-seconds",
         type=float,
         default=None,
-        help="a device turn with no completed step for this long (a wedge, not a long prompt: prefill polls every few "
-        "chunks) ends the server as fatal; default: no watchdog",
+        help="a device turn with no completed step for this long ends the server as fatal (exit 1) so a supervisor "
+        "restarts it; every decode step, prefill event (16 forced tokens, 4 chunks) and admission from the queue "
+        "restarts the clock, so a long prompt is never a stall; must exceed --socket-timeout-seconds; default: no "
+        "watchdog (the launchers pass 300)",
     )
     parser.add_argument(
         "--hardware-profile",
@@ -1406,14 +1355,16 @@ def _parser() -> argparse.ArgumentParser:
         dest="sampling",
         action="store_true",
         default=False,
-        help="capture TAIL with the candidate-row epilogue: sampled requests served (+0.3 ms per greedy token)",
+        help="capture TAIL with the candidate-row epilogue: sampled requests served (+0.3 ms per greedy token); a "
+        "request without sampling fields stays the bitwise greedy loop; the launchers pass this",
     )
     parser.add_argument(
         "--no-sampling",
         dest="sampling",
         action="store_false",
         default=False,
-        help="the default, explicit: capture TAIL without the candidate row, greedy requests only",
+        help="the argparse default, explicit: capture TAIL without the candidate row, greedy requests only (explicit "
+        "sampling fields are refused with 400)",
     )
     parser.add_argument(
         "--sampling-discriminator",
@@ -1458,8 +1409,11 @@ def main() -> int:
         raise SystemExit(f"--request-deadline-seconds must be positive, got {args.request_deadline_seconds}")
     if args.socket_timeout_seconds <= 0:
         raise SystemExit(f"--socket-timeout-seconds must be positive, got {args.socket_timeout_seconds}")
-    if args.stall_seconds is not None and args.stall_seconds <= 0:
-        raise SystemExit(f"--stall-seconds must be positive, got {args.stall_seconds}")
+    if args.stall_seconds is not None and args.stall_seconds <= args.socket_timeout_seconds:
+        # A client write blocked for the socket timeout is not a device step; the watchdog must outlast it.
+        raise SystemExit(
+            f"--stall-seconds must exceed --socket-timeout-seconds {args.socket_timeout_seconds}, got {args.stall_seconds}"
+        )
     if args.sampling_discriminator and (not args.sampling or args.acceptance_prompts is None):
         raise SystemExit("--sampling-discriminator needs --sampling and the acceptance prompt records")
     if args.bf4_stage_limit is not None and args.bf4_stage_limit <= 0:

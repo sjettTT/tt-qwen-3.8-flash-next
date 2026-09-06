@@ -263,11 +263,15 @@ def test_clocks_summary_reports_period_and_host_segment() -> None:
 # --- the request mapping ----------------------------------------------------------------------------------------
 
 
-def test_absent_temperature_maps_to_the_card_profile_keyed_on_thinking() -> None:
-    thinking = step.parameters_from_request({"messages": []}, enable_thinking=True, seed=11)
+def test_no_sampling_field_is_greedy_and_absent_temperature_maps_to_the_card_profile_keyed_on_thinking() -> None:
+    # Decision B (2026-09-06): the launchers serve with --sampling, so a request naming no sampling field must stay
+    # the bitwise greedy loop; a sampling field without a temperature (seed alone included) takes the card profile.
+    assert step.parameters_from_request({"messages": []}, enable_thinking=True, seed=11) is None
+    assert step.parameters_from_request({}, enable_thinking=False, seed=12) is None
+    thinking = step.parameters_from_request({"seed": 11}, enable_thinking=True, seed=99)
     assert thinking.profile is Qwen38SamplingProfile.THINKING and thinking.seed == 11
     assert (thinking.temperature, thinking.top_p, thinking.top_k) == (1.0, 0.95, 20)
-    instruct = step.parameters_from_request({}, enable_thinking=False, seed=12)
+    instruct = step.parameters_from_request({"seed": 12}, enable_thinking=False, seed=99)
     assert instruct.profile is Qwen38SamplingProfile.NON_THINKING and instruct.presence_penalty == 1.5
     # A partial request keeps the profile's other values but is a custom policy.
     partial = step.parameters_from_request({"top_p": 0.5}, enable_thinking=True, seed=1)
@@ -296,7 +300,8 @@ def test_temperature_zero_and_greedy_take_the_greedy_loop() -> None:
     assert step.parameters_from_request({"temperature": 0.0, "top_k": 5}, enable_thinking=True, seed=1) is None
     assert step.parameters_from_request({"greedy": True}, enable_thinking=True, seed=1) is None
     assert step.parameters_from_request({"greedy": True, "temperature": 0}, enable_thinking=True, seed=1) is None
-    assert step.parameters_from_request({"greedy": False}, enable_thinking=True, seed=1) is not None
+    assert step.parameters_from_request({"greedy": False}, enable_thinking=True, seed=1) is None  # asks for nothing
+    assert step.parameters_from_request({"greedy": False, "top_p": 0.5}, enable_thinking=True, seed=1) is not None
 
 
 @pytest.mark.parametrize(

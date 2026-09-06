@@ -32,8 +32,10 @@ fallback's eager full-vocabulary gather of the residue's trace logits).
 Request fields (``parameters_from_request``; ``extra_body`` keys are merged by the server first):
 
     field                                    absent                                       notes
+    (no sampling field at all)               the greedy loop, bitwise                     the default request on any server
     temperature                              card profile keyed on enable_thinking        0 = the greedy loop, bitwise
                                              (thinking 1.0/0.95/20/0, instruct 0.7/0.8/20/1.5)
+                                             when another sampling field is named
     greedy                                   false                                        true = the greedy loop (temperature must be absent or 0)
     top_p, top_k, min_p                      1.0 / 20 / 0 (profile values when             top_k > 32 refused (400);
                                              temperature is absent too)                   top_k 0 = full-vocabulary fallback
@@ -121,8 +123,9 @@ def parameters_from_request(
 ) -> Qwen38SamplingParameters | None:
     """The request's sampling fields as one validated policy (the table in the module docstring); ``None`` = greedy.
 
-    ``temperature 0`` and ``greedy: true`` take the greedy loop (``None``); ``greedy`` with a
-    positive temperature is a contradiction and refused.
+    A request naming no sampling field, ``temperature 0`` and ``greedy: true`` take the greedy
+    loop (``None``), so the default request is the bitwise greedy stream on a sampling server
+    too; ``greedy`` with a positive temperature is a contradiction and refused.
     """
 
     def number(name: str, default: Real, *, integer: bool = False) -> Real:
@@ -146,6 +149,8 @@ def parameters_from_request(
         raise Qwen38SamplingRequestError(f"greedy is true but temperature is {temperature}: greedy needs 0 or none")
     if greedy or (temperature is not None and temperature == 0):
         return None
+    if all(document.get(name) is None for name in (*_PROFILE_FIELDS, "seed")):
+        return None  # nothing asked for sampling: the greedy loop, whatever the server captured
     request_seed = number("seed", seed, integer=True)
     if not 0 <= request_seed <= MAX_SEED:
         raise Qwen38SamplingRequestError(f"seed must be in [0,{MAX_SEED}], got {request_seed}")
@@ -156,7 +161,7 @@ def parameters_from_request(
     )
     if temperature is None:
         if all(document.get(name) is None for name in _PROFILE_FIELDS):
-            return profile
+            return profile  # a seed alone: the card profile, seeded
         defaults = {name: getattr(profile, name) for name in _PROFILE_FIELDS}
     else:
         defaults = {

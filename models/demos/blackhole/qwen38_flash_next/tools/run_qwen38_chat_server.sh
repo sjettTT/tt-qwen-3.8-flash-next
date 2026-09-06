@@ -15,6 +15,11 @@
 #   --allocated-context N   32768 (default) | 65536 | 131072 | 262144
 #   --mtp K                 multi-token-prediction drafting depth, 3 or 4 (off by default; greedy chunked-mode requests draft)
 #   --long-chunks           prefill in 128-row chunks where the prompt allows (off by default; not with --mtp)
+#   --no-sampling           serve greedy requests only (the default server takes --sampling: a request naming no
+#                           sampling field is still the bitwise greedy stream, temperature > 0 samples)
+#   --stall-seconds N       a request with no completed device step for N seconds ends the server with exit 1 so a
+#                           supervisor restarts it (default 300; every decode step, prefill event and admission from
+#                           the queue restarts the clock, so a long prompt never trips it); 0 disables the watchdog
 #   --port N --host ADDR    default 8000 on 0.0.0.0
 #   --acceptance            replay the shipped CPU greedy records (tools/acceptance/greedy-prompts) at startup
 #   --acceptance-prompts D  replay the records in D instead
@@ -38,11 +43,11 @@ readonly REPO_ROOT="$(cd -- "$MODEL_DIR/../../../.." && pwd -P)"
 readonly SERVER="$HERE/qwen38_chat_server.py"
 
 die() { printf 'run_qwen38_chat_server: %s\n' "$*" >&2; exit 2; }
-usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 profile= instance=0 devices= checkpoint= cache_root= allocated_context=32768 mtp= port=8000 host=0.0.0.0 long_chunks=
 acceptance= acceptance_prompts= require_json_96= prepare_only= bf4_stage_limit= bf4_corpus= bf4_corpus_verification=
-serve_seconds= python= validate_only= prefill_mode=chunked
+serve_seconds= python= validate_only= prefill_mode=chunked sampling=1 stall_seconds=300
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --profile) profile=${2-}; shift 2 ;;
@@ -53,6 +58,8 @@ while [[ $# -gt 0 ]]; do
         --allocated-context) allocated_context=${2-}; shift 2 ;;
         --mtp) mtp=${2-}; shift 2 ;;
         --long-chunks) long_chunks=1; shift ;;
+        --no-sampling) sampling=; shift ;;
+        --stall-seconds) stall_seconds=${2-}; shift 2 ;;
         --port) port=${2-}; shift 2 ;;
         --host) host=${2-}; shift 2 ;;
         --acceptance) acceptance=1; shift ;;
@@ -76,6 +83,7 @@ done
 [[ "$instance" =~ ^[01]$ ]] || die "--instance must be 0 or 1"
 [[ -z "$devices" || "$devices" =~ ^[0-9]+,[0-9]+,[0-9]+,[0-9]+$ ]] || die "--devices must be four device nodes, e.g. 4,5,6,7"
 [[ -z "$bf4_stage_limit" || "$bf4_stage_limit" =~ ^[1-9][0-9]*$ ]] || die "--bf4-stage-limit must be a positive integer"
+[[ "$stall_seconds" =~ ^[0-9]+$ ]] || die "--stall-seconds must be a whole number of seconds (0 disables the watchdog)"
 [[ -z "$bf4_corpus" && -z "$bf4_corpus_verification" || -n "$bf4_corpus" && -n "$bf4_corpus_verification" ]] \
     || die "--bf4-corpus and --bf4-corpus-verification go together"
 [[ -z "$acceptance" || -z "$acceptance_prompts" ]] || die "--acceptance and --acceptance-prompts are alternatives"
@@ -147,6 +155,8 @@ if [[ -n "$mtp" ]]; then
 fi
 [[ -z "$long_chunks" || -z "$mtp" ]] || die "--long-chunks and --mtp are alternatives (the MTP chain prefills in 32-row chunks)"
 [[ -z "$long_chunks" ]] || args+=(--long-chunks)
+[[ -z "$sampling" ]] || args+=(--sampling)
+[[ "$stall_seconds" == 0 ]] || args+=(--stall-seconds "$stall_seconds")
 [[ -z "$acceptance" ]] || args+=(--acceptance-prompts "$HERE/acceptance/greedy-prompts")
 [[ -z "$acceptance_prompts" ]] || args+=(--acceptance-prompts "$acceptance_prompts")
 [[ -z "$require_json_96" ]] || args+=(--require-json-96)

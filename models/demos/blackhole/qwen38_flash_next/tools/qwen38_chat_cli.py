@@ -146,7 +146,7 @@ def execute_add_integers(call: dict) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8000/v1", help="base URL (through the ssh port forward)")
-    parser.add_argument("--system", default=None, help="system prompt (default: the server's, the CPU study's)")
+    parser.add_argument("--system", default=None, help="system prompt (default: none; the server adds none either)")
     parser.add_argument(
         "--max-tokens",
         type=int,

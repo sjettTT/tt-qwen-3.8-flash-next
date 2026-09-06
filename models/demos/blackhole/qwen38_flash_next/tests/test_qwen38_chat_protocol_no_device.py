@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 
-"""The chat protocol module without a device: request normalisation, reply assembly, prefix splice (fake tokenizer),
-and, with the pinned checkpoint (4x p150), the template-equality matrix: the server's prompt ids must equal
-``tokenizer.apply_chat_template`` on the raw request bitwise for every message shape x tools x thinking case."""
+"""The chat protocol module without a device: request normalisation, reply assembly (fake tokenizer), and, with the
+pinned checkpoint (4x p150), the template-equality matrix: the server's prompt ids must equal
+``tokenizer.apply_chat_template`` on the raw request bitwise for every message shape x tools x thinking case, and the
+prefix a follow-up turn's reference render shares with the served turn."""
 
 from __future__ import annotations
 
@@ -15,13 +16,7 @@ from types import SimpleNamespace
 import jinja2
 import pytest
 
-from models.demos.blackhole.qwen38_flash_next.chat import (
-    END_OF_TEXT_ID,
-    EOS_TOKEN_IDS,
-    IM_END_ID,
-    IM_START_ID,
-    Qwen38OfficialChatTemplate,
-)
+from models.demos.blackhole.qwen38_flash_next.chat import IM_END_ID, IM_START_ID, Qwen38OfficialChatTemplate
 from models.demos.blackhole.qwen38_flash_next.tools import qwen38_chat_protocol as protocol
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import (
     THINK_END_ID,
@@ -30,7 +25,6 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import 
     TOOL_CALL_START_ID,
     Qwen38ChatRequestRejected,
     Qwen38ReplyAssembler,
-    Qwen38ServedTurn,
 )
 
 CHECKPOINT = Path(os.environ.get("QWEN38_CHECKPOINT", "/nonexistent/Qwen3.8-Flash-Next"))
@@ -99,13 +93,17 @@ class FakeTokenizer:
                 parts.append(f"<|im_start|>user\n{content}<|im_end|>\n")
             elif message["role"] == "assistant":
                 turn = f"<|im_start|>assistant\n<think>\n{message.get('reasoning_content', '').strip()}\n</think>\n\n{content}"
-                for call in message.get("tool_calls", ()):
+                for index, call in enumerate(message.get("tool_calls", ())):
                     function = call["function"]
                     parameters = "".join(
                         f"<parameter={name}>\n{value if isinstance(value, str) else json.dumps(value)}\n</parameter>\n"
                         for name, value in function["arguments"].items()
                     )
-                    turn += f"\n<tool_call>\n<function={function['name']}>\n{parameters}</function>\n</tool_call>"
+                    # The checkpoint's rule: a blank line before the first call after content, one newline otherwise.
+                    separator = ("\n\n" if content else "") if index == 0 else "\n"
+                    turn += (
+                        f"{separator}<tool_call>\n<function={function['name']}>\n{parameters}</function>\n</tool_call>"
+                    )
                 parts.append(turn + "<|im_end|>\n")
             elif message["role"] == "tool":
                 parts.append(f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>\n")
@@ -331,7 +329,6 @@ def test_assembler_splits_reasoning_from_content_at_the_think_end_token() -> Non
     assert deltas == [{"reasoning_content": "Let me"}, {"reasoning_content": " think."}, {"content": "Answer"}]
     assert assembler.reasoning_tokens == 3  # the reasoning tokens before </think>, whitespace included
     assert assembler.message() == {"role": "assistant", "content": "Answer", "reasoning_content": "Let me think."}
-    assert assembler.echo_reply() == {"role": "assistant", "content": "Answer", "reasoning_content": "Let me think."}
     # Non-thinking mode: the think tags are the answer's text (a quoted tag never opens a reasoning phase).
     assembler = Qwen38ReplyAssembler(decode, thinking_open=False)
     deltas = _run(assembler, [THINK_END_ID, 4, THINK_START_ID, 1, THINK_END_ID, 4])
@@ -403,9 +400,6 @@ def test_assembler_emits_a_completed_tool_call_as_one_delta_with_openai_fields()
     message = assembler.message()
     assert message["content"] == "I'll add them." and message["tool_calls"] == [
         {k: v for k, v in call.items() if k != "index"}
-    ]
-    assert assembler.echo_reply()["tool_calls"] == [
-        {"type": "function", "function": {"name": "add_integers", "arguments": {"a": 2, "b": 3}}}
     ]
 
 
@@ -561,108 +555,6 @@ def test_assembler_flush_scans_the_held_and_pending_text_for_stop_strings() -> N
     assert "".join(assembler.content) == "The"
 
 
-# -- prefix side ----------------------------------------------------------------------------------
-
-
-def _served(tokenizer: FakeTokenizer, messages, reply, *, eos: int | None = IM_END_ID, tools=()) -> Qwen38ServedTurn:
-    prompt = protocol.render_prompt(tokenizer, messages, list(tools), **FLAGS)
-    generated = tokenizer(reply["content"] or "<tool_call>x</tool_call>").input_ids + ([eos] if eos is not None else [])
-    return Qwen38ServedTurn(
-        messages=protocol.normalize_messages(messages),
-        tools=list(tools),
-        enable_thinking=FLAGS["enable_thinking"],
-        reasoning_effort=FLAGS["reasoning_effort"],
-        reply=reply,
-        committed=prompt + generated,
-    )
-
-
-def test_splice_continues_the_served_turn_from_the_committed_ids() -> None:
-    tokenizer = FakeTokenizer()
-    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "add 2 and 3"}]
-    reply = {
-        "role": "assistant",
-        "content": "",
-        "reasoning_content": "private",
-        "tool_calls": [{"type": "function", "function": {"name": "add_integers", "arguments": {"a": 2, "b": 3}}}],
-    }
-    served = _served(tokenizer, messages, reply, tools=[ADD_TOOL])
-    # Hermes echoes the call with string arguments and without the reasoning, then the tool result.
-    echo = {
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [
-            {"id": "c", "type": "function", "function": {"name": "add_integers", "arguments": '{"a": 2, "b": 3}'}}
-        ],
-    }
-    history = protocol.normalize_messages([*messages, echo, {"role": "tool", "content": '{"sum":5}'}])
-    spliced = protocol.splice_prompt(tokenizer, served, history, [ADD_TOOL], **FLAGS)
-    assert spliced is not None and spliced[: len(served.committed)] == served.committed
-    remainder = tokenizer.decode(spliced[len(served.committed) :])
-    assert remainder.startswith("\n<|im_start|>") and remainder.endswith("<|im_start|>assistant\n<think>\n")
-    # The reference render of the same history differs where the echo lost the reasoning: full render resets.
-    full = protocol.render_prompt(tokenizer, history, [ADD_TOOL], **FLAGS)
-    assert full[: len(served.committed)] != served.committed and len(spliced) < len(full)
-    # The same rule chains: the next served turn's request messages are this spliced request.
-    assert protocol.splice_prompt(tokenizer, served, history[:2], [ADD_TOOL], **FLAGS) is None  # nothing appended
-    assert protocol.splice_prompt(tokenizer, served, history, [], **FLAGS) is None  # tools changed
-    assert (
-        protocol.splice_prompt(tokenizer, served, history, [ADD_TOOL], enable_thinking=False, reasoning_effort="medium")
-        is None
-    )
-    assert protocol.splice_prompt(tokenizer, None, history, [ADD_TOOL], **FLAGS) is None
-    other = [dict(message) for message in history]
-    other[2] = {**other[2], "content": "edited"}
-    assert protocol.splice_prompt(tokenizer, served, other, [ADD_TOOL], **FLAGS) is None
-    other[2] = {**history[2], "reasoning_content": "different"}
-    assert protocol.splice_prompt(tokenizer, served, other, [ADD_TOOL], **FLAGS) is None
-    other[2] = {**history[2], "reasoning_content": "private"}
-    assert protocol.splice_prompt(tokenizer, served, other, [ADD_TOOL], **FLAGS) == spliced
-    other[1] = {"role": "user", "content": "add 2 and 4"}
-    assert protocol.splice_prompt(tokenizer, served, other, [ADD_TOOL], **FLAGS) is None
-
-
-def test_splice_accepts_an_echo_whose_content_is_text_parts() -> None:
-    tokenizer = FakeTokenizer()
-    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
-    served = _served(tokenizer, messages, {"role": "assistant", "content": "two words", "reasoning_content": "r"})
-    as_string = protocol.normalize_messages(
-        [*messages, {"role": "assistant", "content": "two words"}, {"role": "user", "content": "go on"}]
-    )
-    as_parts = protocol.normalize_messages(
-        [
-            *messages,
-            {"role": "assistant", "content": [{"type": "text", "text": "two "}, {"type": "text", "text": "words"}]},
-            {"role": "user", "content": "go on"},
-        ]
-    )
-    spliced = protocol.splice_prompt(tokenizer, served, as_string, [], **FLAGS)
-    assert spliced is not None and protocol.splice_prompt(tokenizer, served, as_parts, [], **FLAGS) == spliced
-
-
-def test_splice_closes_a_partial_reply_with_the_template_terminator() -> None:
-    tokenizer = FakeTokenizer()
-    messages = [{"role": "user", "content": "hi"}]
-    reply = {"role": "assistant", "content": "partial", "reasoning_content": ""}
-    for eos, expected_head in ((IM_END_ID, "\n<|im_start|>user"), (None, "<|im_end|>\n<|im_start|>user")):
-        served = _served(tokenizer, [{"role": "system", "content": "s"}, *messages], reply, eos=eos)
-        history = protocol.normalize_messages(
-            [
-                {"role": "system", "content": "s"},
-                *messages,
-                {"role": "assistant", "content": "partial"},
-                {"role": "user", "content": "go on"},
-            ]
-        )
-        spliced = protocol.splice_prompt(tokenizer, served, history, [], **FLAGS)
-        assert spliced is not None and spliced[: len(served.committed)] == served.committed
-        assert tokenizer.decode(spliced[len(served.committed) :]).startswith(expected_head), eos
-    # <|endoftext|> closed the reply where the template puts <|im_end|>: the reference render, not a splice.
-    served = _served(tokenizer, [{"role": "system", "content": "s"}, *messages], reply, eos=END_OF_TEXT_ID)
-    assert protocol.splice_prompt(tokenizer, served, history, [], **FLAGS) is None
-    assert EOS_TOKEN_IDS == (248_046, 248_044) and END_OF_TEXT_ID == 248_044
-
-
 # -- checkpoint: template equality against transformers (4x p150) --------------------------------------
 
 MATRIX_TOOLS = {
@@ -811,24 +703,13 @@ def test_special_token_ids_match_the_tokenizer(template: Qwen38OfficialChatTempl
 @pytest.mark.parametrize("tools", sorted(MATRIX_TOOLS))
 @pytest.mark.parametrize("shape", sorted(MATRIX_MESSAGES))
 def test_server_render_equals_transformers_reference_bitwise(template, shape, tools, thinking) -> None:
-    from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import SYSTEM_PROMPT
-
+    # The server renders exactly the client's messages (no system prompt is added: user_only is the case without one).
     enable_thinking, effort = MATRIX_THINKING[thinking]
     messages = MATRIX_MESSAGES[shape]
     server_ids = protocol.render_prompt(
-        template.tokenizer,
-        [{"role": "system", "content": SYSTEM_PROMPT}, *messages] if messages[0]["role"] != "system" else messages,
-        MATRIX_TOOLS[tools],
-        enable_thinking=enable_thinking,
-        reasoning_effort=effort,
+        template.tokenizer, messages, MATRIX_TOOLS[tools], enable_thinking=enable_thinking, reasoning_effort=effort
     )
-    reference = _reference_ids(
-        template,
-        [{"role": "system", "content": SYSTEM_PROMPT}, *messages] if messages[0]["role"] != "system" else messages,
-        MATRIX_TOOLS[tools],
-        enable_thinking,
-        effort,
-    )
+    reference = _reference_ids(template, messages, MATRIX_TOOLS[tools], enable_thinking, effort)
     first = next((index for index, (a, b) in enumerate(zip(server_ids, reference)) if a != b), None)
     assert server_ids == reference, (
         f"{shape}/{tools}/{thinking}: server {len(server_ids)} ids vs reference {len(reference)}, first difference at "
@@ -875,10 +756,15 @@ def test_server_rejects_what_the_reference_raises(template, messages, fragment) 
             _reference_ids(template, messages, [], True, "medium")
 
 
-def test_prefix_reuse_after_a_tool_round_on_the_real_tokenizer(template: Qwen38OfficialChatTemplate) -> None:
-    """Turn N with tools, the model's tool-call text as generated, the tool result appended for turn N+1: the splice
-    reuses the whole committed sequence; the reference re-render agrees for string and integer arguments and its
-    miss for nested arguments is recorded."""
+def test_a_thinking_turns_reference_render_never_extends_the_committed_ids_on_the_real_tokenizer(
+    template: Qwen38OfficialChatTemplate,
+) -> None:
+    """Turn N with tools and thinking on, the model's reasoning and tool-call text as generated, the tool result
+    appended for turn N+1.  The device prompt is the reference render of that history (decision A: the reasoning is
+    not carried forward), and on the real tokenizer it never extends the committed ids: the template renders the
+    past turn's think block empty and the "\\n" after <think> merges into "\\n\\n", so the common prefix stops one
+    token before the served prompt's end and the next turn is a full prefill.  With the reasoning echoed the render
+    agrees for string and integer arguments and misses for nested ones (a tojson re-serialisation)."""
 
     tokenizer = template.tokenizer
     flags = {"enable_thinking": True, "reasoning_effort": "medium"}
@@ -906,20 +792,22 @@ def test_prefix_reuse_after_a_tool_round_on_the_real_tokenizer(template: Qwen38O
             assembler.push(token)
         assembler.finish()
         assert len(assembler.calls) == 1 and assembler.parse_errors == [], name
-        served = Qwen38ServedTurn(messages, tools, True, "medium", assembler.echo_reply(), prompt + generated)
+        committed = prompt + generated
         echo = {k: v for k, v in assembler.message().items() if k != "reasoning_content"}
         history = protocol.normalize_messages([*messages, echo, {"role": "tool", "content": "result"}])
-        spliced = protocol.splice_prompt(tokenizer, served, history, tools, **flags)
-        assert spliced is not None and spliced[: len(served.committed)] == served.committed, name
         full = protocol.render_prompt(tokenizer, history, tools, **flags)
-        assert spliced[len(served.committed) :] == full[len(full) - (len(spliced) - len(served.committed)) :], name
-        # Without the splice, the reference render drops the reasoning: the common prefix stops at the reply, one
-        # token before the prompt's end (the "\n" after <think> merges into the empty block's "\n\n").
         common = 0
-        while common < len(full) and common < len(served.committed) and full[common] == served.committed[common]:
+        while common < len(full) and common < len(committed) and full[common] == committed[common]:
             common += 1
-        assert len(prompt) - 1 <= common < len(served.committed), (name, common, len(prompt))
-        # With the reasoning echoed, the reference agrees for string/integer arguments and misses for nested ones.
+        assert len(prompt) - 1 <= common < len(prompt), (name, common, len(prompt))
+        assert full[common - 1 : common + 1] == [
+            THINK_START_ID,
+            tokenizer("\n\n", add_special_tokens=False).input_ids[0],
+        ]
+        assert committed[common - 1 : common + 1] == [
+            THINK_START_ID,
+            tokenizer("\n", add_special_tokens=False).input_ids[0],
+        ]
         echoed = protocol.normalize_messages([*messages, assembler.message(), {"role": "tool", "content": "result"}])
         full_with_reasoning = protocol.render_prompt(tokenizer, echoed, tools, **flags)
-        assert (full_with_reasoning[: len(served.committed)] == served.committed) is reference_agrees, name
+        assert (full_with_reasoning[: len(committed)] == committed) is reference_agrees, name
