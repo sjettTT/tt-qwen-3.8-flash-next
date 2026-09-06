@@ -51,6 +51,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import (
     Qwen38BF4Cache,
     Qwen38BF4ResidentSet,
     Qwen38BF4Streamer,
+    bf4_converter_source_identity,
     qualify_live_bf4_ring,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE, Qwen38MeshContract
@@ -773,8 +774,9 @@ class Qwen38TTNNBuilder:
 
         # The component and model-I/O caches receive a root namespaced by the complete builder identity (the
         # runtime digest, the live ring, the allocated context); component-specific paths add their own layer/block
-        # key.  The routed BF4 cache is keyed by its own identity only (checkpoint, tt-metal revision, mesh, ring):
-        # the expert bytes do not depend on the allocated context, so one conversion serves every context.
+        # key.  The routed BF4 cache is keyed by its own identity only (checkpoint, converter sources, mesh, ring): the
+        # expert bytes depend neither on the allocated context nor on the rest of the runtime, so one conversion serves
+        # every context and survives a runtime rebuild.
         component_cache_root = cache_roots.component_weights / live_identity.key
         routed_cache_root = cache_roots.routed_bf4
         io_cache_root = cache_roots.model_io / live_identity.key
@@ -783,7 +785,7 @@ class Qwen38TTNNBuilder:
             checkpoint_config_sha256=provenance.checkpoint_config_sha256,
             checkpoint_file_manifest_sha256=provenance.checkpoint_file_manifest_sha256,
             checkpoint_hash_manifest_sha256=provenance.checkpoint_hash_manifest_sha256,
-            tt_metal_revision=provenance.tt_metal_sha,
+            converter_sources=bf4_converter_source_identity(),
             mesh_shape=tuple(mesh_contract.mesh_shape),
             physical_ids=mesh_contract.physical_ids,
             ring_size=len(worker_order),

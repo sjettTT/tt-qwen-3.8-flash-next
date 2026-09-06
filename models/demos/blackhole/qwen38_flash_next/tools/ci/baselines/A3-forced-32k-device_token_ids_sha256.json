@@ -1,0 +1,24 @@
+{
+ "expected": {
+  "chat": "ba71d08515d020b3dfd966f225a720078d27e28905db27f0ef7c4272e6f9571b",
+  "code": "c47bd4bb0310a04e8528c94f36e00f1bb35cf516c0004aa7ac1e6ef179e4ddaf",
+  "fact": "1a6706b54bac5fc0b51d143b3b1ec379af3a4077acdf6a3f3866dc075ead7080",
+  "json": "a5b4defa72fae270391869377862fe60b95d893a6c2cfd24ea265bb59de6d16f",
+  "list": "076653890164e2d266af532003c23855b44478334adcce0bb32b66125cc4c034",
+  "math": "3e2537b3e422baaea54d6faea21b9d8c3209593164ec938248c35c0c7754e919",
+  "multilingual": "0ce1dd60ced7ec322a04c04ab6318cf0e4bbf60b4373539c19b76069d1ab2c51",
+  "prose": "9792e51c9b563cd06253bcc80f78ad1294ff5be4c086c7400fd4b7c761c3eaef",
+  "refactor": "c85de7b4b54734aca888134450a94db82fe6a83ba3ebcbc4145c356377b0ac60",
+  "sky": "de86bbc09c482272bf2da4c31c3f13cc593e5590ed85a8dacbd72d6cc80205fc",
+  "story": "46932967767190f7e45c15eb7b5796e87d55a00a932d30e62b14cebda7f5de85",
+  "summary": "4797397debe009ec96699fbe77869ebc5560bcafd5400c7fd5094652b90d3bd0"
+ },
+ "pin": "A3/forced-32k/device_token_ids_sha256",
+ "schema": "qwen38-ci-baseline/v1",
+ "source": {
+  "evidence": "chat server startup replay, teacher-forced prefill, the eval server of 2026-09-04",
+  "head": "9fe47a5444649d63e13ca96423a54a24675cf843",
+  "sku": "p150x4"
+ },
+ "status": "proposal"
+}

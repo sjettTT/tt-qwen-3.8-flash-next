@@ -1,0 +1,24 @@
+{
+ "expected": {
+  "chat": "30cb0ac674877412183e9a3e32f4827c1c336ff92739e91cbfe53ffcec08b6e7",
+  "code": "0e4f95afbe99c05d44a352639935f2828b3c4bbd1ac74aec7abc5f1a92ea2217",
+  "fact": "99c44660557d419b1861f46c978331b0749f974fff07570f89237ba02bc8f9c2",
+  "json": "a5b4defa72fae270391869377862fe60b95d893a6c2cfd24ea265bb59de6d16f",
+  "list": "80cbd38d674bae9003685ffaf12da5a1b7e95aa9bf0e8aebcdf8fe72e106cfe0",
+  "math": "19f55ccb4bb2174423d32141df95c365aa6306b246a65f26b4e5b255b64a7ea2",
+  "multilingual": "921daa53897dc9b68d2bb54b20d672d64966a550723324b573bd17e4cb9c3286",
+  "prose": "bfc44bbf28ead793209a47c2ca9e543280705e7edc15cd684789b77049495ae1",
+  "refactor": "60ffc1074670ca098228ce3bd47c74a0eb879e672900f819cdea15119a22a233",
+  "sky": "de86bbc09c482272bf2da4c31c3f13cc593e5590ed85a8dacbd72d6cc80205fc",
+  "story": "ceee0ffb7c797b54722812273c8d0bf2842b394dd3105087c8827a752fea9af0",
+  "summary": "d9d024681580637c7df49daeb494605434d11459d87314dae53566a7527cbba6"
+ },
+ "pin": "A3/chunked-32k/device_token_ids_sha256",
+ "schema": "qwen38-ci-baseline/v1",
+ "source": {
+  "evidence": "chat server startup replay, chunked prefill, both lanes of one host, 2026-09-04 (identical streams)",
+  "head": "3c6ea549bf4e79a813aefa6c88cea663234e6f57",
+  "sku": "p150x4"
+ },
+ "status": "proposal"
+}

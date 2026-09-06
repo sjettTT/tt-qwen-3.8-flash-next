@@ -216,13 +216,13 @@ def test_pinned_runtime_view_reshape_is_a_buffer_alias_and_the_indexer_never_mix
     assert "diagonal (k_tile == diag_tile): L1-ACCUMULATE the strict-upper -inf tile, keeping the lower tri." in kernel
     assert "stamp_mask_tile<cb_acc_strip, cb_mask>(slot_base + k_col, k_tile0 + k_col, diag_tile);" in kernel
     assert "compute_kernel_lib::untilize<k_tiles_per_unit, cb_acc_strip, cb_out_strip>(q_tiles_per_unit);" in kernel
-    assert "if (span.k_tiles() == 0) {" in kernel  # cells past kv_len are skipped, not computed
+    assert "if (k_tiles_in_unit == 0) {" in kernel  # cells past kv_len are skipped, not computed
     split = _cpp("ttnn/cpp/ttnn/operations/experimental/indexer_score/device/kernels/indexer_score_work_split.hpp")
     assert "return chunk_start_tiles + q_row_abs + (q_row_abs >= straddle_q_tile ? straddle_jump_tiles : 0);" in split
     assert "const uint32_t v = diag_tile > k_tile_start ? diag_tile - k_tile_start : 0;" in split
     device = _cpp("ttnn/cpp/ttnn/operations/experimental/indexer_score/device/indexer_score_device_operation.cpp")
     assert '"indexer_score kv_len {} must be tile-aligned"' in device
-    assert "max_cs + Sq <= T," in device and "max_cs + Sq <= kv_len," in device
+    assert "attrs.chunk_start_idx < T," in device and "attrs.chunk_start_idx < kv_len," in device
 
 
 # --- T3: template row with per-token masks instead of the unaligned concat -------------

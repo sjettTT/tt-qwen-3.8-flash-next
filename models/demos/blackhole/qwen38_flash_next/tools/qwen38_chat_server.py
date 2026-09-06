@@ -683,7 +683,13 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                     },
                     "supports": ["tools", "streaming", "reasoning_content", "stop", "thinking_budget", "ignore_eos"]
                     + (["sampling", "seed", "logprobs"] if session.sampling is not None else []),
-                    "sampling": "greedy" if session.sampling is None else "candidate_row_host_sampler",
+                    "sampling": (
+                        "greedy"
+                        if session.sampling is None
+                        else "candidate_row_device_sampler"
+                        if getattr(session.sampling, "sampler", None) is not None
+                        else "candidate_row_host_sampler"
+                    ),
                     # logprobs are relative to the read candidates (above the vocabulary's by -log of the row's mass).
                     "logprobs_normalizer": None if session.sampling is None else "candidate_row",
                     "mtp": None if session.mtp is None else session.mtp.summary(),
@@ -910,7 +916,9 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
         sampling = (
             None
             if request["sampling"] is None
-            else sampling_step.Qwen38SamplingRequest(request["sampling"], top_logprobs=request["top_logprobs"])
+            else sampling_step.Qwen38SamplingRequest(
+                request["sampling"], top_logprobs=request["top_logprobs"], logprobs=bool(request["logprobs"])
+            )
         )
         extension_of = lambda completion: _extension(  # noqa: E731
             completion, assembler, queue_wait=queue_wait, think_budget=request["think_budget"], sampling=sampling
@@ -1367,6 +1375,12 @@ def _parser() -> argparse.ArgumentParser:
         "sampling fields are refused with 400)",
     )
     parser.add_argument(
+        "--device-sampler",
+        action="store_true",
+        help="with --sampling: the on-device sampler after the candidate row (TAIL writes the sampled token; "
+        "sampled requests without penalties or logprobs run the greedy loop plus one draw write per step)",
+    )
+    parser.add_argument(
         "--sampling-discriminator",
         action="store_true",
         help="after the acceptance replay run the sampling chain arms on the gate prompt, write "
@@ -1414,6 +1428,8 @@ def main() -> int:
         raise SystemExit(
             f"--stall-seconds must exceed --socket-timeout-seconds {args.socket_timeout_seconds}, got {args.stall_seconds}"
         )
+    if args.device_sampler and not args.sampling:
+        raise SystemExit("--device-sampler needs --sampling (the composite reads the candidate row)")
     if args.sampling_discriminator and (not args.sampling or args.acceptance_prompts is None):
         raise SystemExit("--sampling-discriminator needs --sampling and the acceptance prompt records")
     if args.bf4_stage_limit is not None and args.bf4_stage_limit <= 0:
@@ -1498,7 +1514,13 @@ def main() -> int:
         "socket_timeout_seconds": args.socket_timeout_seconds,
         "stall_seconds": args.stall_seconds,
         "defaults": {"enable_thinking": ENABLE_THINKING_DEFAULT, "reasoning_effort": REASONING_EFFORT_DEFAULT},
-        "sampling": "candidate_row_host_sampler" if args.sampling else "greedy",
+        "sampling": (
+            "candidate_row_device_sampler"
+            if args.device_sampler
+            else "candidate_row_host_sampler"
+            if args.sampling
+            else "greedy"
+        ),
         "sampling_discriminator": bool(args.sampling_discriminator),
         "mtp": {
             "k": args.mtp,
@@ -1568,10 +1590,16 @@ def main() -> int:
             missing = missing_bf4_layers(construction.builder)
             report["prepare"] = {
                 "bf4_cache_root": str(construction.production_cache.root),
+                "bf4_admission": construction.bf4_admission,
                 "staged_bf4_layers": [list(slot) for slot in construction.staged_bf4_layers],
                 "missing_bf4_layers": [list(slot) for slot in missing],
             }
-            _log("prepared", staged=len(construction.staged_bf4_layers), missing=len(missing))
+            _log(
+                "prepared",
+                staged=len(construction.staged_bf4_layers),
+                missing=len(missing),
+                admission=construction.bf4_admission,
+            )
             ttnn.synchronize_device(mesh)
             report["status"] = "stopped"
             raise Qwen38ChatServerStop("prepare-only run complete")
@@ -1585,6 +1613,7 @@ def main() -> int:
             long_chunks=bool(args.long_chunks),
             mtp=args.mtp,
             mtp_gdn_anchor=args.mtp_gdn_anchor,
+            device_sampler=bool(args.device_sampler),
         )
         if chain.allocated_context != resident_context.allocated_context:
             raise Qwen38ChatChainError(
@@ -1595,6 +1624,8 @@ def main() -> int:
             raise Qwen38ChatChainError(f"session prefill mode {session.prefill_mode} vs requested {args.prefill_mode}")
         if (session.sampling is not None) != bool(args.sampling):
             raise Qwen38ChatChainError(f"session sampling {session.sampling is not None} vs requested {args.sampling}")
+        if (getattr(session.sampling, "sampler", None) is not None) != bool(args.device_sampler):
+            raise Qwen38ChatChainError(f"session device sampler vs requested {args.device_sampler}")
         if (session.mtp is not None) != (args.mtp is not None):
             raise Qwen38ChatChainError(f"session mtp {session.mtp is not None} vs requested {args.mtp}")
         if session.context_limit != resident_context.context_limit:

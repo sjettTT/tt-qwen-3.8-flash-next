@@ -35,8 +35,9 @@ This was implemented with the intention of the n-gram model residing in system m
 - Four Blackhole chips in one host as one 1x4 mesh: a QuietBox (4x p150c in an ethernet ring), a Blackhole LoudBox
   (4x p150 in an ethernet line), or four chips of a larger host (`--devices`).  tt-kmd and the firmware bundle the
   chips shipped with (19.4.1.0 or later).
-- This repository, built (section 2).  It is tt-metal main `d04395ed86` (2026-08-29) plus the runtime fixes the
-  model needs, which are not on main yet:
+- This repository, built (section 2).  It is tt-metal main `28238f903b` (2026-09-06; the previous base `d04395ed86`
+  of 2026-08-29 was merged forward, the device token streams are bitwise the same) plus the runtime fixes the model
+  needs, which are not on main yet and have no upstream equivalent:
   - `Fix empty-rank moe compute metadata ownership` (moe_compute tilize writer; routed experts at batch 1)
   - `skip idle-expert combine sync in moe_compute B=1` (-1.2 ms per token)
   - `Add exact TP4 TTNN component path` (`moe_compute(..., local_combine=True)`, DRAM-bank-to-worker query)
@@ -51,7 +52,8 @@ This was implemented with the intention of the n-gram model residing in system m
   The server admits only a `ttnn` imported from this checkout's own build and records the checkout's commit, tree
   and extension digest with every run (`tools/runtime_admission.py`).
 - The checkpoint: 360 GB (131 safetensors shards, the tokenizer, the chat template; section 3).
-- Disk under `--cache-root`: 107 GB for the BF4 expert cache (built once, shared by every context), about 23 GB for
+- Disk under `--cache-root`: 107 GB for the BF4 expert cache (built once, shared by every context, kept across
+  runtime rebuilds), about 23 GB for
   the 32k context and 10 GB for each other allocated context (the converted non-expert weights and the model I/O
   cache), and the JIT kernel cache (about 1.3 GB).
 - Host memory: the first start reads the checkpoint once and converts one MoE layer at a time (about 10 GB of host
@@ -128,6 +130,12 @@ the payload of every tensorbin is byte for byte the CPU-staged corpus's (`tools/
 (512 experts) while the mesh tensor presents one device's 128.  A machine that bounds a job's wall time can build the
 expert cache in pieces: `--prepare-only --bf4-stage-limit N` converts at most N missing layers and stops; every layer
 is manifested as it completes (a refused layer publishes nothing), so the next run continues.
+The expert cache is keyed by the checkpoint and by the converter's sources (`ttnn/bf4.py`, the `moe_compute` layout
+packer, tt-metal's BFP4 packer), not by the tt-metal revision: a rebuilt runtime keeps the cache.  Every start re-packs
+one routed expert of the first cached layer from the checkpoint and compares the bytes with the cache (about a second,
+the `bf4-cache-admission` phase); a cache converted by different code is refused, the layer, expert and tensor named.
+A cache built by an earlier runtime, keyed by its tt-metal revision, is adopted on the first start: its manifest is
+rewritten and the slot renamed under the new key, nothing is reconverted.
 **Warm starts** reach `READY` in about five minutes: the weights load, the traces are captured, the acceptance
 prompts (`--acceptance`: the twelve shipped CPU greedy records under `tools/acceptance/greedy-prompts/`) replay
 against the CPU, then the server listens.  `--require-json-96` refuses to serve unless the `json` record matches
@@ -308,11 +316,48 @@ route is derived from the cluster descriptor at start and recorded.  Nothing her
                                                    a BF4 expert corpus staged on the CPU (produce, verify, bind, probe)
     tools/prewarm_ple_table.py verify_checkpoint_files.py checkpoint_budget.py safetensors_metadata.py
     tools/qb_mesh_smoke.py                         open the mesh and check the route without the model
+    tools/ci/q38_ci.py                             the regression harness: pins.json, baselines/, job runner, verdicts, seeding (8a)
     tests/                                         no-device tests (set QWEN38_CHECKPOINT for the checkpoint-reading ones)
 
 Run the tests from the repository root:
 
     QWEN38_CHECKPOINT=/data/Qwen3.8-Flash-Next python_env/bin/python -m pytest models/demos/blackhole/qwen38_flash_next/tests
+
+### 8a. The regression harness (development)
+
+`tools/ci/q38_ci.py` (standard library only) turns the numbers the tools already produce into gated verdicts.
+`tools/ci/pins.json` names every gated value as `<job>/<configuration>/<metric>` with a rule and a status:
+
+- rules: `band` (a symmetric relative band, two-sided as in tt-metal's model targets: a result better than the band
+  is a stale target), `floor` (target minus slack), `ceiling` (target times 1 + tolerance, with a warning level),
+  `not_earlier` (divergence indices; null is the largest), `exact`, `at_most`, `flips` (per-item eval answers: items
+  the baseline passes and the run fails, at most N per task);
+- status `todo` warns only, `active` gates; a pin with `baseline: true` compares a per-key map (per prompt, item or
+  task) against `tools/ci/baselines/<pin id with - for />.json`;
+- jobs: `A1` corpus agreement against the HF reference (the scorer's `score.json`), `A2` the CPU oracle against HF,
+  `A3` the startup acceptance replay plus the runner's probes (the verbatim echo of a sentence at temperature 0,
+  N short completions that must all finish, one-token replies at several prompt lengths for TTFT), `D1` perf (the
+  timing runner's period, the ledger's prefill and decode rates, TTFT, startup, captures, program cache, DRAM
+  headroom), `C1`/`C2` lm-eval per-item answers and accuracies. Device-timed pins are `not_gated` when the 1-minute
+  load average is above `idle_loadavg_1min`, or use their `loaded_tolerance`.
+
+A job list (`qwen38-ci-jobs/v1`) names the commands to run on one lane: a `command` job runs to completion, a
+`server` job starts a launcher, waits for its `READY` marker, probes the server over HTTP and sends the server pid
+SIGTERM; each job then collects its artifacts (globs over the launchers' evidence directories, `$Q38_CI_RUN_DIR`
+for an earlier job's files) and validates them. One result file per job (`qwen38-ci-result/v1`: host, lane, head,
+runtime identity, load average, item ids, every observed value, one verdict per pin with observed and expected
+side by side) lands under `<out>/<date>/<stamp>-<lane>-<head12>/<job>/`, with `summary.json`, `summary.txt` and
+`progress.log` beside them.
+
+    python -m models.demos.blackhole.qwen38_flash_next.tools.ci.q38_ci run --jobs JOBS.json --out RESULTS
+    python -m models.demos.blackhole.qwen38_flash_next.tools.ci.q38_ci report --run RESULTS/<date>/<run>
+    python -m models.demos.blackhole.qwen38_flash_next.tools.ci.q38_ci seed --runs RESULTS/<date>/<run>... --write
+
+`seed` promotes `todo` pins whose last three idle runs agree within the pin's tolerance: the target becomes the
+median (`band`, `ceiling`), the minimum or the preset proposal (`floor`) or the common value, the run ids are
+recorded on the pin, and baseline-backed pins get their baseline file written. Until then the committed targets
+are proposals from the runs named in each pin's `note` and the baselines' `source`; only the rules that already
+gate today are `active` (the json record's 96/96 replay, the echo, request completion, a program-cache delta of 0).
 
 ## 9. What is verified, and the known limits
 

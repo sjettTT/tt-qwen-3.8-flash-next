@@ -795,6 +795,7 @@ class Qwen38ChatSession:
         should_stop: Callable[[], str | None] | None = None,
         sampling: sampling_step.Qwen38SamplingRequest | None = None,
         speculative: bool = True,
+        verify_each_step: bool = False,
     ) -> Qwen38ChatCompletion:
         """Prefill what the device does not already hold, then generate up to ``max_tokens`` tokens (the remaining
         context when ``None``; ``require_budget``).
@@ -814,7 +815,10 @@ class Qwen38ChatSession:
         ``think_budget`` forces ``</think>`` after that many reasoning tokens
         (the caller passes it only when the prompt left the think block open).
         ``sampling`` (a request with ``temperature > 0``) runs the sampled loop over
-        the chain's candidate row instead of the greedy loop; ``None`` is greedy.
+        the chain's candidate row instead of the greedy loop; ``None`` is greedy.  On
+        a device-sampler chain a request the device policy admits runs the device loop
+        (the greedy loop plus a draw write per step; ``verify_each_step`` adds the
+        per-step host check of the discriminator); the others keep the host loop.
         On an MTP chain a greedy chunked-mode request generates through the pass
         loop unless ``speculative`` is False (the 1-row loop, for the hand-off gate).
         """
@@ -833,6 +837,12 @@ class Qwen38ChatSession:
         drafting = self.mtp is not None and speculative and sampling is None and mode == "chunked"
         started_ns = self.clock_ns()
         common, reuse = self.reusable_prefix(token_ids)
+        # The device sampler's per-request writes (the policy, the greedy flag, the first draw) precede every
+        # prompt step: the last prompt TAIL chooses the first token under this request's policy.
+        device_loop = False
+        if getattr(self.sampling, "sampler", None) is not None:
+            self.sampling.begin_request(sampling)
+            device_loop = sampling is not None and bool(sampling.uniforms)
         try:
             self.row_token = None
             if reuse == "snapshot":
@@ -903,10 +913,24 @@ class Qwen38ChatSession:
                     first_ns = last_ns = prefill_done_ns
                     if not hook_stopped:
                         finish = "length"
-                        consume(
-                            self._generate(max_tokens, stop_ids, think_budget, should_stop)
-                            if sampling is None
-                            else sampling_step.generate_sampled(
+                        if sampling is None:
+                            steps = self._generate(max_tokens, stop_ids, think_budget, should_stop)
+                        elif device_loop:
+                            steps = sampling_step.generate_sampled_on_device(
+                                self,
+                                sampling,
+                                max_tokens,
+                                stop_ids=stop_ids,
+                                tokenizer_size=TOKENIZER_SIZE,
+                                prefilled=bool(suffix),
+                                think_budget=think_budget,
+                                should_stop=should_stop,
+                                forced_step=self._forced_step,
+                                clock_ns=self.clock_ns,
+                                verify_each_step=verify_each_step,
+                            )
+                        else:
+                            steps = sampling_step.generate_sampled(
                                 self,
                                 sampling,
                                 max_tokens,
@@ -917,7 +941,7 @@ class Qwen38ChatSession:
                                 forced_step=self._forced_step,
                                 clock_ns=self.clock_ns,
                             )
-                        )
+                        consume(steps)
             self.last_finish = finish
             self.row_unconsumed = not chunk_stopped and (hook_stopped or finish in ("length", "disconnected"))
             position = self.chain.position()
@@ -1399,6 +1423,7 @@ class Qwen38TracedChain:
         long_chunks: bool = False,
         mtp: int | None = None,
         mtp_gdn_anchor: str = "off",
+        device_sampler: bool = False,
     ) -> Qwen38TracedChain:
         """Target build, generic state (+ chunk state), warm pass (+ one eager chunk and both hand-off forms), miss
         guard, 8 decode captures (+ the chunk capture): the runner's chain prologue and the full-model gate's order.
@@ -1408,7 +1433,10 @@ class Qwen38TracedChain:
         GDN state re-anchor) baked into the warm chunk and the capture.  ``sampling`` (off by default: the
         greedy loop keeps its measured period) adds the candidate-row epilogue to every TAIL (its constants are
         allocated before the warm pass, its programs compile in the warm pass, its row is checked there against
-        torch.topk of the eager full gather).  ``warm_hook`` runs after the warm pass, misses still allowed, on
+        torch.topk of the eager full gather); ``device_sampler`` (needs ``sampling``) adds the on-device sampler
+        after the row, so TAIL writes the sampled token itself (``ttnn/device_sampler.py``; its constants are
+        allocated with the row's, its programs compile in the warm pass, checked there against the host reference
+        and the greedy row).  ``warm_hook`` runs after the warm pass, misses still allowed, on
         the open chain: a caller with an eager path of its own (the long-context chain's hidden windows) compiles
         its programs there.  ``mtp`` (off by default) builds the MTP components and allocates the verify / draft
         states, the TAIL step inputs and the chunk extension before the warm pass, adds the MTP layer's row to
@@ -1420,6 +1448,10 @@ class Qwen38TracedChain:
             raise ValueError(f"chunk_gdn_step_anchor must be a bool, got {chunk_gdn_step_anchor!r}")
         if type(long_chunks) is not bool:
             raise ValueError(f"long_chunks must be a bool, got {long_chunks!r}")
+        if type(device_sampler) is not bool:
+            raise ValueError(f"device_sampler must be a bool, got {device_sampler!r}")
+        if device_sampler and not sampling:
+            raise ValueError("device_sampler needs sampling: the composite reads the candidate row")
         if long_chunks and (not chunked_prefill or chunk_gdn_step_anchor):
             raise ValueError("long chunks need the chunked prefill and run without the GDN step anchor")
         if mtp is not None and mtp not in MTP_DRAFTS:
@@ -1555,7 +1587,11 @@ class Qwen38TracedChain:
             open_seconds=0.0,
             misses_forbidden=False,
             chunk_state=chunk_state,
-            sampling=sampling_step.Qwen38SamplingChainExtension(lm_head, mesh) if sampling else None,
+            sampling=(
+                sampling_step.Qwen38SamplingChainExtension(lm_head, mesh, device_sampler=device_sampler)
+                if sampling
+                else None
+            ),
             chunk_gdn_step_anchor=chunk_gdn_step_anchor,
             mtp=chain_mtp,
             snapshot=snapshot,
@@ -1618,7 +1654,7 @@ class Qwen38TracedChain:
                 token_row_io, resident_decode.host_token_row(resolved), label=f"warm position {position} row copy"
             )
             if chain.sampling is not None:
-                chain.sampling.warm(output.logits, label=f"warm position {position} candidate row")
+                chain.sampling.warm(output.logits, resolved_row, label=f"warm position {position} candidate row")
             ttnn.deallocate(candidates.local_indices)
             ttnn.deallocate(candidates.local_values)
             ttnn.deallocate(resolved_row)
@@ -2070,6 +2106,7 @@ def construct_chain(
     long_chunks: bool = False,
     mtp: int | None = None,
     mtp_gdn_anchor: str = "off",
+    device_sampler: bool = False,
 ) -> Qwen38TracedChain:
     """Live construction on the open mesh (missing BF4 layers converted first), then the chain prologue."""
 
@@ -2088,4 +2125,5 @@ def construct_chain(
         long_chunks=long_chunks,
         mtp=mtp,
         mtp_gdn_anchor=mtp_gdn_anchor,
+        device_sampler=device_sampler,
     )

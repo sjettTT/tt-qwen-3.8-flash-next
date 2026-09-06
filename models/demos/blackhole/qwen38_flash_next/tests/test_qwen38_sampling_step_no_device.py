@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import THINK_END_ID
+from models.demos.blackhole.qwen38_flash_next.ttnn import device_sampler as ds
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import VOCAB_SIZE
 from models.demos.blackhole.qwen38_flash_next.ttnn.sampling import (
     Qwen38CandidateRow,
@@ -256,6 +257,10 @@ def test_clocks_summary_reports_period_and_host_segment() -> None:
         "fallbacks",
         "candidate_misses",
         "logprobs_normalizer",
+        "device_path",
+        "draws",
+        "first_token_rewrites",
+        "verified_steps",
     }
     assert request.as_dict()["logprobs_normalizer"] == "candidate_row"  # the reported logprobs are row-relative
 
@@ -364,3 +369,246 @@ def test_chain_extension_runs_the_greedy_epilogue_unchanged_before_the_row() -> 
     warm = inspect.getsource(step.Qwen38SamplingChainExtension.warm)
     assert "sampling_candidates(logits, self.constants)" in warm and "self._gather(logits)" in warm
     assert "ids_equal_up_to_boundary_ties" in warm and "raise RuntimeError" in warm
+
+
+# --- the device-sampled loop: the greedy loop plus one draw write per step ---------------------------------------------
+
+
+class FakeDeviceSampler:
+    """The device sampler's constants: records the policy and draw writes the loop makes."""
+
+    def __init__(self, chain: "FakeDeviceChain") -> None:
+        self.chain = chain
+        self.policy = ds.Qwen38DeviceSamplerPolicy.greedy_policy()
+        self.uniform = 0.0
+        self.writes: list[str] = []
+
+    def write_policy(self, policy) -> dict:
+        self.policy = policy
+        self.chain.log.append(f"policy:{'greedy' if policy.greedy else 'sampled'}")
+        return {}
+
+    def write_uniform(self, uniform: float) -> None:
+        self.uniform = uniform
+        self.chain.log.append(f"u:{uniform}")
+
+
+class FakeDeviceChain(FakeChain):
+    """TAIL chooses the token the way the device composite does: the greedy id under the flag, else the reference."""
+
+    def __init__(self, prefix: list[int], sampler_holder: dict, *, eos_at: int | None = None) -> None:
+        super().__init__(prefix, eos_at=eos_at)
+        self.sampler_holder = sampler_holder
+        self.row_history: list[torch.Tensor] = []  # the candidate row TAIL(t) computed, for the host replay
+
+    def execute_tail(self, residue: int) -> None:
+        self.log.append(f"tail:{residue}")
+        self.tails += 1
+        logits = self.logits()
+        host_row = Qwen38CandidateRow.emulate(logits).to_host_row()
+        self.row_history.append(host_row)
+        sampler = self.sampler_holder["sampler"]
+        if sampler.policy.greedy:
+            self.row = int(torch.argmax(logits.to(torch.float32)))
+        else:
+            values, ids = ds.candidate_row_lanes(host_row)
+            self.row = ds.device_sampler_reference(values, ids, sampler.policy, sampler.uniform).token_id
+
+    def read_token_row_nonblocking(self):
+        self.log.append("read_nonblocking")
+        return self.row
+
+    @staticmethod
+    def pending_value(pending) -> int:
+        return pending
+
+
+class FakeDeviceSampling(FakeSampling):
+    def __init__(self, chain: FakeDeviceChain) -> None:
+        super().__init__(chain)
+        self.sampler = FakeDeviceSampler(chain)
+        chain.sampler_holder["sampler"] = self.sampler
+
+    def read_candidate_row(self) -> Qwen38CandidateRow:
+        self.chain.log.append("read_row")
+        return Qwen38CandidateRow.from_host_row(self.chain.row_history[-1])
+
+    def begin_request(self, request) -> None:
+        step.Qwen38SamplingChainExtension.begin_request(self, request)
+
+
+class FakeDeviceSession(FakeSession):
+    def __init__(self, prefix: list[int], *, eos_at: int | None = None) -> None:
+        holder: dict = {}
+        self.chain = FakeDeviceChain(prefix, holder, eos_at=eos_at)
+        self.sampling = FakeDeviceSampling(self.chain)
+        self.committed = list(prefix)
+        self.ple_context = None
+        self.row_token = None
+
+    def prompt(self, tokens: list[int]) -> None:
+        for token in tokens:
+            self._forced_step(token)
+
+
+def _run_device(session: FakeDeviceSession, request, max_new_tokens: int, *, prefilled: bool = True, **extra):
+    extra.setdefault("forced_step", session._forced_step)
+    return list(
+        step.generate_sampled_on_device(
+            session,
+            request,
+            max_new_tokens,
+            stop_ids=EOS,
+            tokenizer_size=TOKENIZER_SIZE,
+            prefilled=prefilled,
+            **extra,
+        )
+    )
+
+
+def test_device_loop_is_the_greedy_loop_plus_a_draw_write_and_replays_the_reference() -> None:
+    session, request = FakeDeviceSession([1, 2]), _request()
+    session.sampling.begin_request(request)  # request start: the policy and the first draw, before the prompt
+    assert session.chain.log == ["policy:sampled", f"u:{request.uniforms[0]}"] and len(request.uniforms) == 1
+    session.prompt([3])  # the prompt's last TAIL chooses x_0 under the request's policy and u_0
+    start = len(session.chain.log)
+    items = _run_device(session, request, 5)
+    tokens = [token for token, _ in items]
+    assert [finish for _, finish in items] == [None, None, None, None, "length"]
+    log = session.chain.log[start:]
+    # Entry: the row read and the token read (both complete the prompt's TAIL); no rewrite when prefilled.
+    assert log[:2] == ["read_row", "read_token_row"] and request.first_token_rewrites == 0
+    first = tokens[0]
+    assert log[2:9] == [
+        "read_nonblocking",
+        "event",
+        "head:3",
+        f"u:{request.uniforms[1]}",
+        "sync",
+        f"ple:{first}",
+        "tail:3",
+    ]
+    assert "write:" not in " ".join(log[2:])  # no host token write: the device chose every token
+    assert log[-1] == "read_token_row" and session.chain.row == tokens[-1]  # max_tokens: the row keeps the token
+    assert len(request.uniforms) == 5 and request.samples == [None] * 4
+    # The host replay: x_k = reference(row of TAIL(k-1), u_k) over the rows the fake TAIL computed.
+    policy = request.device_policy()
+    for k, token in enumerate(tokens):
+        values, ids = ds.candidate_row_lanes(session.chain.row_history[k])
+        assert token == ds.device_sampler_reference(values, ids, policy, request.uniforms[k]).token_id
+    assert session.committed == [1, 2, 3] + tokens[:-1]
+    assert request.as_dict()["device_path"] and request.as_dict()["draws"] == 5
+    # The same seed gives the same stream on a fresh session; a different seed differs.
+    again, again_request = FakeDeviceSession([1, 2]), _request()
+    again.sampling.begin_request(again_request)
+    again.prompt([3])
+    assert [t for t, _ in _run_device(again, again_request, 5)] == tokens
+    other, other_request = FakeDeviceSession([1, 2]), _request(Qwen38SamplingParameters.official_thinking(seed=78))
+    other.sampling.begin_request(other_request)
+    other.prompt([3])
+    assert [t for t, _ in _run_device(other, other_request, 5)] != tokens
+
+
+def test_device_loop_verifies_each_step_when_asked_and_rewrites_a_stale_continuation() -> None:
+    session, request = FakeDeviceSession([4]), _request()
+    session.sampling.begin_request(request)
+    session.prompt([5])
+    items = _run_device(session, request, 6, verify_each_step=True)
+    assert len(items) == 6 and request.verified_steps == 4  # tokens 1..4 of the loop; x_0 at entry, x_5 by the read
+    assert session.chain.log.count("read_row") == 5
+    # A continuation: the row was chosen under the previous request's policy (greedy here); the host rewrites x_0
+    # (a seed whose first draw leaves the argmax).
+    session.sampling.sampler.write_policy(ds.Qwen38DeviceSamplerPolicy.greedy_policy())
+    session._forced_step(9)
+    values, ids = ds.candidate_row_lanes(session.chain.row_history[-1])
+    for seed in range(5, 200):
+        request = _request(Qwen38SamplingParameters.official_thinking(seed=seed))
+        session.sampling.begin_request(request)
+        expected = ds.device_sampler_reference(values, ids, request.device_policy(), request.uniforms[0]).token_id
+        if expected != session.chain.row:
+            break
+    else:
+        raise AssertionError("no seed left the argmax")
+    start = len(session.chain.log)
+    items = _run_device(session, request, 3, prefilled=False)
+    assert items[0][0] == expected and request.first_token_rewrites == 1
+    assert session.chain.log[start : start + 3] == ["read_row", "read_token_row", f"write:{expected}"]
+    # Prefilled and mismatching is a device error.
+    session.sampling.sampler.write_policy(ds.Qwen38DeviceSamplerPolicy.greedy_policy())
+    session._forced_step(9)
+    request = _request(Qwen38SamplingParameters.official_thinking(seed=6))
+    session.sampling.begin_request(request)
+    with pytest.raises(RuntimeError, match="first token"):
+        _run_device(session, request, 3, prefilled=True)
+
+
+def test_device_loop_finishes_like_the_greedy_loop() -> None:
+    session, request = FakeDeviceSession([5, 6], eos_at=4), _request()
+    session.sampling.begin_request(request)
+    session.prompt([7])
+    items = _run_device(session, request, 32)
+    assert items[-1] == (EOS[0], "stop") and session.chain.log[-1] == "read_token_row"
+    assert session.committed[-1] == EOS[0]
+    session, request = FakeDeviceSession([1]), _request()
+    session.sampling.begin_request(request)
+    session.prompt([2])
+    items = _run_device(session, request, 6, think_budget=2)
+    tokens = [token for token, _ in items]
+    assert tokens[2] == THINK_END_ID and request.samples[2] is None and len(request.samples) == 5
+    polls = []
+    session, request = FakeDeviceSession([1]), _request()
+    session.sampling.begin_request(request)
+    session.prompt([2])
+    items = _run_device(
+        session, request, 8, should_stop=lambda: (polls.append(1), "halt" if len(polls) == 3 else None)[1]
+    )
+    assert items[-1] == (None, "halt") and len(items) == 3
+    with pytest.raises(RuntimeError, match="begin_request"):
+        _run_device(FakeDeviceSession([1]), _request(), 2)
+
+
+def test_device_policy_routing_and_begin_request_for_greedy_and_host_loop_requests() -> None:
+    thinking = _request()
+    assert thinking.device_policy() == ds.Qwen38DeviceSamplerPolicy(temperature=1.0, top_k=20, top_p=0.95, min_p=0.0)
+    assert _request(top_logprobs=2).device_policy() is None and _request(logprobs=True).device_policy() is None
+    assert _request(Qwen38SamplingParameters.official_non_thinking(seed=1)).device_policy() is None  # presence 1.5
+    assert (
+        _request(
+            Qwen38SamplingParameters(temperature=0.8, top_p=0.9, top_k=0, presence_penalty=0.0, seed=3)
+        ).device_policy()
+        is None
+    )
+    session = FakeDeviceSession([1])
+    session.sampling.begin_request(None)  # a greedy request: the flag, no draw
+    assert session.chain.log == ["policy:greedy"]
+    host_loop = _request(Qwen38SamplingParameters.official_non_thinking(seed=1))
+    session.sampling.begin_request(host_loop)
+    assert session.chain.log == ["policy:greedy", "policy:greedy"] and host_loop.uniforms == []
+    assert not host_loop.as_dict()["device_path"]
+    assert set(_request().as_dict()) >= {"device_path", "draws", "first_token_rewrites", "verified_steps"}
+
+
+def test_device_sampler_epilogue_runs_after_the_row_and_the_host_branch_is_unchanged() -> None:
+    body = inspect.getsource(step.Qwen38SamplingChainExtension.capture_epilogue)
+    host_branch, device_branch = body.split("if self.sampler is None:")[1].split(
+        "return candidates, trace_token_row", 1
+    )
+    assert "resolve_greedy_on_device(candidates)" in host_branch and "sample_on_device" not in host_branch
+    order = [
+        device_branch.index(f)
+        for f in (
+            "resolve_greedy_on_device(candidates)",
+            "sampling_candidates(",
+            "sample_on_device(row, greedy_row, self.sampler)",
+            "ttnn.copy(trace_token_row, token_row_io)",
+        )
+    ]
+    assert order == sorted(order)
+    loop = inspect.getsource(step.generate_sampled_on_device)
+    assert "sampler.write_uniform(request.next_uniform())" in loop and loop.index(
+        "chain.execute_head(residue)"
+    ) < loop.index("sampler.write_uniform") < loop.index("chain.execute_tail(residue)")
+    assert (
+        "read_candidate_row"
+        not in loop.split("def reference_token")[1].split("produced = 0")[1].split("verify_each_step")[0]
+    )

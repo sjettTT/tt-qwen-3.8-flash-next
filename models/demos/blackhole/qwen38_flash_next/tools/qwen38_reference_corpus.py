@@ -768,6 +768,7 @@ class OracleRunner(_Runner):
                                 bfp4_round(exact.gate_up), bfp4_round(exact.down), exact.intermediate_size
                             )
                             self.quantised[(_index, expert_index)] = cached
+                            weights._expert_cache.pop(expert_index, None)  # only the rounded copy is used
                         return cached
 
                     weights.expert = expert  # type: ignore[method-assign]

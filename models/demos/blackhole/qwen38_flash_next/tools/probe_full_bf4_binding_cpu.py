@@ -28,14 +28,17 @@ from models.demos.blackhole.qwen38_flash_next.checkpoint import (
     PINNED_CHECKPOINT_REVISION,
 )
 from models.demos.blackhole.qwen38_flash_next.config import CONFIG_SHA256
-from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import BF4CacheIdentity, Qwen38BF4Cache
+from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import (
+    BF4CacheIdentity,
+    Qwen38BF4Cache,
+    bf4_converter_source_identity,
+)
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import Qwen38MeshContract
 
 MODE = "diagnostic_non_promoting_cpu_bf4_binding_probe"
 PHYSICAL_IDS = (1, 0, 2, 3)
 DRAM_BANK_WORKER_ORDER = ((0, 9), (0, 0), (0, 7), (0, 3), (6, 9), (6, 1), (6, 6), (6, 4))
 EXPECTED_SLOTS = tuple(("backbone", index) for index in range(48)) + (("mtp", 0),)
-LOWER_HEX_40 = re.compile(r"[0-9a-f]{40}")
 LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -55,13 +58,11 @@ def _loaded_device_descriptors() -> list[str]:
     return sorted(descriptors)
 
 
-def probe(*, artifact_root: Path, tt_metal_sha: str, expected_identity_key: str) -> dict[str, Any]:
+def probe(*, artifact_root: Path, expected_identity_key: str) -> dict[str, Any]:
     if os.environ.get("TT_VISIBLE_DEVICES") != "":
         raise RuntimeError("CPU binding probe requires TT_VISIBLE_DEVICES to be the exact empty string")
     if _loaded_device_descriptors():
         raise RuntimeError(f"CPU binding probe inherited device descriptors: {_loaded_device_descriptors()}")
-    if LOWER_HEX_40.fullmatch(tt_metal_sha) is None:
-        raise ValueError("TT-Metal revision must be exact lowercase 40-hex")
     if LOWER_HEX_64.fullmatch(expected_identity_key) is None:
         raise ValueError("BF4 identity key must be exact lowercase SHA-256")
     if not artifact_root.is_absolute():
@@ -75,7 +76,7 @@ def probe(*, artifact_root: Path, tt_metal_sha: str, expected_identity_key: str)
         checkpoint_config_sha256=CONFIG_SHA256,
         checkpoint_file_manifest_sha256=CHECKPOINT_FILE_MANIFEST_SHA256,
         checkpoint_hash_manifest_sha256=CHECKPOINT_TENSOR_MANIFEST_SHA256,
-        tt_metal_revision=tt_metal_sha,
+        converter_sources=bf4_converter_source_identity(),
         mesh_shape=(1, 4),
         physical_ids=PHYSICAL_IDS,
         ring_size=len(DRAM_BANK_WORKER_ORDER),
@@ -159,13 +160,11 @@ def _write_json_exclusive(path: Path, document: dict[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact-root", type=Path, required=True)
-    parser.add_argument("--tt-metal-sha", required=True)
     parser.add_argument("--expected-identity-key", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     report = probe(
         artifact_root=args.artifact_root,
-        tt_metal_sha=args.tt_metal_sha,
         expected_identity_key=args.expected_identity_key,
     )
     _write_json_exclusive(args.output, report)

@@ -755,6 +755,7 @@ class Qwen38LiveDecodeConstruction:
     diagnostic_cache: Qwen38DiagnosticBF4Cache | None
     expert_streamer: Any
     staged_bf4_layers: tuple[tuple[str, int], ...] = ()
+    bf4_admission: dict[str, Any] | None = None  # the one-expert byte check of the production cache, if it held a layer
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -826,6 +827,7 @@ def construct_live_decode_diagnostic(
     production_cache = builder.bf4_cache
     diagnostic_cache = None
     staged: list[tuple[str, int]] = []
+    admission = None
     if prepared.corpus is not None:
         prepared.bf4_consumer_compatibility.validate_live(builder=builder, production_cache=production_cache)
         diagnostic_cache = Qwen38DiagnosticBF4Cache(
@@ -841,6 +843,15 @@ def construct_live_decode_diagnostic(
         _mark(marker, "before-bf4-cache-inventory")
         missing = missing_bf4_layers(builder)
         _mark(marker, f"after-bf4-cache-inventory-missing-{len(missing)}")
+        # The cache pins the converter's sources, not the runtime: prove the cached bytes are this converter's output
+        # on one expert of the first cached layer before anything is loaded or converted next to them.
+        cached_slot = next((slot for slot in EXPECTED_SLOTS if slot not in missing), None)
+        if cached_slot is not None:
+            _mark(marker, f"before-bf4-cache-admission-{cached_slot[0]}-{cached_slot[1]:02d}")
+            admission = production_cache.admit_converted_bytes(
+                prepared.checkpoint, prepared.placement, namespace=cached_slot[0], layer_index=cached_slot[1]
+            )
+            _mark(marker, f"after-bf4-cache-admission-expert-{admission['expert']}-{admission['seconds']}s")
         if missing and stage_missing_bf4:
             for namespace, layer_index in missing[: len(missing) if bf4_stage_limit is None else bf4_stage_limit]:
                 _mark(marker, f"before-bf4-stage-{namespace}-{layer_index:02d}")
@@ -872,6 +883,7 @@ def construct_live_decode_diagnostic(
         diagnostic_cache=diagnostic_cache,
         expert_streamer=builder.expert_streamer,
         staged_bf4_layers=tuple(staged),
+        bf4_admission=admission,
     )
 
 

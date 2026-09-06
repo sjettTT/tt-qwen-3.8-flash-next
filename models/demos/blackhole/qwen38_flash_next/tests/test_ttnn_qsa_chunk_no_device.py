@@ -262,10 +262,11 @@ def _cpp(relative: str) -> str:
 
 def test_pinned_indexer_window_admits_a_32_row_query_against_the_generic_cache() -> None:
     device = _cpp("ttnn/cpp/ttnn/operations/experimental/indexer_score/device/indexer_score_device_operation.cpp")
-    assert "const uint32_t Sq = t.q.logical_shape()[2];" in device
-    assert "max_cs + Sq <= T," in device
+    # The chunk must BEGIN inside the allocated k length; its causal window may end past kv_len (pad query rows).
+    assert "attrs.chunk_start_idx < T," in device
     # The generic cache carries one extra tile past the resident blocks: chunk_start = blocks, Sq = 32 fit exactly.
     chunk_start, window_rows = RESIDENT_BLOCKS, ttnn.TILE_SIZE
+    assert chunk_start < RESIDENT_BLOCKS + window_rows
     assert chunk_start + CHUNK_ROWS <= RESIDENT_BLOCKS + window_rows
     assert CHUNK_ROWS == window_rows  # a wider chunk would need a wider cache window
     nanobind = _cpp("ttnn/cpp/ttnn/operations/experimental/indexer_score/indexer_score_nanobind.cpp")

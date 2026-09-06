@@ -1,0 +1,24 @@
+{
+ "expected": {
+  "chat": 8,
+  "code": 24,
+  "fact": 15,
+  "json": null,
+  "list": 46,
+  "math": 61,
+  "multilingual": 9,
+  "prose": 13,
+  "refactor": 22,
+  "sky": 19,
+  "story": 6,
+  "summary": 75
+ },
+ "pin": "A3/chunked-32k/divergence_index",
+ "schema": "qwen38-ci-baseline/v1",
+ "source": {
+  "evidence": "chat server startup replay, chunked prefill, both lanes of one host, 2026-09-04 (identical streams)",
+  "head": "3c6ea549bf4e79a813aefa6c88cea663234e6f57",
+  "sku": "p150x4"
+ },
+ "status": "proposal"
+}

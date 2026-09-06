@@ -5,8 +5,13 @@
 
 The fused ``moe_compute`` kernel consumes a ring-specific packed layout, not a
 plain BF4 quantization of checkpoint matrices.  Cache identity therefore binds
-the checkpoint, TT-Metal source revision, exact 1x4 topology, Blackhole DRAM
-ring size, expert ranges, packer layout version, and output file hashes.
+the checkpoint, the converter's sources (this module, the ``moe_compute`` layout
+packer and tt-metal's BFP4 packer), exact 1x4 topology, Blackhole DRAM ring
+size, expert ranges, packer layout version, and output file hashes.  The
+tt-metal revision is not part of it: the packed bytes do not depend on the rest
+of the runtime, so a rebuilt runtime keeps the cache.  Every start re-packs one
+routed expert of one cached layer from the checkpoint and compares the bytes
+(``Qwen38BF4Cache.admit_converted_bytes``).
 
 Conversion is deliberately performed one layer at a time.  It is weight
 conversion, not CPU inference.  The first qualified device run creates the
@@ -32,6 +37,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
+import ttnn.experimental.moe_compute_utils as moe_compute_utils
 from ttnn.experimental.moe_compute_utils import (
     BLOCK_TILES_H,
     W2_TILES_PER_A2A_ITER_W,
@@ -58,7 +64,8 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     qwen38_tensor_backing_identity,
 )
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+LEGACY_FORMAT_VERSION = 1  # keyed by the tt-metal revision; adopted in place by the first format-2 run
 PACKER = "ttnn.experimental.moe_compute_utils"
 DTYPE = "BFLOAT4_B"
 LAYOUT = "TILE"
@@ -70,6 +77,17 @@ CONVERSION_LOCK_TIMEOUT_SECONDS = 60.0
 TENSORBIN_HEADER_PREFIX_BYTES = 8
 TENSORBIN_HEADER_ALIGNMENT = 8
 MAX_TENSORBIN_HEADER_BYTES = 16 << 20
+REPO_ROOT = Path(__file__).resolve().parents[5]
+# The sources that determine the packed bytes: this module (the layer walk), the moe_compute layout packer, and
+# tt-metal's BFP4 tile packer.  The cache identity pins their digests instead of the tt-metal revision.
+CONVERTER_SOURCES = (
+    Path(__file__).resolve(),
+    Path(moe_compute_utils.__file__).resolve(),
+    REPO_ROOT / "tt_metal/impl/data_format/bfloat4.cpp",
+    REPO_ROOT / "tt_metal/impl/data_format/blockfloat_common.hpp",
+    REPO_ROOT / "tt_metal/impl/data_format/blockfloat_common.cpp",
+)
+ADMISSION_EXPERT = 511  # the last routed expert: the last mesh shard, the last block of every ring bank
 
 
 def validate_bf4_layer_request(namespace: str, layer_index: int) -> None:
@@ -82,6 +100,20 @@ def validate_bf4_layer_request(namespace: str, layer_index: int) -> None:
     layer_count = BACKBONE_LAYERS if namespace == "backbone" else MTP_LAYERS
     if not 0 <= layer_index < layer_count:
         raise ValueError(f"{namespace} layer index must be in [0,{layer_count}), got {layer_index}")
+
+
+def bf4_converter_source_identity() -> tuple[tuple[str, str], ...]:
+    """``(repository-relative path, sha256)`` of every converter source, in path order."""
+
+    identity = []
+    for path in CONVERTER_SOURCES:
+        try:
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"BF4 converter source is unavailable under {REPO_ROOT}: {path}") from error
+        identity.append((relative, digest))
+    return tuple(sorted(identity))
 
 
 def _utc_now() -> str:
@@ -542,7 +574,7 @@ class BF4CacheIdentity:
     checkpoint_config_sha256: str
     checkpoint_file_manifest_sha256: str
     checkpoint_hash_manifest_sha256: str
-    tt_metal_revision: str
+    converter_sources: tuple[tuple[str, str], ...]
     mesh_shape: tuple[int, int]
     physical_ids: tuple[int, int, int, int]
     ring_size: int
@@ -561,7 +593,6 @@ class BF4CacheIdentity:
             "checkpoint_config_sha256",
             "checkpoint_file_manifest_sha256",
             "checkpoint_hash_manifest_sha256",
-            "tt_metal_revision",
             "dtype",
             "packer",
         )
@@ -601,10 +632,23 @@ class BF4CacheIdentity:
             actual = getattr(self, name)
             if actual != expected:
                 raise ValueError(f"BF4 cache {name} must be the pinned value {expected}, got {actual}")
-        if len(self.tt_metal_revision) != 40 or any(
-            character not in "0123456789abcdef" for character in self.tt_metal_revision
+        if (
+            type(self.converter_sources) is not tuple
+            or not self.converter_sources
+            or any(
+                type(source) is not tuple
+                or len(source) != 2
+                or type(source[0]) is not str
+                or not source[0]
+                or type(source[1]) is not str
+                or len(source[1]) != 64
+                or any(character not in "0123456789abcdef" for character in source[1])
+                for source in self.converter_sources
+            )
+            or [source[0] for source in self.converter_sources]
+            != sorted({source[0] for source in self.converter_sources})
         ):
-            raise ValueError("BF4 cache requires the exact lowercase 40-hex TT-Metal revision")
+            raise ValueError("BF4 cache requires the converter sources as sorted (path, lowercase sha256) pairs")
         if self.mesh_shape != MESH_SHAPE:
             raise ValueError(f"BF4 cache requires mesh {MESH_SHAPE}, got {self.mesh_shape}")
         if (
@@ -792,6 +836,62 @@ def _prepare_routed_layer_host_tensors(
     return torch_w01, torch_w2
 
 
+def _expert_byte_ranges(
+    logical_shape: tuple[int, ...],
+    expert: int,
+    physical_ids: tuple[int, ...],
+) -> tuple[tuple[int, int], ...]:
+    """``(offset, size)`` of one expert's tiles in the tensorbin payload, one contiguous run per ring bank.
+
+    The payload is the mesh shards in coordinate order, each a tiled ``(ring, 1, experts_per_device, groups, rows,
+    cols)`` tensor: tiles run over the leading dims in row-major order, so an expert's groups are one run per ring bank.
+    """
+
+    ring_size, _, experts, groups, rows, cols = logical_shape
+    experts_per_device = experts // len(physical_ids)
+    run = groups * (rows // ttnn.TILE_SIZE) * (cols // ttnn.TILE_SIZE) * BF4_TILE_BYTES
+    shard = experts_per_device * ring_size * run
+    device_index, local = divmod(expert, experts_per_device)
+    return tuple(
+        (device_index * shard + (ring_bank * experts_per_device + local) * run, run) for ring_bank in range(ring_size)
+    )
+
+
+def _fresh_expert_bf4_bytes(
+    checkpoint: Qwen38Checkpoint,
+    placement: Qwen38Placement,
+    *,
+    namespace: str,
+    layer_index: int,
+    expert: int,
+    ring_size: int,
+    scratch: Path,
+) -> dict[str, bytes]:
+    """Pack one routed expert exactly as the layer conversion does (``E = 1``): the packed tile bytes per tensor."""
+
+    if namespace == "backbone":
+        weights = Qwen38MoEWeights(checkpoint, placement, layer_index=layer_index)
+    else:
+        weights = Qwen38MoEWeights(checkpoint, placement, mtp_layer_index=layer_index)
+    routed = weights.expert(expert)
+    gate_up = routed.gate_up.transpose(0, 1)[None, None].contiguous()
+    down = routed.down.transpose(0, 1)[None, None].contiguous()
+    w01_map, w2_map = ring_shard_maps(2560, 640, ring_size)
+    gate, up = torch.split(gate_up, 640, dim=-1)
+    prepared = {
+        "w0_w1": prepare_w0_w1_tensor_for_moe_compute(gate, up, 1, 1, 2560, 640, w01_map),
+        "w2": prepare_w2_tensor_for_moe_compute(down, 1, 1, 640, 2560, w2_map, w01_map),
+    }
+    packed = {}
+    for name, host_tensor in prepared.items():
+        path = scratch / f"{name}.tensorbin"
+        ttnn.dump_tensor(path, ttnn.from_torch(host_tensor, dtype=ttnn.bfloat4_b, layout=ttnn.TILE_LAYOUT))
+        raw = path.read_bytes()
+        header_size = int.from_bytes(raw[:TENSORBIN_HEADER_PREFIX_BYTES], byteorder="little", signed=False)
+        packed[name] = raw[TENSORBIN_HEADER_PREFIX_BYTES + header_size :]
+    return packed
+
+
 def packed_bf4_model_bytes_per_device(*, ring_size: int, moe_layers: int = 49) -> int:
     """Packed routed bytes for 48 backbone layers plus the one MTP layer."""
 
@@ -819,6 +919,55 @@ class Qwen38BF4Cache:
             tuple[str, int],
             tuple[BF4LayerRecord, tuple[tuple[int, int, int, int, int], ...]],
         ] = {}
+        if not self.manifest_path.exists():
+            self._adopt_legacy_slot(Path(root).resolve())
+
+    def _adopt_legacy_slot(self, cache_root: Path) -> None:
+        """Move a sibling slot that holds this identity's bytes under this identity's key.
+
+        A format-1 slot was keyed by the tt-metal revision; one whose checkpoint and topology fields equal ours is
+        rewritten as format 2 (the converter sources replace the revision) and renamed.  A format-2 slot that already
+        carries our key under another name (an interrupted adoption) is only renamed.  The admission probe checks the
+        bytes at every start, so a slot converted by different code is still refused.
+        """
+
+        expected_legacy = _json_normalized(asdict(self.identity))
+        del expected_legacy["converter_sources"]
+        expected_legacy["format_version"] = LEGACY_FORMAT_VERSION
+        candidates = []
+        for manifest_path in cache_root.glob("*/manifest.json"):
+            if manifest_path.parent == self.root:
+                continue
+            try:
+                document = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if type(document) is not dict or type(document.get("identity")) is not dict:
+                continue
+            if document.get("format_version") == FORMAT_VERSION:
+                adoptable = document.get("identity_key") == self.identity.key
+            else:
+                identity = dict(document["identity"])
+                revision = identity.pop("tt_metal_revision", None)
+                adoptable = (
+                    document.get("format_version") == LEGACY_FORMAT_VERSION
+                    and type(revision) is str
+                    and _same_exact_typed_tree(identity, expected_legacy)
+                )
+            if adoptable and type(document.get("updated_utc")) is str:
+                candidates.append((document["updated_utc"], manifest_path, document))
+        if not candidates:
+            return
+        _, manifest_path, document = max(candidates, key=lambda candidate: candidate[0])
+        with _exclusive_file_lock(manifest_path.parent / ".conversion.lock"):
+            if self.manifest_path.exists() or not manifest_path.exists():
+                return
+            document["format_version"] = FORMAT_VERSION
+            document["identity"] = _json_normalized(asdict(self.identity))
+            document["identity_key"] = self.identity.key
+            document["updated_utc"] = _utc_now()
+            _atomic_json(manifest_path, document)
+            os.rename(manifest_path.parent, self.root)
 
     @staticmethod
     def _validate_layer_request(namespace: str, layer_index: int) -> None:
@@ -1266,6 +1415,77 @@ class Qwen38BF4Cache:
                 w2_path=w2_path,
                 memory_configs=memory_configs,
             )
+
+    def admit_converted_bytes(
+        self,
+        checkpoint: Qwen38Checkpoint,
+        placement: Qwen38Placement,
+        *,
+        namespace: str = "backbone",
+        layer_index: int = 0,
+        expert: int = ADMISSION_EXPERT,
+    ) -> dict[str, Any]:
+        """Re-pack one routed expert of one cached layer from the checkpoint and compare the bytes with the cache.
+
+        The manifest pins the converter's sources, not the runtime that ran them; this is the check that the cached
+        bytes are what this runtime's converter produces.  Fails closed naming the layer, expert, tensor and ring bank.
+        The host packer needs the cluster open (tt-metal initializes on the first BF4 tensor), so this runs after the
+        mesh is open, on ~4 MB of packed bytes.
+        """
+
+        started = time.monotonic()
+        record = self.verify_layer(namespace, layer_index)
+        if record is None:
+            raise RuntimeError(f"BF4 cache holds no {namespace} layer {layer_index} to admit")
+        if not 0 <= expert < self.identity.routed_experts:
+            raise ValueError(f"expert must be in [0, {self.identity.routed_experts}), got {expert}")
+        paths = self._validate_record(record, namespace=namespace, layer_index=layer_index)
+        with tempfile.TemporaryDirectory(prefix=".admit.", dir=self.root) as scratch:
+            fresh = _fresh_expert_bf4_bytes(
+                checkpoint,
+                placement,
+                namespace=namespace,
+                layer_index=layer_index,
+                expert=expert,
+                ring_size=self.identity.ring_size,
+                scratch=Path(scratch),
+            )
+        compared = 0
+        for artifact, path in zip((record.w0_w1, record.w2), paths):
+            ranges = _expert_byte_ranges(artifact.logical_shape, expert, self.identity.physical_ids)
+            if len(fresh[artifact.name]) != len(ranges) * ranges[0][1]:
+                raise RuntimeError(
+                    f"fresh {artifact.name} packing of expert {expert} is {len(fresh[artifact.name])} bytes, "
+                    f"expected {len(ranges) * ranges[0][1]}"
+                )
+            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            try:
+                header_size = _validate_tensorbin_payload_fd(
+                    descriptor,
+                    signature=_artifact_fd_signature(descriptor),
+                    expected_payload_bytes=_packed_payload_bytes(artifact.logical_shape),
+                )
+                for ring_bank, (offset, size) in enumerate(ranges):
+                    cached = _pread_exact(descriptor, size, TENSORBIN_HEADER_PREFIX_BYTES + header_size + offset)
+                    expected = fresh[artifact.name][ring_bank * size : (ring_bank + 1) * size]
+                    if cached != expected:
+                        first = next(index for index in range(size) if cached[index] != expected[index])
+                        raise RuntimeError(
+                            f"BF4 cache {self.root} was not produced by this runtime's converter: {namespace} layer "
+                            f"{layer_index} expert {expert} ({artifact.name}, ring bank {ring_bank}) differs from a fresh "
+                            f"conversion of the checkpoint at byte {first} of {size}; move the slot aside or delete it "
+                            "and the next start reconverts"
+                        )
+                    compared += size
+            finally:
+                os.close(descriptor)
+        return {
+            "namespace": namespace,
+            "layer_index": layer_index,
+            "expert": expert,
+            "compared_bytes": compared,
+            "seconds": round(time.monotonic() - started, 3),
+        }
 
     def load_layer(self, mesh_device, *, layer_index: int, namespace: str = "backbone") -> tuple[Any, Any]:
         """Load one already-converted layer and revalidate live ring/topology."""

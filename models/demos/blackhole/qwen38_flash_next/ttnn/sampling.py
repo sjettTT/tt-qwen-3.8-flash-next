@@ -392,9 +392,50 @@ def _validate_host_logits(logits: torch.Tensor) -> tuple[torch.Tensor, int]:
     return values, int(logits.shape[2])
 
 
-def _validate_generator(generator: torch.Generator, *, seed: int) -> None:
+_MASK64 = (1 << 64) - 1
+UNIFORM_BITS = 24  # u = n * 2**-24: exact in fp32, the draw the device sampler consumes
+
+
+class UniformStream:
+    """splitmix64 per request: ``state += gamma; z = mix(state); u = (z >> 40) * 2**-24`` (exact in fp32).
+
+    The draw of the device sampler (``ttnn/device_sampler.py``), written to the device once per step; given to the
+    host samplers in place of a ``torch.Generator`` it makes a host fallback step continue the same sequence.
+    Reproducible from any language: ten lines of 64-bit integer arithmetic.
+    """
+
+    def __init__(self, seed: int) -> None:
+        if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= _MASK64:
+            raise ValueError(f"seed must be an integer in [0, 2**64), got {seed!r}")
+        self.seed = seed
+        self.state = seed
+        self.draws = 0
+
+    def initial_seed(self) -> int:
+        return self.seed
+
+    def next_bits(self) -> int:
+        self.state = (self.state + 0x9E3779B97F4A7C15) & _MASK64
+        z = self.state
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
+        z ^= z >> 31
+        self.draws += 1
+        return z >> (64 - UNIFORM_BITS)
+
+    def next_uniform(self) -> float:
+        """The next draw in [0, 1) as a float fp32 holds exactly."""
+
+        return self.next_bits() / float(1 << UNIFORM_BITS)
+
+
+def _validate_generator(generator: torch.Generator | UniformStream, *, seed: int) -> None:
+    if isinstance(generator, UniformStream):
+        if generator.seed != seed:
+            raise ValueError(f"uniform stream seed {generator.seed} differs from parameters {seed}")
+        return
     if not isinstance(generator, torch.Generator):
-        raise TypeError("generator must be a torch.Generator")
+        raise TypeError("generator must be a torch.Generator or a UniformStream")
     if torch.device(generator.device).type != "cpu":
         raise ValueError("sampling generator must be a CPU generator")
     if generator.initial_seed() != seed:
@@ -493,11 +534,18 @@ def _inverse_cdf(probabilities: torch.Tensor, uniform: torch.Tensor) -> int:
     return min(index, last_positive)
 
 
-def _draw(generator: torch.Generator | None, p: Qwen38SamplingParameters) -> tuple[torch.Tensor, torch.Generator]:
+def _draw(
+    generator: torch.Generator | UniformStream | None, p: Qwen38SamplingParameters
+) -> tuple[torch.Tensor, torch.Generator | UniformStream]:
+    """One fp32 uniform: the request's torch generator (or a one-shot one from the seed), or the device sampler's
+    splitmix64 stream (the same ``u`` the device would have consumed on this step)."""
+
     request_generator = generator
     if request_generator is None:
         request_generator = torch.Generator(device="cpu")
         request_generator.manual_seed(p.seed)
+    if isinstance(request_generator, UniformStream):
+        return torch.tensor(request_generator.next_uniform(), dtype=torch.float32), request_generator
     return torch.rand((), generator=request_generator, dtype=torch.float32), request_generator
 
 
@@ -1079,6 +1127,8 @@ __all__ = [
     "Qwen38SamplingProfile",
     "Qwen38SamplingTiming",
     "Qwen38TTNNHostSampler",
+    "UNIFORM_BITS",
+    "UniformStream",
     "sample_candidates",
     "sample_full_vocabulary",
     "sample_host_logits",

@@ -64,6 +64,13 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import 
 from models.demos.blackhole.qwen38_flash_next.tools.resident_decode import (
     SINGLE_TRACE_RESIDUE_CLASS_TRACES as RESIDUE_CLASSES,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn.device_sampler import (
+    Qwen38DeviceSamplerPolicy,
+    Qwen38TTNNDeviceSamplerConstants,
+    candidate_row_lanes,
+    device_sampler_reference,
+    sample_on_device,
+)
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import (
     Qwen38ShardedLogits,
     Qwen38TTNNLMHead,
@@ -77,6 +84,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.sampling import (
     Qwen38CandidateRow,
     Qwen38CandidateSample,
     Qwen38SamplingParameters,
+    UniformStream,
     sample_candidates,
     sample_full_vocabulary,
 )
@@ -109,6 +117,7 @@ DISCRIMINATOR_TOKENS = 128
 DISCRIMINATOR_SEED = 20260904
 DISCRIMINATOR_ROW_TOKENS = 33
 DISCRIMINATOR_PERIOD_TARGET_MS = 50.4
+DEVICE_PERIOD_NOISE_MS = 0.25  # the device loop's bar: within this of the greedy loop's period on the same chain
 
 
 class Qwen38SamplingRequestError(ValueError):
@@ -217,58 +226,129 @@ def logprobs_content_item(
 # -- the chain additions -------------------------------------------------------------------------------------
 
 
-class Qwen38SamplingChainExtension:
-    """What a sampling chain adds to the traced chain: the epilogue, its warm-pass check and three per-step primitives."""
+WARM_POLICY = Qwen38DeviceSamplerPolicy(temperature=1.0, top_k=20, top_p=0.95, min_p=0.0)
+WARM_UNIFORM = 0.37500011920928955  # 6291458 * 2**-24
 
-    def __init__(self, lm_head: Qwen38TTNNLMHead, mesh: Any) -> None:
+
+class Qwen38SamplingChainExtension:
+    """What a sampling chain adds to the traced chain: the epilogue, its warm-pass check and three per-step primitives.
+
+    ``device_sampler`` adds the on-device sampler (``ttnn/device_sampler.py``) after the candidate row: TAIL then
+    writes the sampled token (or the greedy one, by the request's flag) into the token row itself, and a sampled
+    request runs the greedy loop plus one draw write per step (:func:`generate_sampled_on_device`).
+    """
+
+    def __init__(self, lm_head: Qwen38TTNNLMHead, mesh: Any, *, device_sampler: bool = False) -> None:
         self.lm_head = lm_head
         self.mesh = mesh
         self.constants = Qwen38TTNNSamplingCandidateConstants.build(mesh, lm_head.mesh_contract)
+        self.sampler = Qwen38TTNNDeviceSamplerConstants.build(mesh, lm_head.mesh_contract) if device_sampler else None
         self.trace_logits: list[Qwen38ShardedLogits] = []  # TAIL residue r's logits (trace-stable), for the fallback
         self.trace_rows: list[Any] = []
 
     def capture_epilogue(self, trace_output: Any, token_row_io: Any) -> tuple[Any, Any]:
-        """TAIL's last ops: the greedy path exactly as today, then the candidate row into the readback buffer."""
+        """TAIL's last ops: the greedy path exactly as today, then the candidate row into the readback buffer; with the
+        device sampler the row feeds the composite and its token row (greedy or sampled, by the flag) is the copy."""
 
         if trace_output.logits is None:
             raise RuntimeError("TAIL capture returned no logits")
+        if self.sampler is None:
+            candidates = self.lm_head.greedy_candidates(trace_output.logits)
+            trace_token_row = self.lm_head.resolve_greedy_on_device(candidates)
+            ttnn.copy(trace_token_row, token_row_io)
+            self.trace_rows.append(self.lm_head.sampling_candidates(trace_output.logits, self.constants))
+            self.trace_logits.append(trace_output.logits)
+            return candidates, trace_token_row
         candidates = self.lm_head.greedy_candidates(trace_output.logits)
-        trace_token_row = self.lm_head.resolve_greedy_on_device(candidates)
+        greedy_row = self.lm_head.resolve_greedy_on_device(candidates)
+        row = self.lm_head.sampling_candidates(trace_output.logits, self.constants)
+        trace_token_row = sample_on_device(row, greedy_row, self.sampler)
+        ttnn.deallocate(greedy_row)
         ttnn.copy(trace_token_row, token_row_io)
-        self.trace_rows.append(self.lm_head.sampling_candidates(trace_output.logits, self.constants))
+        self.trace_rows.append(row)
         self.trace_logits.append(trace_output.logits)
         return candidates, trace_token_row
 
     def mark_corruptible(self) -> None:
-        """Before the miss guard closes: the readback row is rewritten by every replay, like the token row."""
+        """Before the miss guard closes: the readback row is rewritten by every replay, like the token row; the
+        sampler's host-written scalars and table between replays."""
 
         ttnn.mark_corruptible(self.constants.readback_row)
+        if self.sampler is not None:
+            self.sampler.mark_corruptible()
 
     def mark_trace_rows_corruptible(self) -> None:
         """After a capture: its row is rewritten by every replay, like the greedy candidates."""
 
         ttnn.mark_corruptible(self.trace_rows[-1])
 
-    def warm(self, logits: Qwen38ShardedLogits, *, label: str) -> dict[str, Any]:
-        """Eager epilogue and fallback gather (their programs compile here); the row must equal torch.topk of the gather."""
+    def warm(self, logits: Qwen38ShardedLogits, greedy_row: Any = None, *, label: str) -> dict[str, Any]:
+        """Eager epilogue and fallback gather (their programs compile here); the row must equal torch.topk of the gather.
+
+        With the device sampler (``greedy_row`` = the warm step's resolved token row): the composite runs eagerly
+        under the warm policy and under the greedy flag; its token must equal the host reference on the read row
+        and the greedy row's id.
+        """
 
         row = self.lm_head.sampling_candidates(logits, self.constants)
         full = self._gather(logits)
         actual = self.read_candidate_row()
-        ttnn.deallocate(row)
         agreement = actual.agreement(Qwen38CandidateRow.emulate(full.to(torch.bfloat16)))
         if not all(agreement["values_bitwise"]) or not all(agreement["ids_equal_up_to_boundary_ties"]):
             raise RuntimeError(
                 f"{label}: candidate row {actual.values.tolist()} {actual.ids.tolist()} vs torch.topk of the full "
                 f"gather beyond boundary ties: {agreement}"
             )
+        if self.sampler is not None:
+            if greedy_row is None:
+                raise TypeError("the device sampler's warm pass needs the step's resolved token row")
+            values, ids = candidate_row_lanes(actual.to_host_row())
+            checks = {}
+            for name, policy, expected in (
+                ("sampled", WARM_POLICY, device_sampler_reference(values, ids, WARM_POLICY, WARM_UNIFORM).token_id),
+                ("greedy", Qwen38DeviceSamplerPolicy.greedy_policy(), self._token_of(greedy_row)),
+            ):
+                self.sampler.write_policy(policy)
+                self.sampler.write_uniform(WARM_UNIFORM)
+                token_row = sample_on_device(row, greedy_row, self.sampler)
+                device = self._token_of(token_row)
+                ttnn.deallocate(token_row)
+                checks[name] = {"device": device, "expected": expected}
+                if device != expected:
+                    raise RuntimeError(f"{label}: device sampler {name} token {device} vs expected {expected}")
+            agreement["device_sampler"] = checks
+        ttnn.deallocate(row)
         return agreement
+
+    @staticmethod
+    def _token_of(token_row: Any) -> int:
+        host = ttnn.to_torch(ttnn.get_device_tensors(token_row)[0]).reshape(-1)
+        if not torch.equal(host[1:], torch.zeros_like(host[1:])) or float(host[0]) != int(host[0]):
+            raise RuntimeError(f"token row is not one id at column 0: {host.tolist()}")
+        return int(host[0])
 
     def release(self) -> None:
         for tensor in (*self.trace_rows, self.constants.readback_row, self.constants.shard_vocab_start):
             ttnn.deallocate(tensor)
+        if self.sampler is not None:
+            self.sampler.release()
         self.trace_rows.clear()
         self.trace_logits.clear()
+
+    def begin_request(self, request: "Qwen38SamplingRequest | None") -> None:
+        """Request start, before the prompt's steps: the device policy (the greedy flag for a greedy or host-loop
+        request) and, on the device path, the first draw; eager writes ordered before the request's first TAIL."""
+
+        if self.sampler is None:
+            return
+        policy = None if request is None else request.device_policy()
+        if policy is None:
+            self.sampler.write_policy(Qwen38DeviceSamplerPolicy.greedy_policy())
+            return
+        self.sampler.write_policy(policy)
+        request.uniforms.clear()
+        request.stream = UniformStream(request.parameters.seed)
+        self.sampler.write_uniform(request.next_uniform())
 
     def read_candidate_row(self) -> Qwen38CandidateRow:
         """Blocking: completes the queued TAIL and parses its row (device 0's replica; the four agree)."""
@@ -334,16 +414,39 @@ class Qwen38SamplingRequest:
 
     parameters: Qwen38SamplingParameters
     top_logprobs: int = 0
+    logprobs: bool = False
     generator: torch.Generator = field(init=False, repr=False)
     samples: list[Qwen38CandidateSample | None] = field(default_factory=list)
     clocks: Qwen38SamplingStepClocks = field(default_factory=Qwen38SamplingStepClocks)
+    # The device path (``generate_sampled_on_device``): its splitmix64 stream, the draws written (the ledger), how
+    # many first tokens the host had to rewrite (a continuation whose row the previous request's policy chose).
+    stream: UniformStream = field(init=False, repr=False)
+    uniforms: list[float] = field(default_factory=list)
+    first_token_rewrites: int = 0
+    verified_steps: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.parameters, Qwen38SamplingParameters) or self.parameters.temperature == 0:
             raise ValueError("a sampling request needs Qwen38SamplingParameters with temperature > 0")
         if isinstance(self.top_logprobs, bool) or type(self.top_logprobs) is not int:
             raise TypeError(f"top_logprobs must be an integer, got {self.top_logprobs!r}")
+        if type(self.logprobs) is not bool:
+            raise TypeError(f"logprobs must be a bool, got {self.logprobs!r}")
         self.generator = torch.Generator(device="cpu").manual_seed(self.parameters.seed)
+        self.stream = UniformStream(self.parameters.seed)
+
+    def device_policy(self) -> Qwen38DeviceSamplerPolicy | None:
+        """The device sampler's policy for this request, or ``None`` when it takes the host loop: penalties, a
+        temperature above the table's range, ``top_k`` 0, or the logprobs the device loop does not read."""
+
+        if self.logprobs or self.top_logprobs:
+            return None
+        return Qwen38DeviceSamplerPolicy.from_parameters(self.parameters)
+
+    def next_uniform(self) -> float:
+        uniform = self.stream.next_uniform()
+        self.uniforms.append(uniform)
+        return uniform
 
     def as_dict(self) -> dict[str, Any]:
         """The response's ``qwen38.sampling`` object: the policy, its seed and the loop's counters."""
@@ -354,6 +457,10 @@ class Qwen38SamplingRequest:
             "candidate_misses": self.clocks.candidate_misses,
             # The reported logprobs are normalised over the read candidates, not the vocabulary (the row's mass).
             "logprobs_normalizer": "candidate_row",
+            "device_path": bool(self.uniforms),
+            "draws": len(self.uniforms),
+            "first_token_rewrites": self.first_token_rewrites,
+            "verified_steps": self.verified_steps,
         }
 
 
@@ -482,6 +589,117 @@ def generate_sampled(
         yield token_id, None
 
 
+def generate_sampled_on_device(
+    session: Any,
+    request: Qwen38SamplingRequest,
+    max_new_tokens: int,
+    *,
+    stop_ids: Sequence[int],
+    tokenizer_size: int,
+    prefilled: bool,
+    think_budget: int | None = None,
+    should_stop: Callable[[], str | None] | None = None,
+    forced_step: Callable[[int], None] | None = None,
+    clock_ns: Callable[[], int] | None = None,
+    verify_each_step: bool = False,
+) -> Iterator[tuple[int | None, str | None]]:
+    """The device-sampled loop: the greedy A-G loop plus one draw write per step; yields ``(x_t, finish)`` like
+    :func:`generate_sampled`.
+
+    Entry: the request's policy and first draw were written by ``begin_request`` before the prompt's steps, so the
+    last prompt TAIL chose the first token on the device.  The row is read once here (blocking, completing that
+    TAIL) and the host reference recomputes the token from it and the first draw: equal when ``prefilled`` (a
+    mismatch is a device error), rewritten into the row when the request continues an unconsumed row the previous
+    request's policy chose (``first_token_rewrites``).  Every step then writes the next draw behind HEAD(t) (ordered
+    before TAIL(t), which consumes it); a forced ``</think>`` step reuses the resident draw.  ``verify_each_step``
+    (the discriminator's arm) also reads the row every step and checks the device token against the reference
+    (``verified_steps``); the production loop reads nothing but the token.
+    """
+
+    if not isinstance(request, Qwen38SamplingRequest):
+        raise TypeError("generate_sampled_on_device needs a Qwen38SamplingRequest")
+    if think_budget is not None and forced_step is None:
+        raise TypeError("a thinking budget needs the session's forced step")
+    if not request.uniforms:
+        raise RuntimeError("the device path needs begin_request's policy and first draw before the prompt")
+    chain, sampler, clocks = session.chain, session.sampling.sampler, request.clocks
+    now = clock_ns or (lambda: 0)
+
+    def reference_token() -> int:
+        values, ids = candidate_row_lanes(session.sampling.read_candidate_row().to_host_row())
+        return device_sampler_reference(values, ids, request.device_policy(), request.uniforms[-1]).token_id
+
+    # The first token: the device's choice against the host reference on the row it was chosen from.
+    expected = reference_token()
+    device_token = chain.read_token_row()
+    if device_token != expected:
+        if prefilled:
+            raise RuntimeError(
+                f"device sampler first token {device_token} vs host reference {expected} on the read row "
+                f"(u={request.uniforms[-1]}, policy={request.device_policy()})"
+            )
+        chain.write_token_row(expected)
+        request.first_token_rewrites += 1
+    produced = 0
+    reasoning_tokens = 0
+    thinking_open = think_budget is not None
+    while True:
+        reason = None if should_stop is None else should_stop()
+        if reason is not None:
+            yield None, reason
+            return
+        if thinking_open and reasoning_tokens >= think_budget:
+            forced_step(THINK_END_ID)
+            request.samples.append(None)
+            thinking_open = False
+            produced += 1
+            yield THINK_END_ID, "length" if produced == max_new_tokens else None
+            if produced == max_new_tokens:
+                return
+            continue
+        if produced + 1 == max_new_tokens:
+            token_id = chain.read_token_row()  # completes TAIL(t-1); the row keeps the unconsumed token
+            if token_id >= tokenizer_size:
+                raise RuntimeError(f"token row holds {token_id}, at or above the tokenizer size {tokenizer_size}")
+            session.row_token = token_id
+            yield token_id, "length"
+            return
+        residue = len(session.committed) % RESIDUE_CLASSES
+        pending = chain.read_token_row_nonblocking()
+        event = chain.record_event()
+        chain.execute_head(residue)
+        sampler.write_uniform(request.next_uniform())  # behind HEAD(t), before TAIL(t)
+        clocks.head_enqueued_ns.append(now())
+        chain.event_synchronize(event)
+        token_id = chain.pending_value(pending)
+        clocks.token_available_ns.append(now())
+        if verify_each_step and produced > 0:
+            if token_id != (check := device_sampler_reference_of(session, request, -2)):
+                raise RuntimeError(f"device sampler step {produced} token {token_id} vs host reference {check}")
+            request.verified_steps += 1
+        produced += 1
+        if thinking_open:
+            thinking_open = token_id != THINK_END_ID
+            reasoning_tokens += 1
+        session.ple_context = chain.refresh_ple_row(token_id, session.ple_context)
+        chain.execute_tail(residue)
+        clocks.tail_enqueued_ns.append(now())
+        session.committed.append(token_id)
+        request.samples.append(None)
+        if token_id >= tokenizer_size or token_id in stop_ids:
+            chain.read_token_row()  # completes TAIL(t); x_{t+1} is discarded
+            yield token_id, "error" if token_id >= tokenizer_size else "stop"
+            return
+        yield token_id, None
+
+
+def device_sampler_reference_of(session: Any, request: Qwen38SamplingRequest, draw_index: int) -> int:
+    """The host reference on the readback row (the last completed TAIL's) with the request's draw ``draw_index``."""
+
+    values, ids = candidate_row_lanes(session.sampling.read_candidate_row().to_host_row())
+    return device_sampler_reference(values, ids, request.device_policy(), request.uniforms[draw_index]).token_id
+
+
 # -- the discriminator over a live session ------------------------------------------------------------------
 
 
@@ -537,24 +755,42 @@ def run_discriminator(
         for record in rows
     )
     greedy = session.complete(prompt_ids, tokens, stop_ids=())  # extends the forced prefix
-    greedy_period_ms = None if greedy.tokens_per_second is None else 1e3 / greedy.tokens_per_second
     streams, clocks, completions = [], [], []
-    for _ in range(2):
+    device_sampler = getattr(session.sampling, "sampler", None) is not None
+    # On a device-sampler chain a third stream runs with the per-step host verification (arm d): the same tokens.
+    for verify in (False, False, *([True] if device_sampler else [])):
         request = Qwen38SamplingRequest(Qwen38SamplingParameters.official_thinking(seed=seed))
-        completion = session.complete(prompt_ids, tokens, stop_ids=(), sampling=request)
+        completion = session.complete(prompt_ids, tokens, stop_ids=(), sampling=request, verify_each_step=verify)
         streams.append(completion.token_ids)
         clocks.append(request.clocks.summary())
+        logprobs = [sample.logprob for sample in request.samples if sample is not None]
         completions.append(
             {
                 "tokens_per_second": completion.tokens_per_second,
                 "period_ms": None if completion.tokens_per_second is None else 1e3 / completion.tokens_per_second,
                 "finish_reason": completion.finish_reason,
                 "samples": len(request.samples),
-                "sampled_logprob_median": median(sample.logprob for sample in request.samples if sample is not None),
+                "sampled_logprob_median": median(logprobs) if logprobs else None,
+                "device_path": bool(request.uniforms),
+                "draws": len(request.uniforms),
+                "first_token_rewrites": request.first_token_rewrites,
+                "verified_steps": request.verified_steps,
+                "verify_each_step": verify,
             }
         )
-    sampled_periods = [summary["period_median_ms"] for summary in clocks]
-    period_pass = all(period is not None and period <= period_target_ms for period in sampled_periods)
+    sampled_periods = [summary["period_median_ms"] for summary in clocks[:2]]
+    # The host loop's bar is the absolute target; the device loop's is "no exposed host cost": its period within
+    # noise of the greedy loop's period on the same chain (the sampler ops run for greedy requests too).
+    greedy_period_ms = None if greedy.tokens_per_second is None else 1e3 / greedy.tokens_per_second
+    period_pass = all(
+        period is not None
+        and (
+            period <= greedy_period_ms + DEVICE_PERIOD_NOISE_MS
+            if device_sampler and greedy_period_ms is not None
+            else period <= period_target_ms
+        )
+        for period in sampled_periods
+    )
     exposed = []
     for summary in clocks:
         sample, host = summary["sample_median_ms"], summary["host_segment_median_ms"]
@@ -573,7 +809,8 @@ def run_discriminator(
             "finish_reason": greedy.finish_reason,
         },
         "sampled": {"streams": streams, "clocks": clocks, "completions": completions},
-        "streams_identical": streams[0] == streams[1] and len(streams[0]) == tokens,
+        "device_sampler": device_sampler,
+        "streams_identical": all(stream == streams[0] for stream in streams) and len(streams[0]) == tokens,
         "sampled_differs_from_greedy": streams[0] != greedy.token_ids,
         "sampled_period_median_ms": sampled_periods,
         "period_target_ms": period_target_ms,
@@ -591,9 +828,16 @@ def run_discriminator(
         "fallbacks": [summary["fallbacks"] for summary in clocks],
         "candidate_misses": [summary["candidate_misses"] for summary in clocks],
         "tokens_inside_candidates": all(summary["candidate_misses"] == 0 for summary in clocks),
+        "device_verified": (
+            None if not device_sampler else completions[-1]["verified_steps"] == max(0, len(streams[-1]) - 2)
+        ),
     }
     result["pass"] = bool(
-        rows_pass and result["streams_identical"] and result["tokens_inside_candidates"] and period_pass
+        rows_pass
+        and result["streams_identical"]
+        and result["tokens_inside_candidates"]
+        and period_pass
+        and result["device_verified"] is not False
     )
     return result
 
@@ -611,7 +855,9 @@ __all__ = [
     "Qwen38SamplingStepClocks",
     "choose_token",
     "compare_candidate_rows_with_full_gathers",
+    "device_sampler_reference_of",
     "generate_sampled",
+    "generate_sampled_on_device",
     "logprobs_content_item",
     "logprobs_from_request",
     "parameters_as_dict",

@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -39,6 +39,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
 RING7_WORKERS = ((0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0))
 EXPERT_RANGES = ((0, 128), (128, 256), (256, 384), (384, 512))
 _TEST_TENSORBIN_HEADER_BYTES = 64
+CONVERTER_SOURCES = (
+    ("models/demos/blackhole/qwen38_flash_next/ttnn/bf4.py", "1" * 64),
+    ("tt_metal/impl/data_format/bfloat4.cpp", "2" * 64),
+)
 
 
 def _identity() -> BF4CacheIdentity:
@@ -47,7 +51,7 @@ def _identity() -> BF4CacheIdentity:
         checkpoint_config_sha256=CONFIG_SHA256,
         checkpoint_file_manifest_sha256=CHECKPOINT_FILE_MANIFEST_SHA256,
         checkpoint_hash_manifest_sha256=CHECKPOINT_TENSOR_MANIFEST_SHA256,
-        tt_metal_revision="181ac080751bccbaea2e5106fdf880f4b1ca04c4",
+        converter_sources=CONVERTER_SOURCES,
         mesh_shape=(1, 4),
         physical_ids=(0, 1, 2, 3),
         ring_size=7,
@@ -1446,6 +1450,176 @@ class TTNNBF4StaticTest(unittest.TestCase):
         self.assertEqual(len(raised.exception.cleanup_errors), 2)
         self.assertEqual(released, [w01, w2])
         self.assertIsNone(streamer._active)
+
+
+class TTNNBF4ConverterIdentityTest(unittest.TestCase):
+    """The cache pins the converter's sources instead of the tt-metal revision, adopts the old slots, checks bytes."""
+
+    def setUp(self):
+        patcher = mock.patch.object(bf4_module, "_sha256_fd", side_effect=_fast_sparse_digest_fd)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_converter_source_identity_pins_this_module_the_layout_packer_and_the_bfp4_packer(self):
+        identity = bf4_module.bf4_converter_source_identity()
+        self.assertEqual(
+            [path for path, _ in identity],
+            [
+                "models/demos/blackhole/qwen38_flash_next/ttnn/bf4.py",
+                "tt_metal/impl/data_format/bfloat4.cpp",
+                "tt_metal/impl/data_format/blockfloat_common.cpp",
+                "tt_metal/impl/data_format/blockfloat_common.hpp",
+                "ttnn/ttnn/_experimental/moe_compute_utils.py",
+            ],
+        )
+        for relative, digest in identity:
+            self.assertEqual(digest, hashlib.sha256((bf4_module.REPO_ROOT / relative).read_bytes()).hexdigest())
+        accepted = replace(_identity(), converter_sources=identity)
+        self.assertNotIn("tt_metal_revision", asdict(accepted))
+        self.assertNotEqual(accepted.key, _identity().key)
+        for malformed in (
+            (),
+            tuple(reversed(CONVERTER_SOURCES)),
+            (CONVERTER_SOURCES[0], CONVERTER_SOURCES[0]),
+            (("models/demos/blackhole/qwen38_flash_next/ttnn/bf4.py", "X" * 64),),
+            (("models/demos/blackhole/qwen38_flash_next/ttnn/bf4.py", "1" * 40),),
+            [tuple(CONVERTER_SOURCES[0])],
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaisesRegex(ValueError, "converter sources"):
+                    replace(_identity(), converter_sources=malformed)
+
+    def test_legacy_slot_keyed_by_the_tt_metal_revision_is_adopted_in_place(self):
+        identity = _identity()
+        contract = Qwen38MeshContract(identity.physical_ids)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = Qwen38BF4Cache(root, identity, contract)
+            record0, paths0 = _write_layer(cache, 0)
+            record5, _ = _write_layer(cache, 5)
+            document = json.loads(cache.manifest_path.read_text(encoding="utf-8"))
+            legacy_identity = dict(document["identity"])
+            del legacy_identity["converter_sources"]
+            legacy_identity["tt_metal_revision"] = "9fb1403a93" + "0" * 30
+            legacy_identity["format_version"] = 1
+            legacy_key = hashlib.sha256(
+                json.dumps(legacy_identity, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            document.update(format_version=1, identity=legacy_identity, identity_key=legacy_key)
+            bf4_module._atomic_json(cache.manifest_path, document)
+            os.rename(cache.root, root / legacy_key)
+            # A legacy slot of another ring, an unreadable manifest and a stray file are left alone.
+            decoy = copy.deepcopy(document)
+            decoy["identity"]["ring_size"] = 8
+            bf4_module._atomic_json(root / "decoy-ring-8" / "manifest.json", decoy)
+            (root / "decoy-broken").mkdir()
+            (root / "decoy-broken" / "manifest.json").write_text("{", encoding="utf-8")
+            (root / "stray.txt").write_text("x", encoding="utf-8")
+
+            adopted = Qwen38BF4Cache(root, identity, contract)
+
+            self.assertEqual(adopted.root, root / identity.key)
+            self.assertTrue(adopted.manifest_path.exists())
+            self.assertFalse((root / legacy_key).exists())
+            self.assertTrue((root / "decoy-ring-8" / "manifest.json").exists())
+            adopted_document = json.loads(adopted.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(adopted_document["format_version"], 2)
+            self.assertEqual(adopted_document["identity_key"], identity.key)
+            self.assertEqual(adopted_document["identity"], bf4_module._json_normalized(asdict(identity)))
+            self.assertEqual(sorted(adopted_document["layers"]), ["backbone:0", "backbone:5"])
+            self.assertEqual(adopted_document["created_utc"], document["created_utc"])
+            self.assertEqual(adopted.verify_layer("backbone", 0), record0)
+            self.assertEqual(adopted.verify_layer("backbone", 5), record5)
+            self.assertEqual(
+                adopted._validate_record(record0, namespace="backbone", layer_index=0)[0],
+                adopted.root / paths0["w0_w1"].relative_to(cache.root),
+            )
+            # An interrupted adoption (format 2, our key, another directory name) is only renamed.
+            os.rename(adopted.root, root / "interrupted")
+            renamed = Qwen38BF4Cache(root, identity, contract)
+            self.assertTrue(renamed.manifest_path.exists())
+            self.assertFalse((root / "interrupted").exists())
+            self.assertEqual(renamed.verify_layer("backbone", 5), record5)
+            # Nothing to adopt: a fresh root stays empty until a layer is converted.
+            with tempfile.TemporaryDirectory() as empty:
+                self.assertFalse(Qwen38BF4Cache(empty, identity, contract).manifest_path.exists())
+                self.assertEqual(os.listdir(empty), [])
+
+    def test_expert_byte_ranges_walk_the_tiled_shards_one_run_per_ring_bank(self):
+        shapes = bf4_module._canonical_packed_shapes(ring_size=7)
+        physical_ids = (0, 1, 2, 3)
+        for name, groups, rows in (("w0_w1", 2, 2688), ("w2", 3, 672)):
+            with self.subTest(name=name):
+                run = groups * (rows // 32) * 4 * 576
+                payload = bf4_module._packed_payload_bytes(shapes[name])
+                shard = payload // 4
+                first = bf4_module._expert_byte_ranges(shapes[name], 0, physical_ids)
+                last = bf4_module._expert_byte_ranges(shapes[name], 511, physical_ids)
+                middle = bf4_module._expert_byte_ranges(shapes[name], 200, physical_ids)
+                self.assertEqual(first, tuple((ring_bank * 128 * run, run) for ring_bank in range(7)))
+                self.assertEqual(last[0], (3 * shard + 127 * run, run))
+                self.assertEqual(last[-1][0] + run, payload)
+                self.assertEqual(middle, tuple((shard + (ring_bank * 128 + 72) * run, run) for ring_bank in range(7)))
+                self.assertEqual(bf4_module.ADMISSION_EXPERT, 511)
+
+    def test_admission_compares_one_expert_with_a_fresh_packing_and_names_the_differing_bank(self):
+        identity = _identity()
+        contract = Qwen38MeshContract(identity.physical_ids)
+        shapes = bf4_module._canonical_packed_shapes(ring_size=7)
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Qwen38BF4Cache(directory, identity, contract)
+            _, paths = _write_layer(cache, 3)
+            fresh = {}
+            for name in ("w0_w1", "w2"):
+                ranges = bf4_module._expert_byte_ranges(shapes[name], 200, identity.physical_ids)
+                fresh[name] = bytes(hashlib.sha256(name.encode()).digest() * (ranges[0][1] * 7 // 32))
+                with paths[name].open("r+b") as stream:
+                    for ring_bank, (offset, size) in enumerate(ranges):
+                        stream.seek(bf4_module.TENSORBIN_HEADER_PREFIX_BYTES + _TEST_TENSORBIN_HEADER_BYTES + offset)
+                        stream.write(fresh[name][ring_bank * size : (ring_bank + 1) * size])
+            checkpoint, placement = object(), object()
+            with mock.patch.object(bf4_module, "_fresh_expert_bf4_bytes", return_value=fresh) as packer:
+                admitted = cache.admit_converted_bytes(checkpoint, placement, layer_index=3, expert=200)
+            self.assertEqual(
+                packer.call_args.kwargs | {"scratch": None},
+                {"namespace": "backbone", "layer_index": 3, "expert": 200, "ring_size": 7, "scratch": None},
+            )
+            self.assertEqual(packer.call_args.args, (checkpoint, placement))
+            self.assertTrue(str(packer.call_args.kwargs["scratch"]).startswith(str(cache.root / ".admit.")))
+            self.assertEqual(sorted(os.listdir(cache.root)), ["backbone", "manifest.json"])  # the scratch is gone
+            self.assertEqual(
+                sorted(os.listdir(cache.root / "backbone" / "layer-03")), sorted(path.name for path in paths.values())
+            )
+            self.assertEqual(
+                {key: admitted[key] for key in ("namespace", "layer_index", "expert", "compared_bytes")},
+                {
+                    "namespace": "backbone",
+                    "layer_index": 3,
+                    "expert": 200,
+                    "compared_bytes": sum(map(len, fresh.values())),
+                },
+            )
+            self.assertGreaterEqual(admitted["seconds"], 0.0)
+
+            corrupt = dict(fresh)
+            corrupt["w2"] = bytearray(fresh["w2"])
+            size = len(fresh["w2"]) // 7
+            corrupt["w2"][4 * size + 17] ^= 0x01
+            corrupt["w2"] = bytes(corrupt["w2"])
+            with mock.patch.object(bf4_module, "_fresh_expert_bf4_bytes", return_value=corrupt):
+                with self.assertRaisesRegex(
+                    RuntimeError, r"backbone layer 3 expert 200 \(w2, ring bank 4\) differs .* at byte 17 of "
+                ):
+                    cache.admit_converted_bytes(checkpoint, placement, layer_index=3, expert=200)
+            short = dict(fresh)
+            short["w0_w1"] = fresh["w0_w1"][:-1]
+            with mock.patch.object(bf4_module, "_fresh_expert_bf4_bytes", return_value=short):
+                with self.assertRaisesRegex(RuntimeError, "fresh w0_w1 packing of expert 200"):
+                    cache.admit_converted_bytes(checkpoint, placement, layer_index=3, expert=200)
+            with self.assertRaisesRegex(RuntimeError, "holds no backbone layer 9 to admit"):
+                cache.admit_converted_bytes(checkpoint, placement, layer_index=9)
+            with self.assertRaisesRegex(ValueError, "expert must be in"):
+                cache.admit_converted_bytes(checkpoint, placement, layer_index=3, expert=512)
 
 
 if __name__ == "__main__":
