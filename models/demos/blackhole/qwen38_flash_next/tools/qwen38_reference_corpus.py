@@ -67,7 +67,7 @@ PARTS = ("acceptance", "served", "book", "eval", "long")
 TOP_K = 32
 CONTINUATION_TOKENS = 256
 BOOK_TOKENS = 1024
-LONG_TOKENS = (8_192, 32_704)  # the second is the long-context prompt's length (tools/dev long_context_prompt)
+LONG_TOKENS = (8_192, 32_704)  # the second is the 32k build's context limit less the 64-token headroom
 LONG_WINDOW = 32
 LONG_DEPTHS = (2_048, 8_192)  # plus the item's end; a window is the 32 positions before depth - 32
 CLEAR_MARGIN = 0.125  # one bf16 ulp at logit magnitude 16..32: both observed near-tie flips were inside it
@@ -1207,7 +1207,29 @@ def _parser() -> argparse.ArgumentParser:
     verify = modes.add_parser("verify", help="check the corpus files (and a reference file against them)")
     verify.add_argument("--corpus", type=Path, default=REFERENCE_DIR)
     verify.add_argument("--reference", type=Path, default=None)
+    verify.add_argument(
+        "--stamp",
+        type=Path,
+        default=None,
+        help="write the reference file's identity (name, sha256, bytes, items, producer) as JSON here: the repository "
+        "keeps the stamp, the hosts keep the file",
+    )
+    verify.add_argument("--expect-stamp", type=Path, default=None, help="a stamp the reference file must match")
     return parser
+
+
+def reference_stamp(path: Path, document: dict[str, Any], columns: dict[str, ReferenceItem]) -> dict[str, Any]:
+    return {
+        "schema": "qwen38-reference-stamp/v1",
+        "file": path.name,
+        "sha256": _sha256_file(path),
+        "bytes": path.stat().st_size,
+        "corpus_id": document["corpus_id"],
+        "corpus_items_sha256": document["corpus_items_sha256"],
+        "items": sorted(columns),
+        "positions": sum(len(column.positions) for column in columns.values()),
+        "producer": document["producer"],
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1233,6 +1255,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 f"{args.reference}: {len(columns)} items, producer {json.dumps(document['producer'], sort_keys=True)}"
             )
+            stamp = reference_stamp(args.reference, document, columns)
+            if args.expect_stamp is not None:
+                expected = json.loads(args.expect_stamp.read_text(encoding="utf-8"))
+                differing = {k: (stamp.get(k), expected.get(k)) for k in expected if stamp.get(k) != expected.get(k)}
+                if differing:
+                    raise ReferenceCorpusError(
+                        f"{args.reference} differs from the stamp {args.expect_stamp}: {differing}"
+                    )
+                print(f"matches the stamp {args.expect_stamp}")
+            if args.stamp is not None:
+                args.stamp.write_text(json.dumps(stamp, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+                print(f"stamp written to {args.stamp}: sha256 {stamp['sha256']}, {stamp['bytes']} bytes")
         return 0
     manifest, corpus = load_corpus(args.corpus)
     if args.mode == "device":

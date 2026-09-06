@@ -428,6 +428,33 @@ def test_scorer_aligns_positions_and_needs_a_shared_item():
         corpus.score_references({"book-a": a}, {"other": b}, [], clear_margin=0.125)
 
 
+def test_verify_writes_and_checks_a_reference_stamp(tmp_path):
+    items = [_text_item("book-b", 7)]
+    manifest = corpus.write_corpus(items, tmp_path, provenance={})
+    out = tmp_path / "ref.json"
+    corpus.produce_reference(
+        _SyntheticRunner(),
+        manifest,
+        items,
+        out=out,
+        chunk_tokens=8,
+        teacher=None,
+        full_logits_dir=None,
+        producer={"kind": "s"},
+    )
+    stamp = tmp_path / "stamp.json"
+    assert corpus.main(["verify", "--corpus", str(tmp_path), "--reference", str(out), "--stamp", str(stamp)]) == 0
+    written = json.loads(stamp.read_text())
+    assert written["items"] == ["book-b"] and written["positions"] == 6 and written["producer"] == {"kind": "s"}
+    assert written["sha256"] == corpus._sha256_file(out) and written["bytes"] == out.stat().st_size
+    assert (
+        corpus.main(["verify", "--corpus", str(tmp_path), "--reference", str(out), "--expect-stamp", str(stamp)]) == 0
+    )
+    out.write_text(out.read_text().replace('"kind": "s"', '"kind": "t"'))
+    with pytest.raises(corpus.ReferenceCorpusError, match="differs from the stamp"):
+        corpus.main(["verify", "--corpus", str(tmp_path), "--reference", str(out), "--expect-stamp", str(stamp)])
+
+
 # -- the committed corpus ----------------------------------------------------------------------------------------
 
 
