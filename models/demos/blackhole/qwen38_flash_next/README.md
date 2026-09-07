@@ -11,7 +11,7 @@ its caches.  Nothing else is required: no prebuilt archive, no pinned binary, no
 
 | hardware | profile | status |
 |---|---|---|
-| QuietBox, 4x p150c (fw 19.4.1.0) | `tt-quietbox` | verified 2026-09-04: startup acceptance 96/96 tokens against the CPU, 19.6 tokens/s at 32k context; section 9a: the fresh-clone proof of 2026-09-06 |
+| QuietBox, 4x p150c (fw 19.4.1.0) | `tt-quietbox` | verified 2026-09-04: startup acceptance 96/96 tokens against the CPU, 19.6 tokens/s at 32k context; `docs/PROOFS.md`: the fresh-clone proof of 2026-09-06 |
 | Blackhole LoudBox, 4x p150 (one line) | `bh-loudbox` | section 9: what was verified and where |
 | QuietBox 2, 2x p300c (4 dies) | `qb2` | **untested**: designed from the p300 ring topology, should run fine |
 
@@ -26,7 +26,7 @@ This was implemented with the intention of the n-gram model residing in system m
 |---|---|---|
 | prompt prefill | 300 tok/s (and climbing); 500 tok/s with `--long-chunks` | 32-token chunk trace, 3.0-3.5 ms per prompt token, flat from 2k to 261k tokens; 128-token chunks at 1.9-2.0 ms per prompt token (`--long-chunks`, one routed-expert stream per 128 rows since 2026-09-06); 256-token chunks are in progress |
 | decode, one stream | 19.9 tok/s | position-generic traced decode, 50 ms per token, flat with depth |
-| decode with MTP (`--mtp 4`) | 37 tok/s aggregate, 55 tok/s on structured output | speculative drafting with exact acceptance: the committed stream leaves the CPU reference at the same token as greedy decode on 8 of the 12 acceptance prompts and at a different token on the other 4 (section 6) |
+| decode with MTP (`--mtp 4`) | 37 tok/s aggregate, 55 tok/s on structured output | speculative drafting with exact acceptance: the committed stream leaves the CPU reference at the same token as greedy decode on 8 of the 12 acceptance prompts and at a different token on the other 4 (section 6, `docs/NUMERICS.md`) |
 | contexts | 32k, 64k, 128k, 256k | 256k is single-user; MTP fits at 32k, 64k and 128k |
 | correctness | bitwise repeatable; 96/96 greedy token match against the CPU reference on the acceptance prompt | chunked prefill is tolerance-class against the CPU reference on all 48 layers |
 
@@ -50,12 +50,11 @@ This was implemented with the intention of the n-gram model residing in system m
     `ttnn.load_tensor` on `/proc/self/fd` paths, used by `ttnn/bf4.py`
 
   The server admits only a `ttnn` imported from this checkout's own build and records the checkout's commit, tree
-  and extension digest with every run (`tools/runtime_admission.py`).
+  and extension digest with every run (`tools/runtime_admission.py`; `docs/SERVER.md`).
 - The checkpoint: 360 GB (131 safetensors shards, the tokenizer, the chat template; section 3).
 - Disk under `--cache-root`: 107 GB for the BF4 expert cache (built once, shared by every context, kept across
-  runtime rebuilds), about 23 GB for
-  the 32k context and 10 GB for each other allocated context (the converted non-expert weights and the model I/O
-  cache), and the JIT kernel cache (about 1.3 GB).
+  runtime rebuilds), about 23 GB for the 32k context and 10 GB for each other allocated context (the converted
+  non-expert weights and the model I/O cache), and the JIT kernel cache (about 1.3 GB).
 - Host memory: the first start reads the checkpoint once and converts one MoE layer at a time (about 10 GB of host
   tensors in flight); 64 GB is comfortable.  The optional CPU reference (`tools/run_full_cpu_oracle.py`) needs
   170-240 GB and is not a user step.
@@ -100,14 +99,12 @@ residency budget; `tools/safetensors_metadata.py` lists tensors.
 ## 4. Start the server
 
 First the n-gram table.  Every decode token reads sixteen 320-byte rows of the PLE n-gram table, which stays in the
-checkpoint (104 GB in 33 shards of layer 1) and is read by the host through the page cache; on a cold cache each row
-is an NVMe page-in, so on a host whose RAM holds the table (the QuietBox has 503 GB) read it once before the start:
+checkpoint (104 GB in 33 shards of layer 1) and is read by the host through the page cache, so on a host whose RAM
+holds the table read it once before the start (13 s from a warm cache on the QuietBox; `docs/SERVER.md`):
 
     python_env/bin/python -m models.demos.blackhole.qwen38_flash_next.tools.prewarm_ple_table --checkpoint /data/Qwen3.8-Flash-Next
 
-It prints the residency before and after (`fincore`, util-linux) and the read rate; nothing is written.  On the
-QuietBox the pass over the 104 GB took 13 s from a warm cache (7.8 GB/s); a cold NVMe cache is 35-60 s at 2-3 GB/s.
-`--report-only` only prints the residency.  Then the server:
+Then the server:
 
     tools/run_qwen38_chat_server.sh --profile tt-quietbox \
         --checkpoint /data/Qwen3.8-Flash-Next --cache-root /data/qwen38-cache --acceptance
@@ -120,89 +117,41 @@ commit, whether the tree is modified), the interpreter and the `ttnn` extension,
 the context and the run directory, and starts the server.
 
 **The first start** converts the routed experts of all 49 MoE layers into the BF4 cache
-(`<cache-root>/caches/bf4-experts/`, 107 GB: each layer read from the checkpoint, packed on the host, uploaded to the
-mesh and written back as one tensorbin per weight; a `bf4-stage-backbone-NN` phase per layer in the log), then builds
-the component and model I/O caches of the chosen context (a few minutes), compiles the kernels (the JIT cache fills
-during the warm pass, two to four minutes cold) and captures the decode traces and the prefill chunk trace.  A layer
-takes about 33 s on a 4x p150 host (2.2 GB written; measured 2026-09-05: 25 layers in 812 s; on the QuietBox 2026-09-06:
-49 layers in 1772 s, 35.9-36.9 s each, 100 GB), the 49 under half an hour;
-the payload of every tensorbin is byte for byte the CPU-staged corpus's (`tools/stage_full_bf4_cpu.py`), the manifest records the slot's global shape
-(512 experts) while the mesh tensor presents one device's 128.  A machine that bounds a job's wall time can build the
-expert cache in pieces: `--prepare-only --bf4-stage-limit N` converts at most N missing layers and stops; every layer
-is manifested as it completes (a refused layer publishes nothing), so the next run continues.
-The expert cache is keyed by the checkpoint and by the converter's sources (`ttnn/bf4.py`, the `moe_compute` layout
-packer, tt-metal's BFP4 packer), not by the tt-metal revision: a rebuilt runtime keeps the cache.  Every start re-packs
-one routed expert of the first cached layer from the checkpoint and compares the bytes with the cache (about a second,
-the `bf4-cache-admission` phase); a cache converted by different code is refused, the layer, expert and tensor named.
-A cache built by an earlier runtime, keyed by its tt-metal revision, is adopted on the first start: its manifest is
-rewritten and the slot renamed under the new key, nothing is reconverted.
+(`<cache-root>/caches/bf4-experts/`, 107 GB; a `bf4-stage-backbone-NN` phase per layer in the log), then builds the
+component and model I/O caches of the chosen context (a few minutes), compiles the kernels (two to four minutes
+cold) and captures the decode traces and the prefill chunk trace.  A layer takes about 33 s on a 4x p150 host (on the
+QuietBox 2026-09-06: 49 layers in 1772 s), the 49 under half an hour.  A machine that bounds a job's wall time can
+build the expert cache in pieces: `--prepare-only --bf4-stage-limit N` converts at most N missing layers and stops,
+and the next run continues.  The cache is keyed by the checkpoint and the converter's sources, not by the tt-metal
+revision: a rebuilt runtime keeps it, and every start checks one re-packed expert against it (`docs/SERVER.md`).
+
 **Warm starts** reach `READY` in about five minutes: the weights load, the traces are captured, the acceptance
 prompts (`--acceptance`: the twelve shipped CPU greedy records under `tools/acceptance/greedy-prompts/`) replay
 against the CPU, then the server listens.  `--require-json-96` refuses to serve unless the `json` record matches
-the CPU 96/96 (the other records diverge from the CPU after 6-75 tokens, the known greedy-prompt pattern; their first
-divergence index is in `acceptance.json`).  The records were rendered by the CPU study with the system prompt
-`You are a helpful assistant.`; that system turn is inside their recorded prompt ids, which the replay feeds to the
-device as they are.  The server itself adds no system prompt to a client's request (section 5).
-
-The pinned table (`tools/ci/baselines/A3-chunked-32k-divergence_index.json`), measured 2026-09-06 on 4x p150 with
-the chunked prefill, is the first index where each record leaves the CPU greedy stream; a start whose replay leaves
-earlier is a regression:
-
-| json | chat | code | fact | list | math | multilingual | prose | refactor | sky | story | summary |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| none (96/96) | 43 | 32 | 15 | 56 | 61 | 9 | 13 | 24 | 19 | 6 | 75 |
-
-Before 2026-09-06 the table read chat 8, code 24, list 46, refactor 22 (the other eight as above).  The change is the
-GDN decay gate: the fused `add + softplus` activation the gate used returned exactly 0 wherever its input was below
--5.02 (and was 1.5e-3 off elsewhere); the gate now runs `ttnn.add` then `ttnn.softplus`, which follows the reference
-everywhere (4e-5 absolute).  Against the CPU oracle the device's GDN state error on a decode step fell from 0.29 to
-0.013; with the chunked prefill the device stays on the CPU stream longer on 4 of the 12 prompts and no prompt leaves
-earlier (the teacher-forced table, `A3-forced-32k-divergence_index.json`, moved later on four prompts and earlier on
-three); the cost is one more program per layer, about 0.4 ms per decoded token (50.0 -> 50.4 ms).  The proofs of
-section 9a predate this fix where they quote the old indices.
-
-**Reference corpus.**  `tools/reference/` freezes `Q38-REF-v1`: 36 teacher-forced items (the twelve acceptance
-prompts as their records render them and as the server renders a request today, four requests with tools, the first
-1024 tokens of two books, four evaluation items, two long prompts scored in 32-position windows), about 13k positions,
-with sha256s.  `tools/qwen38_reference_corpus.py hf` runs the Transformers `qwen4_exp` model on the CPU over it (bf16
-weights, fp32 LM head; a transformers checkout with the `qwen4_exp` model class, several hundred GB of RAM, hours) and
-keeps per position the top-32 ids and log-probs and the teacher's log-prob; `oracle` does the same through `tt/` (bf16
-or BF4-emulated experts); `device` converts a served chain's agreement records; `score` compares two columns (top-1 /
-top-5 agreement, clear-margin top-1, truncated KL over the shared top-32 support, first divergence).  The HF column is
-the acceptance reference the other columns are read against.
+the CPU 96/96; the other records diverge from the CPU after 6-75 tokens, the known greedy-prompt pattern, and a start
+whose replay leaves earlier than the pinned table is a regression.  The pinned tables, what they measure and how the
+acceptance mechanism works are in `docs/NUMERICS.md`.
 
 The run directory (`<cache-root>/runs/<stamp>/`) holds `READY`, `phase-markers.jsonl`, `requests.jsonl`,
-`acceptance.json` and, at shutdown, `result.json` and `STOPPED`.  `result.json` and `/health` carry the runtime
-identity: the checkout's commit and tree, the extension's SHA-256, the route the mesh opened in.
+`acceptance.json` and, at shutdown, `result.json` and `STOPPED`.
 
-Options: `--allocated-context 32768|65536|131072|262144` selects the resident build (KV caches, RoPE tables and the
-context limit; the limit is the context minus 64 for the consumed EOS step), `--port`, `--host` (default
-`0.0.0.0`: the QuietBox and LoudBox profiles serve the LAN), `--serve-seconds N` to stop after N seconds,
-`--validate-only` to run the checks and the CPU preparation without opening the mesh (a profile whose route is
-derived at start, the LoudBox, still needs the chips present), `--devices A,B,C,D` to run `bh-loudbox` on four other
-KMD device nodes (four chips of a larger host), `--python` for another interpreter of this checkout.  The launcher
-starts the server with `--sampling` (sampled requests are served; a request naming no sampling field is still the
-bitwise greedy stream, section 5) and `--stall-seconds 300` (the watchdog, section 5); `--no-sampling` serves greedy
-requests only (+0.3 ms per token saved, sampling fields refused with HTTP 400) and `--stall-seconds 0` disables the
-watchdog.
+| launcher flag | meaning |
+|---|---|
+| `--profile tt-quietbox\|bh-loudbox\|qb2` | the hardware profile: the mesh graph descriptor, the device set, the route |
+| `--allocated-context 32768\|65536\|131072\|262144` | the resident build (KV caches, RoPE tables and the context limit; the limit is the context minus 64 for the consumed EOS step); default 32768 |
+| `--acceptance`, `--require-json-96` | replay the twelve CPU greedy records at start; refuse to serve unless `json` matches 96/96 |
+| `--prepare-only --bf4-stage-limit N` | convert at most N missing expert layers into the BF4 cache and stop |
+| `--long-chunks` | 128-row prefill chunks where the prompt allows (section 6); off by default, not combined with `--mtp` |
+| `--mtp 3\|4` | speculative drafting on greedy requests (section 6); off by default |
+| `--port`, `--host` | the listening port; `--host` default `0.0.0.0`: the QuietBox and LoudBox profiles serve the LAN |
+| `--serve-seconds N` | stop after N seconds (a drain: the request in flight gets its reply) |
+| `--sampling` / `--no-sampling` | the launcher passes `--sampling`: sampled requests are served, a request naming no sampling field is still the bitwise greedy stream; `--no-sampling` refuses sampling fields with HTTP 400 (+0.3 ms per token saved) |
+| `--stall-seconds N` | the watchdog on zero device progress, 300 through the launcher; 0 disables it (`docs/SERVER.md`) |
+| `--validate-only` | run the checks and the CPU preparation without opening the mesh (a profile whose route is derived at start, the LoudBox, still needs the chips present) |
+| `--devices A,B,C,D` | run `bh-loudbox` on four other KMD device nodes (four chips of a larger host) |
+| `--python` | another interpreter of this checkout |
 
-What the launcher does not do: no device locks, no runtime archives or digests.  It exports the QuietBox mesh graph
-descriptor for `tt-quietbox` (`tools/qb_p150_x4_1x4_line_mesh_graph_descriptor.textproto`: the four chips' ethernet
-ring opened as one 1x4 line), the device set, the cache and log roots, and `TT_METAL_HOME` = this checkout.
-
-### Runtime admission
-
-`tools/runtime_admission.py` admits the runtime before the mesh opens: the interpreter's `ttnn` package and its
-compiled extension must resolve under this repository (`ttnn` built from this checkout), the checkout's `git`
-head and tree are read, the extension is hashed.  That identity (`{repo, head, tree, dirty, extension,
-extension_sha256}`) becomes the builder provenance (`tt_metal_sha` = the head, `ttnn_runtime_sha256` = the digest),
-the cache namespaces, the `system_fingerprint` of every response and the `runtime` block of `result.json`.  A
-modified tree is admitted and recorded as `dirty`.  A `ttnn` from elsewhere is refused with both paths printed.  The
-CPU preparation (`tools/live_decode_diagnostic.py`) derives the consumer identity from that runtime identity, the
-pinned checkpoint digests and the mesh order; the BF4 experts come from the production cache described above, or,
-with `--bf4-corpus DIR --bf4-corpus-verification FILE`, from a corpus staged on the CPU by
-`tools/stage_full_bf4_cpu.py` and verified by `tools/verify_full_bf4_cpu.py` (`diagnostic_bf4.py` binds it; the
-producer identity is what the verification record claims, `--bf4-producer-identity` pins it).
+What the launcher exports, how the runtime is admitted and what `result.json` and `/health` record: `docs/SERVER.md`.
 
 ## 5. Talk to it
 
@@ -215,70 +164,30 @@ OpenAI-compatible HTTP on the port you chose:
       "messages": [{"role": "user", "content": "Why does ice float?"}],
       "max_tokens": 256, "stream": true}'
 
-`POST /v1/chat/completions` (streaming or one document), `GET /v1/models`, `GET /health` (context limit, sampling
-mode, free DRAM after the captures, the runtime identity).  Requests: `messages`, `max_tokens` or
-`max_completion_tokens` (default and limit: the remaining context, the context limit less the prompt), `stream`,
-`stop`, `tools` / `tool_choice` (OpenAI shape; `tool_calls` finish reason), `enable_thinking` (default true;
-reasoning streams as `reasoning_content`), `reasoning_effort`, `thinking_budget`, `ignore_eos`, `seed`,
-`temperature` / `top_p` / `top_k` / `min_p` / `presence_penalty` / `frequency_penalty` / `repetition_penalty` /
-`logprobs`.  Sampling: a request that names none of the sampling fields is greedy, the argmax stream bitwise equal to
-the greedy loop the acceptance replay and the evaluations measure, on the launcher's `--sampling` server too
-(`qwen38.decode_loop` is `greedy` in the response and the ledger; `temperature 0` and `greedy: true` are the same
-path); `temperature > 0` samples with it (`top_p` 1.0, `top_k` 20, no penalties unless given); another sampling
-field alone (`top_p`, `top_k`, `min_p`, a penalty, `seed`) samples with the model card's profile for the thinking
-mode (`/health.sampling_defaults`), so `seed` alone is a reproducible sampled stream.  A `--no-sampling` server
-refuses every sampling field with HTTP 400 unless `temperature` is 0.  `chat_template_kwargs` (`enable_thinking`,
-`reasoning_effort`, the vLLM spelling) means the same as the top-level fields; JSON `null` is an absent field.  What
-the server cannot honour is refused with HTTP 400 rather than dropped: `response_format` other than `text`,
-`logit_bias`, `parallel_tool_calls: false`; unknown fields are logged.  Tool-call arguments are typed by the tool's
-parameter schema (a `string` parameter is returned as text whatever it looks like).  `logprobs` are relative to the
-read candidate row, not the vocabulary (`logprobs_normalizer` in `/health` and `qwen38.sampling`).  One request
-decodes at a time; up to four wait in the queue (`queue_wait_seconds` in `usage`), the fifth gets HTTP 503.  A prompt
-over the context limit gets HTTP 400 `context_length_exceeded`.
-
-The prompt is the client's messages, exactly: the server adds no system prompt when the request carries none
-(`/health.defaults.system_prompt` is null), and the device prompt of every request is the reference render
-(`tokenizer.apply_chat_template` on the request), so `usage.prompt_tokens` is the count the client computes itself.
-A follow-up turn holds the served reply as the template re-renders it from the client's echo (its content and tool
-calls, an empty think block); reasoning never re-enters the device context (`qwen38.served_reasoning_tokens` is
-always 0).  The device keeps its committed prefix when the render extends it and prefills only the new turn
-(`qwen38.reset` false, `prefix_reused` the reused count): with thinking off, the template renders the past reply as
-the generation prompt plus its text, so a conversation continues at the cost of the new turn.  With thinking on, the
-template renders the past turn's think block empty (`<think>\n\n</think>`), which the tokenizer merges differently
-from the `<think>\n` the model generated after, so the render never extends the committed ids; the server then
-restores the prompt-end snapshot instead (`qwen38.prefix_restored` true, `prefix_reused` = the prompt length less
-one): before the last prompt token of every request the chain copies the recurrent part of the device state (GDN
-states and ring slots, PLE slots, QSA staging and raw-key rings, ~53 MB per device; the KV and compressed caches are
-positional and rewritten by the tail) into a resident snapshot, and a follow-up whose render extends those ids
-copies it back and prefills only the rendered tail (the re-rendered reply and the new turn) from that position.  An
-exact repeat of a prompt restores the same way.  A history that diverges earlier (an edited turn) still resets and
-prefills the whole conversation (3.3 ms per token of history, `qwen38.reset` true).
-
-A client that hangs up is noticed at the next device step (or prefill event) whether or not anything was being
-streamed to it, and a queued request whose client left gives up its place: the device never runs a request for
-nobody.  A streaming request gets its head and role chunk as soon as it is admitted and an SSE comment
-(`: keepalive`) every `--heartbeat-seconds` (30 s) through the queue wait and the prefill, so a 60 s proxy or SDK
-read timeout does not cut a long prompt.  A socket write blocked for `--socket-timeout-seconds` (60 s: a reader that
-stopped reading) ends the request as `disconnected`.  `--request-deadline-seconds` (off by default) is honoured
-inside the chunked prefill too.  `/health.current_request` shows the request holding the device with the seconds
-since its last completed step.
-
-The stall watchdog (`--stall-seconds`, 300 through the launchers) fires only on zero progress.  Its clock belongs to
-the request holding the device: it starts when the request is admitted from the queue and restarts at every
-completed device step: every decode step (50 ms), every teacher-forced prefill event (16 forced tokens, under a
-second) and every chunk-prefill event sync (4 chunks, about 0.4 s; 1.3 s with `--long-chunks`), so a 200k-token
-prefill restarts it several times a second and a long answer every token; it is not measured while no request holds
-the device or while requests only wait in the queue.  A request whose device call has not returned for that long is
-a wedge: the server logs `stalled`, ends with exit status 1 without releasing the chain, and a supervisor restarts
-it (the launcher exits with the server's status).  The value must exceed `--socket-timeout-seconds` (a client write
-blocked for that long is not a device step); `--stall-seconds 0` on the launcher disables the watchdog.  The stop
-signal (`--serve-seconds`, SIGTERM) drains: the request in flight ends at its next step with `qwen38.finish`
-`shutdown` and gets its reply, queued and new requests get 503, then the chain is released.  `HEAD` and `OPTIONS` are
-served (no CORS headers); a body needs `Content-Length`.
-
 The command-line client:
 
     python_env/bin/python -m models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_cli --url http://<host>:8000/v1 --thinking --tools
+
+`POST /v1/chat/completions` (streaming or one document), `GET /v1/models`, `GET /health`.  The request rules in short
+(`docs/SERVER.md` has them in full):
+
+| request | rule |
+|---|---|
+| `messages` | the prompt, exactly: the server adds no system prompt, and the device prompt is the reference render (`tokenizer.apply_chat_template`), so `usage.prompt_tokens` is the count the client computes itself |
+| `max_tokens` / `max_completion_tokens` | default and limit: the remaining context (the context limit less the prompt); a prompt over the limit gets HTTP 400 `context_length_exceeded` |
+| `stream`, `stop`, `ignore_eos`, `seed`, `logprobs` | as in OpenAI; `logprobs` are relative to the read candidate row, not the vocabulary |
+| `tools` / `tool_choice` | OpenAI shape, `tool_calls` finish reason; arguments are typed by the tool's parameter schema |
+| `enable_thinking` (default true), `reasoning_effort`, `thinking_budget` | reasoning streams as `reasoning_content`; `chat_template_kwargs` means the same as the top-level fields |
+| no sampling field | greedy: the argmax stream, bitwise equal to the greedy loop the acceptance replay measures (`temperature 0` and `greedy: true` are the same path) |
+| `temperature > 0` | samples with it (`top_p` 1.0, `top_k` 20, no penalties unless given) |
+| another sampling field alone (`top_p`, `top_k`, `min_p`, a penalty, `seed`) | samples with the model card's profile for the thinking mode (`/health.sampling_defaults`); `seed` alone is a reproducible sampled stream |
+| `response_format` other than `text`, `logit_bias`, `parallel_tool_calls: false` | refused with HTTP 400 rather than dropped; unknown fields are logged |
+| follow-up turns | the device keeps its committed prefix and prefills only the new turn; with thinking on it restores the prompt-end snapshot instead (`docs/SERVER.md`) |
+| concurrency | one request decodes at a time; up to four wait in the queue (`queue_wait_seconds` in `usage`), the fifth gets HTTP 503 |
+
+A client that hangs up is noticed at the next device step; a streaming request gets an SSE keepalive every 30 s
+through the queue wait and the prefill; the stop signal (`--serve-seconds`, SIGTERM) drains.  The full serving
+contract (hang-ups, stalled readers, deadlines, the stall watchdog, `/health` fields) is in `docs/SERVER.md`.
 
 ## 6. Long context and MTP
 
@@ -291,19 +200,12 @@ The command-line client:
   all 48 layers); off by default and not combined with `--mtp`, whose chain prefills in 32-row chunks.
 - MTP drafting (`--mtp 3|4`, 31-37 tokens/s on 4x p150) is off by default; greedy requests in the chunked prefill
   mode draft K tokens per pass with exact acceptance.  The MTP path is not bitwise with plain decode on 4 of the 12
-  acceptance prompts (measured 2026-09-06 with the GDN gate fix of section 4; the verify rows and the 1-row loop
-  round differently): the committed stream leaves the CPU reference on `chat` at token 56 where plain decode leaves
-  at 43, on `list` at 46 against 56, on `math` at 56 against 61 and on `summary` at 1 against 75 (`In 1947,` becomes
-  `Invented at Bell Labs in`); the other eight records leave the reference at the plain-decode token (`json` 96/96,
-  `code` and `refactor` bitwise the plain streams), and every gate passes.  At each of the three earlier tokens the
-  device's own 1-row logits hold the CPU's token and the MTP token within one bf16 step (an exact tie on `summary` and
-  `list`, which the 1-row loop breaks toward the lower id), the verify row lands one step the other way, and the CPU
-  oracle rates the two 0.4-1.0 logits apart: near-ties, not a defect (the rows-path gate is the 1-row gate bitwise on
-  the same row; the pinned MTP table is `tools/ci/baselines/A3-mtp4-32k-divergence_index.json`).  Before the gate
-  fix the two paths differed on `code` (44 against 24) and `fact` (16 against 15) only.  `--mtp-gdn-anchor layer0`
-  (server flag) re-anchors the
-  layer-0 GDN state from the 1-row recurrence.  MTP does not fit at 256k (94 MB free per bank against the 128 MiB
-  contiguous it needs); 32k, 64k and 128k fit.
+  acceptance prompts (measured 2026-09-06): the committed stream leaves the CPU reference at a different token on
+  `chat`, `list`, `math` and `summary`, at the plain-decode token on the other eight (`json` 96/96), and every gate
+  passes; the three earlier tokens are near-ties within one bf16 step, not a defect (`docs/NUMERICS.md` has the
+  indices and the pinned table).  `--mtp-gdn-anchor layer0` (server flag) re-anchors the layer-0 GDN state from the
+  1-row recurrence.  MTP does not fit at 256k (94 MB free per bank against the 128 MiB contiguous it needs); 32k, 64k
+  and 128k fit.
 
 ## 7. QuietBox 2 (untested)
 
@@ -340,57 +242,24 @@ route is derived from the cluster descriptor at start and recorded.  Nothing her
                                                    a BF4 expert corpus staged on the CPU (produce, verify, bind, probe)
     tools/prewarm_ple_table.py verify_checkpoint_files.py checkpoint_budget.py safetensors_metadata.py
     tools/qb_mesh_smoke.py                         open the mesh and check the route without the model
-    tools/ci/q38_ci.py                             the regression harness: pins.json, baselines/, job runner, verdicts, seeding (8a)
+    tools/ci/q38_ci.py                             the regression harness: pins.json, baselines/, job runner, verdicts, seeding
     tests/                                         no-device tests (set QWEN38_CHECKPOINT for the checkpoint-reading ones)
+    docs/                                          PROOFS, NUMERICS, SERVER, TESTING (the "More" section below)
 
-Run the tests from the repository root:
+Run the tests from the repository root (`docs/TESTING.md` has the regression harness and the reference corpus):
 
     QWEN38_CHECKPOINT=/data/Qwen3.8-Flash-Next python_env/bin/python -m pytest models/demos/blackhole/qwen38_flash_next/tests
-
-### 8a. The regression harness (development)
-
-`tools/ci/q38_ci.py` (standard library only) turns the numbers the tools already produce into gated verdicts.
-`tools/ci/pins.json` names every gated value as `<job>/<configuration>/<metric>` with a rule and a status:
-
-- rules: `band` (a symmetric relative band, two-sided as in tt-metal's model targets: a result better than the band
-  is a stale target), `floor` (target minus slack), `ceiling` (target times 1 + tolerance, with a warning level),
-  `not_earlier` (divergence indices; null is the largest), `exact`, `at_most`, `flips` (per-item eval answers: items
-  the baseline passes and the run fails, at most N per task);
-- status `todo` warns only, `active` gates; a pin with `baseline: true` compares a per-key map (per prompt, item or
-  task) against `tools/ci/baselines/<pin id with - for />.json`;
-- jobs: `A1` corpus agreement against the HF reference (the scorer's `score.json`), `A2` the CPU oracle against HF,
-  `A3` the startup acceptance replay plus the runner's probes (the verbatim echo of a sentence at temperature 0,
-  N short completions that must all finish, one-token replies at several prompt lengths for TTFT), `D1` perf (the
-  timing runner's period, the ledger's prefill and decode rates, TTFT, startup, captures, program cache, DRAM
-  headroom), `C1`/`C2` lm-eval per-item answers and accuracies. Device-timed pins are `not_gated` when the 1-minute
-  load average is above `idle_loadavg_1min`, or use their `loaded_tolerance`.
-
-A job list (`qwen38-ci-jobs/v1`) names the commands to run on one lane: a `command` job runs to completion, a
-`server` job starts a launcher, waits for its `READY` marker, probes the server over HTTP and sends the server pid
-SIGTERM; each job then collects its artifacts (globs over the launchers' evidence directories, `$Q38_CI_RUN_DIR`
-for an earlier job's files) and validates them. One result file per job (`qwen38-ci-result/v1`: host, lane, head,
-runtime identity, load average, item ids, every observed value, one verdict per pin with observed and expected
-side by side) lands under `<out>/<date>/<stamp>-<lane>-<head12>/<job>/`, with `summary.json`, `summary.txt` and
-`progress.log` beside them.
-
-    python -m models.demos.blackhole.qwen38_flash_next.tools.ci.q38_ci run --jobs JOBS.json --out RESULTS
-    python -m models.demos.blackhole.qwen38_flash_next.tools.ci.q38_ci report --run RESULTS/<date>/<run>
-    python -m models.demos.blackhole.qwen38_flash_next.tools.ci.q38_ci seed --runs RESULTS/<date>/<run>... --write
-
-`seed` promotes `todo` pins whose last three idle runs agree within the pin's tolerance: the target becomes the
-median (`band`, `ceiling`), the minimum or the preset proposal (`floor`) or the common value, the run ids are
-recorded on the pin, and baseline-backed pins get their baseline file written. Until then the committed targets
-are proposals from the runs named in each pin's `note` and the baselines' `source`; only the rules that already
-gate today are `active` (the json record's 96/96 replay, the echo, request completion, a program-cache delta of 0).
 
 ## 9. What is verified, and the known limits
 
 - `tt-quietbox`: a QuietBox (4x p150c, fw 19.4.1.0) served the model on 2026-09-04 from a pinned build: startup
-  acceptance 96/96 against the CPU, 19.6 tokens/s at 32k.  The launcher and profile are the ones here; section 9a
-  is the same box served from a fresh clone of this repository.
-- The checkout build and `bh-loudbox`: section 9a records the fresh-clone proof of this release (built with
-  `build_metal.sh` + `create_venv.sh`, the checkpoint by digest, the first-start expert conversion, the acceptance
-  replay) and the hardware it ran on.
+  acceptance 96/96 against the CPU, 19.6 tokens/s at 32k.  The launcher and profile are the ones here; on 2026-09-06
+  the same box served the model from a fresh clone of this repository (`docs/PROOFS.md`: build, checkpoint by digest,
+  the first-start expert conversion, the acceptance replay, then `--mtp 4`, `--long-chunks` and the 64k context).
+- The checkout build and `bh-loudbox`: `docs/PROOFS.md` records the fresh-clone proof (the build, the checkpoint by
+  digest, the first-start expert conversion, the acceptance replay) and the hardware it ran on.
+- Numerics, 2026-09-06 on 4x p150: `json` 96/96 against the CPU, the other eleven records leave the CPU greedy stream
+  between token 6 and 75 (`docs/NUMERICS.md`); MTP is not bitwise with plain decode on 4 of 12 prompts (near-ties).
 - `qb2`: designed, never run.
 - 256k context is single-user; MTP is not available at 256k.
 - One request decodes at a time (the traced chain is single-stream); the queue holds four more.
@@ -398,49 +267,13 @@ gate today are `active` (the json record's 96/96 replay, the echo, request compl
   --bf4-stage-limit N` runs first.
 - Python 3.10 (`create_venv.sh` default); Linux x86_64.
 
-### 9a. Release proof
+## More
 
-The QuietBox (`tt-quietbox`: 4x p150c, which `tt-smi` reports as p150b; firmware bundle 19.4.1.0, tt-kmd 2.6.0-rc1, 32 cores, 503 GB RAM, Ubuntu
-22.04, clang-20, Python 3.10.19 through `uv`) served the model on 2026-09-06 from a fresh clone of the public repository
-at `cadebdff7c1c`, following sections 2-5 as written (the deviations found on the way are folded into the text above):
-
-- clone 53 s, the three submodules 15 s, `build_metal.sh` 684 s with its defaults, `create_venv.sh` 95 s; the
-  runtime identity of every run: head `cadebdff7c1c`, tree `dd25966f522c`, clean, extension
-  `f3d1fb4c3ab4...`.
-- the checkpoint copy already on the host: `download_checkpoint.py --verify-only` verified 142 of the 145 listed files
-  in 13 s (LICENSE differed, `.gitattributes` and `configuration.json` were absent), the plain run fetched those three in
-  17 s (145/145); `verify_checkpoint_files.py`: 131/131 shards, 360,000,192,888 bytes, every SHA-256 equal to the
-  ModelScope listing (176 s, 4 workers).
-- `prewarm_ple_table.py`: the 104,298,732,704 B of the n-gram table in 13.4 s (already resident), 33/33 files resident.
-- the first start (`--profile tt-quietbox --acceptance --require-json-96`, 32k): mesh open 9.6 s; the 49 BF4 layers
-  1772.5 s (35.9-36.9 s each, 100 GB written); target build 41.4 s; warm pass with a cold JIT cache 150.2 s; captures
-  5.1 s and the chunk capture 1.7 s; acceptance replay 59.2 s; `READY` 2096.6 s after the mesh open (launched
-  17:19:30Z, `READY` 17:54:33Z); 474,261,568 bytes free per bank after the captures.
-- acceptance: `json` 96/96 (the gate passed); the other eleven records leave the CPU stream at the same indices as the
-  4x p150 hosts did (chat 8, code 24, fact 15, list 46, math 61, multilingual 9, prose 13, refactor 22, sky 19, story
-  6, summary 75: the table before the GDN gate fix of 2026-09-06, section 4 has the current one); 19.4-19.6 tokens/s
-  in the replays.
-- requests over the LAN: a 36-token answer at 19.1 tokens/s (first token 0.30 s after a 33-token prompt), a 128-token
-  generation at 19.6 tokens/s (first token 0.39 s, 47-token prompt in 2 chunks); the CLI's question answered.  SIGTERM
-  stopped it cleanly (`result.json` status `stopped`, mesh closed, launcher exit 0).
-- the same launcher line with `--mtp 4` (warm caches; the MTP kernels compiled on this start): `READY` 225 s after the
-  launch (MTP warm pass 40 s, acceptance replay 48 s); `json` 96/96 through MTP at 55.0 tokens/s (4.8 tokens per
-  pass), the split hand-off gate passed in both orders; `code` left the CPU stream at 44 and `fact` at 16, the other
-  nine records at the plain-decode indices of that day (before the GDN gate fix of 2026-09-06; section 6 has the
-  current MTP indices); 375,594,496 bytes free per bank (98.7 MB less than without MTP).
-  Requests: the `json` prompt as a chat request reproduced the CPU record's 96 tokens at 55.2 tokens/s; a 6942-token
-  prompt prefilled in 23.4 s (3.37 ms per prompt token, 217 chunks of 32 rows) then decoded at 31.3 tokens/s (3.0 per
-  pass), its follow-up turn reused the 6980 committed tokens (first token 1.6 s, 43.1 tokens/s); a 128-token generation
-  36.7 tokens/s (27.0 ms per token); a 220-token prose answer 31.0 tokens/s (2.6 per pass).
-- the same line with `--long-chunks` (warm caches; the 128-row chunk kernels compiled on this start): `READY` 214 s
-  after the launch; acceptance identical to the plain start (`json` 96/96, the same eleven divergence indices, 19.4-19.6
-  tokens/s); 439,384,896 bytes free per bank (34.9 MB less than without).  The 6942-token prompt prefilled in 18.8 s =
-  2.71 ms per prompt token (first token 18.9 s; 3.37 with 32-row chunks on the MTP start above), hand-off 805 ms, the
-  same answer; decode 50.6 ms per token (19.6 tokens/s on a 128-token generation).  The `json` chat request again
-  reproduced the CPU record's 96 tokens.
-- `--allocated-context 65536` (the 64k component and model I/O caches built on this start, 9.8 GB): `READY` 220 s after
-  the launch (target build 41 s, warm pass 13.5 s, acceptance replay 60 s); `json` 96/96, the same divergence indices;
-  `/health` `context_limit` 65472; 419,440,704 bytes free per bank.  Left serving the LAN on port 8000
-  (`--serve-seconds 86400`); a client on the LAN got its first token 0.30 s after a 33-token prompt.
-- Every start above was stopped with SIGTERM between runs and closed its mesh (`result.json` status `stopped`,
-  launcher exit 0); no board needed a reset.
+- `docs/PROOFS.md`: the fresh-clone release proof of 2026-09-06 on the QuietBox (build, checkpoint, first start,
+  acceptance, `--mtp 4`, `--long-chunks`, 64k), with its run logs.
+- `docs/NUMERICS.md`: the acceptance mechanism, the pinned divergence tables (plain, `--long-chunks`, MTP,
+  teacher-forced), the GDN gate fix of 2026-09-06, what "bitwise" means here, the reference columns.
+- `docs/SERVER.md`: the request rules in full, sampling, thinking, the prompt-end snapshot, the stall watchdog,
+  `/health`, runtime admission, the BF4 cache identity, the n-gram table pre-warm, disk and memory.
+- `docs/TESTING.md`: the no-device tests, the reference corpus Q38-REF-v1 and its scorer, the regression harness
+  (`tools/ci/q38_ci.py`), how to run the acceptance gate.
