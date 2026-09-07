@@ -73,7 +73,8 @@ took 684 s and `create_venv.sh` 95 s, measured 2026-09-06):
     ./create_venv.sh
 
 `build_metal.sh` takes its defaults (Release, clang-20 with libstdc++; `--toolchain-path cmake/x86_64-linux-gcc-12-toolchain.cmake`
-for gcc); `create_venv.sh` makes `python_env/` with torch and installs `ttnn` from this tree in editable mode, so
+for gcc); `create_venv.sh` makes `python_env/` with torch and installs `ttnn` from this tree in editable mode (on a later
+update it asks before reusing an existing `python_env/`; answer `y`), so
 `python_env/bin/python -c 'import ttnn'` resolves inside the checkout.  The launcher below uses that interpreter and
 sets `TT_METAL_HOME` to the checkout itself; nothing needs to be exported by hand.
 
@@ -106,10 +107,10 @@ holds the table read it once before the start (13 s from a warm cache on the Qui
 
 Then the server:
 
-    tools/run_qwen38_chat_server.sh --profile tt-quietbox \
+    models/demos/blackhole/qwen38_flash_next/tools/run_qwen38_chat_server.sh --profile tt-quietbox \
         --checkpoint /data/Qwen3.8-Flash-Next --cache-root /data/qwen38-cache --acceptance
 
-    tools/run_qwen38_chat_server.sh --profile bh-loudbox \
+    models/demos/blackhole/qwen38_flash_next/tools/run_qwen38_chat_server.sh --profile bh-loudbox \
         --checkpoint /data/Qwen3.8-Flash-Next --cache-root /data/qwen38-cache --acceptance
 
 (`tools/` is `models/demos/blackhole/qwen38_flash_next/tools/`.)  The launcher prints the checkout it runs from (its
@@ -212,7 +213,7 @@ contract (hang-ups, stalled readers, deadlines, the stall watchdog, `/health` fi
 A p300 card is two Blackhole dies joined on the card; a QuietBox 2 (2x p300c) has four dies in one ring (the two
 on-card links and the two Warp400 links), so it is one 1x4 instance:
 
-    tools/run_qwen38_chat_server.sh --profile qb2 --checkpoint ... --cache-root ...
+    models/demos/blackhole/qwen38_flash_next/tools/run_qwen38_chat_server.sh --profile qb2 --checkpoint ... --cache-root ...
 
 The profile exports `tools/qb2_p300_1x4_line_mesh_graph_descriptor.textproto` (a 1x4 LINE over three of the four ring
 links, two channels per link as in tt-metal's `p300_x2` descriptor); tt-metal classifies a p300 cluster that is not
