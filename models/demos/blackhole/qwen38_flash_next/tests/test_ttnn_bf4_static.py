@@ -1448,5 +1448,79 @@ class TTNNBF4StaticTest(unittest.TestCase):
         self.assertIsNone(streamer._active)
 
 
+class _FakeCore:
+    __slots__ = ("x", "y")
+
+    def __init__(self, x: int, y: int) -> None:
+        self.x = x
+        self.y = y
+
+
+class _RingMeshDevice(_FakeMeshDevice):
+    """A four-die Blackhole mesh whose per-die bank-to-worker assignment is scripted."""
+
+    def __init__(self, per_die_signatures):
+        self._per_die = tuple(per_die_signatures)
+
+    @staticmethod
+    def arch():
+        import ttnn
+
+        return ttnn.Arch.BLACKHOLE
+
+    def assignment(self, coordinate):
+        _, column = tuple(coordinate)
+        return [_FakeCore(x, y) for x, y in self._per_die[column]]
+
+
+# Observed on a QuietBox 2: three p300c dies service their banks from worker column 6,
+# the fourth from column 5.  The derived ring order is identical on all four, because
+# the sort is by (y, x) descending and 5 and 6 order the same way against 0.
+QB2_COLUMN_6 = ((0, 9), (0, 0), (0, 7), (0, 3), (6, 9), (6, 1), (6, 6), (6, 4))
+QB2_COLUMN_5 = ((0, 9), (0, 0), (0, 7), (0, 3), (5, 9), (5, 1), (5, 6), (5, 4))
+
+
+class BF4LiveRingQualificationTest(unittest.TestCase):
+    def _qualify(self, per_die_signatures):
+        mesh = _RingMeshDevice(per_die_signatures)
+        with mock.patch.object(
+            bf4_module.ttnn.device,
+            "get_optimal_dram_bank_to_logical_worker_assignment_at_mesh_coordinate",
+            side_effect=lambda device, noc, coordinate: mesh.assignment(coordinate),
+        ):
+            return bf4_module.qualify_live_bf4_ring(mesh)
+
+    def test_derived_ring_order_matches_the_packing_sort(self):
+        # bank ids in ring position order: sorted by (y, x) descending.
+        self.assertEqual(bf4_module._derived_ring_order(QB2_COLUMN_6), (4, 0, 2, 6, 7, 3, 5, 1))
+        self.assertEqual(bf4_module._derived_ring_order(QB2_COLUMN_5), (4, 0, 2, 6, 7, 3, 5, 1))
+
+    def test_uniform_ring_is_accepted(self):
+        signature = self._qualify([QB2_COLUMN_6] * 4)
+        self.assertEqual(signature, QB2_COLUMN_6)
+
+    def test_mixed_harvesting_with_one_derived_order_is_accepted(self):
+        """The real QuietBox 2 case: differing worker columns, identical ring order."""
+
+        signature = self._qualify([QB2_COLUMN_6, QB2_COLUMN_5, QB2_COLUMN_6, QB2_COLUMN_6])
+        self.assertEqual(signature, QB2_COLUMN_6)
+
+    def test_mixed_derived_ring_order_is_rejected(self):
+        # Swap two banks' cores on one die: same coordinates as a set, different ring order.
+        reordered = list(QB2_COLUMN_6)
+        reordered[0], reordered[1] = reordered[1], reordered[0]
+        with self.assertRaisesRegex(RuntimeError, "mixed Blackhole DRAM ring orders"):
+            self._qualify([QB2_COLUMN_6, tuple(reordered), QB2_COLUMN_6, QB2_COLUMN_6])
+
+    def test_mixed_ring_size_is_rejected(self):
+        seven = QB2_COLUMN_6[:7]
+        with self.assertRaisesRegex(RuntimeError, "mixed Blackhole DRAM ring sizes"):
+            self._qualify([QB2_COLUMN_6, seven, QB2_COLUMN_6, QB2_COLUMN_6])
+
+    def test_unsupported_ring_size_is_still_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "unsupported DRAM worker order"):
+            self._qualify([QB2_COLUMN_6[:5]] * 4)
+
+
 if __name__ == "__main__":
     unittest.main()

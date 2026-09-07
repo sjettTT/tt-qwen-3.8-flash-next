@@ -347,14 +347,42 @@ def _core_xy(core) -> tuple[int, int]:
     return int(core.x), int(core.y)
 
 
+def _derived_ring_order(signature: tuple[tuple[int, int], ...]) -> tuple[int, ...]:
+    """The DRAM bank ids in ring position order, as the weight packing sees them.
+
+    ``get_weight_core_shard_maps`` (ttnn/_experimental/moe_compute_utils.py) sorts
+    the bank-to-worker assignment by logical core ``(y, x)`` descending and maps
+    each sorted position back to its DRAM bank id; the packed shards are laid out
+    against *that* ordering.  Mirrored here so the cache guard tests exactly what
+    the packing consumes.  Keep the sort key in step with that function.
+    """
+
+    core_to_bank = {core: bank for bank, core in enumerate(signature)}
+    ordered = sorted(signature, key=lambda core: (core[1], core[0]), reverse=True)
+    return tuple(core_to_bank[core] for core in ordered)
+
+
 def qualify_live_bf4_ring(mesh_device) -> tuple[tuple[int, int], ...]:
-    """Require identical live DRAM-bank worker ordering on all four devices.
+    """Require a cache-compatible live DRAM ring on all four devices.
 
     The public mesh-level query returns the first device's assignment.  That is
     insufficient for a cache whose packing and DRAM shard placement must match
     every physical card, so this guard deliberately queries each device object.
     The returned tuple is ordered by DRAM bank id and is suitable for inclusion
     in :class:`BF4CacheIdentity`.
+
+    Cards on one box may be harvested differently, so the *logical core* that
+    services a given DRAM bank can differ between dies of the same mesh (a
+    QuietBox 2 was observed with one p300c die servicing its banks from worker
+    column 5 while the other three used column 6).  That difference alone does
+    not make the cache invalid: the packed weights are laid out against the
+    derived ring order -- the bank ids in ring position order, see
+    :func:`_derived_ring_order` -- and ttnn maps each ring position onto that
+    die's own worker core when the tensor is placed.  So the compatibility test
+    is the derived ring order and the ring size, not the raw coordinates.
+
+    A mesh whose dies disagree on either is still rejected: the shard a bank
+    receives would then differ per die, which the packed bytes cannot express.
     """
 
     physical_ids = tuple(int(item) for item in mesh_device.get_device_ids())
@@ -380,9 +408,19 @@ def qualify_live_bf4_ring(mesh_device) -> tuple[tuple[int, int], ...]:
             raise RuntimeError(f"physical device {physical_ids[index]} has unsupported DRAM worker order {signature}")
         signatures.append(signature)
 
-    if len(set(signatures)) != 1:
-        details = {physical_ids[index]: signature for index, signature in enumerate(signatures)}
-        raise RuntimeError(f"mixed Blackhole DRAM ring layouts are not cache-compatible: {details}")
+    ring_sizes = {len(signature) for signature in signatures}
+    if len(ring_sizes) != 1:
+        details = {physical_ids[index]: len(signature) for index, signature in enumerate(signatures)}
+        raise RuntimeError(f"mixed Blackhole DRAM ring sizes are not cache-compatible: {details}")
+
+    ring_orders = {_derived_ring_order(signature) for signature in signatures}
+    if len(ring_orders) != 1:
+        details = {
+            physical_ids[index]: (signature, _derived_ring_order(signature))
+            for index, signature in enumerate(signatures)
+        }
+        raise RuntimeError(f"mixed Blackhole DRAM ring orders are not cache-compatible: {details}")
+
     return signatures[0]
 
 
