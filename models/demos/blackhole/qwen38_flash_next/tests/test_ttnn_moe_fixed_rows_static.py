@@ -533,8 +533,8 @@ def test_five_row_forward_validates_reduce_scatter_shape_and_topology() -> None:
     # The five-row verifier hands the gathered width-sharded hidden to the
     # router and shared-expert linears exactly like the one-row decode path.
     to_memory_config.assert_not_called()
-    module._route.assert_called_once_with(full_hidden, phase_observer=mock.ANY)
-    module._shared_partial.assert_called_once_with(hidden_sharded, full_hidden)
+    module._route.assert_called_once_with(full_hidden, hidden_tiles=None, phase_observer=mock.ANY)
+    module._shared_partial.assert_called_once_with(hidden_sharded, full_hidden, None)
     tt_all_reduce.assert_called_once_with(
         local_sum,
         module.mesh_device,
@@ -788,7 +788,9 @@ def _production_ttnn_calls(function) -> list[str]:
     """ttnn calls on the one-row production path, in source order.
 
     Skips the multi-row reshapes (``if self.rows != 1:``), the long chunk's per-tile concats
-    (``if self.row_contract.row_tiles != 1:``) and deallocations.
+    (``if self.row_contract.row_tiles != 1:``), the per-tile routed stream's routing tiles
+    (``if self.routed_calls != 1:``), the long chunk's own arms (``if self.rows == LONG_PREFILL_CHUNK_ROWS:``)
+    and deallocations.
     """
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
@@ -797,6 +799,8 @@ def _production_ttnn_calls(function) -> list[str]:
         if isinstance(node, ast.If) and ast.unparse(node.test) in (
             "self.rows != 1",
             "self.row_contract.row_tiles != 1",
+            "self.routed_calls != 1",
+            "self.rows == LONG_PREFILL_CHUNK_ROWS",
         ):
             skipped.update(id(child) for statement in node.body for child in ast.walk(statement))
     calls: list[tuple[int, int, str]] = []

@@ -1694,12 +1694,14 @@ class Qwen38TTNNGDN:
         ``_recurrent_decode`` does it (rms_norm with eps / head_dim, then head_dim ** -0.5): a copied head
         normalizes to the same bits, so the kernel reads what the 1-row path's repeat_interleave would
         have given it.  beta and the log decay use the 1-row arithmetic.  The row masks zero rows >= R
-        (x * 1.0 and x * 0.0 are exact) and are the ops that land in the persistent buffers.
+        (x * 1.0 and x * 0.0 are exact) and are the ops that land in the persistent buffers; the long chunk
+        has no padding rows (every mask is all ones), so its producing ops land in the buffers themselves.
         """
 
         l1 = ttnn.L1_MEMORY_CONFIG
         constants = rows_state.constants
         tile_rows = constants.tile_rows
+        full_rows = constants.rows == tile_rows == LONG_CHUNK_ROWS
         q_slice = ttnn.slice(conv, (0, 0, 0, 0), (1, 1, tile_rows, QK_WIDTH_PER_DEVICE), memory_config=l1)
         k_slice = ttnn.slice(
             conv, (0, 0, 0, QK_WIDTH_PER_DEVICE), (1, 1, tile_rows, 2 * QK_WIDTH_PER_DEVICE), memory_config=l1
@@ -1722,11 +1724,15 @@ class Qwen38TTNNGDN:
             _deallocate(expanded)
             normed = ttnn.rms_norm(heads_tensor, epsilon=QK_L2_NORM_EPS / HEAD_DIM)
             _deallocate(heads_tensor)
-            unit = ttnn.multiply(normed, HEAD_DIM**-0.5, memory_config=l1)
+            if full_rows:
+                landed = ttnn.multiply(normed, HEAD_DIM**-0.5, output_tensor=target)
+                _require_landed(landed, target, label=f"GDN rows {name}")
+            else:
+                unit = ttnn.multiply(normed, HEAD_DIM**-0.5, memory_config=l1)
+                landed = ttnn.multiply(unit, constants.row_mask_bf16, output_tensor=target)
+                _require_landed(landed, target, label=f"GDN rows {name}")
+                _deallocate(unit)
             _deallocate(normed)
-            landed = ttnn.multiply(unit, constants.row_mask_bf16, output_tensor=target)
-            _require_landed(landed, target, label=f"GDN rows {name}")
-            _deallocate(unit)
         # v stays token-major flat [1, 1, T, 1536]: the composite's flat-v form (no head split, no fill, no
         # transpose; the prep reader addresses head h's tiles at columns 128h.. of the same tile row).
         landed = ttnn.multiply(v_slice, constants.row_mask_bf16_col, output_tensor=rows_state.v)
@@ -1735,21 +1741,27 @@ class Qwen38TTNNGDN:
 
         b_fp32 = ttnn.typecast(b, ttnn.float32, memory_config=l1)
         _deallocate(b)
-        beta_fp32 = ttnn.sigmoid(b_fp32, memory_config=l1)
-        _deallocate(b_fp32)
-        landed = ttnn.multiply(beta_fp32, constants.row_mask_fp32, output_tensor=rows_state.beta)
+        if full_rows:
+            landed = ttnn.sigmoid(b_fp32, output_tensor=rows_state.beta)
+        else:
+            beta_fp32 = ttnn.sigmoid(b_fp32, memory_config=l1)
+            landed = ttnn.multiply(beta_fp32, constants.row_mask_fp32, output_tensor=rows_state.beta)
+            _deallocate(beta_fp32)
         _require_landed(landed, rows_state.beta, label="GDN rows beta")
-        _deallocate(beta_fp32)
+        _deallocate(b_fp32)
 
         a_fp32 = ttnn.typecast(a, ttnn.float32, memory_config=l1)
         _deallocate(a)
         softplus = softplus_gate(a_fp32, self.weights.dt_bias, memory_config=l1)
         _deallocate(a_fp32)
-        log_decay = ttnn.multiply(self.weights.neg_exp_A, softplus, memory_config=l1)
-        _deallocate(softplus)
-        landed = ttnn.multiply(log_decay, constants.row_mask_fp32, output_tensor=rows_state.g)
+        if full_rows:
+            landed = ttnn.multiply(self.weights.neg_exp_A, softplus, output_tensor=rows_state.g)
+        else:
+            log_decay = ttnn.multiply(self.weights.neg_exp_A, softplus, memory_config=l1)
+            landed = ttnn.multiply(log_decay, constants.row_mask_fp32, output_tensor=rows_state.g)
+            _deallocate(log_decay)
         _require_landed(landed, rows_state.g, label="GDN rows log decay")
-        _deallocate(log_decay)
+        _deallocate(softplus)
         rows_state.validate()
 
     def _chunk_rows(self, rows_state: Qwen38TTNNGDNRowsState, initial_state, committed_mask=None):
@@ -1836,45 +1848,57 @@ class Qwen38TTNNGDN:
         _require_shape(
             normalized_heads, (1, VALUE_HEADS_PER_DEVICE, tile_rows, HEAD_DIM), label="GDN rows normalized heads"
         )
-        if tile_rows == CHUNK_SIZE:
-            # Head-major [1, HV, 32, 128] and token-major [1, 1, 32, HV * 128] TILE tensors store their tiles in
-            # the same order (tile (h, c) at 4h + c), so the fold to the gate's row form is a metadata view of
-            # the same buffer: no permute, no relayout.  The view owns the buffer from here on.
-            normalized = ttnn.experimental.view(normalized_heads, (1, 1, CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE))
-        else:
-            normalized = self._fold_head_rows_long(normalized_heads)
-        _retag_head_shard_after_reshape(normalized, reference=z, shard_dim=3)
-        self.mesh_contract.validate_tensor(normalized, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
-        _require_shape(normalized, (1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE), label="GDN rows normalized output")
-
         z_fp32 = ttnn.typecast(z, ttnn.float32, memory_config=l1)
         _deallocate(z)
         sigmoid_fp32 = ttnn.sigmoid(z_fp32, memory_config=l1)
         _deallocate(z_fp32)
         sigmoid_bf16 = ttnn.typecast(sigmoid_fp32, ttnn.bfloat16, memory_config=l1)
         _deallocate(sigmoid_fp32)
-        # One tile is gated straight into the out-proj activation shard; the long chunk gates interleaved and
-        # runs the out-proj and its reduce-scatter per row tile (the 32-row programs on the same rows).
-        gated = ttnn.multiply(
-            normalized,
-            sigmoid_bf16,
-            memory_config=self.out_proj_act_memory_config if tile_rows == CHUNK_SIZE else ttnn.DRAM_MEMORY_CONFIG,
-        )
-        _deallocate(normalized, sigmoid_bf16)
-        self.mesh_contract.validate_tensor(gated, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
-        _require_shape(gated, (1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE), label="GDN rows sigmoid-gated output")
-
         if tile_rows == CHUNK_SIZE:
+            # Head-major [1, HV, 32, 128] and token-major [1, 1, 32, HV * 128] TILE tensors store their tiles in
+            # the same order (tile (h, c) at 4h + c), so the fold to the gate's row form is a metadata view of
+            # the same buffer: no permute, no relayout.  The view owns the buffer from here on.  The tile is
+            # gated straight into the out-proj activation shard.
+            normalized = ttnn.experimental.view(normalized_heads, (1, 1, CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE))
+            _retag_head_shard_after_reshape(normalized, reference=z, shard_dim=3)
+            self.mesh_contract.validate_tensor(normalized, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
+            _require_shape(normalized, (1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE), label="GDN rows normalized output")
+            gated = ttnn.multiply(normalized, sigmoid_bf16, memory_config=self.out_proj_act_memory_config)
+            _deallocate(normalized, sigmoid_bf16)
+            self.mesh_contract.validate_tensor(gated, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
+            _require_shape(gated, (1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE), label="GDN rows sigmoid-gated output")
             output = self._out_proj_tile(gated, full_hidden)
         else:
-            output_tiles = [
-                self._out_proj_tile(tile, full_hidden)
-                for tile in dram_sharded_row_tiles(gated, self.out_proj_act_memory_config)
-            ]
-            _deallocate(gated)
+            # The long chunk folds one 32-row tile at a time: the head-major rows of tile c are a whole-tile
+            # slice whose fold is the same metadata view, gated by the gate's rows of that tile straight into
+            # the out-proj activation shard; the out-proj and its reduce-scatter run per tile (the 32-row
+            # programs on the same rows) and the tiles are copied into the persistent output (concat admits no
+            # output tensor on this runtime).
+            output_tiles = []
+            for start in range(0, tile_rows, CHUNK_SIZE):
+                heads_tile = ttnn.slice(
+                    normalized_heads,
+                    (0, 0, start, 0),
+                    (1, VALUE_HEADS_PER_DEVICE, start + CHUNK_SIZE, HEAD_DIM),
+                    memory_config=l1,
+                )
+                normalized = ttnn.experimental.view(heads_tile, (1, 1, CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE))
+                _retag_head_shard_after_reshape(normalized, reference=z, shard_dim=3)
+                _require_shape(normalized, (1, 1, CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE), label="GDN rows folded tile")
+                gate_tile = ttnn.slice(
+                    sigmoid_bf16, (0, 0, start, 0), (1, 1, start + CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE), memory_config=l1
+                )
+                gated = ttnn.multiply(normalized, gate_tile, memory_config=self.out_proj_act_memory_config)
+                _deallocate(normalized, gate_tile)
+                self.mesh_contract.validate_tensor(gated, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
+                _require_shape(gated, (1, 1, CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE), label="GDN rows gated tile")
+                output_tiles.append(self._out_proj_tile(gated, full_hidden))
+            _deallocate(normalized_heads, sigmoid_bf16)
             output = ttnn.concat(output_tiles, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
             _deallocate(*output_tiles)
-            _retag_head_shard_after_reshape(output, reference=rows_state.output, shard_dim=3)
+            _copy_inplace(output, rows_state.output, label="GDN rows output")
+            _deallocate(output)
+            output = rows_state.output
         _deallocate(full_hidden)
         if full_tile:
             if tile_rows != CHUNK_SIZE:
@@ -1882,28 +1906,17 @@ class Qwen38TTNNGDN:
             _require_shape(output, (1, 1, CHUNK_SIZE, HIDDEN_SIZE_PER_DEVICE), label="GDN rows output tile")
             self.mesh_contract.validate_tensor(output, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
             return output
-        # The row slice of the first tile may alias its input on this runtime; writing it into the persistent
-        # output buffer (the 1-row path's slice form) keeps a fixed address and lets the 32-row tensor go.
-        landed = ttnn.slice(output, (0, 0, 0, 0), (1, 1, rows, HIDDEN_SIZE_PER_DEVICE), output_tensor=rows_state.output)
-        _require_landed(landed, rows_state.output, label="GDN rows output slice")
-        _deallocate(output)
+        if tile_rows == CHUNK_SIZE:
+            # The row slice of the first tile may alias its input on this runtime; writing it into the persistent
+            # output buffer (the 1-row path's slice form) keeps a fixed address and lets the 32-row tensor go.
+            landed = ttnn.slice(
+                output, (0, 0, 0, 0), (1, 1, rows, HIDDEN_SIZE_PER_DEVICE), output_tensor=rows_state.output
+            )
+            _require_landed(landed, rows_state.output, label="GDN rows output slice")
+            _deallocate(output)
         self.mesh_contract.validate_tensor(rows_state.output, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         _require_shape(rows_state.output, (1, 1, rows, HIDDEN_SIZE_PER_DEVICE), label="GDN rows output")
         return rows_state.output
-
-    def _fold_head_rows_long(self, normalized_heads):
-        """Head-major ``[1, HV, T, 128]`` -> token-major ``[1, 1, T, HV * 128]`` for T > 32: the tile orders
-        differ (tile (h, c) sits at page NC * h + c), so the fold is a real permute and a reshape (data
-        movement only; every element keeps its value)."""
-
-        token_major = ttnn.permute(normalized_heads, (0, 2, 1, 3), memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        _deallocate(normalized_heads)
-        tile_rows = _shape(token_major)[1]
-        normalized = ttnn.reshape(token_major, (1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE))
-        if _tensor_key(normalized) != _tensor_key(token_major):
-            _deallocate(token_major)
-        _require_shape(normalized, (1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE), label="GDN rows folded heads")
-        return normalized
 
     def _out_proj_tile(self, gated_tile, full_hidden):
         """The 1-row out-proj on one gated 32-row tile in the out-proj activation shard, reduce-scattered."""

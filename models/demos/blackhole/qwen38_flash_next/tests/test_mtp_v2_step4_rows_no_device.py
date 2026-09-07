@@ -133,8 +133,14 @@ def _rowwise(fn, x: torch.Tensor) -> torch.Tensor:
 
 
 def _unary(fn, dtype_keep=True):
-    def op(tensor, *args, memory_config=None, **kwargs):
-        return FakeTensor([_rowwise(fn, t) for t in tensor.torch_shards()], tensor.dtype, tensor.layout)
+    def op(tensor, *args, memory_config=None, output_tensor=None, **kwargs):
+        results = [_rowwise(fn, t) for t in tensor.torch_shards()]
+        if output_tensor is not None:
+            assert output_tensor.dtype is tensor.dtype and output_tensor.shape == tuple(results[0].shape)
+            for target, result in zip(output_tensor.locals, results):
+                target.copy_(result)
+            return output_tensor
+        return FakeTensor(results, tensor.dtype, tensor.layout)
 
     return op
 

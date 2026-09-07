@@ -719,9 +719,10 @@ class Qwen38TTNNGatedResidual:
     # ------------------------------------------------------------------ rows path (prefill chunk)
     # read_rows / write_rows are read / write over the rows of one chunk (32 or 128): the same ops row
     # for row (every op is per row or per element), with the two zero-copy views replaced by real
-    # permutes.  The two DRAM-sharded matmuls read one 32-row tile per call on this runtime: at 32 rows
-    # the tile is the chunk, at 128 rows the four row tiles run the same program one after another
-    # (row j sees the same program on the same values either way).  The 1-row bodies above are untouched.
+    # permutes at 32 rows and by branch slices + concats at 128.  The two DRAM-sharded matmuls read one
+    # 32-row tile per call on this runtime: at 32 rows the tile is the chunk, at 128 rows the four row
+    # tiles run the same program one after another (row j sees the same program on the same values either
+    # way) and their FP32 partials are reduced over TP in one collective.  The 1-row bodies above are untouched.
 
     def _validate_rows(self, tensor, expected: tuple[int, ...], *, label: str) -> None:
         if _shape(tensor) != expected or tensor.layout != ttnn.TILE_LAYOUT or tensor.dtype != ttnn.bfloat16:
@@ -763,11 +764,21 @@ class Qwen38TTNNGatedResidual:
         )
         _deallocate(gathered_stats)
         self._validate_rows(unit, residual_rows_shape(rows), label="GR rows RMS unit")
-        # Branch-major -> token-major -> one flat (branch, local hidden) row per token.
+        # Branch-major -> one flat (branch, local hidden) row per token.  At 128 rows the four branches are
+        # whole row-tile blocks: sliced out and concatenated on the width, no token-major intermediate (whose
+        # 4-row branch dim would pad to a tile: 8x the bytes through a permute and a reshape).
         if flat_views:
             if rows != CHUNK_ROWS:
                 raise ValueError(f"GR rows flat views are the 32-row form's option, got {rows} rows")
             unit_flat = ttnn.experimental.view(unit, flat_rows_shape)  # the view owns unit's buffer
+        elif rows != CHUNK_ROWS:
+            branches = [
+                ttnn.slice(unit, (0, b, 0, 0), (1, b + 1, rows, LOCAL_HIDDEN_SIZE), memory_config=dram)
+                for b in range(RESIDUAL_BRANCHES)
+            ]
+            _deallocate(unit)
+            unit_flat = ttnn.concat(branches, dim=3, memory_config=dram)
+            _deallocate(*branches)
         else:
             unit_tokens = ttnn.permute(unit, (0, 2, 1, 3), memory_config=dram)
             _deallocate(unit)
@@ -804,7 +815,7 @@ class Qwen38TTNNGatedResidual:
             if rows == CHUNK_ROWS
             else dram_sharded_row_tiles(normalized_ws, self.down_inject_act_memory_config)
         )
-        reduced_tiles = []
+        partial_tiles = []
         for normalized_tile in normalized_tiles:
             partial_ws = ttnn.linear(
                 normalized_tile,
@@ -814,55 +825,58 @@ class Qwen38TTNNGatedResidual:
                 dtype=ttnn.float32,
                 compute_kernel_config=self.compute_config,
             )
-            partial = ttnn.to_memory_config(partial_ws, dram)
+            partial_tiles.append(ttnn.to_memory_config(partial_ws, dram))
             _deallocate(partial_ws)
-            self._mark_partial(partial, PARTIAL_REDUCTION_ROWS_SHAPE)
-            if (
-                _shape(partial) != PARTIAL_REDUCTION_ROWS_SHAPE
-                or _padded_shape(partial) != PARTIAL_REDUCTION_ROWS_SHAPE
-                or partial.dtype != ttnn.float32
-                or partial.layout != ttnn.TILE_LAYOUT
-                or partial.memory_config() != dram
-            ):
-                raise RuntimeError(
-                    f"GR rows partial must be FP32 TILE DRAM {PARTIAL_REDUCTION_ROWS_SHAPE}; "
-                    f"got {_shape(partial)}/{_padded_shape(partial)} {partial.dtype} {partial.layout}"
-                )
-            # The 1-row partial reduction over the 32-row tile: the same gather + fast reduce, the
-            # logical shape already the padded one.
-            gathered = ttnn.experimental.all_gather_async(
-                partial,
-                persistent_output_buffer=None,
-                dim=0,
-                multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(TP_AXIS),
-                num_links=self.tt_ccl.get_num_links(TP_AXIS),
-                cluster_axis=TP_AXIS,
-                memory_config=dram,
-                topology=ttnn.Topology.Linear,
-                barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(TP_AXIS),
-                chunks_per_sync=1,
-                num_workers_per_link=1,
-                num_buffers_per_channel=2,
-            )
-            _deallocate(partial)
-            reduced = ttnn.experimental.fast_reduce_nc(
-                gathered, dims=[0], output=None, compute_kernel_config=self.compute_config, memory_config=dram
-            )
-            _deallocate(gathered)
-            self.mesh_contract.validate_tensor(reduced, placement=TensorPlacement.REPLICATED)
-            if _shape(reduced) != PARTIAL_REDUCTION_ROWS_SHAPE or reduced.dtype != ttnn.float32:
-                raise RuntimeError(
-                    f"GR rows partial reduction returned {_shape(reduced)} {reduced.dtype}, "
-                    f"expected FP32 {PARTIAL_REDUCTION_ROWS_SHAPE}"
-                )
-            reduced_tiles.append(ttnn.typecast(reduced, ttnn.bfloat16, memory_config=dram))
-            _deallocate(reduced)
+        partial_rows_shape = (1, 1, rows, PARTIAL_WIDTH)
         if rows == CHUNK_ROWS:
-            reduced_bf16 = reduced_tiles[0]
+            partial = partial_tiles[0]
         else:
+            # The four FP32 tile partials stacked on the rows: one gather and one reduce for the 128 rows (the
+            # same four device terms per element, summed in the same device order).
             _deallocate(*normalized_tiles)
-            reduced_bf16 = ttnn.concat(reduced_tiles, dim=2, memory_config=dram)
-            _deallocate(*reduced_tiles)
+            partial = ttnn.concat(partial_tiles, dim=2, memory_config=dram)
+            _deallocate(*partial_tiles)
+        self._mark_partial(partial, partial_rows_shape)
+        if (
+            _shape(partial) != partial_rows_shape
+            or _padded_shape(partial) != partial_rows_shape
+            or partial.dtype != ttnn.float32
+            or partial.layout != ttnn.TILE_LAYOUT
+            or partial.memory_config() != dram
+        ):
+            raise RuntimeError(
+                f"GR rows partial must be FP32 TILE DRAM {partial_rows_shape}; "
+                f"got {_shape(partial)}/{_padded_shape(partial)} {partial.dtype} {partial.layout}"
+            )
+        # The 1-row partial reduction over the row tiles: the same gather + fast reduce, the logical shape
+        # already the padded one.
+        gathered = ttnn.experimental.all_gather_async(
+            partial,
+            persistent_output_buffer=None,
+            dim=0,
+            multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(TP_AXIS),
+            num_links=self.tt_ccl.get_num_links(TP_AXIS),
+            cluster_axis=TP_AXIS,
+            memory_config=dram,
+            topology=ttnn.Topology.Linear,
+            barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(TP_AXIS),
+            chunks_per_sync=1,
+            num_workers_per_link=1,
+            num_buffers_per_channel=2,
+        )
+        _deallocate(partial)
+        reduced = ttnn.experimental.fast_reduce_nc(
+            gathered, dims=[0], output=None, compute_kernel_config=self.compute_config, memory_config=dram
+        )
+        _deallocate(gathered)
+        self.mesh_contract.validate_tensor(reduced, placement=TensorPlacement.REPLICATED)
+        if _shape(reduced) != partial_rows_shape or reduced.dtype != ttnn.float32:
+            raise RuntimeError(
+                f"GR rows partial reduction returned {_shape(reduced)} {reduced.dtype}, "
+                f"expected FP32 {partial_rows_shape}"
+            )
+        reduced_bf16 = ttnn.typecast(reduced, ttnn.bfloat16, memory_config=dram)
+        _deallocate(reduced)
         inject_rows = ttnn.slice(
             reduced_bf16,
             (0, 0, 0, RESIDUAL_RANK),
@@ -917,9 +931,23 @@ class Qwen38TTNNGatedResidual:
         _deallocate(up_flat)
         gated_flat = ttnn.multiply(normalized_ws, gate_flat, memory_config=dram)
         _deallocate(gate_flat, normalized_ws)
-        # Flat rows -> token-major -> branch-major, then the branch mean (the 1/4 is in norm_scale).
+        # Flat rows -> branch-major, then the branch mean (the 1/4 is in norm_scale).  At 128 rows the four
+        # branch columns are sliced out and stacked on dim 1 (the fold's inverse, no token-major intermediate).
         if flat_views:
             gated = ttnn.experimental.view(gated_flat, residual_rows_shape(rows))  # owns gated_flat's buffer
+        elif rows != CHUNK_ROWS:
+            branches = [
+                ttnn.slice(
+                    gated_flat,
+                    (0, 0, 0, b * LOCAL_HIDDEN_SIZE),
+                    (1, 1, rows, (b + 1) * LOCAL_HIDDEN_SIZE),
+                    memory_config=dram,
+                )
+                for b in range(RESIDUAL_BRANCHES)
+            ]
+            _deallocate(gated_flat)
+            gated = ttnn.concat(branches, dim=1, memory_config=dram)
+            _deallocate(*branches)
         else:
             gated_tokens = ttnn.reshape(gated_flat, (1, rows, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE))
             if _tensor_key(gated_tokens) != _tensor_key(gated_flat):

@@ -383,7 +383,7 @@ class Qwen38TTNNMoEWeights:
 @dataclass(frozen=True)
 class Qwen38TTNNRouting:
     """The ROW_MAJOR top-k scores (BF16) and indices (UINT16) ``[1,1,rows,10]``; ``tiles`` holds the same per
-    32-row tile when the routed stream runs one ``moe_compute`` call per tile (the long chunk)."""
+    32-row tile when the routed stream runs one ``moe_compute`` call per tile (the long chunk's oracle form)."""
 
     scores: Any
     indices: Any
@@ -626,15 +626,20 @@ class Qwen38TTNNMoE:
             )
         return full_hidden
 
-    def _route(self, full_hidden, *, phase_observer=None) -> Qwen38TTNNRouting:
+    def _route(self, full_hidden, *, hidden_tiles=None, phase_observer=None) -> Qwen38TTNNRouting:
         if phase_observer is None:
             phase_observer = _ignore_phase
         # The router is a DRAM-sharded decode linear: one row tile per call.  Up to 32 rows the gathered
-        # shard is the call's input; the long chunk runs the router, the FP32 softmax and the top-k per row
-        # tile (the same programs on the same rows) and concatenates the four [1,1,32,10] results.
-        hidden_tiles = [full_hidden]
-        if self.row_contract.row_tiles != 1:
-            hidden_tiles = dram_sharded_row_tiles(full_hidden, self.hidden_act_memory_config)
+        # shard is the call's input; the long chunk runs the router per row tile (``hidden_tiles``: the four
+        # tiles in the activation shard, shared with the shared-expert chain), concatenates the four FP32
+        # logits tiles and runs the softmax, the top-k and the normalization ONCE on the 128 rows: every op
+        # of the tail is per row (the top-k's single-core factory hands each 32-row tile to its own core;
+        # the multi-core factory needs a width of 1024, so the 512 logits never reach it), so row j sees the
+        # same programs on the same values as in the 32-row form.
+        if self.row_contract.row_tiles == 1:
+            hidden_tiles = [full_hidden]
+        elif hidden_tiles is None or len(hidden_tiles) != self.row_contract.row_tiles:
+            raise ValueError(f"the long chunk's router needs its {self.row_contract.row_tiles} hidden row tiles")
         phase_observer("before-router-logits")
         logits_tiles = []
         for hidden_tile in hidden_tiles:
@@ -653,67 +658,63 @@ class Qwen38TTNNMoE:
             logits_tiles.append(ttnn.to_memory_config(logits_ws, ttnn.DRAM_MEMORY_CONFIG, dtype=ttnn.float32))
             _deallocate(logits_ws)
         expected_logits = (1, 1, self.rows, ROUTED_EXPERTS)
+        logits = logits_tiles[0]
         if self.row_contract.row_tiles != 1:
-            _deallocate(*hidden_tiles)
-            expected_logits = (1, 1, CHUNK_ROWS, ROUTED_EXPERTS)
-        for logits in logits_tiles:
-            self.mesh_contract.validate_tensor(logits, placement=TensorPlacement.REPLICATED)
-            if _shape(logits) != expected_logits or logits.dtype != ttnn.float32:
-                raise RuntimeError(
-                    f"router produced {_shape(logits)} {logits.dtype}, expected {expected_logits} {ttnn.float32}"
-                )
+            logits = ttnn.concat(logits_tiles, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(*logits_tiles)
+        self.mesh_contract.validate_tensor(logits, placement=TensorPlacement.REPLICATED)
+        if _shape(logits) != expected_logits or logits.dtype != ttnn.float32:
+            raise RuntimeError(
+                f"router produced {_shape(logits)} {logits.dtype}, expected {expected_logits} {ttnn.float32}"
+            )
         phase_observer("after-router-logits")
 
         phase_observer("before-router-topk")
-        normalized_tiles, indices_tiles = [], []
-        for logits in logits_tiles:
-            probabilities = ttnn.softmax(
-                logits,
-                dim=-1,
-                numeric_stable=True,
-                memory_config=ttnn.L1_MEMORY_CONFIG,
-                compute_kernel_config=self.compute_config,
-            )
-            _deallocate(logits)
-            scores, indices = ttnn.topk(
-                probabilities,
-                k=TOP_K,
-                dim=-1,
-                largest=True,
-                sorted=True,
-                memory_config=ttnn.L1_MEMORY_CONFIG,
-            )
-            _deallocate(probabilities)
-            denominator = ttnn.sum(
-                scores,
-                dim=-1,
-                keepdim=True,
-                memory_config=ttnn.L1_MEMORY_CONFIG,
-                compute_kernel_config=self.compute_config,
-            )
-            normalized_fp32 = ttnn.div(scores, denominator, memory_config=ttnn.L1_MEMORY_CONFIG)
-            _deallocate(scores, denominator)
-            normalized_tiles.append(ttnn.typecast(normalized_fp32, ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG))
-            indices_tiles.append(indices)
-            _deallocate(normalized_fp32)
-        normalized, indices = normalized_tiles[0], indices_tiles[0]
-        if self.row_contract.row_tiles != 1:
-            # The 32-row program's ROW_MAJOR routing per tile (the per-tile routed stream reads it), stacked.
-            tiles = tuple(self._routing_rows(n, i) for n, i in zip(normalized_tiles, indices_tiles))
-            scores_rm = ttnn.concat([tile.scores for tile in tiles], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-            indices_rm = ttnn.concat([tile.indices for tile in tiles], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-            if _shape(scores_rm) != self.row_contract.routing or _shape(indices_rm) != self.row_contract.routing:
-                raise RuntimeError(
-                    f"router top-k shapes must be {self.row_contract.routing}, got scores={_shape(scores_rm)} "
-                    f"indices={_shape(indices_rm)}"
+        probabilities = ttnn.softmax(
+            logits,
+            dim=-1,
+            numeric_stable=True,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+        )
+        _deallocate(logits)
+        scores, indices = ttnn.topk(
+            probabilities,
+            k=TOP_K,
+            dim=-1,
+            largest=True,
+            sorted=True,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+        )
+        _deallocate(probabilities)
+        denominator = ttnn.sum(
+            scores,
+            dim=-1,
+            keepdim=True,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+        )
+        normalized_fp32 = ttnn.div(scores, denominator, memory_config=ttnn.L1_MEMORY_CONFIG)
+        _deallocate(scores, denominator)
+        normalized = ttnn.typecast(normalized_fp32, ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
+        _deallocate(normalized_fp32)
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        tiles = None
+        if self.routed_calls != 1:
+            # The per-tile routed stream reads the 32-row program's ROW_MAJOR routing per tile: whole 32-row
+            # tiles sliced from the TILE results (the same values; literal bounds), converted as the 32-row form
+            # converts them.
+            tiles = tuple(
+                self._routing_rows(normalized_tile, indices_tile)
+                for normalized_tile, indices_tile in zip(
+                    dram_sharded_row_tiles(normalized, None), dram_sharded_row_tiles(indices, None)
                 )
-            phase_observer("after-router-topk")
-            return Qwen38TTNNRouting(scores_rm, indices_rm, tiles)
-        scores_rm = ttnn.to_layout(normalized, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        indices_rm = ttnn.to_layout(indices, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            )
+        scores_rm = ttnn.to_layout(normalized, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+        indices_rm = ttnn.to_layout(indices, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
         _deallocate(normalized, indices)
         if indices_rm.dtype != ttnn.uint16:
-            converted = ttnn.typecast(indices_rm, ttnn.uint16, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            converted = ttnn.typecast(indices_rm, ttnn.uint16, memory_config=dram)
             _deallocate(indices_rm)
             indices_rm = converted
         if _shape(scores_rm) != self.row_contract.routing or _shape(indices_rm) != self.row_contract.routing:
@@ -724,7 +725,7 @@ class Qwen38TTNNMoE:
         self.mesh_contract.validate_tensor(scores_rm, placement=TensorPlacement.REPLICATED)
         self.mesh_contract.validate_tensor(indices_rm, placement=TensorPlacement.REPLICATED)
         phase_observer("after-router-topk")
-        return Qwen38TTNNRouting(scores_rm, indices_rm)
+        return Qwen38TTNNRouting(scores_rm, indices_rm, tiles)
 
     def _routed_partial(
         self,
@@ -809,10 +810,13 @@ class Qwen38TTNNMoE:
         phase_observer("after-routed-dispatch")
 
         # Local combine writes only owned k slots.  Clear every invocation so a
-        # masked 0*uninitialized-NaN cannot poison fast-reduce.
-        zeroed = ttnn.fill(self.local_combine_output, 0.0, output_tensor=self.local_combine_output)
-        if zeroed.tensor_id != self.local_combine_output.tensor_id:
-            raise RuntimeError("ttnn.fill did not update the persistent local-combine buffer in place")
+        # masked 0*uninitialized-NaN cannot poison fast-reduce.  The long chunk's shared buffer is zero at
+        # allocation and every slot it ever holds is a finite expert output (the weighted reduce multiplies
+        # the slots this device does not own by an exact 0), so its 48 layers skip the 6.5 MB fill.
+        if self.rows != LONG_PREFILL_CHUNK_ROWS:
+            zeroed = ttnn.fill(self.local_combine_output, 0.0, output_tensor=self.local_combine_output)
+            if zeroed.tensor_id != self.local_combine_output.tensor_id:
+                raise RuntimeError("ttnn.fill did not update the persistent local-combine buffer in place")
 
         phase_observer("before-moe-compute-launch")
         outputs = ttnn.experimental.moe_compute(
@@ -855,9 +859,21 @@ class Qwen38TTNNMoE:
             raise RuntimeError(
                 f"weighted-reduce input must be {self.row_contract.fast_reduce_input}, got {_shape(local_stack)}"
             )
-        local_stack_tiled = ttnn.to_layout(
-            local_stack, ttnn.TILE_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG, pad_value=0.0
-        )
+        if self.rows == LONG_PREFILL_CHUNK_ROWS:
+            # The 6.5 MB combine tilized as one [1280, 2560] tile grid (the tilize spreads its 40 tile rows over
+            # the grid; the rank-4 form works one 4-tile-row batch at a time: 0.28 -> 0.14 ms) and viewed back
+            # as the reduce's [10, 1, 128, 2560] (the same tile order; the view owns the buffer).
+            combine_flat = ttnn.to_layout(
+                ttnn.reshape(outputs[5], (TOP_K * self.rows, HIDDEN_SIZE)),
+                ttnn.TILE_LAYOUT,
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+                pad_value=0.0,
+            )
+            local_stack_tiled = ttnn.experimental.view(combine_flat, self.row_contract.fast_reduce_input)
+        else:
+            local_stack_tiled = ttnn.to_layout(
+                local_stack, ttnn.TILE_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG, pad_value=0.0
+            )
         # Preserve the externally visible [1,1,rows,10] routing tensor.  The
         # fused reducer independently treats score dim 0 as the token count.
         fast_reduce_scores = routing.scores
@@ -1012,7 +1028,7 @@ class Qwen38TTNNMoE:
         phase_observer("after-selective-reduce")
         return partial
 
-    def _shared_partial(self, hidden_sharded, full_hidden):
+    def _shared_partial(self, hidden_sharded, full_hidden, hidden_tiles=None):
         if _shape(hidden_sharded) != self.row_contract.hidden_sharded:
             raise ValueError(
                 f"shared-expert hidden shard must be {self.row_contract.hidden_sharded}, got {_shape(hidden_sharded)}"
@@ -1022,11 +1038,14 @@ class Qwen38TTNNMoE:
                 f"shared-expert full hidden must be {self.row_contract.full_hidden}, got {_shape(full_hidden)}"
             )
         # The four shared-expert linears are DRAM-sharded decode linears (one row tile per call): the long
-        # chunk runs the whole shared chain per row tile and concatenates the gated partials.
-        hidden_tiles = [full_hidden]
+        # chunk runs the whole shared chain per row tile (``hidden_tiles``: the router's tiles, moved into the
+        # activation shard once per layer) and concatenates the gated partials.
         tile_shape = self.row_contract.full_hidden
-        if self.row_contract.row_tiles != 1:
-            hidden_tiles = dram_sharded_row_tiles(full_hidden, self.hidden_act_memory_config)
+        if self.row_contract.row_tiles == 1:
+            hidden_tiles = [full_hidden]
+        elif hidden_tiles is None or len(hidden_tiles) != self.row_contract.row_tiles:
+            raise ValueError(f"the long chunk's shared experts need its {self.row_contract.row_tiles} hidden row tiles")
+        else:
             tile_shape = (1, 1, CHUNK_ROWS, HIDDEN_SIZE)
         gated_partials = []
         for hidden_tile in hidden_tiles:
@@ -1080,7 +1099,6 @@ class Qwen38TTNNMoE:
             _deallocate(partial, scalar, scalar_gate)
         gated_partial = gated_partials[0]
         if self.row_contract.row_tiles != 1:
-            _deallocate(*hidden_tiles)
             gated_partial = ttnn.concat(gated_partials, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
             _deallocate(*gated_partials)
         self.mesh_contract.mark_local_partial(
@@ -1124,6 +1142,7 @@ class Qwen38TTNNMoE:
         routing = None
         temporaries = {
             "full_hidden": None,
+            "hidden_tiles": None,
             "routing_scores": None,
             "routing_indices": None,
             "routing_tiles": None,
@@ -1141,6 +1160,9 @@ class Qwen38TTNNMoE:
                 for tile in tensor:
                     ttnn.deallocate(tile.scores)
                     ttnn.deallocate(tile.indices)
+            elif name == "hidden_tiles":
+                for tile in tensor:
+                    ttnn.deallocate(tile)
             else:
                 ttnn.deallocate(tensor)
             # Clear immediately after each successful release so a later
@@ -1166,8 +1188,16 @@ class Qwen38TTNNMoE:
 
             # The gathered width-sharded hidden feeds the router, every
             # shared-expert linear and the routed untilize; it is owned until
-            # the reduce-scatter enqueue returns.
-            routing = self._route(temporaries["full_hidden"], phase_observer=observe)
+            # the reduce-scatter enqueue returns.  The long chunk moves its four
+            # row tiles into the dense linears' shard once for the router and
+            # the shared chain and lets them go before the expert stream.
+            if self.row_contract.row_tiles != 1:
+                temporaries["hidden_tiles"] = dram_sharded_row_tiles(
+                    temporaries["full_hidden"], self.hidden_act_memory_config
+                )
+            routing = self._route(
+                temporaries["full_hidden"], hidden_tiles=temporaries["hidden_tiles"], phase_observer=observe
+            )
             temporaries["routing_scores"] = routing.scores
             temporaries["routing_indices"] = routing.indices
             temporaries["routing_tiles"] = routing.tiles
@@ -1176,7 +1206,10 @@ class Qwen38TTNNMoE:
 
             observe("before-shared-partial")
             raise_deferred_phase_error()
-            temporaries["shared_partial"] = self._shared_partial(hidden_sharded, temporaries["full_hidden"])
+            temporaries["shared_partial"] = self._shared_partial(
+                hidden_sharded, temporaries["full_hidden"], temporaries["hidden_tiles"]
+            )
+            release("hidden_tiles")
             self._synchronize_stage("shared-partial")
             observe("after-shared-partial")
             raise_deferred_phase_error()
@@ -1313,6 +1346,7 @@ class Qwen38TTNNMoE:
                 "local_sum",
                 "routed_partial",
                 "shared_partial",
+                "hidden_tiles",
                 "full_hidden",
                 "routing_scores",
                 "routing_indices",

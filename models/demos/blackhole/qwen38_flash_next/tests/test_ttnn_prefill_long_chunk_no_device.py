@@ -304,10 +304,11 @@ def test_qsa_long_chunk_emulation_is_the_four_chunk_emulations_stacked(position:
         for tile in range(TILES)
     ]
     assert torch.equal(long["kv_block_start"], short[0]["kv_block_start"])
-    assert [t.item() for t in long["block_index_i32"]] == [position // 4 + block for block in range(32)]
-    assert [t.item() for t in long["block_index_i32"]] == [
-        t.item() for chunk in short for t in chunk["block_index_i32"]
-    ]
+    # The four 32-row chunks write compressed blocks P/4 .. P/4 + 31 one by one; the 128-row chunk writes them as the
+    # cache's tile P/128 in one page (no per-block indices).
+    assert [t.item() for chunk in short for t in chunk["block_index_i32"]] == [position // 4 + b for b in range(32)]
+    assert long["block_index_i32"] == () and long["compressed_tile_i32"].tolist() == [[position // 128]]
+    assert long["compressed_tile_i32"].dtype == torch.int32 and "compressed_tile_i32" not in short[0]
     for name in ("indexer_neg_mask", "row_keep_bits", "row_fill"):
         assert torch.equal(long[name], torch.cat([chunk[name] for chunk in short], dim=2)), name
     host = qsa_module.qsa_chunk_constant_rows(blocks, LONG_CHUNK_ROWS)
@@ -343,9 +344,23 @@ def test_qsa_long_chunk_inputs_derive_on_the_integer_fake(monkeypatch, position:
     )
     inputs = qsa_module.derive_qsa_chunk_inputs(qsa_test._u32(torch.full((1, 1, 1, 1), position)), constants, chunk)
     expected = qsa_module.emulate_qsa_chunk_inputs(position, allocated_compressed_blocks=blocks, rows=LONG_CHUNK_ROWS)
-    assert inputs.rows == 128 and len(inputs.block_index_i32) == 32
+    # The 128-row chunk writes its 32 compressed rows as one tile: the page table P / 128, no per-block indices.
+    assert inputs.rows == 128 and len(inputs.block_index_i32) == len(expected["block_index_i32"]) == 0
     assert inputs.kv_block_start._read().tolist() == expected["kv_block_start"].tolist()
-    assert [t._read().tolist() for t in inputs.block_index_i32] == [e.tolist() for e in expected["block_index_i32"]]
+    assert (
+        inputs.compressed_tile_i32._read().tolist() == expected["compressed_tile_i32"].tolist() == [[position // 128]]
+    )
+    assert inputs.compressed_tile_i32.dtype is qsa_test.I32 and inputs.compressed_tile_i32.shape == (1, 1)
+    # The layer's admission of the 128-row inputs: the page table, no per-block indices.
+    layer = qsa_module.Qwen38TTNNQSA.__new__(qsa_module.Qwen38TTNNQSA)
+    layer.allocated_compressed_blocks = blocks
+    layer._validate_chunk_inputs(inputs)
+    with pytest.raises(ValueError):  # allow-pytest.raises: the 128-row inputs without their page table
+        layer._validate_chunk_inputs(
+            qsa_module.Qwen38TTNNQSAChunkInputs(
+                inputs.rows, inputs.kv_block_start, (), inputs.indexer_neg_mask, inputs.row_keep_bits, inputs.row_fill
+            )
+        )
     assert inputs.indexer_neg_mask.shape == (1, 1, 128, blocks)
     assert torch.equal(inputs.indexer_neg_mask._read(), expected["indexer_neg_mask"])
     assert torch.equal(inputs.row_keep_bits._read(), expected["row_keep_bits"])
@@ -515,19 +530,45 @@ def test_long_chunk_source_pins() -> None:
         "moe_module.allocate_local_combine_output(" in allocate
         and "self.mesh_device, self.mesh_contract, moe_module.routed_tokens_per_call_for(rows)" in allocate
     )
-    # The DRAM-sharded linears run one row tile per call on every 128-row body.
+    # The DRAM-sharded linears run one row tile per call on every 128-row body; the hidden row tiles are moved
+    # into the activation shard once per layer (MoE: router + shared chain; QSA: the five linears).
     for function in (
         gdn_module.Qwen38TTNNGDN._project_rows,
-        gdn_module.Qwen38TTNNGDN._gate_and_project_rows,
         gr_module.Qwen38TTNNGatedResidual.read_rows,
-        moe_module.Qwen38TTNNMoE._route,
-        moe_module.Qwen38TTNNMoE._shared_partial,
-        qsa_module.Qwen38TTNNQSA._linear_rows,
+        moe_module.Qwen38TTNNMoE.forward,
+        qsa_module.Qwen38TTNNQSA._hidden_row_tiles,
         qsa_module.Qwen38TTNNQSA._project_output_rows,
     ):
         assert "dram_sharded_row_tiles(" in inspect.getsource(function), function.__name__
+    for function in (
+        gdn_module.Qwen38TTNNGDN._gate_and_project_rows,
+        moe_module.Qwen38TTNNMoE._shared_partial,
+        qsa_module.Qwen38TTNNQSA._linear_rows,
+    ):
+        assert "dram_sharded_row_tiles(" not in inspect.getsource(function), function.__name__
     tiles = inspect.getsource(decode_matmul_module.dram_sharded_row_tiles)
     assert "ttnn.slice(" in tiles and "ttnn.to_memory_config(tile, activation_memory_config)" in tiles
+    # The router tail (softmax, top-k, normalization, the ROW_MAJOR routing) runs once per layer on the
+    # concatenated logits; the 128-row GR read folds by branch slices + concats and reduces its four FP32
+    # partials in one collective; the GDN out-proj folds one head-major tile at a time (the 32-row form's view).
+    route = inspect.getsource(moe_module.Qwen38TTNNMoE._route)
+    assert route.count("ttnn.softmax(") == route.count("ttnn.topk(") == 1 and "logits_tiles, dim=2" in route
+    read = inspect.getsource(gr_module.Qwen38TTNNGatedResidual.read_rows)
+    assert (
+        read.count("ttnn.experimental.all_gather_async(") == 1 and read.count("ttnn.experimental.fast_reduce_nc(") == 2
+    )
+    assert read.count("ttnn.concat(branches, dim=3") == read.count("ttnn.concat(branches, dim=1") == 1
+    gate = inspect.getsource(gdn_module.Qwen38TTNNGDN._gate_and_project_rows)
+    assert (
+        gate.count("ttnn.experimental.view(") == 2
+        and '_copy_inplace(output, rows_state.output, label="GDN rows output")' in gate
+    )
+    assert not hasattr(gdn_module.Qwen38TTNNGDN, "_fold_head_rows_long")
+    routed = inspect.getsource(moe_module.Qwen38TTNNMoE._routed_partial)
+    assert "if self.rows != LONG_PREFILL_CHUNK_ROWS:\n            zeroed = ttnn.fill(" in routed
+    # The long chunk's combine is tilized as one [1280, 2560] tile grid and viewed back as the reduce's rank-4 input.
+    assert "ttnn.reshape(outputs[5], (TOP_K * self.rows, HIDDEN_SIZE))" in routed
+    assert "ttnn.experimental.view(combine_flat, self.row_contract.fast_reduce_input)" in routed
     # The chunk kernel is called once per pass at either row count (chunk_size stays the 32-row tile).
     chunk = inspect.getsource(gdn_module.Qwen38TTNNGDN._chunk_rows)
     assert chunk.count("ttnn.transformer.chunk_gated_delta_rule(") == 1 and "chunk_size=CHUNK_SIZE" in chunk

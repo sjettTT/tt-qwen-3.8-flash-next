@@ -697,8 +697,14 @@ def test_moe_dense_linears_share_one_width_sharded_hidden() -> None:
     forward = inspect.getsource(moe_module.Qwen38TTNNMoE.forward)
     assert not _calls_named(ast.parse(textwrap.dedent(forward)), "to_memory_config")
     assert "hidden_ws" not in forward
-    assert 'self._route(temporaries["full_hidden"], phase_observer=observe)' in forward
-    assert 'self._shared_partial(hidden_sharded, temporaries["full_hidden"])' in forward
+    assert (
+        'self._route(\n                temporaries["full_hidden"], hidden_tiles=temporaries["hidden_tiles"], phase_observer=observe\n            )'
+        in forward
+    )
+    assert (
+        'self._shared_partial(\n                hidden_sharded, temporaries["full_hidden"], temporaries["hidden_tiles"]\n            )'
+        in forward
+    )
     # The gathered shard is also the routed untilize's input, so it is released
     # only after the reduce-scatter enqueue.
     assert forward.index("self._routed_partial(") < forward.index(
@@ -1438,7 +1444,11 @@ def test_generic_model_snapshot_copies_the_recurrent_buffers_and_restores_positi
             )
         else:
             attention = SimpleNamespace(kv_staging=f"staging-{index}", raw_key_ring=f"ring-{index}")
-        ple = SimpleNamespace(conv=tuple(f"ple-{slot}" for slot in range(9)), token_context="stale") if index == 1 else None
+        ple = (
+            SimpleNamespace(conv=tuple(f"ple-{slot}" for slot in range(9)), token_context="stale")
+            if index == 1
+            else None
+        )
         layers.append(SimpleNamespace(namespace=layer_state.namespace, layer_index=index, attention=attention, ple=ple))
     state = Qwen38TTNNTextModelGenericState(state.position, tuple(layers), owner._state_owner)
     monkeypatch.setattr(

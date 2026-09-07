@@ -163,7 +163,10 @@ def test_chunk_constants_and_inputs_declare_the_device_fields() -> None:
         "row_selects",
         "zero_value_half_rows",
     )
-    assert tuple(Qwen38TTNNQSAChunkInputs.__dataclass_fields__) == ("rows",) + CHUNK_INPUT_FIELDS
+    # compressed_tile_i32: the 128-row chunk's page table (None for the 32-row forms).
+    assert tuple(Qwen38TTNNQSAChunkInputs.__dataclass_fields__) == ("rows",) + CHUNK_INPUT_FIELDS + (
+        "compressed_tile_i32",
+    )
     build = inspect.getsource(Qwen38TTNNQSAChunkConstants.build)
     assert "_upload_uint32(" in build and "replicate_tensor_2d_mesh_mapper(mesh_device)" in build
     assert "layout=ttnn.TILE_LAYOUT" in build and "dtype=ttnn.bfloat16" in build
@@ -217,9 +220,11 @@ def test_chunk_derivation_uses_only_exact_integer_ops_and_the_scalar_broadcast()
     )
     for compare in ("ttnn.lt(", "ttnn.ge("):
         assert all("dtype=u32" in line for line in source.splitlines() if compare in line)
-    # Casts: the block-validity mask to bf16 and the eight INT32 block indices.
-    assert source.count("ttnn.typecast(") == 2
+    # Casts: the block-validity mask to bf16, the eight INT32 block indices (32-row forms) and the 128-row chunk's
+    # INT32 compressed tile index (its page table).
+    assert source.count("ttnn.typecast(") == 3
     assert "ttnn.typecast(valid_bits, ttnn.bfloat16" in source and "ttnn.typecast(shifted, ttnn.int32" in source
+    assert "ttnn.typecast(tile_index, ttnn.int32" in source and "bitwise_right_shift(position_scalar, 7" in source
     # The 1-row derivation is untouched.
     single = inspect.getsource(qsa_module.derive_qsa_position_inputs)
     assert "chunk" not in single and "CHUNK" not in single
@@ -330,11 +335,12 @@ def test_chunk_body_has_no_host_ints_no_host_io_and_the_decode_order() -> None:
     body = _method_source("forward_chunk_generic")
     order = (
         "self._all_gather_hidden_rows(hidden_rows, constants)",
-        "self._index_projection_rows(full_hidden, cos, sin, constants)",
+        "self._hidden_row_tiles(full_hidden, constants)",
+        "self._index_projection_rows(full_hidden, hidden_tiles, cos, sin, constants)",
         "self._write_compressed_index_chunk(",
         "self._score_blocks_chunk(index_query, state, chunk)",
         "self._materialize_rows_chunk(masked_scores, chunk, constants)",
-        "self._main_projection_rows(full_hidden, cos, sin, constants)",
+        "self._main_projection_rows(full_hidden, hidden_tiles, cos, sin, constants)",
         "self._write_packed_kv_chunk(state, chunk_state, key, value, chunk)",
         "self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)",
         "self._project_output_rows(local_attention, full_hidden, constants)",
@@ -347,10 +353,11 @@ def test_chunk_body_has_no_host_ints_no_host_io_and_the_decode_order() -> None:
         for line in decode.splitlines()
         if "self._" in line and "validate" not in line
     ]
+    # The long chunk's hidden row tiles (moved once for the five linears) are a chunk-only stage.
     chunk_order = [
         line.strip().split("=", 1)[-1].strip() if "=" in line else line.strip()
         for line in body.splitlines()
-        if "self._" in line and "validate" not in line
+        if "self._" in line and "validate" not in line and "_hidden_row_tiles" not in line
     ]
 
     # The same nine stages in the same order (the chunk names end in _rows / _chunk).
@@ -365,9 +372,21 @@ def test_chunk_body_has_no_host_ints_no_host_io_and_the_decode_order() -> None:
 
 def test_chunk_body_replaces_the_one_hots_with_whole_slab_writes_and_selection_matmuls() -> None:
     compressed = _ttnn_op_walk("_write_compressed_index_chunk")
-    # Call sites: the pool select, then the per-block row pick / view / reshard / write inside the block loop.
-    assert compressed == ["copy", "matmul", "rms_norm", "matmul", "reshape", "to_memory_config", "paged_update_cache"]
+    # Call sites: the pool select, then the 128-row chunk's one-tile write (the cache viewed as tile blocks, one
+    # paged_fill_cache), then the 32-row form's per-block row pick / view / reshard / write inside the block loop.
+    assert compressed == [
+        "copy",
+        "matmul",
+        "rms_norm",
+        "view",
+        "paged_fill_cache",
+        "matmul",
+        "reshape",
+        "to_memory_config",
+        "paged_update_cache",
+    ]
     assert "for block in range(len(constants.row_selects)):" in _method_source("_write_compressed_index_chunk")
+    assert "if constants.rows == LONG_CHUNK_ROWS:" in _method_source("_write_compressed_index_chunk")
     assert "multiply" not in compressed and "sum" not in compressed  # no ring one-hots, no scaled sum
     kv = _ttnn_op_walk("_write_packed_kv_chunk")
     assert kv == ["concat", "copy", "to_layout", "update_padded_kv_cache"]

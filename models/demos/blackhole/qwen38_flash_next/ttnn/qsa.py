@@ -47,6 +47,7 @@ from models.demos.blackhole.qwen38_flash_next.config import Qwen38Placement
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROW_COUNTS,
     CHUNK_ROWS,
+    LONG_CHUNK_ROWS,
     MESH_SHAPE,
     Qwen38MeshContract,
     TensorPlacement,
@@ -1123,9 +1124,11 @@ class Qwen38TTNNQSAChunkConstants:
 class Qwen38TTNNQSAChunkInputs:
     """Per-chunk device tensors derived from the position; shared by all QSA layers.
 
-    ``kv_block_start`` UINT32 ``[1,1,1,1]`` (= P), ``block_index_i32`` rows / 4 INT32 ``[1]`` (P/4 + i),
-    ``indexer_neg_mask`` BF16 ROW_MAJOR ``[1,1,rows,blocks]`` and the UINT32 ROW_MAJOR ``[1,1,rows,2080]``
-    ``row_keep_bits`` / ``row_fill``: row j is the 1-row input at position P + j.
+    ``kv_block_start`` UINT32 ``[1,1,1,1]`` (= P), ``block_index_i32`` rows / 4 INT32 ``[1]`` (P/4 + i; the 32-row
+    forms, one ``paged_update_cache`` per compressed block), ``compressed_tile_i32`` INT32 ``[1,1]`` (= P / 128; the
+    128-row chunk's page table: its 32 compressed rows are one tile-aligned block of the cache, written by one
+    ``paged_fill_cache``), ``indexer_neg_mask`` BF16 ROW_MAJOR ``[1,1,rows,blocks]`` and the UINT32 ROW_MAJOR
+    ``[1,1,rows,2080]`` ``row_keep_bits`` / ``row_fill``: row j is the 1-row input at position P + j.
     """
 
     rows: int
@@ -1134,10 +1137,16 @@ class Qwen38TTNNQSAChunkInputs:
     indexer_neg_mask: Any
     row_keep_bits: Any
     row_fill: Any
+    compressed_tile_i32: Any = None
 
     def deallocate(self) -> None:
         _deallocate(
-            self.kv_block_start, *self.block_index_i32, self.indexer_neg_mask, self.row_keep_bits, self.row_fill
+            self.kv_block_start,
+            *self.block_index_i32,
+            self.indexer_neg_mask,
+            self.row_keep_bits,
+            self.row_fill,
+            self.compressed_tile_i32,
         )
 
 
@@ -1180,14 +1189,21 @@ def derive_qsa_chunk_inputs(
     ):
         raise ValueError(f"QSA chunk inputs derive 1..{max_blocks} block indices, got {completed_blocks!r}")
     kv_block_start = ttnn.bitwise_and(position_scalar, constants.high27_mask, memory_config=dram)
-    block_index = ttnn.bitwise_right_shift(position_scalar, 2, memory_config=dram)
     block_indices_i32 = []
-    for block in range(completed_blocks):
-        shifted = block_index if block == 0 else ttnn.add(block_index, block, memory_config=dram)
-        block_indices_i32.append(ttnn.reshape(ttnn.typecast(shifted, ttnn.int32, memory_config=dram), (1,)))
-        if block:
-            _deallocate(shifted)
-    _deallocate(block_index)
+    compressed_tile_i32 = None
+    if template_rows == LONG_CHUNK_ROWS:
+        # P % 128 == 0: the chunk's 32 compressed rows are the cache's tile P / 128, one paged_fill_cache page.
+        tile_index = ttnn.bitwise_right_shift(position_scalar, 7, memory_config=dram)
+        compressed_tile_i32 = ttnn.reshape(ttnn.typecast(tile_index, ttnn.int32, memory_config=dram), (1, 1))
+        _deallocate(tile_index)
+    else:
+        block_index = ttnn.bitwise_right_shift(position_scalar, 2, memory_config=dram)
+        for block in range(completed_blocks):
+            shifted = block_index if block == 0 else ttnn.add(block_index, block, memory_config=dram)
+            block_indices_i32.append(ttnn.reshape(ttnn.typecast(shifted, ttnn.int32, memory_config=dram), (1,)))
+            if block:
+                _deallocate(shifted)
+        _deallocate(block_index)
 
     # Per row j: context = P + j + 1, complete = context // 4; blocks at or past complete are masked.
     context_blocks = ttnn.add(chunk.row_index_blocks, position_scalar, memory_config=dram)
@@ -1245,6 +1261,7 @@ def derive_qsa_chunk_inputs(
         indexer_neg_mask=indexer_neg_mask,
         row_keep_bits=row_keep_bits,
         row_fill=row_fill,
+        compressed_tile_i32=compressed_tile_i32,
     )
     for name, tensor, shape, dtype, layout in (
         ("kv_block_start", kv_block_start, (1, 1, 1, 1), u32, ttnn.ROW_MAJOR_LAYOUT),
@@ -1254,6 +1271,11 @@ def derive_qsa_chunk_inputs(
         *(
             (f"block_index_i32[{i}]", t, (1,), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
             for i, t in enumerate(block_indices_i32)
+        ),
+        *(
+            (("compressed_tile_i32", compressed_tile_i32, (1, 1), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT),)
+            if compressed_tile_i32 is not None
+            else ()
         ),
     ):
         _require_shape(tensor, shape, f"QSA chunk input {name}")
@@ -1275,15 +1297,21 @@ def emulate_qsa_chunk_inputs(
         emulate_qsa_position_inputs(position + row, allocated_compressed_blocks=allocated_compressed_blocks)
         for row in range(rows)
     ]
-    return {
+    long = rows == LONG_CHUNK_ROWS
+    inputs = {
         "kv_block_start": per_row[0]["kv_block_start"],
+        # The 128-row chunk writes its compressed rows as one tile (the page table below), not block by block.
         "block_index_i32": tuple(
-            torch.tensor([position // COMPRESS_RATIO + block], dtype=torch.int32) for block in range(chunk_blocks(rows))
+            torch.tensor([position // COMPRESS_RATIO + block], dtype=torch.int32)
+            for block in range(0 if long else chunk_blocks(rows))
         ),
         "indexer_neg_mask": torch.cat([row["indexer_neg_mask"] for row in per_row], dim=2),
         "row_keep_bits": torch.cat([row["row_keep_bits"] for row in per_row], dim=2),
         "row_fill": torch.cat([row["row_fill"] for row in per_row], dim=2),
     }
+    if long:
+        inputs["compressed_tile_i32"] = torch.tensor([[position // LONG_CHUNK_ROWS]], dtype=torch.int32)
+    return inputs
 
 
 def chunk_handoff_ring_select_rows(prefilled: int) -> torch.Tensor:
@@ -3434,10 +3462,19 @@ class Qwen38TTNNQSA:
     def _validate_chunk_inputs(self, chunk: Qwen38TTNNQSAChunkInputs, *, completed_blocks: int | None = None) -> None:
         blocks = self.allocated_compressed_blocks
         rows = chunk.rows
+        # The 128-row chunk carries its page table (one tile write) instead of per-block indices.
+        long = rows == LONG_CHUNK_ROWS
         if completed_blocks is None:
-            completed_blocks = chunk_blocks(rows) if rows in CHUNK_ROW_COUNTS else CHUNK_BLOCKS
+            completed_blocks = 0 if long else (chunk_blocks(rows) if rows in CHUNK_ROW_COUNTS else CHUNK_BLOCKS)
+        if long and chunk.compressed_tile_i32 is None:
+            raise ValueError("the 128-row QSA chunk inputs carry no compressed tile index")
         expected = (
             ("kv_block_start", chunk.kv_block_start, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
+            *(
+                (("compressed_tile_i32", chunk.compressed_tile_i32, (1, 1), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT),)
+                if long
+                else ()
+            ),
             (
                 "indexer_neg_mask",
                 chunk.indexer_neg_mask,
@@ -3492,11 +3529,20 @@ class Qwen38TTNNQSA:
         self.mesh_contract.validate_tensor(full_hidden, placement=TensorPlacement.REPLICATED)
         return full_hidden
 
-    def _linear_rows(self, full_hidden, weight, program_config, constants: Qwen38TTNNQSAChunkConstants):
-        """A DRAM-sharded decode linear over the chunk rows: one call on the gathered shard at 32 rows, one
-        call per row tile (moved into the activation shard) at 128 rows, the outputs concatenated interleaved."""
+    def _hidden_row_tiles(self, full_hidden, constants: Qwen38TTNNQSAChunkConstants):
+        """The long chunk's four hidden row tiles in the decode linears' activation shard, moved once per layer
+        for its five DRAM-sharded linears (``None`` at 32 rows: the gathered shard is the input)."""
 
         if constants.rows == CHUNK_ROWS:
+            return None
+        return dram_sharded_row_tiles(full_hidden, self.hidden_act_memory_config)
+
+    def _linear_rows(self, full_hidden, weight, program_config, hidden_tiles):
+        """A DRAM-sharded decode linear over the chunk rows: one call on the gathered shard at 32 rows, one
+        call per row tile (``hidden_tiles``, from :meth:`_hidden_row_tiles`) at 128 rows, the outputs
+        concatenated interleaved."""
+
+        if hidden_tiles is None:
             projected_ws = ttnn.linear(
                 full_hidden,
                 weight,
@@ -3508,7 +3554,7 @@ class Qwen38TTNNQSA:
             _deallocate(projected_ws)
             return projected
         projected_tiles = []
-        for tile in dram_sharded_row_tiles(full_hidden, self.hidden_act_memory_config):
+        for tile in hidden_tiles:
             projected_ws = ttnn.linear(
                 tile,
                 weight,
@@ -3517,15 +3563,15 @@ class Qwen38TTNNQSA:
                 compute_kernel_config=self.compute_config,
             )
             projected_tiles.append(ttnn.to_memory_config(projected_ws, ttnn.DRAM_MEMORY_CONFIG))
-            _deallocate(tile, projected_ws)
+            _deallocate(projected_ws)
         projected = ttnn.concat(projected_tiles, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(*projected_tiles)
         return projected
 
-    def _index_projection_rows(self, full_hidden, cos, sin, constants: Qwen38TTNNQSAChunkConstants):
+    def _index_projection_rows(self, full_hidden, hidden_tiles, cos, sin, constants: Qwen38TTNNQSAChunkConstants):
         rows = constants.rows
-        index_q = self._linear_rows(full_hidden, self.weights.index_q, self.index_program_config, constants)
-        raw_key = self._linear_rows(full_hidden, self.weights.index_k, self.index_program_config, constants)
+        index_q = self._linear_rows(full_hidden, self.weights.index_q, self.index_program_config, hidden_tiles)
+        raw_key = self._linear_rows(full_hidden, self.weights.index_k, self.index_program_config, hidden_tiles)
         self.mesh_contract.validate_tensor(index_q, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
         self.mesh_contract.validate_tensor(raw_key, placement=TensorPlacement.REPLICATED)
         _require_shape(index_q, (1, 1, rows, INDEX_HEAD_DIM), "local index query rows")
@@ -3585,6 +3631,23 @@ class Qwen38TTNNQSA:
         _retag_tensor(rotated, reference=state.compressed_index_cache, shard_dim=None)
         self.mesh_contract.validate_tensor(rotated, placement=TensorPlacement.REPLICATED)
         _require_shape(rotated, (1, 1, CHUNK_ROWS, INDEX_HEAD_DIM), "rotated chunk index keys")
+        if constants.rows == LONG_CHUNK_ROWS:
+            # All 32 rows are compressed blocks and P % 128 == 0 makes them the cache's tile P / 128: one
+            # paged_fill_cache of the tile into the cache viewed as tile-sized blocks (a raw tile copy of the same
+            # rows the per-block loop writes; the view shares the cache's buffer, so the op returns its own tensor id
+            # over the same address).
+            cache = state.compressed_index_cache
+            blocks_view = ttnn.experimental.view(
+                cache, (_shape(cache)[2] // ttnn.TILE_SIZE, 1, ttnn.TILE_SIZE, INDEX_HEAD_DIM)
+            )
+            result = ttnn.experimental.paged_fill_cache(blocks_view, rotated, chunk.compressed_tile_i32, batch_idx=0)
+            if result.buffer_address() != cache.buffer_address():
+                raise RuntimeError(
+                    f"compressed QSA chunk tile write landed at {result.buffer_address()}, "
+                    f"the cache is at {cache.buffer_address()}"
+                )
+            _deallocate(rotated)
+            return
         one_row = ttnn.Shape((1, 1, 1, INDEX_HEAD_DIM))
         tile = ttnn.Shape((1, 1, CHUNK_ROWS, INDEX_HEAD_DIM))
         for block in range(len(constants.row_selects)):
@@ -3707,11 +3770,11 @@ class Qwen38TTNNQSA:
         self.mesh_contract.validate_tensor(sparse_indices, placement=TensorPlacement.REPLICATED)
         return sparse_indices
 
-    def _main_projection_rows(self, full_hidden, cos, sin, constants: Qwen38TTNNQSAChunkConstants):
+    def _main_projection_rows(self, full_hidden, hidden_tiles, cos, sin, constants: Qwen38TTNNQSAChunkConstants):
         rows = constants.rows
-        qg = self._linear_rows(full_hidden, self.weights.qg, self.qg_program_config, constants)
-        k = self._linear_rows(full_hidden, self.weights.k_pair_grouped, self.kv_program_config, constants)
-        v = self._linear_rows(full_hidden, self.weights.v_pair_grouped, self.kv_program_config, constants)
+        qg = self._linear_rows(full_hidden, self.weights.qg, self.qg_program_config, hidden_tiles)
+        k = self._linear_rows(full_hidden, self.weights.k_pair_grouped, self.kv_program_config, hidden_tiles)
+        v = self._linear_rows(full_hidden, self.weights.v_pair_grouped, self.kv_program_config, hidden_tiles)
         self.mesh_contract.validate_tensor(qg, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
         self.mesh_contract.validate_tensor(k, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=3)
         self.mesh_contract.validate_tensor(v, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=3)
@@ -3968,7 +4031,8 @@ class Qwen38TTNNQSA:
             )
 
         full_hidden = self._all_gather_hidden_rows(hidden_rows, constants)
-        index_query, raw_key = self._index_projection_rows(full_hidden, cos, sin, constants)
+        hidden_tiles = self._hidden_row_tiles(full_hidden, constants)
+        index_query, raw_key = self._index_projection_rows(full_hidden, hidden_tiles, cos, sin, constants)
         self._write_compressed_index_chunk(
             state, chunk_state, raw_key, block_start_cos, block_start_sin, chunk, constants
         )
@@ -3976,7 +4040,9 @@ class Qwen38TTNNQSA:
         _deallocate(index_query)
         sparse_indices = self._materialize_rows_chunk(masked_scores, chunk, constants)
 
-        query, gate, key, value = self._main_projection_rows(full_hidden, cos, sin, constants)
+        query, gate, key, value = self._main_projection_rows(full_hidden, hidden_tiles, cos, sin, constants)
+        if hidden_tiles is not None:
+            _deallocate(*hidden_tiles)
         self._write_packed_kv_chunk(state, chunk_state, key, value, chunk)
         local_attention = self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)
         _deallocate(sparse_indices)
@@ -4431,7 +4497,8 @@ class Qwen38TTNNQSA:
             )
 
         full_hidden = self._all_gather_hidden_rows(hidden_rows, constants)
-        index_query, raw_key = self._index_projection_rows(full_hidden, cos, sin, constants)
+        # The verify rows are one 32-row tile: the gathered shard is every linear's input (no row tiles).
+        index_query, raw_key = self._index_projection_rows(full_hidden, None, cos, sin, constants)
         self._write_compressed_index_verify(
             state, verify_state, raw_key, block_start_cos, block_start_sin, verify, constants
         )
@@ -4439,7 +4506,7 @@ class Qwen38TTNNQSA:
         _deallocate(index_query)
         sparse_indices = self._materialize_rows_chunk(masked_scores, verify.chunk, constants)
 
-        query, gate, key, value = self._main_projection_rows(full_hidden, cos, sin, constants)
+        query, gate, key, value = self._main_projection_rows(full_hidden, None, cos, sin, constants)
         self._write_packed_kv_verify(state, key, value, verify)
         local_attention = self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)
         _deallocate(sparse_indices)

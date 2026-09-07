@@ -70,7 +70,8 @@ def _forward_fixture(module: Qwen38TTNNMoE):
 
 
 def _install_forward_mocks(module, tensors, routing, events, monkeypatch) -> None:
-    def route(full, *, phase_observer=None):
+    def route(full, *, hidden_tiles=None, phase_observer=None):
+        assert hidden_tiles is None  # the one-row form hands the gathered shard itself to the router
         if phase_observer is not None:
             for phase in (
                 "before-router-logits",
@@ -104,7 +105,8 @@ def _install_forward_mocks(module, tensors, routing, events, monkeypatch) -> Non
     )
     module._route = mock.Mock(side_effect=route)
     module._shared_partial = mock.Mock(
-        side_effect=lambda hidden, full: events.append(("shared", hidden.name, full.name)) or tensors["shared_partial"]
+        side_effect=lambda hidden, full, tiles=None: events.append(("shared", hidden.name, full.name))
+        or tensors["shared_partial"]
     )
     module._routed_partial = mock.Mock(side_effect=routed)
     monkeypatch.setattr(moe_module.ttnn, "to_memory_config", no_reshard)
@@ -480,6 +482,7 @@ def test_diagnostic_failure_hook_drains_before_first_exception_cleanup_release(m
         assert str(error) == "final fence failed"
         assert tuple(owners) == (
             "full_hidden",
+            "hidden_tiles",
             "routing_scores",
             "routing_indices",
             "routing_tiles",
