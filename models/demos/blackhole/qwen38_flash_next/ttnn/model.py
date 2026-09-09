@@ -654,6 +654,17 @@ class Qwen38TTNNTextModelChunkState:
     local_combine_output: Any | None = None
 
 
+@dataclass(frozen=True)
+class Qwen38TTNNChunkHostInputs:
+    """One chunk's inputs prepared on the host (:meth:`Qwen38TTNNTextModel.prepare_chunk_inputs`, no device call):
+    the token-rows image and the n-gram rows as host tensors for :meth:`Qwen38TTNNTextModel.upload_chunk_inputs`,
+    and the rows + 1 contexts of :meth:`Qwen38TTNNPLE.host_rows` (``contexts[r]`` after committing r rows)."""
+
+    token_rows: Any
+    embedding_rows: Any
+    contexts: tuple[tuple[int, int] | None, ...]
+
+
 @dataclass
 class Qwen38TTNNTextModelGenericSnapshot:
     """Device-resident copy of the generic state's recurrent buffers at one position (the chat server's prompt-end
@@ -2550,12 +2561,12 @@ class Qwen38TTNNTextModel:
         )
         ttnn.copy_host_to_device_tensor(host, chunk_state.accepted)
 
-    def write_chunk_inputs(
+    def prepare_chunk_inputs(
         self, chunk_state: Qwen38TTNNTextModelChunkState, token_ids: Sequence[int], *, ple_context
-    ) -> tuple[tuple[int, int] | None, ...]:
-        """Host writes of one chunk's inputs (outside any trace): the ``rows`` token ids into the token rows and
-        their n-gram rows, looked up from ``ple_context`` in one pass, into the persistent PLE rows.  Returns
-        the rows + 1 contexts of :meth:`Qwen38TTNNPLE.host_rows` (``contexts[r]`` after committing r rows)."""
+    ) -> Qwen38TTNNChunkHostInputs:
+        """The host half of one chunk's input write (no device call): the ``rows`` token ids as the token-rows
+        image and their n-gram rows, looked up from ``ple_context`` in one pass, as host tensors shaped for the
+        chunk state's persistent inputs."""
 
         self._validate_chunk_state(chunk_state)
         ple = self.layers[PLE_CHECKPOINT_LAYER].ple
@@ -2566,26 +2577,44 @@ class Qwen38TTNNTextModel:
             raise ValueError(
                 f"the {chunk_state.rows}-row chunk takes {chunk_state.rows} token ids, got {len(token_ids)}"
             )
-        ttnn.copy_host_to_device_tensor(
-            ttnn.from_torch(
-                self.model_io.embedding.host_token_rows(token_ids),
-                dtype=ttnn.float32,
-                layout=ttnn.TILE_LAYOUT,
-                mesh_mapper=replicate_tensor_2d_mesh_mapper(self.mesh_device),
-            ),
-            chunk_state.token_row,
+        token_rows = ttnn.from_torch(
+            self.model_io.embedding.host_token_rows(token_ids),
+            dtype=ttnn.float32,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=replicate_tensor_2d_mesh_mapper(self.mesh_device),
         )
         rows, contexts = ple.host_rows(token_ids, ple_context)
-        ttnn.copy_host_to_device_tensor(
-            ttnn.from_torch(
-                rows.contiguous(),
-                dtype=ttnn.bfloat16,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
-                mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3)),
-            ),
-            chunk_state.ple_rows.embedding_rows,
+        embedding_rows = ttnn.from_torch(
+            rows.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3)),
         )
-        return contexts
+        return Qwen38TTNNChunkHostInputs(token_rows, embedding_rows, contexts)
+
+    def upload_chunk_inputs(
+        self, chunk_state: Qwen38TTNNTextModelChunkState, prepared: Qwen38TTNNChunkHostInputs
+    ) -> None:
+        """The device half: the two copies into the chunk state's persistent inputs, queued on the command queue
+        in order (behind a replay that reads the same buffers: the device finishes that replay before they land)."""
+
+        self._validate_chunk_state(chunk_state)
+        if len(prepared.contexts) != chunk_state.rows + 1:
+            raise ValueError(
+                f"prepared inputs of {len(prepared.contexts) - 1} rows vs the {chunk_state.rows}-row chunk state"
+            )
+        ttnn.copy_host_to_device_tensor(prepared.token_rows, chunk_state.token_row)
+        ttnn.copy_host_to_device_tensor(prepared.embedding_rows, chunk_state.ple_rows.embedding_rows)
+
+    def write_chunk_inputs(
+        self, chunk_state: Qwen38TTNNTextModelChunkState, token_ids: Sequence[int], *, ple_context
+    ) -> tuple[tuple[int, int] | None, ...]:
+        """Host writes of one chunk's inputs (outside any trace): :meth:`prepare_chunk_inputs` then
+        :meth:`upload_chunk_inputs`.  Returns the rows + 1 contexts (``contexts[r]`` after committing r rows)."""
+
+        prepared = self.prepare_chunk_inputs(chunk_state, token_ids, ple_context=ple_context)
+        self.upload_chunk_inputs(chunk_state, prepared)
+        return prepared.contexts
 
     def forward_prefill_chunk_generic(
         self,

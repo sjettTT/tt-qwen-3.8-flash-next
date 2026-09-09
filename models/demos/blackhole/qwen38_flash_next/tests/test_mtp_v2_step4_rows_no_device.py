@@ -1237,6 +1237,15 @@ class _FakeResidentLookup:
         row = self._row(token, context).contiguous()
         return bytearray(row.view(torch.int16).numpy().tobytes()), (c1, token)
 
+    def lookup_tokens(self, tokens, context):
+        payload = bytearray()
+        contexts = [context]
+        for token in tokens:
+            row, context = self.lookup_token(int(token), context)
+            payload += row
+            contexts.append(context)
+        return payload, tuple(contexts)
+
     def lookup(self, input_ids: torch.Tensor, previous_context):
         context = None if previous_context is None else tuple(int(v) for v in previous_context[0])
         token = int(input_ids.reshape(-1)[0])

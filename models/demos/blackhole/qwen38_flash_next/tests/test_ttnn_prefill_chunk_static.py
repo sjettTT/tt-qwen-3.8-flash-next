@@ -148,10 +148,19 @@ def test_model_chunk_state_is_allocated_before_capture_with_host_written_inputs(
     accepted = inspect.getsource(Qwen38TTNNTextModel.write_chunk_accepted)
     assert "ttnn.copy_host_to_device_tensor(host, chunk_state.accepted)" in accepted
     assert "0 <= accepted < CHUNK_ROWS" in accepted
+    # The input write is a host half (the lookup and the packing: host tensors, no device call) and a device half
+    # (the two copies), so a driver can prepare one chunk's inputs while the previous chunk replays.
+    prepare = inspect.getsource(Qwen38TTNNTextModel.prepare_chunk_inputs)
+    assert "ttnn.copy_host_to_device_tensor(" not in prepare and "device=" not in prepare
+    assert "self.model_io.embedding.host_token_rows(token_ids)" in prepare
+    assert "ple.host_rows(token_ids, ple_context)" in prepare and prepare.count("ttnn.from_torch(") == 2
+    upload = inspect.getsource(Qwen38TTNNTextModel.upload_chunk_inputs)
+    assert upload.count("ttnn.copy_host_to_device_tensor(") == 2
+    assert "chunk_state.token_row)" in upload and "chunk_state.ple_rows.embedding_rows)" in upload
     inputs = inspect.getsource(Qwen38TTNNTextModel.write_chunk_inputs)
-    assert inputs.count("ttnn.copy_host_to_device_tensor(") == 2
-    assert "self.model_io.embedding.host_token_rows(token_ids)" in inputs
-    assert "ple.host_rows(token_ids, ple_context)" in inputs and "chunk_state.ple_rows.embedding_rows" in inputs
+    assert inputs.index("self.prepare_chunk_inputs(chunk_state, token_ids, ple_context=ple_context)") < inputs.index(
+        "self.upload_chunk_inputs(chunk_state, prepared)"
+    )
     reset = inspect.getsource(Qwen38TTNNTextModel.reset_chunk_state_inplace)
     assert "layer.reset_chunk_state_inplace(layer_chunk, layer_state)" in reset
     assert (

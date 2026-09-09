@@ -385,14 +385,17 @@ class _FakeModel:
     def write_chunk_accepted(self, chunk_state, accepted: int) -> None:
         self.calls.append(("accepted", chunk_state, accepted))
 
-    def write_chunk_inputs(self, chunk_state, token_ids, *, ple_context):
+    def prepare_chunk_inputs(self, chunk_state, token_ids, *, ple_context):
         tokens = list(token_ids)
         assert len(tokens) == {"chunk_state": 32, "long_state": 128}[chunk_state]
         contexts = [ple_context]
         for token in tokens:
             contexts.append((2 if contexts[-1] is None else contexts[-1][1], token))
         self.calls.append(("inputs", chunk_state, tuple(tokens), ple_context))
-        return tuple(contexts)
+        return SimpleNamespace(chunk_state=chunk_state, contexts=tuple(contexts))
+
+    def upload_chunk_inputs(self, chunk_state, prepared) -> None:
+        assert prepared.chunk_state == chunk_state  # the upload lands in the state the rows were prepared for
 
     def finish_prefill(self, state, chunk_state, prefilled: int) -> None:
         self.calls.append(("finish", chunk_state, prefilled))

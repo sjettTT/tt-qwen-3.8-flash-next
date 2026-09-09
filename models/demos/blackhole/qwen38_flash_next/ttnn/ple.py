@@ -643,6 +643,31 @@ class Qwen38ResidentPLELookup:
         )
         return self._read_rows(ids), next_context
 
+    def lookup_tokens(
+        self, tokens: Sequence[int], context: tuple[int, int] | None
+    ) -> tuple[bytearray, tuple[tuple[int, int] | None, ...]]:
+        """:meth:`lookup_token` over a token stream in one read: the decode-step hash per token, the contexts chained
+        as the steps chain them (``contexts[c]`` after c tokens), then every row in one ``_read_rows`` batch (one
+        WILLNEED pass per part; the same bytes in the same order as the per-token calls, about three times faster)."""
+
+        for value in (*tokens, *(() if context is None else context)):
+            if isinstance(value, bool) or type(value) is not int or not 0 <= value < self.vocab_size:
+                raise ValueError(f"PLE tokens must be exact integers in [0,{self.vocab_size}), got {value!r}")
+        hashed: list[int] = []
+        contexts: list[tuple[int, int] | None] = [context]
+        for token in tokens:
+            ids, context = ngram_token_ids_decode_step(
+                token,
+                context,
+                eos_token_id=self.eos_token_id,
+                multipliers=self.multipliers,
+                head_vocab_sizes=self.head_vocab_sizes,
+                head_offsets=self.head_offsets,
+            )
+            hashed += ids
+            contexts.append(context)
+        return self._read_rows(hashed), tuple(contexts)
+
     def close(self) -> None:
         for reader in self.readers:
             reader.close()
@@ -990,19 +1015,15 @@ class Qwen38TTNNPLE:
         """The n-gram rows of ``tokens`` looked up sequentially from ``context``, as BF16 ``[1,1,rows,2560]``.
 
         Row i uses the context after rows 0 .. i-1; ``contexts`` has rows + 1 entries, ``contexts[c]`` being
-        the context after committing c rows.  Same hash, bytes and row order as the 1-row decode step.
+        the context after committing c rows.  Same hash, bytes and row order as the 1-row decode step, read in one
+        batch (:meth:`Qwen38ResidentPLELookup.lookup_tokens`).
         """
 
         if len(tokens) == 0:
             raise ValueError("PLE rows need at least one token")
-        payloads = []
-        contexts: list[tuple[int, int] | None] = [context]
-        for token in tokens:
-            payload, context = self.resident_lookup.lookup_token(int(token), context)
-            payloads.append(torch.frombuffer(bytearray(payload), dtype=torch.bfloat16).reshape(EMBEDDING_WIDTH))
-            contexts.append(context)
-        host = torch.stack(payloads).reshape(1, 1, len(tokens), EMBEDDING_WIDTH)
-        return host, tuple(contexts)
+        payload, contexts = self.resident_lookup.lookup_tokens([int(token) for token in tokens], context)
+        host = torch.frombuffer(bytearray(payload), dtype=torch.bfloat16).reshape(1, 1, len(tokens), EMBEDDING_WIDTH)
+        return host, contexts
 
     def _validate_prepared_rows(self, tensor, rows: int, *, label: str) -> None:
         self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)

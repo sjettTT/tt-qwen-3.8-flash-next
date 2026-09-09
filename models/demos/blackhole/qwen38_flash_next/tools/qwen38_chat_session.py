@@ -226,6 +226,11 @@ class Qwen38ChatCompletion:
     prefill_slabs: int = 0  # the slab replays ahead of those (--prefill-slab)
     prefill_tail_rows: int = 0
     prefill_handoff_ms: float = 0.0
+    # The slabs' host work, summed over the request's slabs: the input preparation (the n-gram lookup and the row
+    # packing), the input copies' enqueue, the wait at the slab event syncs.
+    prefill_slab_prepare_ms: float = 0.0
+    prefill_slab_upload_ms: float = 0.0
+    prefill_slab_wait_ms: float = 0.0
     # MTP drafting when the request generated through the pass loop: {k, passes, accepted_drafts, tokens_per_pass,
     # anchor}; None for the 1-row and sampled loops.
     mtp: dict[str, Any] | None = None
@@ -246,6 +251,9 @@ class Qwen38ChatCompletion:
             "prefill_slabs": self.prefill_slabs,
             "prefill_tail_rows": self.prefill_tail_rows,
             "prefill_handoff_ms": round(self.prefill_handoff_ms, 3),
+            "prefill_slab_prepare_ms": round(self.prefill_slab_prepare_ms, 3),
+            "prefill_slab_upload_ms": round(self.prefill_slab_upload_ms, 3),
+            "prefill_slab_wait_ms": round(self.prefill_slab_wait_ms, 3),
             "prefill_ms_per_prompt_token": (
                 None if not self.prefill_tokens else round(1000.0 * self.prefill_seconds / self.prefill_tokens, 3)
             ),
@@ -1002,6 +1010,9 @@ class Qwen38ChatSession:
             prefill_slabs=0 if chunked is None else chunked.timing.slabs,
             prefill_tail_rows=0 if chunked is None else chunked.timing.tail_rows,
             prefill_handoff_ms=0.0 if chunked is None else chunked.timing.handoff_ms,
+            prefill_slab_prepare_ms=0.0 if chunked is None else sum(chunked.timing.slab_prepare_ms),
+            prefill_slab_upload_ms=0.0 if chunked is None else sum(chunked.timing.slab_upload_ms),
+            prefill_slab_wait_ms=0.0 if chunked is None else sum(chunked.timing.slab_wait_ms),
             mtp=(
                 None
                 if not drafting

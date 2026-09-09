@@ -31,7 +31,7 @@ def _next_context(context, token: int) -> tuple[int, int]:
 
 
 class _FakeModel:
-    """Records the driver's calls; ``write_chunk_inputs`` returns the 33 contexts the PLE lookup would."""
+    """Records the driver's calls; ``prepare_chunk_inputs`` returns the 33 contexts the PLE lookup would."""
 
     allocated_context = ALLOCATED_CONTEXT
 
@@ -44,14 +44,17 @@ class _FakeModel:
     def write_chunk_accepted(self, chunk_state, accepted: int) -> None:
         self.calls.append(("write_chunk_accepted", accepted))
 
-    def write_chunk_inputs(self, chunk_state, token_ids, *, ple_context):
+    def prepare_chunk_inputs(self, chunk_state, token_ids, *, ple_context):
         tokens = list(token_ids)
         assert len(tokens) == CHUNK_ROWS
         contexts = [ple_context]
         for token in tokens:
             contexts.append(_next_context(contexts[-1], token))
-        self.calls.append(("write_chunk_inputs", tuple(tokens), ple_context))
-        return tuple(contexts)
+        self.calls.append(("prepare_chunk_inputs", tuple(tokens), ple_context))
+        return SimpleNamespace(tokens=tuple(tokens), contexts=tuple(contexts))
+
+    def upload_chunk_inputs(self, chunk_state, prepared) -> None:
+        self.calls.append(("upload_chunk_inputs", prepared.tokens))
 
     def finish_prefill(self, state, chunk_state, prefilled: int) -> None:
         self.calls.append(("finish_prefill", prefilled))
@@ -117,6 +120,7 @@ def test_run_sequences_alignment_chunks_tail_and_handoff(harness, start: int, co
     timing = result.timing
     assert (timing.alignment_steps, timing.chunks, timing.tail_rows) == (aligned, len(accepts), len(remaining) % 32)
     assert timing.chunk_replay_ms == () and timing.chunk_host_ms == () and timing.wall_ms >= 0.0
+    assert timing.slab_prepare_ms == () and timing.slab_upload_ms == () and timing.slab_wait_ms == ()  # no slabs
 
     log = harness.log
     forced = [entry for entry in log if entry[0] == "forced_step"]
@@ -140,7 +144,7 @@ def test_run_sequences_alignment_chunks_tail_and_handoff(harness, start: int, co
         if accepted != 31:
             expected.append(("write_chunk_accepted", accepted))
             rows = rows + [CHUNK_PAD_TOKEN_ID] * (32 - real)
-        expected.append(("write_chunk_inputs", tuple(rows), context))
+        expected += [("prepare_chunk_inputs", tuple(rows), context), ("upload_chunk_inputs", tuple(rows))]
         context = _expected_context(rows[:real], context)  # the pad rows never enter the committed context
         expected.append(("replay", False))
         if (index + 1) % 4 == 0:
@@ -240,8 +244,9 @@ def test_driver_source_pins() -> None:
         "self.model.reset_chunk_state_inplace(self.state, self.chunk_state)",
         "verify_before_replay",
         "self.model.write_chunk_accepted(self.chunk_state, accepted)",
-        "self.model.write_chunk_inputs(chunk_state, rows, ple_context=ple_context)",
-        "ple_context = contexts[real_rows]",
+        "prepared = self.model.prepare_chunk_inputs(chunk_state, rows, ple_context=ple_context)",
+        "ple_context = prepared.contexts[real_rows]",
+        "self.model.upload_chunk_inputs(chunk_state, prepared)",
         "self._run_chunk(blocking=True, kind=kind)",
         "self._run_chunk(blocking=False, kind=kind)",
         "ttnn.event_synchronize(ttnn.record_event(self.mesh, cq_id=0))",
@@ -249,6 +254,17 @@ def test_driver_source_pins() -> None:
     )
     positions = [run.index(fragment) for fragment in order]
     assert positions == sorted(positions)
+    # The host half (the lookup and the packing) is timed apart from the copies' enqueue and the slab's event wait.
+    assert run.index("slab_prepare_ms.append((upload_started_ns - host_started_ns)") < run.index(
+        "slab_upload_ms.append((replay_started_ns - upload_started_ns)"
+    )
+    assert "slab_wait_ms.append((time.perf_counter_ns() - wait_started_ns)" in run
+    # A slab waits for the previous slab's event once its own replay is queued (the host runs one slab ahead).
+    assert run.index("self._run_chunk(blocking=False, kind=kind)") < run.index("ttnn.event_synchronize(slab_event)")
+    assert run.index("ttnn.event_synchronize(slab_event)") < run.index(
+        "slab_event = ttnn.record_event(self.mesh, cq_id=0)"
+    )
+    assert run.count("ttnn.record_event(") == 2 and run.count("ttnn.event_synchronize(") == 2
     chunk = inspect.getsource(Qwen38ChunkPrefill._run_chunk)
     assert "ttnn._ttnn_execute_trace(self.mesh, trace_id, cq_id=0, blocking=blocking)" in chunk
     assert (

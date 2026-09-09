@@ -52,7 +52,7 @@ chunks and a 30-row tail, so its rate blends the slab's with the remainder's):
 
 | | 32-row chunks | `--long-chunks` | `--prefill-slab 2048` |
 |---|---|---|---|
-| ms per prompt token (6942-token prompt) | 3.3 | 1.55 | 1.155 (TTFT 8.07 s) |
+| ms per prompt token (6942-token prompt) | 3.3 | 1.55 | 1.04 (TTFT 7.27 s) |
 | json acceptance | 96/96 | 96/96 | 96/96 |
 | divergence table vs the pinned table | pinned | identical | identical |
 | decode after the prefill | 19.9 tok/s | 19.9 tok/s | 19.7-20.1 tok/s |
@@ -69,26 +69,35 @@ time to its first token, the rate the server's prefill ms per prompt token):
 
 | prompt tokens | `--long-chunks` TTFT / ms per token | `--prefill-slab 2048` TTFT / ms per token (32k context) | the same at a 64k context |
 |---|---|---|---|
-| 4,179 | 6.36 s / 1.51 | 4.57 s / 1.08 | 4.77 s / 1.13 |
-| 8,176 | 12.3 s / 1.50 | 9.65 s / 1.17 | 10.1 s / 1.23 |
-| 16,322 | 24.4 s / 1.49 | 18.0 s / 1.10 | 18.9 s / 1.16 |
-| 31,988 | 47.4 s / 1.48 | 33.6 s / 1.05 | 35.0 s / 1.09 |
-| 64,655 | - | - | 70.3 s / 1.09 (31 slabs) |
-| 127,872 | - | - | 151 s / 1.18 at a 128k context (62 slabs) |
+| 4,179 | 6.36 s / 1.51 | 4.17 s / 0.98 | 4.40 s / 1.04 |
+| 8,176 | 12.3 s / 1.50 | 8.85 s / 1.08 | 9.22 s / 1.12 |
+| 16,322 | 24.4 s / 1.49 | 15.7 s / 0.96 | 16.5 s / 1.01 |
+| 31,988 | 47.4 s / 1.48 | 28.0 s / 0.87 | 29.8 s / 0.93 |
+| 64,655 | - | - | 58.1 s / 0.90 (31 slabs) |
+| 127,872 | - | - | 151 s / 1.18 at a 128k context (62 slabs; measured before the input pipeline below) |
 
-Where the slab's time goes (the device profiler over the traced body, tt-perf-report per replay): the traced slab
-body itself runs 1.32-1.44 s per 2048 rows (0.64-0.70 ms per token, kernel-bound: 19,161 programs, of which the 768
-`moe_compute` calls are 0.20 ms per token, the collectives 0.11, `sparse_sdpa` 0.06, the element-wise ops 0.06, the
-dense matmuls 0.045); the rest of the measured 1.05 ms per token, about 0.35-0.40, is spent outside the trace between
-slabs (the host's n-gram lookup and the 10 MB embedding-rows upload for the next slab, then the event sync), which the
-current driver does not overlap with the replay.
+Where the slab's time goes: the device runs one slab in 1.6-1.8 s (0.78-0.88 ms per token).  The traced body is
+19,161 programs; under the device profiler on 32,000 tokens of natural text it is kernel-bound at 1.52-1.60 s per
+slab (1.58 s of kernel time at P = 0, 1.51 s at P = 28672): the 768 `moe_compute` calls 0.25-0.31 ms per token (their
+time follows the experts the tokens select: 0.20 on a slab of repeated tokens), the collectives 0.11, the element-wise
+ops 0.06, the dense matmuls 0.045, `sparse_sdpa` 0.04-0.06, the combine tilize + weighted reduce 0.07; what the server
+measures beyond the body (under 0.1 s per slab) is the input copies and the dispatch of the replay.  The host's work
+per slab is the preparation of the next slab's inputs (the n-gram lookup of 2048 tokens, read from the table in one
+batch, and the row packing: 0.1-0.25 s, against 0.36 s when the rows were read one token at a time) and the enqueue
+of their copies, a few ms.  The driver overlaps that preparation with the running replay: the copies are queued behind the
+replay on the same command queue (in order, so the device finishes reading the input buffers before they change), and
+the driver waits for slab k - 1's event only once slab k's replay is queued, then prepares slab k + 1 while slab k runs.
+Only the first slab's preparation is exposed, so a prompt of N slabs costs N device periods plus one preparation; the
+served tokens are bitwise those of the un-overlapped driver (the same bytes reach the same buffers before the same
+replay).
 
-The slab takes 28-29 percent less time per prompt token than the 128-row chunks at every length (1.05 against 1.48 ms
-at 32k tokens: TTFT 33.6 s against 47.4 s).  The slab body itself runs at about 1.05 ms per prompt token (about 950
-prompt tokens per second); the shorter prompts pay more for their remainder (the 128- and 32-row chunks after the last slab) and the fixed hand-off.  A 64k context
-(`--allocated-context 65536`) costs about 4 percent more per token (the QSA selection scores over twice the blocks) and
-56 MB per DRAM bank more; a 128k context about 13 percent more per token (1.18-1.34 ms; 226 MB per bank left); the slab
-state and trace themselves cost 45 MB per bank at any context.
+The slab takes 41 percent less time per prompt token than the 128-row chunks at 32k (0.87 against 1.48 ms: TTFT 28.0 s
+against 47.4 s) and 35 percent less at 4k.  The slab body itself runs at about 0.86-0.88 ms per prompt token at 32k
+(about 1,150 prompt tokens per second); the shorter prompts pay more for their remainder (the 128- and 32-row chunks
+after the last slab), the first slab's preparation and the fixed hand-off.  A 64k context (`--allocated-context 65536`)
+costs about 4 percent more per token (the QSA selection scores over twice the blocks) and 56 MB per DRAM bank more; a
+128k context about 13 percent more per token (226 MB per bank left); the slab state and trace themselves cost 45 MB per
+bank at any context.
 
 Memory: the slab state adds about 200 MB per device at 32k (one set of GDN pass buffers shared by the 35 GDN layers,
 the PLE rows, the QSA slab constants and kept rows, the slab trace); the transients inside a layer peak around

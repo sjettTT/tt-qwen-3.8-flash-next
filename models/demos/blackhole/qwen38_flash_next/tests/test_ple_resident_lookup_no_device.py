@@ -367,6 +367,24 @@ def test_lookup_token_returns_the_oracle_rows_and_context(tmp_path) -> None:
             resident.lookup_token(bad, None)
     with pytest.raises(ValueError, match="exact integers"):
         resident.lookup_token(3, (1000, 2))
+    # The stream form (the chunk drivers' host_rows): one batched read, the per-token payloads concatenated in order
+    # and the contexts chained as the steps chain them, from a fresh history and from a mid-stream context.
+    stream = tokens.tolist()
+    for start_context in (None, (EOS, EOS), (5, EOS), (EOS, 9), (11, 12)):
+        payloads = []
+        contexts = [start_context]
+        context = start_context
+        for token in stream:
+            payload, context = resident.lookup_token(token, context)
+            payloads.append(bytes(payload))
+            contexts.append(context)
+        batched, batched_contexts = resident.lookup_tokens(stream, start_context)
+        assert isinstance(batched, bytearray) and bytes(batched) == b"".join(payloads)
+        assert batched_contexts == tuple(contexts) and len(batched_contexts) == len(stream) + 1
+    with pytest.raises(ValueError, match="exact integers"):
+        resident.lookup_tokens([3, 1000], None)
+    with pytest.raises(ValueError, match="exact integers"):
+        resident.lookup_tokens([3], (1000, 2))
     resident.close()
 
 

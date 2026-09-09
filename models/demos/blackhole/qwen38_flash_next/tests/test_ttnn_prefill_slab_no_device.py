@@ -9,6 +9,7 @@ matmul config, and the source pins that keep the slab's forms apart from the 32/
 from __future__ import annotations
 
 import inspect
+import itertools
 import math
 from types import SimpleNamespace
 
@@ -75,7 +76,16 @@ def test_prefill_matmul_config_covers_the_rows_and_columns_with_whole_subblocks(
     original = decode_matmul_module.ttnn.MatmulMultiCoreReuseMultiCastProgramConfig
     decode_matmul_module.ttnn.MatmulMultiCoreReuseMultiCastProgramConfig = _Config
     try:
-        for k, n in ((2560, 4160), (1536, 2560), (2560, 384), (384, 2560), (2560, 512), (2560, 160), (160, 2560), (2560, 1)):
+        for k, n in (
+            (2560, 4160),
+            (1536, 2560),
+            (2560, 384),
+            (384, 2560),
+            (2560, 512),
+            (2560, 160),
+            (160, 2560),
+            (2560, 1),
+        ):
             captured.clear()
             decode_matmul_module.prefill_matmul_program_config(mesh, SLAB, k, n)
             cols, rows = captured["compute_with_storage_grid_size"]
@@ -148,11 +158,15 @@ class _FakeModel:
     def write_chunk_accepted(self, chunk_state, accepted: int) -> None:
         self.calls.append(("accepted", accepted))
 
-    def write_chunk_inputs(self, chunk_state, token_ids, *, ple_context):
+    def prepare_chunk_inputs(self, chunk_state, token_ids, *, ple_context):
         tokens = list(token_ids)
         assert len(tokens) == chunk_state.rows
         self.calls.append(("write", chunk_state.rows, tuple(tokens)))
-        return tuple([ple_context] * (len(tokens) + 1))
+        return SimpleNamespace(rows=chunk_state.rows, contexts=tuple([ple_context] * (len(tokens) + 1)))
+
+    def upload_chunk_inputs(self, chunk_state, prepared) -> None:
+        assert prepared.rows == chunk_state.rows
+        self.calls.append(("upload", chunk_state.rows))
 
     def finish_prefill(self, state, chunk_state, prefilled: int) -> None:
         self.calls.append(("finish", prefilled))
@@ -201,6 +215,11 @@ def test_driver_runs_slabs_then_long_then_short_chunks(driver, start: int, count
     assert written[:remaining] == tokens[aligned:]
     assert result.position == start + count
     assert result.timing.slabs == slabs and result.timing.slab_rows == SLAB
+    uploads = [call for call in model.calls if call[0] == "upload"]
+    assert [rows for _, rows in uploads] == [rows for _, rows, _ in writes]
+    timing = result.timing
+    assert len(timing.slab_prepare_ms) == len(timing.slab_upload_ms) == len(timing.slab_wait_ms) == slabs
+    assert all(ms >= 0.0 for ms in timing.slab_prepare_ms + timing.slab_upload_ms + timing.slab_wait_ms)
     assert result.timing.long_chunks == long and result.timing.chunks == math.ceil(short / 32)
     eager = [call for call in model.calls if call[0] == "eager"]
     assert [rows for _, rows, _, _ in eager] == [SLAB] * slabs + [128] * long + [32] * math.ceil(short / 32)
@@ -209,6 +228,80 @@ def test_driver_runs_slabs_then_long_then_short_chunks(driver, start: int, count
     if remaining:
         assert resets[0] == ("reset", 32) and (slabs == 0 or ("reset", SLAB) in resets)
         assert model.calls[-1] == ("finish", start + count)
+
+
+def test_driver_prepares_the_next_slab_while_the_current_one_replays(monkeypatch) -> None:
+    """The slab cadence: with slab k's replay queued the host waits for slab k - 1's event and records slab k's, so
+    slab k + 1's inputs are prepared and their copies queued while slab k runs; the first slab waits for nothing;
+    the chunks after the slabs keep the every-``event_interval`` sync; the hand-off synchronizes everything."""
+
+    log: list[tuple] = []
+    events = itertools.count()
+
+    def record_event(mesh, cq_id):
+        event = next(events)
+        log.append(("record", event))
+        return event
+
+    monkeypatch.setattr(
+        driver_module,
+        "ttnn",
+        SimpleNamespace(
+            synchronize_device=lambda mesh: log.append(("synchronize",)),
+            record_event=record_event,
+            event_synchronize=lambda event: log.append(("wait", event)),
+            _ttnn_execute_trace=lambda mesh, trace_id, cq_id, blocking: log.append(("replay", trace_id, blocking)),
+        ),
+    )
+    model = _FakeModel()
+    model.calls = log
+    states = {rows: SimpleNamespace(rows=rows) for rows in (32, 128, SLAB)}
+    traces = {"slab": 3, "long": 2, "short": 1}
+    count = 3 * SLAB + 5 * 128 + 32 + 8
+    tokens = list(range(1000, 1000 + count))
+    prefill = driver_module.Qwen38ChunkPrefill(
+        model,
+        object(),
+        object(),
+        states[32],
+        traces["short"],
+        forced_step=lambda token, context: context,
+        verify_allocations=False,
+        long_chunk_state=states[128],
+        long_chunk_trace_id=traces["long"],
+        slab_state=states[SLAB],
+        slab_trace_id=traces["slab"],
+    )
+    result = prefill.run(tokens, start_position=0, ple_context=None)
+
+    plan = [("slab", SLAB)] * 3 + [("long", 128)] * 5 + [("short", 32)] * 2
+    expected: list[tuple] = [("synchronize",), ("reset", 32), ("reset", 128), ("reset", SLAB)]
+    offset = 0
+    pending = None
+    event = 0
+    for index, (kind, rows) in enumerate(plan):
+        chunk = tokens[offset : offset + rows]
+        offset += rows
+        if len(chunk) < rows:
+            expected.append(("accepted", len(chunk) - 1))
+            chunk = chunk + [driver_module.CHUNK_PAD_TOKEN_ID] * (rows - len(chunk))
+        expected += [("write", rows, tuple(chunk)), ("upload", rows), ("replay", traces[kind], False)]
+        if kind == "slab":
+            if pending is not None:
+                expected.append(("wait", pending))
+            expected.append(("record", event))
+            pending, event = event, event + 1
+        elif (index + 1) % driver_module.CHUNK_EVENT_INTERVAL == 0:
+            expected += [("record", event), ("wait", event)]
+            event += 1
+    expected += [("synchronize",), ("finish", count), ("synchronize",)]
+    assert log == expected
+    assert result.position == count and result.timing.slabs == 3 and len(result.timing.slab_wait_ms) == 3
+    # The blocking (timed) form keeps every replay blocking and records no event.
+    log.clear()
+    timed = prefill.run(tokens[: 2 * SLAB], start_position=0, ple_context=None, time_each_chunk=True)
+    assert [entry for entry in log if entry[0] in ("replay", "record", "wait")] == [("replay", 3, True)] * 2
+    assert len(timed.timing.slab_replay_ms) == 2 and timed.timing.slab_wait_ms == ()
 
 
 def test_driver_rejects_a_slab_without_the_long_chunks_or_with_mtp(driver) -> None:
@@ -270,13 +363,19 @@ def test_slab_source_pins() -> None:
     router = inspect.getsource(moe_module.Qwen38TTNNMoE._slab_router_logits)
     assert "prefill_linear(" in router and "ttnn.typecast(router_bf16, ttnn.float32" in router
     blocks = inspect.getsource(moe_module.Qwen38TTNNMoE._routed_partial_blocks)
-    assert "self.block_instance._routed_partial(rows, Qwen38TTNNRouting(scores, indices), packed_w0_w1, packed_w2)" in blocks
+    assert (
+        "self.block_instance._routed_partial(rows, Qwen38TTNNRouting(scores, indices), packed_w0_w1, packed_w2)"
+        in blocks
+    )
     slab_select = inspect.getsource(qsa_module.Qwen38TTNNQSA._sparse_indices_slab)
     assert "ttnn.all_reduce(" in slab_select and "ttnn.ge(constants.arange_blocks_row, complete_col" in slab_select
     assert "ttnn.experimental.topk_large_indices(masked, k=BLOCK_TOPK)" in slab_select
     assert qsa_module.SLAB_SCORE_BLOCK_ROWS == 512
     forward = inspect.getsource(qsa_module.Qwen38TTNNQSA.forward_chunk_generic)
-    assert "if is_slab_rows(rows):" in forward and "self._sparse_indices_slab(index_query, state, chunk, constants)" in forward
+    assert (
+        "if is_slab_rows(rows):" in forward
+        and "self._sparse_indices_slab(index_query, state, chunk, constants)" in forward
+    )
     # The 32-row and 128-row bodies keep their forms (their own pins hold): the per-tile loops are still there.
     assert "dram_sharded_row_tiles(full_hidden, self.in_proj_act_memory_config)" in inspect.getsource(gdn_module)
     assert "def _routed_partial_tiles" in inspect.getsource(moe_module)
