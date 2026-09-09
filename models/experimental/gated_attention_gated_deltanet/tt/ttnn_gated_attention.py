@@ -465,8 +465,8 @@ def gated_attention_forward_ttnn(
     elif past_key is not None:
         # Legacy concat mode — used during segmented prefill
         past_len = past_key.shape[2]
-        key_states = ttnn.concat([past_key, key_states], dim=2, memory_config=memory_config)
-        value_states = ttnn.concat([past_value, value_states], dim=2, memory_config=memory_config)
+        key_states = ttnn.concat([past_key, key_states], dim=2)
+        value_states = ttnn.concat([past_value, value_states], dim=2)
         new_key = key_states
         new_value = value_states
         S_total = key_states.shape[2]

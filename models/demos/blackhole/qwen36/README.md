@@ -1,8 +1,7 @@
-# Qwen3.5 / Qwen3.6 / Qwen3.8 on Blackhole
+# Qwen3.5 / Qwen3.6 on Blackhole
 
 This directory implements Tenstorrent Blackhole inference for the hybrid
-**Gated DeltaNet + Gated Full Attention** Qwen3.5/3.6/3.8 family. The same code
-path serves these checkpoints:
+**Gated DeltaNet + Gated Full Attention** Qwen3.5/3.6 family. The same code path serves three checkpoints:
 
 | Model            | `HF_MODEL`             | Mesh / `MESH_DEVICE` | Parallelism            |
 | ---------------- | ---------------------- | -------------------- | ---------------------- |
@@ -10,16 +9,14 @@ path serves these checkpoints:
 | Qwen3.5-27B      | `Qwen/Qwen3.5-27B`     | P150x4 — `P150x4`    | 4-way tensor parallel  |
 | Qwen3.6-27B      | `Qwen/Qwen3.6-27B`     | P150x4 — `P150x4`    | 4-way tensor parallel  |
 | Qwen3.6-27B      | `Qwen/Qwen3.6-27B`     | P150x8 — `P150x8`    | 8-way tensor parallel  |
-| Qwen3.8-27B      | `Qwen/Qwen3.8-27B`     | P150x4 — `P150x4`    | 4-way tensor parallel  |
-| Qwen3.8-27B      | `Qwen/Qwen3.8-27B`     | P150x8 — `P150x8`    | 8-way tensor parallel  |
 
 - The **9B** runs on a **single Blackhole P150** device. It uses the validated
   single-device forward path (no collectives).
-- The **27B** variants run on a **P150x4**
+- The **27B** variants (both Qwen3.5-27B and Qwen3.6-27B) run on a **P150x4**
   (a `(1, 4)` Blackhole mesh) using **4-way tensor parallelism (TP)**. The TP
   path needs `FABRIC_1D` for the cross-device collectives (all-reduce /
   reduce-scatter) and a trace region for the captured chunk-outer prefill trace.
-- **Qwen3.6-27B and Qwen3.8-27B additionally run at TP=8** on a `(1, 8)` mesh (`P150x8`).
+- **Qwen3.6-27B additionally runs at TP=8** on a `(1, 8)` mesh (`P150x8`).
   Because it has only **4 KV heads**, TP=8 cannot give each device its own head:
   each head is instead **replicated across the device pair holding its GQA query
   group** (devices 0-1 share KV head 0, 2-3 head 1, and so on), so
@@ -40,9 +37,8 @@ Assembly: `tok_embeddings → N × Qwen36DecoderLayer → RMSNorm → LM Head`.
 Each model interleaves two attention block types (read from the HF
 `layer_types`): **Gated DeltaNet** (linear-attention, recurrent + causal conv
 state) layers and **Gated Full Attention** (paged KV cache) layers. The 9B has
-32 layers (24 DeltaNet + 8 full-attention); the 27B models have 64 layers (48
-DeltaNet + 16 full-attention). The family uses zero-centered RMSNorm everywhere
-and **partial** RoPE (only a fraction of each head is rotated).
+32 layers (24 DeltaNet + 8 full-attention). Qwen3.5 uses zero-centered RMSNorm
+everywhere and **partial** RoPE (only a fraction of each head is rotated).
 
 ## Environment setup
 
@@ -62,10 +58,6 @@ export MESH_DEVICE=P150
 # Qwen3.6-27B
 export HF_MODEL=Qwen/Qwen3.6-27B
 export MESH_DEVICE=P150x4
-
-# Qwen3.8-27B (also supports MESH_DEVICE=P150x8)
-export HF_MODEL=Qwen/Qwen3.8-27B
-export MESH_DEVICE=P150x8
 
 # …or Qwen3.5-27B
 export HF_MODEL=Qwen/Qwen3.5-27B
@@ -181,8 +173,8 @@ checkpoint. They must run on the `(1,4)` mesh with `FABRIC_1D` (the
 | `test_model_tp.py`    | full-model TP contract: paged+traced path matches the bespoke oracle |
 | `test_generate_tp.py` | full-model bespoke `generate_tp` on a real prompt (answer oracle)   |
 
-Run the 27B TP suite (with `HF_MODEL=Qwen/Qwen3.8-27B`,
-`Qwen/Qwen3.6-27B`, or `Qwen/Qwen3.5-27B`, `MESH_DEVICE=P150x4`):
+Run the 27B TP suite (with `HF_MODEL=Qwen/Qwen3.6-27B` or `Qwen/Qwen3.5-27B`,
+`MESH_DEVICE=P150x4`):
 
 ```bash
 pytest models/demos/blackhole/qwen36/tests/test_mlp_tp.py -v -s

@@ -34,7 +34,8 @@
 #
 # The checkout this script lives in must be built (build_metal.sh, create_venv.sh); the server admits only a ttnn
 # imported from it and records the checkout's commit, tree and extension digest as the runtime identity.  No locks, no
-# archives, no seals.
+# archives, no seals.  Start it from any directory, the model directory included: relative path arguments are the
+# caller's, and the interpreter runs from the repository root so the model's own ttnn/ package never shadows ttnn.
 set -euo pipefail
 
 readonly HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -43,7 +44,7 @@ readonly REPO_ROOT="$(cd -- "$MODEL_DIR/../../../.." && pwd -P)"
 readonly SERVER="$HERE/qwen38_chat_server.py"
 
 die() { printf 'run_qwen38_chat_server: %s\n' "$*" >&2; exit 2; }
-usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 profile= instance=0 devices= checkpoint= cache_root= allocated_context=32768 mtp= port=8000 host=0.0.0.0 long_chunks=
 acceptance= acceptance_prompts= require_json_96= prepare_only= bf4_stage_limit= bf4_corpus= bf4_corpus_verification=
@@ -89,6 +90,10 @@ done
 [[ -z "$acceptance" || -z "$acceptance_prompts" ]] || die "--acceptance and --acceptance-prompts are alternatives"
 [[ -z "${TT_METAL_HOME:-}" || "$(cd -- "$TT_METAL_HOME" && pwd -P)" == "$REPO_ROOT" ]] \
     || die "TT_METAL_HOME=$TT_METAL_HOME is not this checkout ($REPO_ROOT); unset it or run that checkout's launcher"
+for name in checkpoint cache_root acceptance_prompts bf4_corpus bf4_corpus_verification python; do
+    [[ -z "${!name}" || "${!name}" == /* ]] || printf -v "$name" '%s/%s' "$PWD" "${!name}"
+done
+cd "$REPO_ROOT"  # from here on the real ttnn package comes first, not the model's own ttnn/
 python=${python:-$REPO_ROOT/python_env/bin/python}
 [[ -x "$python" ]] || die "no python at $python: build this checkout (build_metal.sh, create_venv.sh) or pass --python"
 

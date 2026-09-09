@@ -20,7 +20,8 @@ Modes (``python -m ...tools.qwen38_reference_corpus MODE``):
     hf       the Transformers ``qwen4_exp`` model on the CPU: bf16 weights, the final hidden state through an fp32
              LM head, fp32 log-softmax; per scored position the top-32 ids and log-probs and the teacher's log-prob
     oracle   the same through the CPU oracle ``tt/`` (never edited), with bf16 experts or BF4-emulated experts
-             (``--experts bf4``: the host packer's shared-exponent rounding applied to every routed expert)
+             (``--experts bf4``: the host packer's shared-exponent rounding applied to every routed expert) and with
+             the QSA K/V cache in bf16 or in one of the device's fp8 formats (``--kv``, ``qwen38_kv_cache_emulation``)
     device   a served chain's agreement records (the chat server's ``--agreement-reference`` run: argmax + the
              32-candidate row per position, one file per item) as a column; its log-probs are normalised over the
              row, so only the shared-support metrics apply (the server writes this column and its score itself)
@@ -65,6 +66,13 @@ REFERENCE_SCHEMA = "qwen38-reference-logits/v1"
 AGREEMENT_RECORDS_SCHEMA = "qwen38-agreement-records/v1"
 SCORE_SCHEMA = "qwen38-reference-score/v1"
 PARTS = ("acceptance", "served", "book", "eval", "long")
+KV_CHOICES = (
+    "bf16",
+    "scaled_fp8",
+    "scaled_fp8_rne",
+    "fp8_e4m3",
+    "fp8_e4m3_storage",
+)  # = qwen38_kv_cache_emulation.KV_FORMATS
 TOP_K = 32
 CONTINUATION_TOKENS = 256
 BOOK_TOKENS = 1024
@@ -734,16 +742,22 @@ class HFRunner(_Runner):
 
 
 class OracleRunner(_Runner):
-    def __init__(self, checkpoint: Path, *, experts: str, rss_limit_gib: float):
+    def __init__(self, checkpoint: Path, *, experts: str, rss_limit_gib: float, kv: str = "bf16"):
         import torch
 
         from models.demos.blackhole.qwen38_flash_next.checkpoint import Qwen38Checkpoint
         from models.demos.blackhole.qwen38_flash_next.config import Qwen38Placement
+        from models.demos.blackhole.qwen38_flash_next.tools.qwen38_kv_cache_emulation import (
+            KVCacheRounding,
+            install_kv_rounding,
+        )
         from models.demos.blackhole.qwen38_flash_next.tt.model import Qwen38TextModelOracle
         from models.demos.blackhole.qwen38_flash_next.tt.moe import Qwen38ExpertWeights
 
         if experts not in ("bf16", "bf4"):
             raise ReferenceCorpusError(f"experts must be bf16 or bf4, got {experts!r}")
+        if kv not in KV_CHOICES:
+            raise ReferenceCorpusError(f"kv must be one of {KV_CHOICES}, got {kv!r}")
         loaded = Qwen38Checkpoint(checkpoint)
         placement = Qwen38Placement(loaded.config, mesh_shape=(1, 4), physical_ids=(0, 1, 2, 3))
         self.oracle = Qwen38TextModelOracle(loaded, placement)
@@ -780,6 +794,9 @@ class OracleRunner(_Runner):
             return created
 
         self.oracle.layer = layer  # type: ignore[method-assign]
+        # The QSA K/V rounding wraps the layer factory after the expert wrapper (the two compose).
+        self.kv_rounding = KVCacheRounding(kv)
+        install_kv_rounding(self.oracle, self.kv_rounding)
         self.description = {
             "kind": "oracle",
             "model_class": type(self.oracle).__name__,
@@ -789,6 +806,7 @@ class OracleRunner(_Runner):
                 if experts == "bf4"
                 else "bf16"
             ),
+            "kv_cache": self.kv_rounding.describe(),
             "lm_head": "fp32 (bf16 final hidden state, fp32 weight copy), fp32 log-softmax",
         }
 
@@ -1194,6 +1212,12 @@ def _parser() -> argparse.ArgumentParser:
             )
         else:
             run.add_argument("--experts", choices=("bf16", "bf4"), default="bf16")
+            run.add_argument(
+                "--kv",
+                choices=KV_CHOICES,
+                default="bf16",
+                help="the QSA K/V cache format the oracle emulates at cache-write time (the device's sparse_sdpa formats)",
+            )
             run.add_argument("--rss-limit-gib", type=float, default=300.0)
 
     device = modes.add_parser("device", help="convert a served chain's agreement records into a column")
@@ -1314,7 +1338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             experts_implementation=args.experts_implementation,
         )
     else:
-        runner = OracleRunner(args.checkpoint, experts=args.experts, rss_limit_gib=args.rss_limit_gib)
+        runner = OracleRunner(args.checkpoint, experts=args.experts, rss_limit_gib=args.rss_limit_gib, kv=args.kv)
     _log(
         "model_loaded",
         seconds=round(time.monotonic() - loaded, 1),

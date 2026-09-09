@@ -60,10 +60,6 @@ class Qwen36GatedDeltaNet:
         self.split_conv_state = None
         # Trace capture support
         self.use_inplace_state = False
-        # Eager callers that need more L1 workspace can persist recurrent and
-        # convolution state in DRAM between layers.  The default keeps the
-        # existing, faster L1 behavior used by traced generation.
-        self.decode_state_memory_config = None
         # When True (set during chunk-outer traced-prefill capture), the chunk (prefill)
         # path writes recurrent + conv state into the persistent external buffers IN PLACE
         # (ttnn.copy) instead of reassigning a fresh tensor, so the state carries across

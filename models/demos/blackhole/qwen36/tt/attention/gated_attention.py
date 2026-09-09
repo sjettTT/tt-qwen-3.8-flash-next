@@ -34,12 +34,6 @@ class Qwen36GatedAttention:
             packer_l1_acc=True,
         )
 
-        # Concat decode normally keeps its output and growing K/V cache in L1.
-        # Callers that coexist with a second decoder (for example MTP) can opt
-        # that decoder into DRAM so its persistent cache does not consume the
-        # target model's decode workspace.
-        self.decode_memory_config = ttnn.L1_MEMORY_CONFIG
-
         # KV cache state (concat-based prefill)
         self.past_key = None
         self.past_value = None
@@ -60,7 +54,7 @@ class Qwen36GatedAttention:
         chunk_start_idx_tensor=None,
     ):
         T = x.shape[1]
-        mc = self.decode_memory_config if T == 1 else None
+        mc = ttnn.L1_MEMORY_CONFIG if T == 1 else None
         ckc = self.compute_kernel_config_decode if T <= 1 else self.compute_kernel_config
 
         # Branches are mutually exclusive on T; decode (T==1) is checked first to keep the hot path short.
@@ -114,15 +108,6 @@ class Qwen36GatedAttention:
                 past_value=self.past_value,
                 use_paged_attention=False,
             )
-            if T == 1 and self.decode_memory_config is not None:
-                if new_key.memory_config() != self.decode_memory_config:
-                    placed_key = ttnn.to_memory_config(new_key, self.decode_memory_config)
-                    ttnn.deallocate(new_key)
-                    new_key = placed_key
-                if new_value.memory_config() != self.decode_memory_config:
-                    placed_value = ttnn.to_memory_config(new_value, self.decode_memory_config)
-                    ttnn.deallocate(new_value)
-                    new_value = placed_value
             self.past_key = new_key
             self.past_value = new_value
             return output

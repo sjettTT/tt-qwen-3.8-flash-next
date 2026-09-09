@@ -29,10 +29,6 @@ class Qwen36DecoderLayer:
         self.tt_ccl = tt_ccl
         self.num_devices = getattr(args, "num_devices", 1)
         self.is_full_attention = args.is_full_attention_layer(layer_num)
-        # Optional safety valve for a wide single-device eager decoder.  The
-        # normal traced path leaves this disabled; MTP enables it because it
-        # needs raw target hidden states from the eager path.
-        self.decode_residual_memory_config = None
 
         prefix = f"layers.{layer_num}"
 
@@ -250,14 +246,6 @@ class Qwen36DecoderLayer:
 
         h = ttnn.add(x, attn_output)
         ttnn.deallocate(attn_output)
-        if (
-            mode == "decode"
-            and self.decode_residual_memory_config is not None
-            and h.memory_config() != self.decode_residual_memory_config
-        ):
-            h_dram = ttnn.to_memory_config(h, self.decode_residual_memory_config)
-            ttnn.deallocate(h)
-            h = h_dram
 
         ff_input = self.ffn_norm(h, mode=_norm_mode, norm_config=_ff_norm_config)
 
