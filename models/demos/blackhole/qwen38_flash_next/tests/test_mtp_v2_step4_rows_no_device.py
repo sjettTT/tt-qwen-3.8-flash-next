@@ -1186,7 +1186,7 @@ def test_rows_bodies_are_the_pinned_walk() -> None:
         "_advance_history_rows",
     ]
     assert walk("_step_committed_rows_state") == ["_step_row_state"]
-    assert walk("_causal_conv_rows") == ["_conv_window_rows", "_select_rows"]
+    assert walk("_causal_conv_rows") == ["_shifted_rows_slab", "_conv_window_rows", "_select_rows"]
     assert walk("_advance_history_rows") == ["_conv_window_rows", "_select_rows"]
 
 

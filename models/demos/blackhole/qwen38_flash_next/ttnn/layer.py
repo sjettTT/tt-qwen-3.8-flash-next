@@ -69,7 +69,8 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.gr import (
     block_rows_shape,
     residual_rows_shape,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.moe import Qwen38TTNNMoE, Qwen38TTNNRouting
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import LONG_CHUNK_ROWS, is_slab_rows
+from models.demos.blackhole.qwen38_flash_next.ttnn.moe import SUPPORTED_ROWS, Qwen38TTNNMoE, Qwen38TTNNRouting
 from models.demos.blackhole.qwen38_flash_next.ttnn.ple import (
     Qwen38TTNNPLE,
     Qwen38TTNNPLEPreparedInput,
@@ -1182,8 +1183,8 @@ class Qwen38TTNNDecoderLayer:
                 f"chunk state identity {(state.namespace, state.layer_index)} does not match "
                 f"{(self.namespace.value, self.layer_index)}"
             )
-        if state.rows not in CHUNK_ROW_COUNTS:
-            raise ValueError(f"chunk state rows must be one of {CHUNK_ROW_COUNTS}, got {state.rows!r}")
+        if state.rows not in CHUNK_ROW_COUNTS and not is_slab_rows(state.rows):
+            raise ValueError(f"chunk state rows must be one of {CHUNK_ROW_COUNTS} or a slab row count, got {state.rows!r}")
         if isinstance(self.attention, Qwen38TTNNGDN) != isinstance(state.attention, Qwen38TTNNGDNRowsState):
             raise TypeError(f"layer {self.layer_index} chunk attention state is {type(state.attention).__name__}")
         attention_rows = (
@@ -1195,8 +1196,10 @@ class Qwen38TTNNDecoderLayer:
             raise ValueError(f"chunk attention state holds {attention_rows} rows, the chunk state {state.rows}")
         if (self.ple is None) != (state.ple is None):
             raise ValueError("PLE rows state must be present exactly on the PLE layer")
-        if state.ple is not None and state.ple.rows != state.rows:
-            raise ValueError(f"PLE rows state holds {state.ple.rows} rows, the chunk state {state.rows}")
+        # A slab's PLE runs the 128-row pass per block: its rows state holds 128 rows.
+        ple_rows = LONG_CHUNK_ROWS if is_slab_rows(state.rows) else state.rows
+        if state.ple is not None and state.ple.rows != ple_rows:
+            raise ValueError(f"PLE rows state holds {state.ple.rows} rows, the chunk state needs {ple_rows}")
         if state.moe.rows != state.rows or state.moe.weights is not self.mlp.weights:
             raise ValueError(f"chunk MoE must be a rows-{state.rows} instance over this layer's weights")
 
@@ -1206,12 +1209,14 @@ class Qwen38TTNNDecoderLayer:
         *,
         base: Qwen38TTNNDecoderLayerChunkState | None = None,
         local_combine_output=None,
+        gdn_body: Qwen38TTNNGDNRowsState | None = None,
     ) -> Qwen38TTNNDecoderLayerChunkState:
         """Allocate this layer's chunk buffers before any capture: rows state, PLE rows state, the MoE instance.
 
-        ``constants.rows`` picks the form.  The 128-row form needs ``base``, this layer's 32-row chunk state,
-        whose GDN and PLE histories it shares, and ``local_combine_output``, the combine buffer shared by every
-        layer's 128-row MoE instance.
+        ``constants.rows`` picks the form.  The 128-row form and a slab need ``base``, this layer's 32-row chunk
+        state, whose GDN and PLE histories they share, and ``local_combine_output``, the combine buffer shared by
+        every layer's MoE instance of that form.  ``gdn_body`` (slab GDN layers after the first) is the rows state
+        whose pass buffers this layer's rows state reuses.
         """
 
         rows = constants.rows
@@ -1221,9 +1226,11 @@ class Qwen38TTNNDecoderLayer:
             )
         if rows == CHUNK_ROWS and (base is not None or local_combine_output is not None):
             raise ValueError("the 32-row chunk state owns its histories and combine buffer")
+        if gdn_body is not None and (not is_slab_rows(rows) or not isinstance(self.attention, Qwen38TTNNGDN)):
+            raise ValueError("a shared GDN rows body is a slab GDN layer's option")
         if isinstance(self.attention, Qwen38TTNNGDN):
             attention = self.attention.allocate_rows_state(
-                constants, history=None if base is None else base.attention.history
+                constants, history=None if base is None else base.attention.history, body=gdn_body
             )
         else:
             attention = self.attention.allocate_chunk_state(rows)
@@ -1231,7 +1238,9 @@ class Qwen38TTNNDecoderLayer:
         moe = None
         try:
             if self.ple is not None:
-                ple = self.ple.allocate_rows_state(rows, history=None if base is None else base.ple.history)
+                ple = self.ple.allocate_rows_state(
+                    LONG_CHUNK_ROWS if is_slab_rows(rows) else rows, history=None if base is None else base.ple.history
+                )
             moe = Qwen38TTNNMoE(
                 self.mlp.mesh_device,
                 self.mlp.mesh_contract,
@@ -1241,6 +1250,7 @@ class Qwen38TTNNDecoderLayer:
                 rows=rows,
                 synchronization_policy=self.mlp.synchronization_policy,
                 local_combine_output=local_combine_output,
+                admitted_rows=SUPPORTED_ROWS + ((rows,) if is_slab_rows(rows) else ()),
             )
             result = Qwen38TTNNDecoderLayerChunkState(self.namespace, self.layer_index, attention, ple, moe, rows)
             self._validate_chunk_state(result)
@@ -1298,6 +1308,37 @@ class Qwen38TTNNDecoderLayer:
         if state.ple is not None and state.rows == CHUNK_ROWS:
             state.ple.load_from_state(generic_state.ple)
 
+    def _inject_ple_slab(self, residual_rows, prepared: Qwen38TTNNPLERowsPreparedInput, rows_state):
+        """The slab's PLE: the 128-row chunk pass (inject + full commit, bitwise the long chunk) per 128-row block of
+        the residual rows and the prepared rows, the injected blocks concatenated.  The PLE's gate keeps token-major
+        ``[rows, 4, 2560]`` fp32 intermediates whose branch dim pads to a tile: at 2048 rows they would be 670 MB."""
+
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        rows = _shape(residual_rows)[2]
+        blocks = []
+        for start in range(0, rows, LONG_CHUNK_ROWS):
+            residual_block = ttnn.slice(
+                residual_rows,
+                (0, 0, start, 0),
+                (1, RESIDUAL_BRANCHES, start + LONG_CHUNK_ROWS, LOCAL_HIDDEN_SIZE),
+                memory_config=dram,
+            )
+            rows_block = ttnn.slice(
+                prepared.embedding_rows,
+                (0, 0, start, 0),
+                (1, 1, start + LONG_CHUNK_ROWS, LOCAL_HIDDEN_SIZE),
+                memory_config=dram,
+            )
+            rows_block.update_tensor_topology(prepared.embedding_rows.tensor_topology())
+            block_prepared = Qwen38TTNNPLERowsPreparedInput(rows_block, (), ())
+            blocks.append(self.ple.inject_rows(residual_block, block_prepared, rows_state))
+            self.ple.commit_rows_full(rows_state)
+            block_prepared.release()
+        _deallocate_unique(residual_rows)
+        residual = ttnn.concat(blocks, dim=2, memory_config=dram)
+        _deallocate_unique(*blocks)
+        return residual
+
     def forward_chunk_generic(
         self,
         residual_rows,
@@ -1336,11 +1377,14 @@ class Qwen38TTNNDecoderLayer:
             if prepared_ple_rows is None:
                 raise ValueError("the PLE layer's chunk needs its prepared persistent PLE rows")
             generic_state.ple.token_context = None
-            residual = self.ple.inject_rows(residual_rows, prepared_ple_rows, chunk_state.ple)
-            if selectors is None:
-                self.ple.commit_rows_full(chunk_state.ple)
+            if is_slab_rows(rows):
+                residual = self._inject_ple_slab(residual_rows, prepared_ple_rows, chunk_state.ple)
             else:
-                self.ple.commit_rows(chunk_state.ple, selectors)
+                residual = self.ple.inject_rows(residual_rows, prepared_ple_rows, chunk_state.ple)
+                if selectors is None:
+                    self.ple.commit_rows_full(chunk_state.ple)
+                else:
+                    self.ple.commit_rows(chunk_state.ple, selectors)
         else:
             if prepared_ple_rows is not None:
                 raise ValueError("prepared PLE rows were supplied outside checkpoint layer 1")

@@ -56,10 +56,13 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     TensorPlacement,
     replicate_tensor_2d_mesh_mapper,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
+    prefill_linear,
+    prefill_matmul_program_config,
 )
 
 TP_AXIS = 1
@@ -95,10 +98,10 @@ PARTIAL_REDUCTION_ROWS_SHAPE = (1, 1, CHUNK_ROWS, PARTIAL_WIDTH)
 
 
 def residual_rows_shape(rows: int) -> tuple[int, int, int, int]:
-    """Branch-major residual rows of a chunk form (32 or 128 rows)."""
+    """Branch-major residual rows of a chunk form (32 or 128 rows) or of a prefill slab."""
 
-    if rows not in CHUNK_ROW_COUNTS:
-        raise ValueError(f"GR rows path admits {CHUNK_ROW_COUNTS} rows, got {rows}")
+    if rows not in CHUNK_ROW_COUNTS and not is_slab_rows(rows):
+        raise ValueError(f"GR rows path admits {CHUNK_ROW_COUNTS} rows or a slab row count, got {rows}")
     return (1, RESIDUAL_BRANCHES, rows, LOCAL_HIDDEN_SIZE)
 
 
@@ -731,6 +734,15 @@ class Qwen38TTNNGatedResidual:
             )
         self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
 
+    def _slab_program_config(self, rows: int, k: int, n: int):
+        """The slab's 2D-multicast matmul config for one of the two linears, built once per (rows, k, n)."""
+
+        configs = self.__dict__.setdefault("_slab_program_configs", {})
+        key = (rows, k, n)
+        if key not in configs:
+            configs[key] = prefill_matmul_program_config(self.mesh_device, rows, k, n)
+        return configs[key]
+
     def read_rows(self, residual_rows, *, flat_views: bool = False) -> tuple[Any, Qwen38TTNNGatedResidualState]:
         """:meth:`read` for the residual rows ``[1,4,rows,640]`` of a chunk -> block rows ``[1,1,rows,640]``.
 
@@ -810,9 +822,12 @@ class Qwen38TTNNGatedResidual:
         if self.collective_topology != ttnn.Topology.Linear or self.tt_ccl is None:
             raise RuntimeError("GR rows partial reduction requires the TP4 Linear topology and the TT-CCL manager")
 
+        slab = is_slab_rows(rows)
         normalized_tiles = (
             [normalized_ws]
             if rows == CHUNK_ROWS
+            else []
+            if slab
             else dram_sharded_row_tiles(normalized_ws, self.down_inject_act_memory_config)
         )
         partial_tiles = []
@@ -828,7 +843,16 @@ class Qwen38TTNNGatedResidual:
             partial_tiles.append(ttnn.to_memory_config(partial_ws, dram))
             _deallocate(partial_ws)
         partial_rows_shape = (1, 1, rows, PARTIAL_WIDTH)
-        if rows == CHUNK_ROWS:
+        if slab:
+            # The slab: one 2D-multicast matmul over every row on an interleaved copy of the weight (fp32 out).
+            partial = prefill_linear(
+                normalized_ws,
+                self.weights.down_inject,
+                self._slab_program_config(rows, FLAT_LOCAL_WIDTH, PARTIAL_WIDTH),
+                compute_kernel_config=self.compute_config,
+                dtype=ttnn.float32,
+            )
+        elif rows == CHUNK_ROWS:
             partial = partial_tiles[0]
         else:
             # The four FP32 tile partials stacked on the rows: one gather and one reduce for the 128 rows (the
@@ -889,7 +913,7 @@ class Qwen38TTNNGatedResidual:
             )
 
         up_tiles = []
-        for tile in range(rows // CHUNK_ROWS):
+        for tile in range(0 if slab else rows // CHUNK_ROWS):
             reduced_tile = (
                 reduced_bf16
                 if rows == CHUNK_ROWS
@@ -919,7 +943,16 @@ class Qwen38TTNNGatedResidual:
             _deallocate(low_rank_ws)
             up_tiles.append(ttnn.to_memory_config(up_ws, dram))
             _deallocate(up_ws)
-        if rows == CHUNK_ROWS:
+        if slab:
+            low_rank = ttnn.silu(reduced_bf16, memory_config=dram)
+            up_flat = prefill_linear(
+                low_rank,
+                self.weights.up,
+                self._slab_program_config(rows, PARTIAL_WIDTH, FLAT_LOCAL_WIDTH),
+                compute_kernel_config=self.compute_config,
+            )
+            _deallocate(low_rank, reduced_bf16)
+        elif rows == CHUNK_ROWS:
             up_flat = up_tiles[0]
         else:
             up_flat = ttnn.concat(up_tiles, dim=2, memory_config=dram)

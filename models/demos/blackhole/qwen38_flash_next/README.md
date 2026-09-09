@@ -24,7 +24,7 @@ This was implemented with the intention of the n-gram model residing in system m
 
 | path | measured | notes |
 |---|---|---|
-| prompt prefill | 300 tok/s (and climbing); 650 tok/s with `--long-chunks` | 32-token chunk trace, 3.0-3.5 ms per prompt token, flat from 2k to 261k tokens; 128-token chunks at 1.45-1.56 ms per prompt token (`--long-chunks`, one routed-expert stream per 128 rows and fused row data movement since 2026-09-06); 256-token chunks are in progress |
+| prompt prefill | 300 tok/s (and climbing); 650 tok/s with `--long-chunks`; 950 tok/s with `--prefill-slab 2048` | 32-token chunk trace, 3.0-3.5 ms per prompt token, flat from 2k to 261k tokens; 128-token chunks at 1.45-1.56 ms per prompt token (`--long-chunks`); 2,048-row slabs at 1.05-1.17 ms per prompt token (`--prefill-slab 2048`, 2026-09-09, tolerance class: see `docs/PREFILL.md`) |
 | decode, one stream | 19.9 tok/s | position-generic traced decode, 50 ms per token, flat with depth |
 | decode with MTP (`--mtp 4`) | 37 tok/s aggregate, 55 tok/s on structured output | speculative drafting with exact acceptance: the committed stream leaves the CPU reference at the same token as greedy decode on 8 of the 12 acceptance prompts and at a different token on the other 4 (section 6, `docs/NUMERICS.md`) |
 | contexts | 32k, 64k, 128k, 256k | 256k is single-user; MTP fits at 32k, 64k and 128k |
@@ -143,6 +143,7 @@ The run directory (`<cache-root>/runs/<stamp>/`) holds `READY`, `phase-markers.j
 | `--acceptance`, `--require-json-96` | replay the twelve CPU greedy records at start; refuse to serve unless `json` matches 96/96 |
 | `--prepare-only --bf4-stage-limit N` | convert at most N missing expert layers into the BF4 cache and stop |
 | `--long-chunks` | 128-row prefill chunks where the prompt allows (section 6); off by default, not combined with `--mtp` |
+| `--prefill-slab 2048` | prefill slabs of 2048 rows ahead of the 128-row chunks: one matmul per dense linear, tolerance-class against the chunk bodies (`docs/PREFILL.md`); off by default, not combined with `--mtp` |
 | `--mtp 3\|4` | speculative drafting on greedy requests (section 6); off by default |
 | `--port`, `--host` | the listening port; `--host` default `0.0.0.0`: the QuietBox and LoudBox profiles serve the LAN |
 | `--serve-seconds N` | stop after N seconds (a drain: the request in flight gets its reply) |
@@ -278,3 +279,5 @@ Run the tests from the repository root (`docs/TESTING.md` has the regression har
   `/health`, runtime admission, the BF4 cache identity, the n-gram table pre-warm, disk and memory.
 - `docs/TESTING.md`: the no-device tests, the reference corpus Q38-REF-v1 and its scorer, the regression harness
   (`tools/ci/q38_ci.py`), how to run the acceptance gate.
+- `docs/PREFILL.md`: the prefill chunk bodies and the opt-in 2048-row slab (`--prefill-slab`): what runs as one
+  matmul, its numerics class, what it costs and saves.

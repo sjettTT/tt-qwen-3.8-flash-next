@@ -33,13 +33,34 @@ CHUNK_ROWS = ttnn.TILE_SIZE
 # pinned runtime admits one row tile); every other op runs natively on the four tiles.
 LONG_CHUNK_ROWS = 4 * ttnn.TILE_SIZE
 CHUNK_ROW_COUNTS = (CHUNK_ROWS, LONG_CHUNK_ROWS)
+# Rows of one prefill slab (the opt-in layer-major form): a multiple of the long chunk, 256 .. 4096.  Every dense
+# linear runs as one 2D-multicast matmul on an interleaved copy of its weight; the routed experts run in 128-token
+# moe_compute calls; the GDN kernel carries the state through the slab in one call.
+SLAB_ROW_STEP = LONG_CHUNK_ROWS
+MIN_SLAB_ROWS = 2 * LONG_CHUNK_ROWS
+MAX_SLAB_ROWS = 32 * LONG_CHUNK_ROWS
+DEFAULT_SLAB_ROWS = 16 * LONG_CHUNK_ROWS
+
+
+def is_slab_rows(rows) -> bool:
+    """True for a prefill slab row count (a multiple of 128 in 256 .. 4096; never 32 or 128)."""
+
+    return (
+        not isinstance(rows, bool)
+        and type(rows) is int
+        and MIN_SLAB_ROWS <= rows <= MAX_SLAB_ROWS
+        and rows % SLAB_ROW_STEP == 0
+    )
 
 
 def chunk_row_tiles(rows: int) -> int:
-    """The row tiles of a chunk form (1 or 4); rejects any other row count."""
+    """The row tiles of a chunk form (1 or 4) or of a slab (8 .. 128); rejects any other row count."""
 
-    if rows not in CHUNK_ROW_COUNTS:
-        raise ValueError(f"prefill chunk rows must be one of {CHUNK_ROW_COUNTS}, got {rows!r}")
+    if rows not in CHUNK_ROW_COUNTS and not is_slab_rows(rows):
+        raise ValueError(
+            f"prefill chunk rows must be one of {CHUNK_ROW_COUNTS} or a slab row count "
+            f"(a multiple of {SLAB_ROW_STEP} in {MIN_SLAB_ROWS}..{MAX_SLAB_ROWS}), got {rows!r}"
+        )
     return rows // ttnn.TILE_SIZE
 
 

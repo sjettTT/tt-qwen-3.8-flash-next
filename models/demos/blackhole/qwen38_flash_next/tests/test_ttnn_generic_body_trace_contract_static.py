@@ -40,6 +40,7 @@ RECEIVERS = {
     "self.attention.forward_decode_generic": ("Qwen38TTNNQSA", "forward_decode_generic"),
     "self.attention._validate_state": ("Qwen38TTNNGDN", "_validate_state"),  # QSA validates its generic state
     "self.ple.forward_decode": None,  # eager host-token PLE path; the generic body always passes prepared_ple
+    "self._routed_partial_blocks": None,  # the prefill slab's routed stream: a rows form the decode body never takes
     "self.attention_gr": ("Qwen38TTNNGatedResidual", None),
     "self.mlp_gr": ("Qwen38TTNNGatedResidual", None),
     "self.moe": ("Qwen38TTNNMoE", None),

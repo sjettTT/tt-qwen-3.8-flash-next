@@ -42,6 +42,7 @@ def test_layer_chunk_body_is_the_decode_order_on_rows_with_the_history_commits()
         assert forbidden not in body, forbidden
     calls = _self_calls(Qwen38TTNNDecoderLayer.forward_chunk_generic)
     assert calls == [
+        "self._inject_ple_slab",  # the slab's PLE: the 128-row pass per block
         "self.ple.inject_rows",
         "self.ple.commit_rows_full",
         "self.ple.commit_rows",
@@ -70,11 +71,15 @@ def test_layer_chunk_body_is_the_decode_order_on_rows_with_the_history_commits()
     allocate = inspect.getsource(Qwen38TTNNDecoderLayer.allocate_chunk_state)
     assert "rows=rows" in allocate and "self.mlp.weights" in allocate and "rows = constants.rows" in allocate
     assert (
-        "self.attention.allocate_rows_state(\n                constants, history=None if base is None else base.attention.history\n            )"
+        "self.attention.allocate_rows_state(\n                constants, history=None if base is None else base.attention.history, body=gdn_body\n            )"
         in allocate
     )
     assert "self.attention.allocate_chunk_state(rows)" in allocate
-    assert "self.ple.allocate_rows_state(rows, history=None if base is None else base.ple.history)" in allocate
+    assert (
+        "self.ple.allocate_rows_state(\n"
+        "                    LONG_CHUNK_ROWS if is_slab_rows(rows) else rows, history=None if base is None else base.ple.history\n"
+        "                )"
+    ) in allocate
     assert "local_combine_output=local_combine_output" in allocate
     reset = inspect.getsource(Qwen38TTNNDecoderLayer.reset_chunk_state_inplace)
     assert "sync_rows_history_from_state(generic_state.attention, state.attention)" in reset
@@ -133,11 +138,11 @@ def test_model_chunk_state_is_allocated_before_capture_with_host_written_inputs(
     assert "gdn.allocate_rows_constants(rows)" in allocate
     assert "qsa_module.Qwen38TTNNQSAChunkConstants.build(" in allocate and "rows=rows" in allocate
     assert (
-        "layer.allocate_chunk_state(\n                        rows_constants,\n                        base=None if base is None else base.layers[index],\n                        local_combine_output=local_combine_output,\n                    )"
+        "layer.allocate_chunk_state(\n                        rows_constants,\n                        base=None if base is None else base.layers[index],\n                        local_combine_output=local_combine_output,\n                        gdn_body=gdn_body if layer.layer_type is Qwen38TTNNLayerType.GDN else None,\n                    )"
         in allocate
     )
     assert "self.model_io.embedding.upload_token_rows(rows)" in allocate
-    assert "ple_layer.ple.prepare_rows_input([0] * rows, ple_rows_state)" in allocate
+    assert "ple_layer.ple.prepare_rows_input([0] * rows, ple_rows_state, rows=rows)" in allocate
     assert "float(CHUNK_ROWS - 1)" in allocate  # a full chunk by default
     # The host writers are the only host paths into the chunk buffers, all outside the body.
     accepted = inspect.getsource(Qwen38TTNNTextModel.write_chunk_accepted)

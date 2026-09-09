@@ -162,10 +162,16 @@ def test_chunk_constants_and_inputs_declare_the_device_fields() -> None:
         "pool_select",
         "row_selects",
         "zero_value_half_rows",
+        # The slab's mask operands and page offsets (None for the chunk forms).
+        "arange_blocks_row",
+        "row_index_col",
+        "page_offsets",
     )
-    # compressed_tile_i32: the 128-row chunk's page table (None for the 32-row forms).
+    # compressed_tile_i32: the 128-row chunk's / the slab's page table (None for the 32-row forms);
+    # complete_blocks_col: the slab's mask column (None for the chunk forms).
     assert tuple(Qwen38TTNNQSAChunkInputs.__dataclass_fields__) == ("rows",) + CHUNK_INPUT_FIELDS + (
         "compressed_tile_i32",
+        "complete_blocks_col",
     )
     build = inspect.getsource(Qwen38TTNNQSAChunkConstants.build)
     assert "_upload_uint32(" in build and "replicate_tensor_2d_mesh_mapper(mesh_device)" in build
@@ -353,11 +359,15 @@ def test_chunk_body_has_no_host_ints_no_host_io_and_the_decode_order() -> None:
         for line in decode.splitlines()
         if "self._" in line and "validate" not in line
     ]
-    # The long chunk's hidden row tiles (moved once for the five linears) are a chunk-only stage.
+    # The long chunk's hidden row tiles (moved once for the five linears) and the slab's block selection (its
+    # scoring + top-k per 512-row block) are chunk-only stages.
     chunk_order = [
         line.strip().split("=", 1)[-1].strip() if "=" in line else line.strip()
         for line in body.splitlines()
-        if "self._" in line and "validate" not in line and "_hidden_row_tiles" not in line
+        if "self._" in line
+        and "validate" not in line
+        and "_hidden_row_tiles" not in line
+        and "_sparse_indices_slab" not in line
     ]
 
     # The same nine stages in the same order (the chunk names end in _rows / _chunk).
@@ -386,7 +396,9 @@ def test_chunk_body_replaces_the_one_hots_with_whole_slab_writes_and_selection_m
         "paged_update_cache",
     ]
     assert "for block in range(len(constants.row_selects)):" in _method_source("_write_compressed_index_chunk")
-    assert "if constants.rows == LONG_CHUNK_ROWS:" in _method_source("_write_compressed_index_chunk")
+    assert "if constants.rows == LONG_CHUNK_ROWS or is_slab_rows(constants.rows):" in _method_source(
+        "_write_compressed_index_chunk"
+    )
     assert "multiply" not in compressed and "sum" not in compressed  # no ring one-hots, no scaled sum
     kv = _ttnn_op_walk("_write_packed_kv_chunk")
     assert kv == ["concat", "copy", "to_layout", "update_padded_kv_cache"]

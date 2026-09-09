@@ -33,7 +33,11 @@ weights, fp32 LM head; a transformers checkout with the `qwen4_exp` model class,
 keeps per position the top-32 ids and log-probs and the teacher's log-prob; `oracle` does the same through `tt/` (bf16
 or BF4-emulated experts); `device` converts a served chain's agreement records; `score` compares two columns (top-1 /
 top-5 agreement, clear-margin top-1, truncated KL over the shared top-32 support, first divergence).  The HF column is
-the acceptance reference the other columns are read against.
+the acceptance reference the other columns are read against.  `hf` and `oracle` keep every scored position's full
+logits with `--full-logits DIR` (fp16, one `.pt` per item); the server keeps the device's full-vocabulary logits at
+the same positions with `--agreement-reference FILE --agreement-full-logits DIR` (one eager gather of the LM head's
+bf16 row per recorded position, beside the agreement records), so two columns can be compared over the whole
+vocabulary and not only over the candidate row.
 
 ## The regression harness (development)
 

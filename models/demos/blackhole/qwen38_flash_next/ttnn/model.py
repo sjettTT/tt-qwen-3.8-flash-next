@@ -59,6 +59,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     Qwen38TTNNDevicePosition,
     TensorPlacement,
     chunk_row_tiles,
+    is_slab_rows,
     replicate_tensor_2d_mesh_mapper,
     tensor_metadata,
 )
@@ -525,9 +526,10 @@ class Qwen38TTNNRoPETable:
         """
 
         tiles = _shape(index_rows)[2]
+        block_tiles = _shape(block_start_rows)[2]  # one for the chunk forms, rows / 128 for a slab
         for name, row, expected in (
             ("index_rows", index_rows, (1, 1, tiles, ttnn.TILE_SIZE)),
-            ("block_start_rows", block_start_rows, (1, 1, 1, ttnn.TILE_SIZE)),
+            ("block_start_rows", block_start_rows, (1, 1, block_tiles, ttnn.TILE_SIZE)),
         ):
             if _shape(row) != expected or row.dtype != ttnn.uint32 or row.layout != ttnn.ROW_MAJOR_LAYOUT:
                 raise RuntimeError(
@@ -535,14 +537,14 @@ class Qwen38TTNNRoPETable:
                 )
             self.mesh_contract.validate_tensor(row, placement=TensorPlacement.REPLICATED)
         indices = ttnn.reshape(index_rows, (1, 1, tiles * ttnn.TILE_SIZE))
-        block_indices = ttnn.reshape(block_start_rows, (1, 1, ttnn.TILE_SIZE))
+        block_indices = ttnn.reshape(block_start_rows, (1, 1, block_tiles * ttnn.TILE_SIZE))
         looked_up: list[Any] = []
         try:
             for label, table_indices, table, row_count in (
                 ("QSA chunk RoPE cos", indices, self.cos_table, tiles * ttnn.TILE_SIZE),
                 ("QSA chunk RoPE sin", indices, self.sin_table, tiles * ttnn.TILE_SIZE),
-                ("QSA chunk block-start RoPE cos", block_indices, self.cos_table, ttnn.TILE_SIZE),
-                ("QSA chunk block-start RoPE sin", block_indices, self.sin_table, ttnn.TILE_SIZE),
+                ("QSA chunk block-start RoPE cos", block_indices, self.cos_table, block_tiles * ttnn.TILE_SIZE),
+                ("QSA chunk block-start RoPE sin", block_indices, self.sin_table, block_tiles * ttnn.TILE_SIZE),
             ):
                 rows = self._lookup_tile(table_indices, table, label=label, row_count=row_count)
                 looked_up.append(rows)
@@ -2353,8 +2355,10 @@ class Qwen38TTNNTextModel:
         if not isinstance(chunk_state, Qwen38TTNNTextModelChunkState) or chunk_state._owner is not self._state_owner:
             raise ValueError("text-model chunk state was not allocated by this model owner")
         rows = chunk_state.rows
-        if rows not in CHUNK_ROW_COUNTS:
-            raise ValueError(f"text-model chunk state rows must be one of {CHUNK_ROW_COUNTS}, got {rows!r}")
+        if rows not in CHUNK_ROW_COUNTS and not is_slab_rows(rows):
+            raise ValueError(
+                f"text-model chunk state rows must be one of {CHUNK_ROW_COUNTS} or a slab row count, got {rows!r}"
+            )
         if (
             len(chunk_state.layers) != BACKBONE_LAYERS
             or chunk_state.rows_constants.rows != rows
@@ -2389,8 +2393,9 @@ class Qwen38TTNNTextModel:
     ) -> Qwen38TTNNTextModelChunkState:
         """Allocate the chunk constants and every layer's chunk buffers (before the decode captures).
 
-        ``rows`` picks the form; the 128-row form needs ``base``, the 32-row chunk state of the same generic
-        state, whose per-layer GDN and PLE histories it shares (one shared MoE combine buffer for its 48 layers).
+        ``rows`` picks the form; the 128-row form and a slab need ``base``, the 32-row chunk state of the same
+        generic state, whose per-layer GDN and PLE histories they share (one shared MoE combine buffer for the 48
+        layers).  A slab's 35 GDN layers share one set of pass buffers (the first GDN layer's rows state owns them).
         """
 
         self._validate_generic_state(state)
@@ -2423,14 +2428,18 @@ class Qwen38TTNNTextModel:
                 local_combine_output = moe_module.allocate_local_combine_output(
                     self.mesh_device, self.mesh_contract, moe_module.routed_tokens_per_call_for(rows)
                 )
+            gdn_body = None
             for index, layer in enumerate(self.layers):
                 allocated.append(
                     layer.allocate_chunk_state(
                         rows_constants,
                         base=None if base is None else base.layers[index],
                         local_combine_output=local_combine_output,
+                        gdn_body=gdn_body if layer.layer_type is Qwen38TTNNLayerType.GDN else None,
                     )
                 )
+                if is_slab_rows(rows) and gdn_body is None and layer.layer_type is Qwen38TTNNLayerType.GDN:
+                    gdn_body = allocated[-1].attention
             token_row = self.model_io.embedding.upload_token_rows(rows)
             if rows == CHUNK_ROWS:
                 accepted = ttnn.from_torch(
@@ -2444,7 +2453,7 @@ class Qwen38TTNNTextModel:
             ple_layer, ple_rows_state = self.layers[PLE_CHECKPOINT_LAYER], allocated[PLE_CHECKPOINT_LAYER].ple
             if ple_layer.ple is None or ple_rows_state is None:
                 raise RuntimeError("checkpoint layer 1 PLE owner/rows state is unavailable")
-            ple_rows = ple_layer.ple.prepare_rows_input([0] * rows, ple_rows_state)
+            ple_rows = ple_layer.ple.prepare_rows_input([0] * rows, ple_rows_state, rows=rows)
             result = Qwen38TTNNTextModelChunkState(
                 rows_constants=rows_constants,
                 qsa_chunk_constants=qsa_chunk_constants,
@@ -2621,11 +2630,21 @@ class Qwen38TTNNTextModel:
             index_rows = ttnn.add(
                 index_tiles, chunk_state.qsa_chunk_constants.arange32_lanes, memory_config=ttnn.DRAM_MEMORY_CONFIG
             )
+            # The block starts: one lane tile for the chunk forms, rows / 128 tiles for a slab (the same P row
+            # stacked per tile under the [1,1,btiles,32] lanes).
+            block_tiles = chunk_state.qsa_chunk_constants.block_tiles
+            block_index_tiles = (
+                index_row
+                if block_tiles == 1
+                else ttnn.concat([index_row] * block_tiles, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            )
             block_start_rows = ttnn.add(
-                index_row, chunk_state.qsa_chunk_constants.block_start_lanes, memory_config=ttnn.DRAM_MEMORY_CONFIG
+                block_index_tiles,
+                chunk_state.qsa_chunk_constants.block_start_lanes,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
             rope = self.rope_table.rows_chunk(index_rows, block_start_rows)
-            _deallocate_unique(index_row, index_tiles, index_rows, block_start_rows)
+            _deallocate_unique(index_row, index_tiles, block_index_tiles, index_rows, block_start_rows)
             qsa_chunk = qsa_module.derive_qsa_chunk_inputs(
                 state.position.scalar, self.qsa_position_constants, chunk_state.qsa_chunk_constants
             )

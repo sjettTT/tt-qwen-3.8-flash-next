@@ -74,6 +74,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.live_decode_diagnostic impor
     construct_live_decode_diagnostic,
     missing_bf4_layers,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     DEFAULT_PREFILL_MODE,
     MAX_TOKENS_BOUND,
@@ -1193,6 +1194,8 @@ def replay_acceptance(
             "prefill_seconds": completion.prefill_seconds,
             "prefill_mode": completion.prefill_mode,
             "prefill_chunks": completion.prefill_chunks,
+            "prefill_long_chunks": completion.prefill_long_chunks,
+            "prefill_slabs": completion.prefill_slabs,
             "prefill_forced_tokens": completion.prefill_forced_tokens,
             "prefill_handoff_ms": completion.prefill_handoff_ms,
             "tokens_per_second": completion.tokens_per_second,
@@ -1265,6 +1268,7 @@ def record_agreement(
     parts: Sequence[str],
     out_dir: Path,
     producer: dict[str, Any],
+    full_logits_dir: Path | None = None,
 ) -> dict[str, Any]:
     """A1's device column: every corpus item teacher-forced through the session (a prompt followed by the HF
     reference's argmax chain), the resolved argmax and the candidate row (every shard's top-32) per scored position as
@@ -1273,14 +1277,24 @@ def record_agreement(
 
     The chunked mode scores what its path produces rows for: a prompt item's continuation (the prompt goes through
     the chunk trace), a long item's windows, and for a text item without windows the 32 positions at its end.
+
+    ``full_logits_dir`` also keeps every recorded position's full-vocabulary logits per item there, in the reference
+    tool's ``--full-logits`` format (``<item>.pt``: ``positions`` and ``logits_fp16`` [n, V]): the LM head's bf16 row,
+    gathered eagerly after each recorded TAIL; fp16 holds every bf16 logit exactly except values below 2^-17 in
+    magnitude (rounded to 2^-24 steps; the record counts them).
     """
 
     manifest, items = reference_corpus.load_corpus(corpus_dir)
     _document, hf = reference_corpus.load_reference(reference, manifest=manifest)
     records_dir = out_dir / "agreement-records"
     records_dir.mkdir(exist_ok=True)
+    if full_logits_dir is not None:
+        import torch
+
+        full_logits_dir.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     recorded = []
+    gather_seconds = 0.0
     for item in reference_corpus.select_items(items, parts, ()):
         if item.item_id not in hf:
             raise Qwen38ChatChainError(f"{item.item_id}: not in the HF reference {reference}")
@@ -1295,7 +1309,9 @@ def record_agreement(
                 if item.continuation_tokens
                 else scored[-reference_corpus.LONG_WINDOW :]
             )
-        replay = session.teacher_force(stream[: item.positions], positions=scored)
+        replay = session.teacher_force(
+            stream[: item.positions], positions=scored, full_logits=full_logits_dir is not None
+        )
         document = {
             "schema": reference_corpus.AGREEMENT_RECORDS_SCHEMA,
             "item_id": item.item_id,
@@ -1315,6 +1331,21 @@ def record_agreement(
                 for position, (argmax, row) in sorted(replay.rows.items())
             ],
         }
+        if full_logits_dir is not None:
+            positions = sorted(replay.full_logits)
+            rows = torch.stack([replay.full_logits[position] for position in positions])
+            kept = rows.to(torch.float16)
+            # fp16 holds every bf16 logit of magnitude 2^-17 and above exactly; below that it rounds to 2^-24 steps
+            rounding = (kept.to(torch.float32) - rows).abs()
+            torch.save(
+                {"item_id": item.item_id, "positions": positions, "logits_fp16": kept, "device_dtype": "bfloat16"},
+                full_logits_dir / f"{item.item_id}.pt",
+            )
+            document["full_logits_file"] = str(full_logits_dir / f"{item.item_id}.pt")
+            document["full_logits_seconds"] = round(replay.full_logits_seconds, 3)
+            document["fp16_rounded_values"] = int((rounding > 0).sum())
+            document["fp16_max_abs_error"] = float(rounding.max())
+            gather_seconds += replay.full_logits_seconds
         (records_dir / f"{item.item_id}.json").write_text(json.dumps(document) + "\n", encoding="utf-8")
         recorded.append(item.item_id)
         _log(
@@ -1340,6 +1371,8 @@ def record_agreement(
         "positions": score["corpus"]["positions"],
         "prefill_mode": session.prefill_mode,
         "seconds": round(time.perf_counter() - started, 1),
+        "full_logits": None if full_logits_dir is None else str(full_logits_dir),
+        "full_logits_seconds": round(gather_seconds, 3),
         "corpus": score["corpus"],
         "parts": score["parts"],
     }
@@ -1421,6 +1454,13 @@ def _parser() -> argparse.ArgumentParser:
         help="the corpus parts the agreement records cover (default: all)",
     )
     parser.add_argument(
+        "--agreement-full-logits",
+        type=Path,
+        default=None,
+        help="with --agreement-reference: also keep every recorded position's full-vocabulary logits per item in this "
+        "directory (the corpus tool's --full-logits .pt format; one eager gather and readback per position)",
+    )
+    parser.add_argument(
         "--agreement-corpus",
         type=Path,
         default=reference_corpus.REFERENCE_DIR,
@@ -1436,6 +1476,15 @@ def _parser() -> argparse.ArgumentParser:
         "--long-chunks",
         action="store_true",
         help="chunked prefill only: also capture the 128-row chunk trace and run 128-row chunks ahead of the 32-row ones",
+    )
+    parser.add_argument(
+        "--prefill-slab",
+        type=int,
+        default=None,
+        metavar="ROWS",
+        help="chunked prefill only: also capture a prefill slab of ROWS rows (a multiple of 128 in 256..4096; every "
+        "dense linear as one matmul, the GDN state carried through the slab in one kernel call) and run slabs ahead "
+        "of the 128-row chunks; implies --long-chunks; tolerance-class against the chunk bodies (docs/PREFILL.md)",
     )
     parser.add_argument(
         "--allocated-context",
@@ -1519,6 +1568,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
+    if args.prefill_slab is not None and not is_slab_rows(args.prefill_slab):
+        raise SystemExit(f"--prefill-slab takes a multiple of 128 in 256..4096, got {args.prefill_slab}")
+    if args.prefill_slab is not None and args.mtp is not None:
+        raise SystemExit("--prefill-slab and --mtp are alternatives (the MTP chain prefills in 32-row chunks)")
     try:
         hardware_profile = hardware_profiles.resolve_hardware_profile(args.hardware_profile)
     except hardware_profiles.HardwareProfileError as error:
@@ -1550,6 +1603,8 @@ def main() -> int:
         raise SystemExit("--agreement-reference needs --sampling (the records read the candidate row)")
     if args.agreement_reference is not None and not args.agreement_reference.is_file():
         raise SystemExit(f"--agreement-reference {args.agreement_reference}: not a file")
+    if args.agreement_full_logits is not None and args.agreement_reference is None:
+        raise SystemExit("--agreement-full-logits needs --agreement-reference (the positions it keeps logits for)")
     if args.bf4_stage_limit is not None and args.bf4_stage_limit <= 0:
         raise SystemExit(f"--bf4-stage-limit must be positive, got {args.bf4_stage_limit}")
     if args.device_nodes is not None:
@@ -1647,6 +1702,7 @@ def main() -> int:
                 "reference": str(args.agreement_reference),
                 "corpus": str(args.agreement_corpus),
                 "parts": list(args.agreement_parts),
+                "full_logits": None if args.agreement_full_logits is None else str(args.agreement_full_logits),
             }
         ),
         "mtp": {
@@ -1737,7 +1793,8 @@ def main() -> int:
             chunked_prefill=args.prefill_mode == "chunked",
             sampling=bool(args.sampling),
             bf4_stage_limit=args.bf4_stage_limit,
-            long_chunks=bool(args.long_chunks),
+            long_chunks=bool(args.long_chunks) or args.prefill_slab is not None,
+            slab_rows=args.prefill_slab,
             mtp=args.mtp,
             mtp_gdn_anchor=args.mtp_gdn_anchor,
             device_sampler=bool(args.device_sampler),
@@ -1767,7 +1824,10 @@ def main() -> int:
             "program_cache_entries": chain.program_cache_entries,
             "head_traces": len(chain.head_trace_ids),
             "tail_traces": len(chain.tail_trace_ids),
-            "chunk_traces": len([t for t in (chain.chunk_trace_id, chain.long_chunk_trace_id) if t is not None]),
+            "chunk_traces": len(
+                [t for t in (chain.chunk_trace_id, chain.long_chunk_trace_id, chain.slab_trace_id) if t is not None]
+            ),
+            "prefill_slab_rows": args.prefill_slab,
             "chunk_capture_ms": chain.chunk_capture_ms,
             "long_chunk_capture_ms": chain.long_chunk_capture_ms,
             "prefill_mode": session.prefill_mode,
@@ -1821,6 +1881,7 @@ def main() -> int:
                     "runtime_sha256": runtime["extension_sha256"],
                     "normalisation": "log-softmax over the candidate row",
                 },
+                full_logits_dir=args.agreement_full_logits,
             )
             marker("after-agreement-records")
         if args.sampling_discriminator:

@@ -78,6 +78,64 @@ def dram_sharded_matmul_configs(mesh_device, k: int, n: int, *, num_cores: int):
     return activation_memory_config, program_config
 
 
+def _largest_divisor(value: int, cap: int) -> int:
+    return next(divisor for divisor in range(min(value, cap), 0, -1) if value % divisor == 0)
+
+
+def prefill_matmul_program_config(mesh_device, rows: int, k: int, n: int):
+    """The 2D-multicast program config of a ``[rows, k] x [k, n]`` prefill-slab linear on interleaved operands.
+
+    The grid width is the one that keeps the widest output subblock (the runtime's automatic config is 2-2.5x slower
+    on the K = 2560 linears), ``in0_block_w`` the largest divisor of the K tiles up to 8, the output subblock one tile
+    high and up to four wide (fp32 accumulation halves the destination registers), ``per_core_M`` the row tiles over
+    the grid's rows.  Measured 2026-09-09 on 4x p150: 10-12x the per-tile DRAM-sharded form at 2048 rows, within one
+    bf16 ULP of it.
+    """
+
+    grid = mesh_device.compute_with_storage_grid_size()
+    m_tiles, k_tiles, n_tiles = rows // ttnn.TILE_SIZE, k // ttnn.TILE_SIZE, math.ceil(n / ttnn.TILE_SIZE)
+    if rows % ttnn.TILE_SIZE or k % ttnn.TILE_SIZE:
+        raise ValueError(f"prefill linear needs whole row and K tiles, got rows={rows} k={k}")
+    best_cols, best_key = 1, None
+    for cols in range(1, min(int(grid.x), n_tiles) + 1):
+        key = (_largest_divisor(math.ceil(n_tiles / cols), 4), cols)
+        if best_key is None or key > best_key:
+            best_key, best_cols = key, cols
+    grid_rows = min(int(grid.y), m_tiles)
+    per_core_n = math.ceil(n_tiles / best_cols)
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=(best_cols, grid_rows),
+        in0_block_w=_largest_divisor(k_tiles, 8),
+        out_subblock_h=1,
+        out_subblock_w=_largest_divisor(per_core_n, 4),
+        per_core_M=math.ceil(m_tiles / grid_rows),
+        per_core_N=per_core_n,
+        transpose_mcast=False,
+        fused_activation=None,
+        fuse_batch=False,
+    )
+
+
+def prefill_linear(activation, weight, program_config, *, compute_kernel_config, dtype=None):
+    """One prefill-slab linear: the resident DRAM-width-sharded ``weight`` copied interleaved (the 2D-multicast
+    program admits a sharded in1 but reads it wrong: 96 % of the outputs, measured 2026-09-09), the matmul on the
+    interleaved activation into an interleaved DRAM output, the copy released.  The caller's compute config and
+    output dtype are the decode linear's."""
+
+    weight_interleaved = ttnn.to_memory_config(weight, ttnn.DRAM_MEMORY_CONFIG)
+    try:
+        return ttnn.linear(
+            activation,
+            weight_interleaved,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            program_config=program_config,
+            compute_kernel_config=compute_kernel_config,
+            dtype=dtype,
+        )
+    finally:
+        ttnn.deallocate(weight_interleaved)
+
+
 def dram_sharded_row_tiles(rows, activation_memory_config) -> list:
     """The four 32-row tiles of an interleaved ``[1,1,128,W]`` activation (the long prefill chunk), each moved into
     a decode linear's activation shard (``None``: left interleaved, for the per-tile routed expert stream): the

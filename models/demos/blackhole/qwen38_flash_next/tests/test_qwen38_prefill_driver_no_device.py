@@ -242,8 +242,8 @@ def test_driver_source_pins() -> None:
         "self.model.write_chunk_accepted(self.chunk_state, accepted)",
         "self.model.write_chunk_inputs(chunk_state, rows, ple_context=ple_context)",
         "ple_context = contexts[real_rows]",
-        "self._run_chunk(blocking=True, long=long)",
-        "self._run_chunk(blocking=False, long=long)",
+        "self._run_chunk(blocking=True, kind=kind)",
+        "self._run_chunk(blocking=False, kind=kind)",
         "ttnn.event_synchronize(ttnn.record_event(self.mesh, cq_id=0))",
         "self.model.finish_prefill(self.state, self.chunk_state, position)",
     )
@@ -253,7 +253,8 @@ def test_driver_source_pins() -> None:
     assert "ttnn._ttnn_execute_trace(self.mesh, trace_id, cq_id=0, blocking=blocking)" in chunk
     assert (
         "self.model.forward_prefill_chunk_generic(\n"
-        "            chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor and not long, mtp=None if long else self.mtp\n"
+        "            chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor and short, mtp=self.mtp if short else None\n"
         "        )"
     ) in chunk
+    assert 'short = kind == "short"' in chunk
     assert CHUNK_PAD_TOKEN_ID == 0 and driver_module.CHUNK_EVENT_INTERVAL == 4

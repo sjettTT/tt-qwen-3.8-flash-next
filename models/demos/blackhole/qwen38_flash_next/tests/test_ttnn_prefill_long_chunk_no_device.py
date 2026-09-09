@@ -68,7 +68,7 @@ def _full_accept(constants):
 def test_long_chunk_contract() -> None:
     assert (CHUNK_ROWS, LONG_CHUNK_ROWS, CHUNK_ROW_COUNTS) == (32, 128, (32, 128))
     assert contracts_module.chunk_row_tiles(32) == 1 and contracts_module.chunk_row_tiles(128) == 4
-    for rows in (0, 31, 64, 96, 256):
+    for rows in (0, 31, 64, 96, 192):  # 256 .. 4096 in steps of 128 are the slab row counts
         with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
             contracts_module.chunk_row_tiles(rows)
     assert (
@@ -197,7 +197,7 @@ def test_gdn_long_chunk_matches_four_chunks_and_commits_every_row(fake) -> None:
 
 def test_gdn_long_rows_state_and_full_commit_reject_the_wrong_forms(fake) -> None:
     module = step4._gdn_module(step4._device_gdn_weights(step4._gdn_oracle_weights()))
-    for rows in (0, 33, 64, 256):
+    for rows in (0, 33, 64, 192):
         with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
             module.allocate_rows_constants(rows)
     constants = module.allocate_rows_constants(LONG_CHUNK_ROWS)
@@ -516,7 +516,7 @@ def test_driver_without_the_long_trace_runs_32_row_chunks_only_and_rejects_bad_p
 
 def test_long_chunk_source_pins() -> None:
     layer = inspect.getsource(layer_module.Qwen38TTNNDecoderLayer.forward_chunk_generic)
-    assert "if selectors is None:\n                self.ple.commit_rows_full(chunk_state.ple)" in layer
+    assert "if selectors is None:\n                    self.ple.commit_rows_full(chunk_state.ple)" in layer
     assert (
         "self.attention.commit_rows_full(generic_state.attention, chunk_state.attention, result.final_state)" in layer
     )

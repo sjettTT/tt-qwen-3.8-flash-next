@@ -38,10 +38,13 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     TensorPlacement,
     replicate_tensor_2d_mesh_mapper,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
+    prefill_linear,
+    prefill_matmul_program_config,
 )
 
 TP_SIZE = 4
@@ -94,9 +97,9 @@ def rows_tile_count(rows: int) -> int:
 
     if 1 <= rows <= CHUNK_SIZE:
         return CHUNK_SIZE
-    if rows == LONG_CHUNK_ROWS:
-        return LONG_CHUNK_ROWS
-    raise ValueError(f"GDN rows path admits 1..{CHUNK_SIZE} rows or {LONG_CHUNK_ROWS}, got {rows}")
+    if rows == LONG_CHUNK_ROWS or is_slab_rows(rows):
+        return rows
+    raise ValueError(f"GDN rows path admits 1..{CHUNK_SIZE} rows, {LONG_CHUNK_ROWS} or a slab row count, got {rows}")
 
 
 def _window_buffer_row(logical_row: int) -> int:
@@ -789,7 +792,10 @@ class Qwen38TTNNGDNRowsConstants:
         window_rows = CHUNK_SIZE + tile_rows
         keep = (torch.arange(tile_rows) < rows).float()
         tiles = chunk_constant_tiles()
-        selects = rows_window_select_tiles(rows)
+        # A slab reads its FIR taps and next history by row shifts (a [T, 32 + T] select per tap would be 22 GFLOP
+        # at 2048 rows): only the GQA expand of the 32-row selects is uploaded for it.
+        slab = is_slab_rows(rows)
+        selects = rows_window_select_tiles(CHUNK_SIZE if slab else rows)
         uploaded: list[Any] = []
 
         def upload(host: torch.Tensor, dtype, label: str):
@@ -811,7 +817,9 @@ class Qwen38TTNNGDNRowsConstants:
                     torch.arange(CHUNK_SIZE).float().reshape(1, 1, 1, CHUNK_SIZE), ttnn.float32, "arange row"
                 ),
                 one=upload(torch.ones(1, 1, 1, 1), ttnn.float32, "one"),
-                conv_taps=tuple(
+                conv_taps=()
+                if slab
+                else tuple(
                     upload(
                         selects["conv_taps"][tap].reshape(1, 1, tile_rows, window_rows),
                         ttnn.bfloat16,
@@ -824,7 +832,9 @@ class Qwen38TTNNGDNRowsConstants:
                     ttnn.bfloat16,
                     "history select stack",
                 ),
-                history_select_full=upload(
+                history_select_full=None
+                if slab
+                else upload(
                     selects["history_select_full"].reshape(1, 1, CHUNK_SIZE, window_rows),
                     ttnn.bfloat16,
                     "history select full",
@@ -860,7 +870,7 @@ class Qwen38TTNNGDNRowsConstants:
             self.one,
             *self.conv_taps,
             self.history_select_stack,
-            self.history_select_full,
+            *(() if self.history_select_full is None else (self.history_select_full,)),
             self.qk_expand,
             self.eye,
             self.tril,
@@ -965,6 +975,9 @@ class Qwen38TTNNGDNRowsState:
     owns_history: bool = (
         True  # False: ``history`` is another rows state's buffer (the long chunk shares the 32-row one)
     )
+    # False: the pass buffers (qkv, q, k, v, beta, g, output) are another layer's slab rows state's; the slab's
+    # layers run one after another, so the 35 GDN layers share one set (52 MB at 2048 rows) and keep their histories.
+    owns_body: bool = True
 
     @classmethod
     def allocate(
@@ -975,13 +988,17 @@ class Qwen38TTNNGDNRowsState:
         *,
         layer_index: int,
         history=None,
+        body: "Qwen38TTNNGDNRowsState | None" = None,
     ) -> "Qwen38TTNNGDNRowsState":
         """``history`` hands over another rows state's history buffer (same layer): the two row forms then carry
-        one FIR history and need no sync between them."""
+        one FIR history and need no sync between them.  ``body`` hands over another layer's slab rows state whose
+        pass buffers this layer reuses (slab rows only)."""
 
         mesh_contract.validate_mesh(mesh_device)
         if constants.mesh_contract != mesh_contract:
             raise ValueError("GDN rows constants belong to a different physical mesh contract")
+        if body is not None and (not is_slab_rows(constants.rows) or body.constants is not constants):
+            raise ValueError("a shared GDN rows body is a slab option over the same constants")
         allocated: list[Any] = []
 
         def zero(local_shape: tuple[int, ...], dtype, shard_dim: int, label: str):
@@ -1002,15 +1019,26 @@ class Qwen38TTNNGDNRowsState:
                     if history is None
                     else history
                 ),
-                qkv=zero((1, 1, tile_rows, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows qkv"),
-                q=zero(qk_shape, ttnn.bfloat16, 2, "GDN rows q"),
-                k=zero(qk_shape, ttnn.bfloat16, 2, "GDN rows k"),
-                v=zero((1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows v"),
-                beta=zero((1, 1, tile_rows, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3, "GDN rows beta"),
-                g=zero((1, 1, tile_rows, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3, "GDN rows log decay"),
-                output=zero((1, 1, constants.rows, HIDDEN_SIZE_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows output"),
+                qkv=body.qkv
+                if body is not None
+                else zero((1, 1, tile_rows, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows qkv"),
+                q=body.q if body is not None else zero(qk_shape, ttnn.bfloat16, 2, "GDN rows q"),
+                k=body.k if body is not None else zero(qk_shape, ttnn.bfloat16, 2, "GDN rows k"),
+                v=body.v
+                if body is not None
+                else zero((1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows v"),
+                beta=body.beta
+                if body is not None
+                else zero((1, 1, tile_rows, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3, "GDN rows beta"),
+                g=body.g
+                if body is not None
+                else zero((1, 1, tile_rows, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3, "GDN rows log decay"),
+                output=body.output
+                if body is not None
+                else zero((1, 1, constants.rows, HIDDEN_SIZE_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows output"),
                 mesh_contract=mesh_contract,
                 owns_history=history is None,
+                owns_body=body is None,
             )
             result.validate()
             return result
@@ -1043,13 +1071,7 @@ class Qwen38TTNNGDNRowsState:
     def deallocate(self) -> None:
         _deallocate(
             *((self.history,) if self.owns_history else ()),
-            self.qkv,
-            self.q,
-            self.k,
-            self.v,
-            self.beta,
-            self.g,
-            self.output,
+            *((self.qkv, self.q, self.k, self.v, self.beta, self.g, self.output) if self.owns_body else ()),
         )
 
 
@@ -1490,9 +1512,16 @@ class Qwen38TTNNGDN:
     def allocate_rows_constants(self, rows: int) -> Qwen38TTNNGDNRowsConstants:
         return Qwen38TTNNGDNRowsConstants.allocate(self.mesh_device, self.mesh_contract, rows=rows)
 
-    def allocate_rows_state(self, constants: Qwen38TTNNGDNRowsConstants, *, history=None) -> Qwen38TTNNGDNRowsState:
+    def allocate_rows_state(
+        self, constants: Qwen38TTNNGDNRowsConstants, *, history=None, body: Qwen38TTNNGDNRowsState | None = None
+    ) -> Qwen38TTNNGDNRowsState:
         return Qwen38TTNNGDNRowsState.allocate(
-            self.mesh_device, self.mesh_contract, constants, layer_index=self.weights.layer_index, history=history
+            self.mesh_device,
+            self.mesh_contract,
+            constants,
+            layer_index=self.weights.layer_index,
+            history=history,
+            body=body,
         )
 
     def _validate_rows_state(self, rows_state: Qwen38TTNNGDNRowsState) -> int:
@@ -1594,6 +1623,14 @@ class Qwen38TTNNGDN:
             )
             projected = ttnn.to_memory_config(projected_ws, ttnn.L1_MEMORY_CONFIG)
             _deallocate(projected_ws)
+        elif is_slab_rows(tile_rows):
+            # The slab: one 2D-multicast matmul over every row on an interleaved copy of the weight.
+            projected = prefill_linear(
+                full_hidden,
+                self.weights.qkvzab,
+                self._slab_program_config(tile_rows, HIDDEN_SIZE, PROJECTION_WIDTH_PER_DEVICE),
+                compute_kernel_config=self.compute_config,
+            )
         else:
             projected_tiles = []
             for tile in dram_sharded_row_tiles(full_hidden, self.in_proj_act_memory_config):
@@ -1662,14 +1699,57 @@ class Qwen38TTNNGDN:
         _require_shape(selected, (1, 1, _shape(select)[2], QKV_WIDTH_PER_DEVICE), label=label)
         return selected
 
+    def _slab_program_config(self, rows: int, k: int, n: int):
+        """The slab's 2D-multicast matmul config for one linear, built once per (rows, k, n)."""
+
+        configs = self.__dict__.setdefault("_slab_program_configs", {})
+        key = (rows, k, n)
+        if key not in configs:
+            configs[key] = prefill_matmul_program_config(self.mesh_device, rows, k, n)
+        return configs[key]
+
+    def _shifted_rows_slab(self, rows_state: Qwen38TTNNGDNRowsState):
+        """The slab's FIR taps 0..2 by row shifts: tap t is ``[history rows t..2 | new rows 0..T-4+t]``, built in
+        ROW_MAJOR (a row slice at any offset) and tilized; the same rows the 0/1 selects pick at 32 / 128 rows."""
+
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        tile_rows = rows_state.constants.tile_rows
+        history_rm = ttnn.to_layout(rows_state.history, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+        qkv_rm = ttnn.to_layout(rows_state.qkv, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+        pieces = []
+        for tap in range(CONV_HISTORY_ROWS):
+            kept = ttnn.slice(
+                history_rm, (0, 0, tap, 0), (1, 1, CONV_HISTORY_ROWS, QKV_WIDTH_PER_DEVICE), memory_config=dram
+            )
+            new = ttnn.slice(
+                qkv_rm,
+                (0, 0, 0, 0),
+                (1, 1, tile_rows - CONV_HISTORY_ROWS + tap, QKV_WIDTH_PER_DEVICE),
+                memory_config=dram,
+            )
+            shifted_rm = ttnn.concat([kept, new], dim=2, memory_config=dram)
+            _deallocate(kept, new)
+            shifted = ttnn.to_layout(shifted_rm, ttnn.TILE_LAYOUT, memory_config=ttnn.L1_MEMORY_CONFIG)
+            _deallocate(shifted_rm)
+            _retag_head_shard_after_reshape(shifted, reference=rows_state.qkv, shard_dim=3)
+            _require_shape(shifted, (1, 1, tile_rows, QKV_WIDTH_PER_DEVICE), label=f"GDN slab FIR tap {tap}")
+            pieces.append(shifted)
+        _deallocate(history_rm, qkv_rm)
+        return pieces
+
     def _causal_conv_rows(self, rows_state: Qwen38TTNNGDNRowsState):
-        window = self._conv_window_rows(rows_state)
         # Tap t reads logical window rows t .. t + T - 1; tap 3 is the new rows themselves (the persistent qkv).
-        pieces = [
-            self._select_rows(select, window, memory_config=ttnn.L1_MEMORY_CONFIG, label=f"GDN rows FIR tap {tap}")
-            for tap, select in enumerate(rows_state.constants.conv_taps)
-        ]
-        _deallocate(window)
+        if is_slab_rows(rows_state.constants.tile_rows):
+            pieces = self._shifted_rows_slab(rows_state)
+        else:
+            window = self._conv_window_rows(rows_state)
+            pieces = [
+                self._select_rows(
+                    select, window, memory_config=ttnn.L1_MEMORY_CONFIG, label=f"GDN rows FIR tap {tap}"
+                )
+                for tap, select in enumerate(rows_state.constants.conv_taps)
+            ]
+            _deallocate(window)
         pieces.append(rows_state.qkv)
         # Same tap arithmetic as _causal_conv_decode; the [1,1,1,2560] taps broadcast over the rows.
         conv = ttnn.multiply(pieces[0], self.weights.conv_taps[0], memory_config=ttnn.L1_MEMORY_CONFIG)
@@ -1701,7 +1781,7 @@ class Qwen38TTNNGDN:
         l1 = ttnn.L1_MEMORY_CONFIG
         constants = rows_state.constants
         tile_rows = constants.tile_rows
-        full_rows = constants.rows == tile_rows == LONG_CHUNK_ROWS
+        full_rows = constants.rows == tile_rows and tile_rows != CHUNK_SIZE  # the long chunk and the slab
         q_slice = ttnn.slice(conv, (0, 0, 0, 0), (1, 1, tile_rows, QK_WIDTH_PER_DEVICE), memory_config=l1)
         k_slice = ttnn.slice(
             conv, (0, 0, 0, QK_WIDTH_PER_DEVICE), (1, 1, tile_rows, 2 * QK_WIDTH_PER_DEVICE), memory_config=l1
@@ -1868,6 +1948,50 @@ class Qwen38TTNNGDN:
             self.mesh_contract.validate_tensor(gated, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
             _require_shape(gated, (1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE), label="GDN rows sigmoid-gated output")
             output = self._out_proj_tile(gated, full_hidden)
+        elif is_slab_rows(tile_rows):
+            # The slab: the head-major output folded to token-major rows as twelve whole-tile head slices
+            # concatenated on the width (no padded token-major intermediate), gated interleaved, one 2D-multicast
+            # out-proj over every row, one reduce-scatter, the rows copied into the persistent output.
+            heads = [
+                ttnn.slice(
+                    normalized_heads, (0, head, 0, 0), (1, head + 1, tile_rows, HEAD_DIM), memory_config=l1
+                )
+                for head in range(VALUE_HEADS_PER_DEVICE)
+            ]
+            _deallocate(normalized_heads)
+            normalized = ttnn.concat(heads, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(*heads)
+            _retag_head_shard_after_reshape(normalized, reference=z, shard_dim=3)
+            _require_shape(normalized, (1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE), label="GDN slab normalized output")
+            gated = ttnn.multiply(normalized, sigmoid_bf16, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(normalized, sigmoid_bf16)
+            partial = prefill_linear(
+                gated,
+                self.weights.out,
+                self._slab_program_config(tile_rows, VALUE_WIDTH_PER_DEVICE, HIDDEN_SIZE),
+                compute_kernel_config=self.compute_config,
+            )
+            _deallocate(gated)
+            self.mesh_contract.mark_local_partial(
+                partial, replicated_reference=full_hidden, expected_shape=(1, 1, tile_rows, HIDDEN_SIZE)
+            )
+            output = ttnn.reduce_scatter(
+                partial,
+                dim=3,
+                cluster_axis=TP_AXIS,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                topology=self.collective_topology,
+            )
+            _deallocate(partial)
+            self.mesh_contract.mark_collective_shard(
+                output,
+                replicated_reference=full_hidden,
+                shard_dim=3,
+                expected_local_shape=(1, 1, tile_rows, HIDDEN_SIZE_PER_DEVICE),
+            )
+            _copy_inplace(output, rows_state.output, label="GDN slab output")
+            _deallocate(output)
+            output = rows_state.output
         else:
             # The long chunk folds one 32-row tile at a time: the head-major rows of tile c are a whole-tile
             # slice whose fold is the same metadata view, gated by the gate's rows of that tile straight into
@@ -2161,15 +2285,38 @@ class Qwen38TTNNGDN:
         _require_shape(final_state, (1, VALUE_HEADS_PER_DEVICE, HEAD_DIM, HEAD_DIM), label="GDN rows final state")
         _copy_inplace(final_state, state.recurrent, label="GDN rows committed state")
         _deallocate(final_state)
-        window = self._conv_window_rows(rows_state)
-        self._select_rows(
-            rows_state.constants.history_select_full,
-            window,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            label="GDN rows history select",
-            output_tensor=rows_state.history,
-        )
-        _deallocate(window)
+        if is_slab_rows(rows_state.constants.tile_rows):
+            # The last three new rows into history rows 0..2 (rows 3..31 zero) by row shifts: the last row tile
+            # untilized, its rows 29..31 sliced, padded to a tile, tilized, copied into the persistent history.
+            dram = ttnn.DRAM_MEMORY_CONFIG
+            tile_rows = rows_state.constants.tile_rows
+            last_tile = ttnn.slice(
+                rows_state.qkv, (0, 0, tile_rows - CHUNK_SIZE, 0), (1, 1, tile_rows, QKV_WIDTH_PER_DEVICE), memory_config=dram
+            )
+            last_rm = ttnn.to_layout(last_tile, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+            _deallocate(last_tile)
+            tail = ttnn.slice(
+                last_rm,
+                (0, 0, CHUNK_SIZE - CONV_HISTORY_ROWS, 0),
+                (1, 1, CHUNK_SIZE, QKV_WIDTH_PER_DEVICE),
+                memory_config=dram,
+            )
+            _deallocate(last_rm)
+            padded = ttnn.pad(tail, [(0, 0), (0, 0), (0, CHUNK_SIZE - CONV_HISTORY_ROWS), (0, 0)], 0.0, memory_config=dram)
+            history = ttnn.to_layout(padded, ttnn.TILE_LAYOUT, memory_config=dram)
+            _require_shape(history, (1, 1, CHUNK_SIZE, QKV_WIDTH_PER_DEVICE), label="GDN slab history tile")
+            _copy_inplace(history, rows_state.history, label="GDN slab history")
+            _deallocate(history, padded, tail)
+        else:
+            window = self._conv_window_rows(rows_state)
+            self._select_rows(
+                rows_state.constants.history_select_full,
+                window,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                label="GDN rows history select",
+                output_tensor=rows_state.history,
+            )
+            _deallocate(window)
         state.validate()
 
 

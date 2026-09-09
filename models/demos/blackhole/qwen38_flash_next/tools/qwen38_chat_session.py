@@ -102,6 +102,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     MESH_SHAPE,
     TP_SIZE,
     Qwen38MeshContract,
+    is_slab_rows,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.model import GENERIC_HEAD_LAYERS, Qwen38TTNNGenericTraceKey
 
@@ -220,7 +221,9 @@ class Qwen38ChatCompletion:
     # the eager hand-off time and the wall per prompt token.
     prefill_mode: str = "teacher_forced"
     prefill_forced_tokens: int = 0
-    prefill_chunks: int = 0
+    prefill_chunks: int = 0  # the 32-row chunk replays (full and the padded tail)
+    prefill_long_chunks: int = 0  # the 128-row chunk replays ahead of them (--long-chunks / a slab's remainder)
+    prefill_slabs: int = 0  # the slab replays ahead of those (--prefill-slab)
     prefill_tail_rows: int = 0
     prefill_handoff_ms: float = 0.0
     # MTP drafting when the request generated through the pass loop: {k, passes, accepted_drafts, tokens_per_pass,
@@ -239,6 +242,8 @@ class Qwen38ChatCompletion:
             "prefill_mode": self.prefill_mode,
             "prefill_forced_tokens": self.prefill_forced_tokens,
             "prefill_chunks": self.prefill_chunks,
+            "prefill_long_chunks": self.prefill_long_chunks,
+            "prefill_slabs": self.prefill_slabs,
             "prefill_tail_rows": self.prefill_tail_rows,
             "prefill_handoff_ms": round(self.prefill_handoff_ms, 3),
             "prefill_ms_per_prompt_token": (
@@ -264,13 +269,17 @@ class Qwen38PromptSnapshot:
 @dataclass(frozen=True)
 class Qwen38TeacherForcedRows:
     """:meth:`Qwen38ChatSession.teacher_force`'s result: per wanted position p the resolved argmax and the candidate
-    row of the TAIL that consumed tokens 0..p, and the path the replay took."""
+    row of the TAIL that consumed tokens 0..p, and the path the replay took.  ``full_logits`` holds, when asked, that
+    TAIL's full-vocabulary logits per wanted position (the LM head's bf16 row gathered eagerly, fp32 on the host) and
+    ``full_logits_seconds`` the time those gathers and readbacks took."""
 
     rows: dict[int, tuple[int, Any]]
     prefill_mode: str
     chunks: int
     forced_tokens: int
     seconds: float
+    full_logits: dict[int, Any] = field(default_factory=dict)
+    full_logits_seconds: float = 0.0
 
 
 @dataclass
@@ -989,6 +998,8 @@ class Qwen38ChatSession:
                 prefill_tokens if chunked is None else chunked.timing.alignment_steps + (0 if chunk_stopped else 1)
             ),
             prefill_chunks=0 if chunked is None else chunked.timing.chunks,
+            prefill_long_chunks=0 if chunked is None else chunked.timing.long_chunks,
+            prefill_slabs=0 if chunked is None else chunked.timing.slabs,
             prefill_tail_rows=0 if chunked is None else chunked.timing.tail_rows,
             prefill_handoff_ms=0.0 if chunked is None else chunked.timing.handoff_ms,
             mtp=(
@@ -1003,13 +1014,20 @@ class Qwen38ChatSession:
     # -- teacher forcing with rows (the agreement records) -----------------------------------------
 
     def teacher_force(
-        self, token_ids: Sequence[int], *, positions: Sequence[int], prefill_mode: str | None = None
+        self,
+        token_ids: Sequence[int],
+        *,
+        positions: Sequence[int],
+        prefill_mode: str | None = None,
+        full_logits: bool = False,
     ) -> Qwen38TeacherForcedRows:
         """From position 0 through ``token_ids``: at every wanted position p the resolved argmax and the candidate
         row of the TAIL that consumed tokens 0..p, so p's row must be a forced step.  In the chunked mode a stretch of
         unwanted positions goes through the chunk driver when enough rows remain after its alignment steps (the
         chunk rows yield no logits row); the forced mode forces every token.  Feeds up to the last wanted position
-        and leaves the row unconsumed, like a ``length`` finish.  Needs the candidate row (``--sampling``)."""
+        and leaves the row unconsumed, like a ``length`` finish.  Needs the candidate row (``--sampling``).
+        ``full_logits`` also gathers that TAIL's full-vocabulary logits (the sampler's fallback read) at every wanted
+        position."""
 
         if self.sampling is None:
             raise Qwen38ChatRequestError("teacher forcing with rows needs the candidate row: this chain captured none")
@@ -1027,6 +1045,8 @@ class Qwen38ChatSession:
             raise Qwen38ChatChainError("session is poisoned by an earlier device failure")
         started_ns = self.clock_ns()
         rows: dict[int, tuple[int, Any]] = {}
+        full: dict[int, Any] = {}
+        gather_ns = 0
         chunks = forced = 0
         if getattr(self.sampling, "sampler", None) is not None:
             self.sampling.begin_request(
@@ -1061,6 +1081,11 @@ class Qwen38ChatSession:
                         forced += 1
                         if position in wanted_set:
                             rows[position] = (self.chain.read_token_row(), self.sampling.read_candidate_row())
+                            if full_logits:
+                                # TAIL(position) ran with residue position mod 4 (_forced_step, before the append)
+                                gather_started_ns = self.clock_ns()
+                                full[position] = self.sampling.read_full_logits(position % RESIDUE_CLASSES)
+                                gather_ns += self.clock_ns() - gather_started_ns
                         elif forced % PREFILL_EVENT_INTERVAL == 0:
                             self.chain.event_synchronize(self.chain.record_event())
             position = self.chain.position()
@@ -1074,7 +1099,9 @@ class Qwen38ChatSession:
         self.last_finish = "length"
         self.row_unconsumed = True
         self.row_token = None
-        return Qwen38TeacherForcedRows(rows, mode, chunks, forced, (self.clock_ns() - started_ns) / 1e9)
+        return Qwen38TeacherForcedRows(
+            rows, mode, chunks, forced, (self.clock_ns() - started_ns) / 1e9, full, gather_ns / 1e9
+        )
 
 
 class Qwen38TextStream:
@@ -1288,6 +1315,11 @@ class Qwen38TracedChain:
     long_chunk_state: Any = None
     long_chunk_trace_id: int | None = None
     long_chunk_capture_ms: float = 0.0
+    # (``slab_rows``) the slab chunk state beside the 32-row one and its trace, captured after the long chunk trace;
+    # the driver runs the slabs first, then the 128-row chunks, then the 32-row chunks and the padded tail.
+    slab_state: Any = None
+    slab_trace_id: int | None = None
+    slab_capture_ms: float = 0.0
     # The GDN state re-anchor the chunk trace was captured with (every chunk replay commits through it).
     chunk_gdn_step_anchor: bool = False
     # The allocation tracker verified every trace once after the captures; per-prefill re-verification (140-290 ms
@@ -1432,6 +1464,8 @@ class Qwen38TracedChain:
             long_chunk_state=self.long_chunk_state,
             long_chunk_trace_id=self.long_chunk_trace_id,
             mtp=None if self.mtp is None else self.mtp.chunk_extension,
+            slab_state=self.slab_state,
+            slab_trace_id=self.slab_trace_id,
         ).run(
             token_ids,
             start_position=start_position,
@@ -1512,6 +1546,7 @@ class Qwen38TracedChain:
         mtp: int | None = None,
         mtp_gdn_anchor: str = "off",
         device_sampler: bool = False,
+        slab_rows: int | None = None,
     ) -> Qwen38TracedChain:
         """Target build, generic state (+ chunk state), warm pass (+ one eager chunk and both hand-off forms), miss
         guard, 8 decode captures (+ the chunk capture): the runner's chain prologue and the full-model gate's order.
@@ -1550,6 +1585,8 @@ class Qwen38TracedChain:
             raise ValueError(
                 "long chunks and MTP drafting are alternatives: the MTP chunk extension is a 32-row chunk option"
             )
+        if slab_rows is not None and (not is_slab_rows(slab_rows) or not long_chunks):
+            raise ValueError(f"a prefill slab needs a slab row count and the long chunks, got {slab_rows!r}")
         started_ns = clock_ns()
         runtime_surface = resident_decode.b5b_runtime_surface()
         if runtime_surface["nonblocking_read"] != "ttnn.from_device(local, blocking=False)":
@@ -1619,6 +1656,10 @@ class Qwen38TracedChain:
             if long_chunks:
                 long_chunk_state = model.allocate_chunk_state(state, rows=LONG_CHUNK_ROWS, base=chunk_state)
                 model.reset_chunk_state_inplace(state, long_chunk_state)
+        slab_state = None
+        if slab_rows is not None:
+            slab_state = model.allocate_chunk_state(state, rows=slab_rows, base=chunk_state)
+            model.reset_chunk_state_inplace(state, slab_state)
         # The MTP states sit beside the generic and chunk states, before any capture: every trace bakes their
         # addresses in (the verify / draft states, the TAIL step inputs, the chunk extension).
         chain_mtp = None
@@ -1812,6 +1853,22 @@ class Qwen38TracedChain:
             synchronize()
             marker("after-chat-mtp-warm-pass")
 
+        if slab_rows is not None:
+            # One eager slab from the reset state: its programs compile here, before the miss guard.
+            marker("before-chat-slab-warm-pass")
+            model.reset_generic_state_inplace(state)
+            model.reset_chunk_state_inplace(state, chunk_state)
+            model.reset_chunk_state_inplace(state, slab_state)
+            model.write_chunk_inputs(
+                slab_state, list(WARM_LONG_CHUNK_TOKEN_IDS) * (slab_rows // LONG_CHUNK_ROWS), ple_context=None
+            )
+            synchronize()
+            model.forward_prefill_chunk_generic(slab_state, state)
+            synchronize()
+            actual = state.position.read()
+            if actual != slab_rows:
+                raise Qwen38ChatChainError(f"warm slab position counter {actual} vs expected {slab_rows}")
+            marker("after-chat-slab-warm-pass")
         if long_chunks:
             # One eager 128-row chunk from the reset state: its programs compile here, before the miss guard.
             marker("before-chat-long-chunk-warm-pass")
@@ -2057,6 +2114,19 @@ class Qwen38TracedChain:
             chain.long_chunk_capture_ms = (clock_ns() - long_chunk_capture_started_ns) / 1e6
             synchronize()
             marker("after-chat-long-chunk-capture")
+        if slab_rows is not None:
+            marker("before-chat-slab-capture")
+            slab_capture_started_ns = clock_ns()
+            chain.slab_state = slab_state
+            chain.slab_trace_id = model.capture_prefill_chunk(
+                slab_state,
+                state,
+                guard=lambda label: resident_decode.forbid_trace_body_host_io_and_sync(phase=f"chat slab {label}"),
+                cq_id=0,
+            )
+            chain.slab_capture_ms = (clock_ns() - slab_capture_started_ns) / 1e6
+            synchronize()
+            marker("after-chat-slab-capture")
         if chain_mtp is not None:
             # The verify (first pass), commit and draft traces after the chunk trace; the draft body reads the
             # verify output's readback address, so the verify capture comes first.  Capture records without
@@ -2118,7 +2188,11 @@ class Qwen38TracedChain:
         return (
             self.head_trace_ids
             + self.tail_trace_ids
-            + [trace_id for trace_id in (self.chunk_trace_id, self.long_chunk_trace_id) if trace_id is not None]
+            + [
+                trace_id
+                for trace_id in (self.chunk_trace_id, self.long_chunk_trace_id, self.slab_trace_id)
+                if trace_id is not None
+            ]
             + ([] if self.mtp is None else self.mtp.captured_trace_ids())
         )
 
@@ -2138,6 +2212,7 @@ class Qwen38TracedChain:
         self.tail_trace_ids.clear()
         self.chunk_trace_id = None
         self.long_chunk_trace_id = None
+        self.slab_trace_id = None
         if self.mtp is not None:
             self.mtp.traces = None
             if self.mtp.verify_output is not None:
@@ -2159,6 +2234,9 @@ class Qwen38TracedChain:
         if self.prepared.active:
             self.prepared.release()
         ttnn.deallocate(self.token_row_io)
+        if self.slab_state is not None:  # before the 32-row state whose histories it shares
+            self.built_target.model.release_chunk_state(self.slab_state)
+            self.slab_state = None
         if self.long_chunk_state is not None:  # before the 32-row state whose histories it shares
             self.built_target.model.release_chunk_state(self.long_chunk_state)
             self.long_chunk_state = None
@@ -2195,6 +2273,7 @@ def construct_chain(
     mtp: int | None = None,
     mtp_gdn_anchor: str = "off",
     device_sampler: bool = False,
+    slab_rows: int | None = None,
 ) -> Qwen38TracedChain:
     """Live construction on the open mesh (missing BF4 layers converted first), then the chain prologue."""
 
@@ -2214,4 +2293,5 @@ def construct_chain(
         mtp=mtp,
         mtp_gdn_anchor=mtp_gdn_anchor,
         device_sampler=device_sampler,
+        slab_rows=slab_rows,
     )

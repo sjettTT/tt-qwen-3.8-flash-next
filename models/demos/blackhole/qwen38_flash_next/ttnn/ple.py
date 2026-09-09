@@ -37,6 +37,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     TensorPlacement,
     replicate_tensor_2d_mesh_mapper,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn.gdn import Qwen38TTNNRowsSelectors
 
 TP_AXIS = 1
@@ -428,8 +429,8 @@ class Qwen38TTNNPLERowsState:
         (and one host context, kept by the caller) and need no sync between them."""
 
         mesh_contract.validate_mesh(mesh_device)
-        if not 1 <= rows <= 32 and rows != LONG_CHUNK_ROWS:
-            raise ValueError(f"PLE rows path admits 1..32 rows or {LONG_CHUNK_ROWS}, got {rows}")
+        if not 1 <= rows <= 32 and rows != LONG_CHUNK_ROWS and not is_slab_rows(rows):
+            raise ValueError(f"PLE rows path admits 1..32 rows, {LONG_CHUNK_ROWS} or a slab row count, got {rows}")
         mapper = ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3))
 
         def upload_zero(token_rows: int):
@@ -1012,13 +1013,19 @@ class Qwen38TTNNPLE:
             )
 
     def prepare_rows_input(
-        self, tokens: Sequence[int], rows_state: Qwen38TTNNPLERowsState
+        self, tokens: Sequence[int], rows_state: Qwen38TTNNPLERowsState, *, rows: int | None = None
     ) -> Qwen38TTNNPLERowsPreparedInput:
-        """Look up and upload the ``rows`` tokens of one pass (host work, before capture or between replays)."""
+        """Look up and upload the ``rows`` tokens of one pass (host work, before capture or between replays).
+
+        ``rows`` (a prefill slab) sizes the upload past the rows state: the slab's PLE runs the rows state's 128-row
+        pass per block of the uploaded rows."""
 
         rows_state.validate()
-        if len(tokens) != rows_state.rows:
-            raise ValueError(f"PLE rows input needs {rows_state.rows} tokens, got {len(tokens)}")
+        rows = rows_state.rows if rows is None else rows
+        if rows != rows_state.rows and (not is_slab_rows(rows) or rows_state.rows != LONG_CHUNK_ROWS):
+            raise ValueError(f"PLE rows input of {rows} rows needs a slab row count over a 128-row rows state")
+        if len(tokens) != rows:
+            raise ValueError(f"PLE rows input needs {rows} tokens, got {len(tokens)}")
         host, contexts = self.host_rows(tokens, rows_state.token_context)
         tensor = ttnn.from_torch(
             host.contiguous(),
@@ -1028,7 +1035,7 @@ class Qwen38TTNNPLE:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3)),
         )
-        self._validate_prepared_rows(tensor, rows_state.rows, label="PLE rows upload")
+        self._validate_prepared_rows(tensor, rows, label="PLE rows upload")
         return Qwen38TTNNPLERowsPreparedInput(tensor, tuple(int(token) for token in tokens), contexts)
 
     def _distributed_group_norm_rows(self, tensor, weight, rows: int):
