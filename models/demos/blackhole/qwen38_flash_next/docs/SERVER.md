@@ -60,8 +60,14 @@ The expert cache is keyed by the checkpoint and by the converter's sources (`ttn
 packer, tt-metal's BFP4 packer), not by the tt-metal revision: a rebuilt runtime keeps the cache.  Every start re-packs
 one routed expert of the first cached layer from the checkpoint and compares the bytes with the cache (about a second,
 the `bf4-cache-admission` phase); a cache converted by different code is refused, the layer, expert and tensor named.
-A cache built by an earlier runtime, keyed by its tt-metal revision, is adopted on the first start: its manifest is
-rewritten and the slot renamed under the new key, nothing is reconverted.
+The identity also carries the mesh's DRAM ring as the packing sees it: the bank count and the bank order (the banks
+sorted by the worker core that serves them), not the worker coordinates.  `moe_compute` builds every die's program
+from the first die's bank-to-worker assignment and the packed bytes never see worker coordinates, so dies harvested
+differently share one cache and one conversion (a QuietBox 2 was observed with one die serving its banks from worker
+column 5 and three from column 6; its ring workers on that die sit one column from their banks and read the same bank
+ids in the same order); a mesh whose dies differ in bank count or bank order is refused before anything is converted.
+A cache built by an earlier runtime (keyed by its tt-metal revision, or by the first die's worker coordinates) is
+adopted on the first start: its manifest is rewritten and the slot renamed under the new key, nothing is reconverted.
 
 Warm starts reach `READY` in about five minutes: the weights load, the traces are captured, the acceptance prompts
 replay against the CPU (`NUMERICS.md`), then the server listens.

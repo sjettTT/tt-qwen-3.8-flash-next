@@ -199,7 +199,7 @@ def _identity(provenance: Qwen38BuildProvenance) -> Qwen38LiveBuildIdentity:
         mesh_shape=(1, 4),
         physical_ids=PHYSICAL_IDS,
         collective_topology="Ring",
-        dram_bank_worker_order=((0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0)),
+        dram_bank_ring_order=(6, 5, 4, 3, 2, 1, 0),
         ring_size=7,
     )
 

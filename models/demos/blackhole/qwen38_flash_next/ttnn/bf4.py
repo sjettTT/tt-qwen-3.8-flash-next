@@ -64,8 +64,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     qwen38_tensor_backing_identity,
 )
 
-FORMAT_VERSION = 2
-LEGACY_FORMAT_VERSION = 1  # keyed by the tt-metal revision; adopted in place by the first format-2 run
+FORMAT_VERSION = 3
+# Adopted in place by the first format-3 run: 1 was keyed by the tt-metal revision, 2 by the first die's DRAM
+# bank-to-worker coordinates.
+LEGACY_FORMAT_VERSIONS = (1, 2)
 PACKER = "ttnn.experimental.moe_compute_utils"
 DTYPE = "BFLOAT4_B"
 LAYOUT = "TILE"
@@ -379,14 +381,29 @@ def _core_xy(core) -> tuple[int, int]:
     return int(core.x), int(core.y)
 
 
-def qualify_live_bf4_ring(mesh_device) -> tuple[tuple[int, int], ...]:
-    """Require identical live DRAM-bank worker ordering on all four devices.
+def dram_bank_ring_order(signature: tuple[tuple[int, int], ...]) -> tuple[int, ...]:
+    """The DRAM bank ids in ring position order: the banks sorted by their worker core's ``(y, x)``, descending.
 
-    The public mesh-level query returns the first device's assignment.  That is
-    insufficient for a cache whose packing and DRAM shard placement must match
-    every physical card, so this guard deliberately queries each device object.
-    The returned tuple is ordered by DRAM bank id and is suitable for inclusion
-    in :class:`BF4CacheIdentity`.
+    The sort of ``get_weight_core_shard_maps`` (the moe_compute layout packer), which keeps only the resulting bank
+    order; ``tests/test_ttnn_bf4_static.py`` pins the two against each other.  ``signature[bank]`` is the worker
+    ``(x, y)`` that serves ``bank``.
+    """
+
+    return tuple(sorted(range(len(signature)), key=lambda bank: (signature[bank][1], signature[bank][0]), reverse=True))
+
+
+def qualify_live_bf4_ring(mesh_device) -> tuple[int, ...]:
+    """Require one cache-compatible DRAM ring on all four devices; return its bank ids in ring order.
+
+    ``moe_compute`` builds every die's program from the MeshDevice-level bank-to-worker assignment, which is the
+    reference (first) device's: the packed shards are laid out by ring position, the placement grid is bank ids, and
+    the packed bytes never see worker coordinates.  Dies harvested differently (a QuietBox 2 was observed with one
+    die serving its banks from worker column 5, the other three from column 6) are therefore compatible when every
+    die has the same bank count and the same bank order: the odd die's ring workers sit one column from their banks
+    and read the same bank ids in the same order (adjacency lost there, not correctness).  The public mesh-level
+    query returns only the first device's assignment, so this guard queries each device; dies that differ in ring
+    size or bank order are refused with their raw coordinates in the message.  The result is the
+    :class:`BF4CacheIdentity` field.
     """
 
     physical_ids = tuple(int(item) for item in mesh_device.get_device_ids())
@@ -412,10 +429,14 @@ def qualify_live_bf4_ring(mesh_device) -> tuple[tuple[int, int], ...]:
             raise RuntimeError(f"physical device {physical_ids[index]} has unsupported DRAM worker order {signature}")
         signatures.append(signature)
 
-    if len(set(signatures)) != 1:
-        details = {physical_ids[index]: signature for index, signature in enumerate(signatures)}
-        raise RuntimeError(f"mixed Blackhole DRAM ring layouts are not cache-compatible: {details}")
-    return signatures[0]
+    if len({len(signature) for signature in signatures}) != 1:
+        details = {physical_ids[index]: len(signature) for index, signature in enumerate(signatures)}
+        raise RuntimeError(f"mixed Blackhole DRAM ring sizes are not cache-compatible: {details}")
+    ring_orders = [dram_bank_ring_order(signature) for signature in signatures]
+    if len(set(ring_orders)) != 1:
+        details = {physical_ids[index]: (signature, ring_orders[index]) for index, signature in enumerate(signatures)}
+        raise RuntimeError(f"mixed Blackhole DRAM ring orders are not cache-compatible: {details}")
+    return ring_orders[0]
 
 
 @dataclass(frozen=True)
@@ -578,7 +599,7 @@ class BF4CacheIdentity:
     mesh_shape: tuple[int, int]
     physical_ids: tuple[int, int, int, int]
     ring_size: int
-    dram_bank_worker_order: tuple[tuple[int, int], ...]
+    dram_bank_ring_order: tuple[int, ...]
     hidden_size: int = 2560
     intermediate_size: int = 640
     routed_experts: int = 512
@@ -613,13 +634,8 @@ class BF4CacheIdentity:
             or any(type(value) is not int for value in self.mesh_shape)
             or type(self.physical_ids) is not tuple
             or any(type(value) is not int for value in self.physical_ids)
-            or type(self.dram_bank_worker_order) is not tuple
-            or any(
-                type(coordinate) is not tuple
-                or len(coordinate) != 2
-                or any(type(value) is not int or value < 0 for value in coordinate)
-                for coordinate in self.dram_bank_worker_order
-            )
+            or type(self.dram_bank_ring_order) is not tuple
+            or any(type(bank) is not int for bank in self.dram_bank_ring_order)
         ):
             raise ValueError("BF4 cache identity topology fields must be exact integer tuples")
         pinned = {
@@ -659,13 +675,8 @@ class BF4CacheIdentity:
             raise ValueError(f"BF4 cache requires four distinct physical IDs, got {self.physical_ids}")
         if self.ring_size not in BLACKHOLE_RING_SIZES:
             raise ValueError(f"Blackhole ring size must be one of {BLACKHOLE_RING_SIZES}, got {self.ring_size}")
-        if (
-            len(self.dram_bank_worker_order) != self.ring_size
-            or len(set(self.dram_bank_worker_order)) != self.ring_size
-        ):
-            raise ValueError(
-                "BF4 cache identity must contain one distinct logical worker coordinate per live DRAM bank"
-            )
+        if sorted(self.dram_bank_ring_order) != list(range(self.ring_size)):
+            raise ValueError("BF4 cache identity must list every live DRAM bank once in ring order")
         if (self.hidden_size, self.intermediate_size, self.routed_experts, self.experts_per_device) != (
             2560,
             640,
@@ -925,15 +936,18 @@ class Qwen38BF4Cache:
     def _adopt_legacy_slot(self, cache_root: Path) -> None:
         """Move a sibling slot that holds this identity's bytes under this identity's key.
 
-        A format-1 slot was keyed by the tt-metal revision; one whose checkpoint and topology fields equal ours is
-        rewritten as format 2 (the converter sources replace the revision) and renamed.  A format-2 slot that already
-        carries our key under another name (an interrupted adoption) is only renamed.  The admission probe checks the
-        bytes at every start, so a slot converted by different code is still refused.
+        A format-1 slot was keyed by the tt-metal revision, a format-2 slot by the first die's DRAM bank-to-worker
+        coordinates (and by this module's digest among the converter sources, which the format change itself moves).
+        A slot whose other identity fields equal ours (format 2: the packers' digests too) and whose stored coordinates
+        derive to our ring order is rewritten as format 3 and renamed; a format-3 slot that already carries our key
+        under another name (an interrupted adoption) is only renamed.  Nothing is reconverted: the admission probe
+        checks the bytes at every start, so a slot converted by different code is still refused.
         """
 
-        expected_legacy = _json_normalized(asdict(self.identity))
-        del expected_legacy["converter_sources"]
-        expected_legacy["format_version"] = LEGACY_FORMAT_VERSION
+        expected = _json_normalized(asdict(self.identity))
+        del expected["dram_bank_ring_order"], expected["format_version"]
+        this_module = CONVERTER_SOURCES[0].relative_to(REPO_ROOT).as_posix()
+        packers = [source for source in expected.pop("converter_sources") if source[0] != this_module]
         candidates = []
         for manifest_path in cache_root.glob("*/manifest.json"):
             if manifest_path.parent == self.root:
@@ -944,16 +958,34 @@ class Qwen38BF4Cache:
                 continue
             if type(document) is not dict or type(document.get("identity")) is not dict:
                 continue
-            if document.get("format_version") == FORMAT_VERSION:
+            legacy_format = document.get("format_version")
+            if legacy_format == FORMAT_VERSION:
                 adoptable = document.get("identity_key") == self.identity.key
-            else:
+            elif legacy_format in LEGACY_FORMAT_VERSIONS:
                 identity = dict(document["identity"])
-                revision = identity.pop("tt_metal_revision", None)
+                identity.pop("format_version", None)
+                coordinates = identity.pop("dram_bank_worker_order", None)
+                if legacy_format == 1:
+                    comparable = type(identity.pop("tt_metal_revision", None)) is str
+                else:
+                    sources = identity.pop("converter_sources", None)
+                    comparable = type(sources) is list and packers == [
+                        source for source in sources if not (type(source) is list and source[:1] == [this_module])
+                    ]
                 adoptable = (
-                    document.get("format_version") == LEGACY_FORMAT_VERSION
-                    and type(revision) is str
-                    and _same_exact_typed_tree(identity, expected_legacy)
+                    comparable
+                    and _same_exact_typed_tree(identity, expected)
+                    and type(coordinates) is list
+                    and len(coordinates) == self.identity.ring_size
+                    and all(
+                        type(coordinate) is list and len(coordinate) == 2 and all(type(v) is int for v in coordinate)
+                        for coordinate in coordinates
+                    )
+                    and len(set(map(tuple, coordinates))) == self.identity.ring_size
+                    and dram_bank_ring_order(tuple(map(tuple, coordinates))) == self.identity.dram_bank_ring_order
                 )
+            else:
+                adoptable = False
             if adoptable and type(document.get("updated_utc")) is str:
                 candidates.append((document["updated_utc"], manifest_path, document))
         if not candidates:
@@ -1282,15 +1314,15 @@ class Qwen38BF4Cache:
         self.mesh_contract.validate_mesh(mesh_device)
         if tuple(mesh_device.shape) != self.identity.mesh_shape:
             raise RuntimeError("mesh shape changed after BF4 cache construction")
-        live_worker_order = qualify_live_bf4_ring(mesh_device)
-        if len(live_worker_order) != self.identity.ring_size:
+        live_ring_order = qualify_live_bf4_ring(mesh_device)
+        if len(live_ring_order) != self.identity.ring_size:
             raise RuntimeError(
-                f"live ring has {len(live_worker_order)} banks, cache identity requires {self.identity.ring_size}"
+                f"live ring has {len(live_ring_order)} banks, cache identity requires {self.identity.ring_size}"
             )
-        if live_worker_order != self.identity.dram_bank_worker_order:
+        if live_ring_order != self.identity.dram_bank_ring_order:
             raise RuntimeError(
-                "live DRAM-bank worker ordering differs from the cache identity: "
-                f"live={live_worker_order} cache={self.identity.dram_bank_worker_order}"
+                "live DRAM bank ring order differs from the cache identity: "
+                f"live={live_ring_order} cache={self.identity.dram_bank_ring_order}"
             )
         existing = self.verify_layer(namespace, layer_index)
         w01_base = self._base(namespace, layer_index, "w0_w1")
@@ -1492,14 +1524,11 @@ class Qwen38BF4Cache:
 
         self._validate_layer_request(namespace, layer_index)
         self.mesh_contract.validate_mesh(mesh_device)
-        live_worker_order = qualify_live_bf4_ring(mesh_device)
-        if (
-            len(live_worker_order) != self.identity.ring_size
-            or live_worker_order != self.identity.dram_bank_worker_order
-        ):
+        live_ring_order = qualify_live_bf4_ring(mesh_device)
+        if len(live_ring_order) != self.identity.ring_size or live_ring_order != self.identity.dram_bank_ring_order:
             raise RuntimeError(
                 "live Blackhole DRAM ring does not match the BF4 cache identity: "
-                f"live={live_worker_order} cache={self.identity.dram_bank_worker_order}"
+                f"live={live_ring_order} cache={self.identity.dram_bank_ring_order}"
             )
         record = self.verify_layer(namespace, layer_index)
         if record is None:
@@ -1681,10 +1710,7 @@ class Qwen38BF4ResidentSet(Qwen38BF4Streamer):
     @property
     def live_tensor_handle_count(self) -> int:
         handles = {
-            id(handle): handle
-            for slot_handles in self._slots.values()
-            for handle in slot_handles
-            if handle is not None
+            id(handle): handle for slot_handles in self._slots.values() for handle in slot_handles if handle is not None
         }
         return sum(handle.tensor is not None for handle in handles.values())
 
@@ -1768,11 +1794,7 @@ class Qwen38BF4ResidentSet(Qwen38BF4Streamer):
         self,
         key: tuple[str, int],
         error: BF4CleanupError,
-    ) -> tuple[
-        tuple[_BF4ResidentHandle | None, ...],
-        tuple[_BF4ResidentHandle, ...],
-        BaseException | None,
-    ]:
+    ) -> tuple[tuple[_BF4ResidentHandle | None, ...], tuple[_BF4ResidentHandle, ...], BaseException | None,]:
         """Adopt every cache-load tensor whose release outcome is uncertain."""
 
         outcomes = error.tensor_cleanup_outcomes
@@ -1785,11 +1807,7 @@ class Qwen38BF4ResidentSet(Qwen38BF4Streamer):
         if validation_error is None:
             for outcome in outcomes:
                 if outcome.released:
-                    valid = (
-                        outcome.tensor is None
-                        and outcome.release_attempted
-                        and outcome.release_error is None
-                    )
+                    valid = outcome.tensor is None and outcome.release_attempted and outcome.release_error is None
                 elif outcome.tensor is None:
                     valid = not outcome.release_attempted and outcome.release_error is None
                 elif outcome.release_attempted:
@@ -1843,8 +1861,10 @@ class Qwen38BF4ResidentSet(Qwen38BF4Streamer):
             if handle is None:
                 continue
             handle.release_attempted = True
-            handle.release_error = outcome.release_error or validation_error or RuntimeError(
-                "BF4 cache cleanup outcome is not authoritative"
+            handle.release_error = (
+                outcome.release_error
+                or validation_error
+                or RuntimeError("BF4 cache cleanup outcome is not authoritative")
             )
         if validation_error is not None:
             self._poisoned = True
@@ -1903,11 +1923,7 @@ class Qwen38BF4ResidentSet(Qwen38BF4Streamer):
         *,
         primary_error: BaseException,
     ) -> None:
-        errors = tuple(
-            error
-            for handle in reversed(created)
-            if (error := self._release_handle(handle)) is not None
-        )
+        errors = tuple(error for handle in reversed(created) if (error := self._release_handle(handle)) is not None)
         created_identities = {id(handle) for handle in created}
         for key in keys:
             handles = self._slots.get(key)
@@ -1973,9 +1989,7 @@ class Qwen38BF4ResidentSet(Qwen38BF4Streamer):
                         or handles[0] is handles[1]
                         or len(created) != 2
                     ):
-                        raise RuntimeError(
-                            f"BF4 resident preload {key} did not return two new distinct packed tensors"
-                        )
+                        raise RuntimeError(f"BF4 resident preload {key} did not return two new distinct packed tensors")
                 except BF4CleanupError as load_error:
                     # The cache owns tensors before it can return a pair.  If
                     # its best-effort cleanup fails, transfer those exact

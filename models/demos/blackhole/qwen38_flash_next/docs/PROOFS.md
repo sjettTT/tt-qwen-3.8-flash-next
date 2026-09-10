@@ -62,9 +62,23 @@ README):
 - Every start above was stopped with SIGTERM between runs and closed its mesh (`result.json` status `stopped`,
   launcher exit 0); no board needed a reset.
 
+## A QuietBox 2, 2026-09-07 (mixed DRAM harvesting; a contributor's box)
+
+A QuietBox 2 (2x p300c, four dies) served the model on 2026-09-07; the run, the measurements and the fix are
+msollanych-tt's (pull request 7 of the public repository).  One die serves its DRAM banks from worker column 5, the
+other three from column 6, and the release's BF4 guard, which required identical bank-to-worker coordinates on all four
+dies, refused the conversion before it began.  The guard now compares what the packing consumes, the bank count and the
+bank order per die (`SERVER.md`, the expert cache); with it the box converted the 49 layers (about 14 minutes, 100 GB),
+reached `READY`, and its startup acceptance was `json` 96/96 with the eleven divergence indices equal to the pinned
+table of the head it cloned (cadebdff, before the GDN gate fix: chat 8, code 24, fact 15, list 46, math 61,
+multilingual 9, prose 13, refactor 22, sky 19, story 6, summary 75), identical on a second run after a board reset:
+the differently harvested die reproduced the 4x p150 device streams.  19.9 tokens/s at 32k; 17.4 tokens/s end to end
+with 256k allocated context.  The `qb2` route derived as `[0, 1, 2, 3]`.
+
 ## What the other profiles have
 
 - `bh-loudbox` (Blackhole LoudBox, 4x p150 in one line): the README's numbers were measured on 4x p150 hosts (the
   performance table of 2026-09-04, the pinned divergence tables of 2026-09-06 in `NUMERICS.md`, the conversion rate of
   2026-09-05 above); a fresh-clone run of the form recorded above for the QuietBox is not recorded for a LoudBox.
-- `qb2` (QuietBox 2, 2x p300c): designed from the p300 ring topology, never run on p300 hardware.
+- `qb2` (QuietBox 2, 2x p300c): the contributor's run of 2026-09-07 above; the route it derived, `[0, 1, 2, 3]`, is
+  recorded there and not yet pinned in the profile.

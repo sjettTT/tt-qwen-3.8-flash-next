@@ -37,6 +37,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
 )
 
 RING7_WORKERS = ((0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0))
+RING7_ORDER = (6, 5, 4, 3, 2, 1, 0)  # RING7_WORKERS as the packing orders it: banks by worker (y, x) descending
 EXPERT_RANGES = ((0, 128), (128, 256), (256, 384), (384, 512))
 _TEST_TENSORBIN_HEADER_BYTES = 64
 CONVERTER_SOURCES = (
@@ -55,7 +56,7 @@ def _identity() -> BF4CacheIdentity:
         mesh_shape=(1, 4),
         physical_ids=(0, 1, 2, 3),
         ring_size=7,
-        dram_bank_worker_order=RING7_WORKERS,
+        dram_bank_ring_order=RING7_ORDER,
     )
 
 
@@ -376,7 +377,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
             {"ring_size": 7.0},
             {"format_version": True},
             {"mesh_shape": ("1", 4)},
-            {"dram_bank_worker_order": ((0.0, 0), *RING7_WORKERS[1:])},
+            {"dram_bank_ring_order": (6.0, *RING7_ORDER[1:])},
         )
         for changes in mutations:
             with self.subTest(changes=changes):
@@ -394,9 +395,11 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "shape contains"):
                     bf4_module._native_integer_shape(shape, label="BF4 conversion")
 
-    def test_cache_identity_requires_complete_live_ring_signature(self):
-        with self.assertRaisesRegex(ValueError, "one distinct logical worker"):
-            replace(_identity(), dram_bank_worker_order=((0, 0),) * 7)
+    def test_cache_identity_requires_every_live_bank_once_in_ring_order(self):
+        for ring_order in ((0,) * 7, RING7_ORDER[:6], (*RING7_ORDER[:6], 7)):
+            with self.subTest(ring_order=ring_order):
+                with self.assertRaisesRegex(ValueError, "every live DRAM bank once"):
+                    replace(_identity(), dram_bank_ring_order=ring_order)
 
     def test_cache_identity_distinguishes_complete_file_and_tensor_manifests(self):
         identity = _identity()
@@ -477,7 +480,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 mock.patch.object(
                     bf4_module,
                     "qualify_live_bf4_ring",
-                    return_value=RING7_WORKERS,
+                    return_value=RING7_ORDER,
                 ) as qualify_ring,
                 mock.patch.object(bf4_module.ttnn, "load_tensor", side_effect=load_tensor) as load,
                 mock.patch.object(
@@ -773,7 +776,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 return original_validate(tensor, placement=placement, shard_dim=shard_dim)
 
             with (
-                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_WORKERS),
+                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_ORDER),
                 mock.patch.object(bf4_module.ttnn, "load_tensor", side_effect=load_tensor),
                 mock.patch.object(
                     bf4_module.ttnn.experimental,
@@ -811,7 +814,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 return tensor
 
             with (
-                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_WORKERS),
+                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_ORDER),
                 mock.patch.object(bf4_module.ttnn, "load_tensor", side_effect=load_tensor),
                 mock.patch.object(
                     bf4_module.ttnn.experimental,
@@ -851,7 +854,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                     return tensor
 
                 with (
-                    mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_WORKERS),
+                    mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_ORDER),
                     mock.patch.object(bf4_module.ttnn, "load_tensor", side_effect=load_tensor),
                     mock.patch.object(
                         bf4_module.ttnn.experimental,
@@ -890,7 +893,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 return tensor
 
             with (
-                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_WORKERS),
+                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_ORDER),
                 mock.patch.object(bf4_module.ttnn, "load_tensor", side_effect=replace_after_both_reads),
                 mock.patch.object(
                     bf4_module.ttnn.experimental,
@@ -936,7 +939,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 return original_validate(tensor, placement=placement, shard_dim=shard_dim)
 
             with (
-                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_WORKERS),
+                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_ORDER),
                 mock.patch.object(bf4_module.ttnn, "load_tensor", side_effect=load_tensor),
                 mock.patch.object(
                     bf4_module.ttnn.experimental,
@@ -972,7 +975,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 raise RuntimeError("synthetic second load failure")
 
             with (
-                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_WORKERS),
+                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_ORDER),
                 mock.patch.object(bf4_module.ttnn, "load_tensor", side_effect=fail_second_load),
                 mock.patch.object(
                     bf4_module.ttnn.experimental,
@@ -1047,7 +1050,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
             artifact.unlink()
             artifact.symlink_to(target)
             with (
-                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_WORKERS),
+                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_ORDER),
                 mock.patch.object(bf4_module.ttnn, "load_tensor") as load,
             ):
                 with self.assertRaisesRegex(RuntimeError, "unavailable or invalid"):
@@ -1119,7 +1122,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 ),
             )
             with (
-                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_WORKERS),
+                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_ORDER),
                 mock.patch.object(bf4_module.ttnn, "load_tensor") as load,
             ):
                 for expected, mutate in mutations:
@@ -1256,7 +1259,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
             cache = Qwen38BF4Cache(directory, identity, contract)
             with (
                 mock.patch.object(cache, "verify_layer", return_value=None),
-                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_WORKERS),
+                mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_ORDER),
                 mock.patch.object(bf4_module, "Qwen38MoEWeights", return_value=weights),
                 mock.patch.object(bf4_module.ttnn, "ShardTensor2dMesh", return_value=object()),
                 mock.patch.object(
@@ -1317,7 +1320,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
             return uploaded[-1]
 
         with (
-            mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_WORKERS),
+            mock.patch.object(bf4_module, "qualify_live_bf4_ring", return_value=RING7_ORDER),
             mock.patch.object(
                 bf4_module, "Qwen38MoEWeights", return_value=SimpleNamespace(expert_ranges=EXPERT_RANGES)
             ),
@@ -1489,29 +1492,67 @@ class TTNNBF4ConverterIdentityTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "converter sources"):
                     replace(_identity(), converter_sources=malformed)
 
-    def test_legacy_slot_keyed_by_the_tt_metal_revision_is_adopted_in_place(self):
+    def test_legacy_slots_keyed_by_the_revision_or_the_worker_coordinates_are_adopted_in_place(self):
         identity = _identity()
         contract = Qwen38MeshContract(identity.physical_ids)
+
+        def slot_key(legacy_identity: dict) -> str:
+            return hashlib.sha256(
+                json.dumps(legacy_identity, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+
+        def demote(document: dict, legacy_identity: dict) -> str:
+            """Rewrite the manifest as the legacy format its identity names; the slot's new directory name."""
+
+            key = slot_key(legacy_identity)
+            document.update(
+                format_version=legacy_identity["format_version"], identity=legacy_identity, identity_key=key
+            )
+            return key
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             cache = Qwen38BF4Cache(root, identity, contract)
             record0, paths0 = _write_layer(cache, 0)
             record5, _ = _write_layer(cache, 5)
             document = json.loads(cache.manifest_path.read_text(encoding="utf-8"))
-            legacy_identity = dict(document["identity"])
-            del legacy_identity["converter_sources"]
-            legacy_identity["tt_metal_revision"] = "9fb1403a93" + "0" * 30
-            legacy_identity["format_version"] = 1
-            legacy_key = hashlib.sha256(
-                json.dumps(legacy_identity, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
-            document.update(format_version=1, identity=legacy_identity, identity_key=legacy_key)
+            current = document["identity"]
+            common = {key: value for key, value in current.items() if key != "dram_bank_ring_order"}
+            # Format 2 stored the first die's coordinates and this module's digest of the time.  This slot's box had a
+            # differently harvested die first (worker column 1, not 0): other coordinates, the same derived ring order.
+            format2 = dict(common)
+            format2["dram_bank_worker_order"] = [[x, 1] for x in range(7)]
+            format2["converter_sources"] = [
+                [path, "f" * 64 if path.endswith("/bf4.py") else digest]
+                for path, digest in current["converter_sources"]
+            ]
+            format2["format_version"] = 2
+            self.assertEqual(
+                bf4_module.dram_bank_ring_order(tuple(map(tuple, format2["dram_bank_worker_order"]))), RING7_ORDER
+            )
+            format2_key = demote(document, format2)
             bf4_module._atomic_json(cache.manifest_path, document)
-            os.rename(cache.root, root / legacy_key)
-            # A legacy slot of another ring, an unreadable manifest and a stray file are left alone.
-            decoy = copy.deepcopy(document)
-            decoy["identity"]["ring_size"] = 8
-            bf4_module._atomic_json(root / "decoy-ring-8" / "manifest.json", decoy)
+            os.rename(cache.root, root / format2_key)
+            # Decoys, every one newer than the slot so it would win if it were adoptable: another ring size, coordinates
+            # that derive to another ring order (banks 0 and 1 swap workers), another BFP4 packer digest, a format the
+            # code does not know, an unreadable manifest and a stray file.
+            decoys = {}
+            decoys["decoy-ring-8"] = copy.deepcopy(format2)
+            decoys["decoy-ring-8"]["ring_size"] = 8
+            decoys["decoy-other-order"] = copy.deepcopy(format2)
+            decoys["decoy-other-order"]["dram_bank_worker_order"] = [[1, 1], [0, 1], *([x, 1] for x in range(2, 7))]
+            decoys["decoy-other-packer"] = copy.deepcopy(format2)
+            decoys["decoy-other-packer"]["converter_sources"] = [
+                [path, "e" * 64 if path.endswith("bfloat4.cpp") else digest]
+                for path, digest in format2["converter_sources"]
+            ]
+            decoys["decoy-format-9"] = copy.deepcopy(format2)
+            decoys["decoy-format-9"]["format_version"] = 9
+            for name, legacy_identity in decoys.items():
+                decoy = copy.deepcopy(document)
+                demote(decoy, legacy_identity)
+                decoy["updated_utc"] = "9999-01-01T00:00:00Z"
+                bf4_module._atomic_json(root / name / "manifest.json", decoy)
             (root / "decoy-broken").mkdir()
             (root / "decoy-broken" / "manifest.json").write_text("{", encoding="utf-8")
             (root / "stray.txt").write_text("x", encoding="utf-8")
@@ -1520,10 +1561,11 @@ class TTNNBF4ConverterIdentityTest(unittest.TestCase):
 
             self.assertEqual(adopted.root, root / identity.key)
             self.assertTrue(adopted.manifest_path.exists())
-            self.assertFalse((root / legacy_key).exists())
-            self.assertTrue((root / "decoy-ring-8" / "manifest.json").exists())
+            self.assertFalse((root / format2_key).exists())
+            for name in (*decoys, "decoy-broken"):
+                self.assertTrue((root / name / "manifest.json").exists(), name)
             adopted_document = json.loads(adopted.manifest_path.read_text(encoding="utf-8"))
-            self.assertEqual(adopted_document["format_version"], 2)
+            self.assertEqual(adopted_document["format_version"], 3)
             self.assertEqual(adopted_document["identity_key"], identity.key)
             self.assertEqual(adopted_document["identity"], bf4_module._json_normalized(asdict(identity)))
             self.assertEqual(sorted(adopted_document["layers"]), ["backbone:0", "backbone:5"])
@@ -1534,7 +1576,19 @@ class TTNNBF4ConverterIdentityTest(unittest.TestCase):
                 adopted._validate_record(record0, namespace="backbone", layer_index=0)[0],
                 adopted.root / paths0["w0_w1"].relative_to(cache.root),
             )
-            # An interrupted adoption (format 2, our key, another directory name) is only renamed.
+            # Format 1 was keyed by the tt-metal revision and had no converter sources.
+            format1 = {key: value for key, value in common.items() if key != "converter_sources"}
+            format1["dram_bank_worker_order"] = [list(coordinate) for coordinate in RING7_WORKERS]
+            format1["tt_metal_revision"] = "9fb1403a93" + "0" * 30
+            format1["format_version"] = 1
+            format1_key = demote(adopted_document, format1)
+            bf4_module._atomic_json(adopted.manifest_path, adopted_document)
+            os.rename(adopted.root, root / format1_key)
+            adopted = Qwen38BF4Cache(root, identity, contract)
+            self.assertFalse((root / format1_key).exists())
+            self.assertEqual(json.loads(adopted.manifest_path.read_text(encoding="utf-8"))["format_version"], 3)
+            self.assertEqual(adopted.verify_layer("backbone", 5), record5)
+            # An interrupted adoption (format 3, our key, another directory name) is only renamed.
             os.rename(adopted.root, root / "interrupted")
             renamed = Qwen38BF4Cache(root, identity, contract)
             self.assertTrue(renamed.manifest_path.exists())
@@ -1620,6 +1674,91 @@ class TTNNBF4ConverterIdentityTest(unittest.TestCase):
                 cache.admit_converted_bytes(checkpoint, placement, layer_index=9)
             with self.assertRaisesRegex(ValueError, "expert must be in"):
                 cache.admit_converted_bytes(checkpoint, placement, layer_index=3, expert=512)
+
+
+class _FakeCore:
+    __slots__ = ("x", "y")
+
+    def __init__(self, x: int, y: int) -> None:
+        self.x = x
+        self.y = y
+
+
+class _RingMeshDevice(_FakeMeshDevice):
+    """A four-die Blackhole mesh whose per-die DRAM bank-to-worker assignment is scripted; die 0 is the reference."""
+
+    def __init__(self, per_die_signatures):
+        self._per_die = tuple(per_die_signatures)
+
+    @staticmethod
+    def arch():
+        return bf4_module.ttnn.Arch.BLACKHOLE
+
+    def assignment(self, coordinate=(0, 0)):
+        _, column = tuple(coordinate)
+        return [_FakeCore(x, y) for x, y in self._per_die[column]]
+
+
+# Observed on a QuietBox 2 (2x p300c): three dies serve their banks from worker column 6, the fourth from column 5.
+QB2_COLUMN_6 = ((0, 9), (0, 0), (0, 7), (0, 3), (6, 9), (6, 1), (6, 6), (6, 4))
+QB2_COLUMN_5 = ((0, 9), (0, 0), (0, 7), (0, 3), (5, 9), (5, 1), (5, 6), (5, 4))
+QB2_RING_ORDER = (4, 0, 2, 6, 7, 3, 5, 1)
+
+
+class BF4LiveRingQualificationTest(unittest.TestCase):
+    def _qualify(self, per_die_signatures):
+        mesh = _RingMeshDevice(per_die_signatures)
+        with mock.patch.object(
+            bf4_module.ttnn.device,
+            "get_optimal_dram_bank_to_logical_worker_assignment_at_mesh_coordinate",
+            side_effect=lambda device, noc, coordinate: mesh.assignment(coordinate),
+        ):
+            return bf4_module.qualify_live_bf4_ring(mesh)
+
+    def test_ring_order_is_the_bank_order_the_packing_produces(self):
+        """The guard's sort against ``get_weight_core_shard_maps`` on the same assignment: one sort, pinned here."""
+
+        scrambled = ((3, 2), (0, 0), (5, 1), (1, 7), (6, 2), (2, 9), (4, 4), (0, 3))
+        for signature in (QB2_COLUMN_6, QB2_COLUMN_5, RING7_WORKERS, scrambled):
+            with self.subTest(signature=signature):
+                mesh = _RingMeshDevice([signature] * 4)
+                with mock.patch.object(
+                    bf4_module.ttnn.device,
+                    "get_optimal_dram_bank_to_logical_worker_assignment",
+                    side_effect=lambda device, noc: mesh.assignment(),
+                ):
+                    _, _, placement_grid = bf4_module.moe_compute_utils.get_weight_core_shard_maps(mesh, 2560, 640)
+                packed_bank_order = tuple(core_range.start.x for core_range in placement_grid.ranges())
+                self.assertEqual(len(packed_bank_order), len(signature))
+                self.assertEqual(bf4_module.dram_bank_ring_order(signature), packed_bank_order)
+        self.assertEqual(bf4_module.dram_bank_ring_order(QB2_COLUMN_6), QB2_RING_ORDER)
+        self.assertEqual(bf4_module.dram_bank_ring_order(RING7_WORKERS), RING7_ORDER)
+
+    def test_uniform_ring_is_accepted(self):
+        self.assertEqual(self._qualify([QB2_COLUMN_6] * 4), QB2_RING_ORDER)
+
+    def test_mixed_harvesting_with_one_ring_order_is_accepted(self):
+        """The QuietBox 2 case: one die's workers a column away from its banks, the same bank ids in the same order."""
+
+        self.assertEqual(self._qualify([QB2_COLUMN_6, QB2_COLUMN_5, QB2_COLUMN_6, QB2_COLUMN_6]), QB2_RING_ORDER)
+        # The odd die first: the same result, so the cache identity is the same.
+        self.assertEqual(self._qualify([QB2_COLUMN_5, QB2_COLUMN_6, QB2_COLUMN_6, QB2_COLUMN_6]), QB2_RING_ORDER)
+
+    def test_mixed_ring_order_is_rejected_with_the_coordinates(self):
+        # Two banks swap workers on one die: the same coordinates as a set, another ring order.
+        reordered = (QB2_COLUMN_6[1], QB2_COLUMN_6[0], *QB2_COLUMN_6[2:])
+        with self.assertRaisesRegex(
+            RuntimeError, "mixed Blackhole DRAM ring orders.*\\(0, 9\\).*\\(4, 0, 2, 6, 7, 3, 5, 1\\)"
+        ):
+            self._qualify([QB2_COLUMN_6, reordered, QB2_COLUMN_6, QB2_COLUMN_6])
+
+    def test_mixed_ring_size_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "mixed Blackhole DRAM ring sizes.*8.*7"):
+            self._qualify([QB2_COLUMN_6, QB2_COLUMN_6[:7], QB2_COLUMN_6, QB2_COLUMN_6])
+
+    def test_unsupported_ring_size_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "unsupported DRAM worker order"):
+            self._qualify([QB2_COLUMN_6[:5]] * 4)
 
 
 if __name__ == "__main__":

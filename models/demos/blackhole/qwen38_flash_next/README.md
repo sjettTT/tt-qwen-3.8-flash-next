@@ -219,7 +219,7 @@ on-card links and the two Warp400 links), so it is one 1x4 instance:
 The profile exports `tools/qb2_p300_1x4_line_mesh_graph_descriptor.textproto` (a 1x4 LINE over three of the four ring
 links, two channels per link as in tt-metal's `p300_x2` descriptor); tt-metal classifies a p300 cluster that is not
 exactly two or four dies as CUSTOM and refuses to open without a descriptor, so the launcher always exports one.  The
-route is derived from the cluster descriptor at start and recorded.  Nothing here has run on p300 hardware.
+route is derived from the cluster descriptor at start and recorded.  A QuietBox 2 (2x p300c) ran it from a fresh clone on 2026-09-07 (`docs/PROOFS.md`); we have not run p300 hardware ourselves.
 
 ## 8. Layout
 

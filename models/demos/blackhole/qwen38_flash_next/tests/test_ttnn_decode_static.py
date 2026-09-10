@@ -233,7 +233,7 @@ def _target(
         mesh_shape=(1, 4),
         physical_ids=PHYSICAL_IDS,
         collective_topology="Ring",
-        dram_bank_worker_order=((0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0)),
+        dram_bank_ring_order=(6, 5, 4, 3, 2, 1, 0),
         ring_size=7,
         qsa_cache_capacity=allocated_context,
     )
@@ -306,7 +306,7 @@ def test_decode_static_contract_and_live_identity_are_exact() -> None:
     assert session.identity.physical_ids == PHYSICAL_IDS
     assert session.identity.mesh_shape == (1, 4)
     assert session.identity.ring_size == 7
-    assert len(session.identity.dram_bank_worker_order) == session.identity.ring_size
+    assert sorted(session.identity.dram_bank_ring_order) == list(range(session.identity.ring_size))
     assert session.identity.provenance == _provenance()
     assert session.allocated_context == MAX_CONTEXT == 262_144
     session.close()

@@ -519,7 +519,7 @@ def _parts(
         mesh_shape=(1, 4),
         physical_ids=PHYSICAL_IDS,
         collective_topology="Ring",
-        dram_bank_worker_order=((0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0)),
+        dram_bank_ring_order=(6, 5, 4, 3, 2, 1, 0),
         ring_size=7,
     )
     events: list[tuple] = []
@@ -689,10 +689,7 @@ def _resident_owner(monkeypatch) -> tuple[Qwen38BF4ResidentSet, tuple[_Root, ...
     owner = Qwen38BF4ResidentSet(Cache(), object())
     owner._preload((("backbone", 0), ("mtp", 0)))
     tensors = tuple(
-        handle.tensor
-        for key in owner.resident_layers
-        for handle in owner._slots[key]
-        if handle is not None
+        handle.tensor for key in owner.resident_layers for handle in owner._slots[key] if handle is not None
     )
     return owner, tensors
 
@@ -1074,9 +1071,7 @@ def test_owned_constructor_failure_retains_resident_weights_for_mesh_teardown(mo
     assert all(not tensor.released for tensor in tensors)
 
 
-def test_owned_close_failure_skips_resident_release_and_poisoned_exit_does_not_retry(
-    monkeypatch, expect_error
-) -> None:
+def test_owned_close_failure_skips_resident_release_and_poisoned_exit_does_not_retry(monkeypatch, expect_error) -> None:
     owner, tensors = _resident_owner(monkeypatch)
     fixture = _fixture(monkeypatch, resident_owner=owner, owns_built_graph=True)
     fixture.target.fail_release = True

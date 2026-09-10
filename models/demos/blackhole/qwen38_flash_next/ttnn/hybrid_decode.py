@@ -288,7 +288,7 @@ class Qwen38HybridSessionIdentity:
     physical_ids: tuple[int, int, int, int]
     mesh_shape: tuple[int, int]
     collective_topology: str
-    dram_bank_worker_order: tuple[tuple[int, int], ...]
+    dram_bank_ring_order: tuple[int, ...]
     ring_size: int
 
 
@@ -538,9 +538,7 @@ class Qwen38TTNNHybridDecodeSession:
         mtp_expert_owner = getattr(mtp_components.decoder_layer, "expert_streamer", None)
         if _test_collaborators is None and mtp_expert_owner is not target_expert_owner:
             raise ValueError("target and MTP components do not share one exact BF4 expert owner")
-        resident_expert_owner = (
-            target_expert_owner if isinstance(target_expert_owner, Qwen38BF4ResidentSet) else None
-        )
+        resident_expert_owner = target_expert_owner if isinstance(target_expert_owner, Qwen38BF4ResidentSet) else None
         if resident_expert_owner is not None:
             if mtp_expert_owner is not resident_expert_owner:
                 raise ValueError("resident target and MTP components do not share one exact BF4 owner")
@@ -559,7 +557,7 @@ class Qwen38TTNNHybridDecodeSession:
             physical_ids=identity.physical_ids,
             mesh_shape=identity.mesh_shape,
             collective_topology=identity.collective_topology,
-            dram_bank_worker_order=identity.dram_bank_worker_order,
+            dram_bank_ring_order=identity.dram_bank_ring_order,
             ring_size=identity.ring_size,
         )
         self.eos_token_ids = eos_ids
@@ -825,9 +823,7 @@ class Qwen38TTNNHybridDecodeSession:
             resident_graph_is_published = builder._resident_graph_is_published()
             build_failure = builder.resident_build_failure
             requires_process_termination = (
-                isinstance(build_failure, tuple)
-                and len(build_failure) == 5
-                and build_failure[2] is True
+                isinstance(build_failure, tuple) and len(build_failure) == 5 and build_failure[2] is True
             )
             if (
                 built_target is not None
@@ -1633,9 +1629,7 @@ class Qwen38TTNNHybridDecodeSession:
         if type(diagnostic_exact_token_budget) is not bool:
             raise TypeError("diagnostic_exact_token_budget must be boolean")
         if diagnostic_exact_token_budget and limit != DIAGNOSTIC_EXACT_TOKEN_BUDGET:
-            raise ValueError(
-                f"diagnostic_exact_token_budget requires max_new_tokens={DIAGNOSTIC_EXACT_TOKEN_BUDGET}"
-            )
+            raise ValueError(f"diagnostic_exact_token_budget requires max_new_tokens={DIAGNOSTIC_EXACT_TOKEN_BUDGET}")
         selected_mode = _normalize_mode(mode)
         policy = _normalize_cache_policy(cache_policy)
         parameters = Qwen38SamplingParameters.greedy() if sampling is None else sampling

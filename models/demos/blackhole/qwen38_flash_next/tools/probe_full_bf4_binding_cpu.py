@@ -37,7 +37,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import Qwen38MeshCo
 
 MODE = "diagnostic_non_promoting_cpu_bf4_binding_probe"
 PHYSICAL_IDS = (1, 0, 2, 3)
-DRAM_BANK_WORKER_ORDER = ((0, 9), (0, 0), (0, 7), (0, 3), (6, 9), (6, 1), (6, 6), (6, 4))
+DRAM_BANK_RING_ORDER = (4, 0, 2, 6, 7, 3, 5, 1)  # the eight-bank Blackhole ring, banks by worker (y, x) descending
 EXPECTED_SLOTS = tuple(("backbone", index) for index in range(48)) + (("mtp", 0),)
 LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}")
 
@@ -79,8 +79,8 @@ def probe(*, artifact_root: Path, expected_identity_key: str) -> dict[str, Any]:
         converter_sources=bf4_converter_source_identity(),
         mesh_shape=(1, 4),
         physical_ids=PHYSICAL_IDS,
-        ring_size=len(DRAM_BANK_WORKER_ORDER),
-        dram_bank_worker_order=DRAM_BANK_WORKER_ORDER,
+        ring_size=len(DRAM_BANK_RING_ORDER),
+        dram_bank_ring_order=DRAM_BANK_RING_ORDER,
     )
     if identity.key != expected_identity_key or artifact_root.name != identity.key:
         raise RuntimeError(
@@ -131,7 +131,7 @@ def probe(*, artifact_root: Path, expected_identity_key: str) -> dict[str, Any]:
         "cache_class": type(cache).__name__,
         "identity_key": identity.key,
         "physical_ids": list(identity.physical_ids),
-        "dram_bank_worker_order": [list(coordinate) for coordinate in identity.dram_bank_worker_order],
+        "dram_bank_ring_order": list(identity.dram_bank_ring_order),
         "manifest_path": str(cache.manifest_path),
         "manifest_exists": manifest_exists,
         "enumerated_slots": len(EXPECTED_SLOTS),

@@ -438,7 +438,7 @@ class Qwen38BF4ConsumerCompatibility:
         return {
             "builder_identity_key": builder.identity.key,
             "bf4_identity_key": production_cache.identity.key,
-            "dram_bank_worker_order": list(production_cache.identity.dram_bank_worker_order),
+            "dram_bank_ring_order": list(production_cache.identity.dram_bank_ring_order),
         }
 
     def summary(self) -> dict[str, Any]:
@@ -724,9 +724,8 @@ class Qwen38DiagnosticBF4Cache:
         if mesh_device is not self.mesh_device:
             raise LiveDecodeDiagnosticError("diagnostic BF4 load requested on a different mesh object")
         self.mesh_contract.validate_mesh(mesh_device)
-        worker_order = qualify_live_bf4_ring(mesh_device)
-        if worker_order != self.identity.dram_bank_worker_order:
-            raise LiveDecodeDiagnosticError("live DRAM worker order changed before diagnostic BF4 load")
+        if qualify_live_bf4_ring(mesh_device) != self.identity.dram_bank_ring_order:
+            raise LiveDecodeDiagnosticError("live DRAM bank ring order changed before diagnostic BF4 load")
         record = self.corpus.get(namespace, layer_index)
         memory_configs = ttnn.experimental.get_weight_mem_configs(
             mesh_device,

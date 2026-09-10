@@ -158,8 +158,10 @@ def resolve_hardware_profile(
     """By name, or (``None``) the profile of this host whose visible devices are ``TT_VISIBLE_DEVICES``.
 
     A host with several profiles (two lanes) takes the one ``TT_VISIBLE_DEVICES`` names, its default lane when
-    unset.  On a host the table knows, a name from another host refuses, so a launcher cannot open another host's lane
-    by mistake; a host the table does not know (a user's box) takes any named profile.
+    unset.  A named public profile is a box type, not a host, and resolves anywhere (a QuietBox 2 shipped with the
+    hostname ``tt-quietbox``).  A private table's entry is one host's lane: on a host the table knows, a name from
+    another host refuses, so a launcher cannot open another host's lane by mistake; a host the table does not know
+    takes any named profile.
     """
 
     profiles = hardware_profile_table() if table is None else table
@@ -168,7 +170,11 @@ def resolve_hardware_profile(
         if name not in profiles:
             raise HardwareProfileError(f"unknown hardware profile {name!r}, expected one of {sorted(profiles)}")
         profile = profiles[name]
-        if profile.host != host and any(other.host == host for other in profiles.values()):
+        if (
+            HARDWARE_PROFILES.get(name) != profile
+            and profile.host != host
+            and any(other.host == host for other in profiles.values())
+        ):
             raise HardwareProfileError(f"hardware profile {name!r} belongs to {profile.host}, not {host}")
         return profile
     candidates = {key: profile for key, profile in profiles.items() if profile.host == host}

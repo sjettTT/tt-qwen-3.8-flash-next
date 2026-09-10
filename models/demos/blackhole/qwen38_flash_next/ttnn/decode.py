@@ -165,7 +165,7 @@ class Qwen38OrdinarySessionIdentity:
     physical_ids: tuple[int, int, int, int]
     mesh_shape: tuple[int, int]
     collective_topology: str
-    dram_bank_worker_order: tuple[tuple[int, int], ...]
+    dram_bank_ring_order: tuple[int, ...]
     ring_size: int
 
 
@@ -343,7 +343,7 @@ class Qwen38OrdinaryDecodeSession:
             physical_ids=identity.physical_ids,
             mesh_shape=identity.mesh_shape,
             collective_topology=identity.collective_topology,
-            dram_bank_worker_order=identity.dram_bank_worker_order,
+            dram_bank_ring_order=identity.dram_bank_ring_order,
             ring_size=identity.ring_size,
         )
         self.eos_token_ids = eos_ids
@@ -688,8 +688,7 @@ class Qwen38OrdinaryDecodeSession:
         prompt_length = int(prompt.shape[1])
         if state.position + prompt_length > self.allocated_context:
             raise ValueError(
-                "ordinary prompt suffix exceeds the built target's allocated context "
-                f"{self.allocated_context}"
+                "ordinary prompt suffix exceeds the built target's allocated context " f"{self.allocated_context}"
             )
         if self._pending_token_id is not None and int(prompt[0, 0]) != self._pending_token_id:
             raise ValueError(

@@ -419,7 +419,7 @@ class Qwen38LiveBuildIdentity:
     mesh_shape: tuple[int, int]
     physical_ids: tuple[int, int, int, int]
     collective_topology: str
-    dram_bank_worker_order: tuple[tuple[int, int], ...]
+    dram_bank_ring_order: tuple[int, ...]
     ring_size: int
     expert_residency: Literal["streamed", "resident"] = "streamed"
     qsa_cache_capacity: int = MAX_CONTEXT
@@ -440,16 +440,10 @@ class Qwen38LiveBuildIdentity:
             raise ValueError(f"live builder identity requires four distinct physical IDs, got {self.physical_ids}")
         if self.ring_size not in (7, 8):
             raise ValueError(f"live Blackhole DRAM ring must contain seven or eight workers, got {self.ring_size}")
-        if (
-            len(self.dram_bank_worker_order) != self.ring_size
-            or len(set(self.dram_bank_worker_order)) != self.ring_size
-            or any(
-                len(coordinate) != 2
-                or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in coordinate)
-                for coordinate in self.dram_bank_worker_order
-            )
-        ):
-            raise ValueError("live builder identity has an invalid DRAM-bank worker ordering")
+        if any(isinstance(bank, bool) or not isinstance(bank, int) for bank in self.dram_bank_ring_order) or sorted(
+            self.dram_bank_ring_order
+        ) != list(range(self.ring_size)):
+            raise ValueError("live builder identity has an invalid DRAM bank ring order")
         if not self.collective_topology:
             raise ValueError("live builder identity requires an explicit collective topology")
         if self.expert_residency not in {"streamed", "resident"}:
@@ -760,14 +754,14 @@ class Qwen38TTNNBuilder:
         mesh_contract.validate_mesh(mesh_device)
         if mesh_device.arch() != ttnn.Arch.BLACKHOLE:
             raise ValueError("Qwen3.8 four-P150 construction requires a Blackhole mesh")
-        worker_order = qualify_live_bf4_ring(mesh_device)
+        ring_order = qualify_live_bf4_ring(mesh_device)
         live_identity = Qwen38LiveBuildIdentity(
             provenance=provenance,
             mesh_shape=tuple(mesh_contract.mesh_shape),
             physical_ids=mesh_contract.physical_ids,
             collective_topology=topology_identity,
-            dram_bank_worker_order=worker_order,
-            ring_size=len(worker_order),
+            dram_bank_ring_order=ring_order,
+            ring_size=len(ring_order),
             expert_residency=expert_residency,
             qsa_cache_capacity=qsa_cache_capacity,
         )
@@ -788,8 +782,8 @@ class Qwen38TTNNBuilder:
             converter_sources=bf4_converter_source_identity(),
             mesh_shape=tuple(mesh_contract.mesh_shape),
             physical_ids=mesh_contract.physical_ids,
-            ring_size=len(worker_order),
-            dram_bank_worker_order=worker_order,
+            ring_size=len(ring_order),
+            dram_bank_ring_order=ring_order,
         )
         bf4_cache = Qwen38BF4Cache(routed_cache_root, bf4_identity, mesh_contract)
         io_identity = Qwen38IOCacheIdentity(
