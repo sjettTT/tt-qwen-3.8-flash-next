@@ -144,6 +144,22 @@ export TMPDIR="$run_dir/tmp"
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+# Behind a translating IOMMU (group type DMA*) tt-metal pins every host buffer it writes through the KMD's long-term
+# page pin, and the pin of a memory-mapped tensorbin can spin forever (tt-kmd #295, tt-metal #57269: the server is
+# unkillable, tt-smi hangs).  A zero pin cache sends the writes down the copy path; identity mode (iommu=pt +
+# hugepages) never pins.  An explicit TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES wins.
+if [[ -z "${TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES:-}" ]]; then
+    IFS=, read -r -a device_nodes <<<"$visible_devices"
+    for node in "${device_nodes[@]}"; do
+        bdf=$(basename "$(readlink -f "/sys/class/tenstorrent/tenstorrent!$node/device" 2>/dev/null)") || continue
+        iommu_type=$(cat "/sys/bus/pci/devices/$bdf/iommu_group/type" 2>/dev/null) || continue
+        if [[ "$iommu_type" == DMA* ]]; then
+            export TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES=0
+            printf 'run_qwen38_chat_server: %s sits behind a translating IOMMU (%s): host memory pinning off (TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES=0, tt-kmd #295)\n' "$bdf" "$iommu_type" >&2
+            break
+        fi
+    done
+fi
 
 # the BF4 expert cache is keyed by the build identity inside; one root serves every allocated context
 args=(

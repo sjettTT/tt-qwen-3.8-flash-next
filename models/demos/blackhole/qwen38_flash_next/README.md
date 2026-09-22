@@ -228,6 +228,15 @@ checks the four assignments before it builds and runs one reader per bank on suc
 `READY` (`dram_workers_fallback`) and `/health`.  A uniformly harvested mesh keeps two readers.  `QWEN38_DRAM_WORKERS=1`
 still forces one reader everywhere.
 
+A QuietBox 2 ships with the IOMMU translating (Tenstorrent's intended Blackhole configuration: no hugepages needed),
+and there tt-metal pins every host buffer it writes through the KMD's long-term page pin.  The pin of a memory-mapped
+tensorbin can spin forever: the server cannot be killed except with SIGKILL, `tt-smi` and the telemetry agent hang on the
+driver's mutex, and `dmesg` later says `could only pin N of M pages` (tt-kmd #295, tt-metal #57269).  The launcher
+detects a translating group and exports `TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES=0`, which sends the writes down the
+copy path; verified on qb2 with the IOMMU translating (READY in 120 s, acceptance and decode speed unchanged).  Putting
+the groups in passthrough (`iommu=pt`, which then needs the 1 GiB hugepages) also avoids it, but that is the legacy
+configuration and disables the driver features that need translation.
+
 ## 8. Layout
 
     chat.py checkpoint.py config.py reference.py   the checkpoint, the chat template, the torch reference model

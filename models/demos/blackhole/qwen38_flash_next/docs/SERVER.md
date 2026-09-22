@@ -26,7 +26,13 @@ per token saved, sampling fields refused with HTTP 400) and `--stall-seconds 0` 
 
 What the launcher does not do: no device locks, no runtime archives or digests.  It exports the QuietBox mesh graph
 descriptor for `tt-quietbox` (`tools/qb_p150_x4_1x4_line_mesh_graph_descriptor.textproto`: the four chips' ethernet
-ring opened as one 1x4 line), the device set, the cache and log roots, and `TT_METAL_HOME` = this checkout.
+ring opened as one 1x4 line), the device set, the cache and log roots, and `TT_METAL_HOME` = this checkout.  When a
+device of the set sits behind a translating IOMMU (its `iommu_group/type` starts with `DMA`, the shipped QuietBox 2
+state) it also exports `TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES=0` and says so: there tt-metal pins every host buffer it
+writes through the KMD's long-term page pin, and the pin of a memory-mapped tensorbin can spin forever with the server
+unkillable and `tt-smi` blocked (tt-kmd #295, tt-metal #57269); a zero pin cache sends the writes down the copy path
+(measured on a QuietBox 2, 2026-09-22: READY, acceptance and decode speed unchanged).  Set the variable yourself to keep
+another value.
 
 ## Runtime admission
 

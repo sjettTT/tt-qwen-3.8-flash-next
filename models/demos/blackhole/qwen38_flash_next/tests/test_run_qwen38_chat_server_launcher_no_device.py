@@ -88,6 +88,19 @@ def test_validate_only_runs_the_interpreter_from_the_repository_root_wherever_it
     assert reports[0] == reports[1]
 
 
+def test_the_launcher_turns_host_pinning_off_behind_a_translating_iommu() -> None:
+    """The check reads each visible node's PCI IOMMU group, exports the zero pin cache only when no value was given, and
+    runs after the device set is known and before the server starts."""
+
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    check = launcher.index('if [[ -z "${TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES:-}" ]]; then')
+    assert launcher.index('export TT_VISIBLE_DEVICES="$visible_devices"') < check < launcher.index('exec "$python" "$SERVER"')
+    block = launcher[check : launcher.index("fi\n", launcher.index("done", check)) + 3]
+    assert '/sys/class/tenstorrent/tenstorrent!$node/device' in block and "iommu_group/type" in block
+    assert '[[ "$iommu_type" == DMA* ]]' in block and "export TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES=0" in block
+    assert "tt-kmd #295" in block
+
+
 def test_the_launcher_changes_directory_before_the_interpreter_runs() -> None:
     launcher = LAUNCHER.read_text(encoding="utf-8")
     change = launcher.index('cd "$REPO_ROOT"')
