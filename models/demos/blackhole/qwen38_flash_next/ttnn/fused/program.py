@@ -246,3 +246,34 @@ def run_program(io_tensors: Sequence, descriptor: ttnn.ProgramDescriptor):
     """Inputs first, pre-allocated outputs last; returns the last tensor."""
 
     return ttnn.generic_op(list(io_tensors), descriptor)
+
+
+def traced_us_per_call(mesh, call, *, calls: int = 20, replays: int = 10, release=None) -> float:
+    """Host wall per call of ``call()`` captured ``calls`` times in one trace and replayed ``replays`` times (the
+    first replay warms and is not timed).  ``call`` runs once eagerly BEFORE the capture: a program that is not in
+    the program cache cannot be loaded during trace capture (mesh_workload.cpp: "Warm up before capturing a trace").
+    ``release(result)`` frees what ``call`` returns (default: deallocate a tensor or every tensor of a tuple)."""
+
+    import time
+
+    def free(result):
+        for tensor in result if isinstance(result, (tuple, list)) else (result,):
+            if hasattr(tensor, "injection"):  # a GR state
+                ttnn.deallocate(tensor.injection)
+            elif tensor is not None:
+                ttnn.deallocate(tensor)
+
+    release = free if release is None else release
+    release(call())
+    trace = ttnn.begin_trace_capture(mesh, cq_id=0)
+    kept = [call() for _ in range(calls)]
+    ttnn.end_trace_capture(mesh, trace, cq_id=0)
+    ttnn.execute_trace(mesh, trace, cq_id=0, blocking=True)
+    started = time.perf_counter()
+    for _ in range(replays):
+        ttnn.execute_trace(mesh, trace, cq_id=0, blocking=True)
+    elapsed = time.perf_counter() - started
+    ttnn.release_trace(mesh, trace)
+    for result in kept:
+        release(result)
+    return round(elapsed / (replays * calls) * 1e6, 2)

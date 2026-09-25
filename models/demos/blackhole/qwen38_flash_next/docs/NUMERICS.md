@@ -25,10 +25,12 @@ Every number here was measured on 4x p150 unless a date and host say otherwise.
 
 Decode chains run as fused programs (`ttnn/fused/`, built on `ttnn.generic_op`) where a kernel is bitwise against the
 chain it replaces on device, leaves every pinned table above unchanged and beats the previous step time in its own
-timing slot.  On by default: `gr_read`, `gr_write`, `greedy_tail`, `moe_post`, `ple`, `position_derive`, `qsa_block`,
-`router_tail`, `shared_expert`: the gated-residual read as three programs around its two collectives (stats,
-normalize + down-project, low-rank + gate: 18 programs per read as 5, the chain's LLK sequences call for call, its
-reduce scaler and spill/reload rounding included); the gated-residual write as one program (SFPU multiply, FPU add, as
+timing slot.  On by default: `gr_read` with `gr_fold`, `gr_write`, `greedy_tail`, `moe_post`, `ple`, `position_derive`,
+`qsa_block`, `router_tail`, `shared_expert`: the gated-residual read as two programs with its two all-gathers inside
+them (the stats, their gather, normalize + down-project and the partial gather as one program whose transport cores
+send the tiles over the 1D fabric line into the pages the stock collectives write, then low-rank + gate: 18 programs
+per read as 2, the chain's LLK sequences call for call, its reduce scaler and spill/reload rounding included; a gather
+is data movement, so the fold is bitwise, 2026-09-25); the gated-residual write as one program (SFPU multiply, FPU add, as
 the chain); the tail's greedy epilogue (24 programs as 4 plus one gather); the MoE post program (fill, tilize, the
 score-weighted reduce over the ten expert slots in slot order, the shared expert's x sigmoid and the partial add as one
 program); the prologue's position derivation (40 programs as 1); the sparse-attention block's decode glue as six
@@ -42,6 +44,7 @@ as 9, the SFPU `mac_tile` of `ttnn.mac`, the accurate fp32 reduce of the gate's 
 `QWEN38_FUSED=<name>`: `final_mixer`, `gdn_step`, `position_advance`.  The kernels cover rows 1..32 (decode, the MTP
 verify rows); the 128-row prefill chunk and the slab keep their chains.  `QWEN38_FUSED_OFF=<name>[,...]` (or `all`) in
 the server's environment falls back to the composed chains; an unknown name in either variable refuses to start;
+`QWEN38_FUSED_OFF=gr_fold` runs the GR read's merged three-program form with the stock collectives (5 programs per read);
 `QWEN38_FUSED_GR_READ_MERGED=0` runs the GR read's split form (7 programs per read); `QWEN38_ROUTER_TAIL_LANES=0` runs
 the router tail's top-k on one core per tile (the same program, the LLK's four passes on that core).
 

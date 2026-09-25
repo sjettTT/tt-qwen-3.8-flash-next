@@ -45,12 +45,12 @@ def test_merged_forms_are_the_default_and_the_switch_selects_the_split_forms():
 def test_reader_and_writer_argument_contracts():
     reader = _source("reader.cpp")
     assert "NUM_STREAMS = get_compile_time_arg_val(0)" in reader and "NUM_CONSTS = get_compile_time_arg_val(5)" in reader
-    assert "ACCESSOR_BASE = 12" in reader and "STREAM_RT_ARGS = 7" in reader
+    assert "ACCESSOR_BASE = 15" in reader and "STREAM_RT_ARGS = 7" in reader  # 12 + the (gated stream, semaphore, count) triple
     assert "broadcast_row0" not in reader  # the gamma rows come repeated from the host (weights.norm_scale_rows)
     assert "prepare_reduce_scaler" in reader and "generate_bcast_col_scalar" in reader and "prepare_zero_tile" in reader
     writer = _source("writer.cpp")
     assert "ACCESSOR_BASE = 4" in writer and "STREAM_RT_ARGS = 5" in writer
-    # the Python side: 1 + 4 cb slots + 1 + 3 (kind, cb) pairs = 12 args before the accessors
+    # the Python side: 1 + 4 cb slots + 1 + 3 (kind, cb) pairs + the gate triple = 15 args before the accessors
     assert gr_read.CONST_SCALER == 1 and gr_read.CONST_COL_SCALAR == 2 and gr_read.CONST_ZERO == 3
 
 
@@ -73,7 +73,7 @@ def test_compute_kernels_pin_the_cb_indices_the_python_side_allocates():
     assert "add_init(c_gated, c_zero, true)" in gate
     for name, index in (("lr", 2), ("w", 3), ("nws", 4), ("zero", 5), ("up", 6), ("gate", 7), ("gated", 8), ("out", 9)):
         assert f"c_{name} = get_compile_time_arg_val({index});" in gate
-    mcast_w, mcast_r = _source("mcast_writer.cpp"), _source("mcast_reader.cpp")
+    mcast_w, mcast_r = _source("mcast_writer.cpp") + _source("mcast_phase.h"), _source("mcast_reader.cpp")
     assert "noc_probe" in mcast_w and "async_write_multicast" in mcast_w and "sem.up(noc, x, y, 1)" in mcast_w
     assert "sem.wait(SENDERS)" in mcast_r and "recv.push_back(RECV_TILES)" in mcast_r and "ACCESSOR_BASE = 8" in mcast_r
     assert gr_read.NONE_CB == 0xFF and gr_read.MERGED_ENV == "QWEN38_FUSED_GR_READ_MERGED"
@@ -117,7 +117,10 @@ def test_multicast_writer_starts_from_the_far_corner_on_noc_1():
     arch) and NOC_1 routes a multicast from the bottom-right corner; the producers' multicast hung at the write
     barrier until the corners were swapped for it (the DRAM-sharded matmul factory swaps them the same way)."""
 
-    source = _source("mcast_writer.cpp")
+    source = _source("mcast_phase.h")  # the phase body; mcast_writer.cpp runs it once, gr_fold's mcast_writer2.cpp twice
+    writer = _source("mcast_writer.cpp")
+    assert '#include "mcast_phase.h"' in writer
+    assert "mcast_phase<SRC_CB, DST_CB, NUM_TILES, WRITE_TILES, EXTRA_CB, SEM_ID>(tiles_args, extra_args, 0);" in writer
     assert "constexpr bool from_far_corner = noc_index != 0;" in source
     assert ".noc_x_start = from_far_corner ? x1 : x0," in source
     assert ".noc_y_end = from_far_corner ? y0 : y1," in source

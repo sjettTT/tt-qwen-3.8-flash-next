@@ -130,13 +130,16 @@ def _stream(tensor, outer: int, inner: int, first: int, inner_stride: int, outer
     return [tensor.buffer_address(), outer, inner, first, inner_stride, outer_stride, batch]
 
 
-def _reader(cores, streams, consts, runtime):
-    """streams: [(tensor, cb)]; consts: [(kind, cb)]; runtime: per core -> (stream args lists, const bits list)."""
+def _reader(cores, streams, consts, runtime, gate=None):
+    """streams: [(tensor, cb)]; consts: [(kind, cb)]; runtime: per core -> (stream args lists, const bits list);
+    ``gate`` = (stream index, program semaphore id, count): that stream is read once the semaphore reached the count
+    (a producer of the same program signals that its pages are complete), then the semaphore is reset."""
 
     compile_args = [len(streams), *[cb for _, cb in streams], *[0] * (4 - len(streams)), len(consts)]
     for kind, cb in consts:
         compile_args += [kind, cb]
     compile_args += [0, 0] * (3 - len(consts))
+    compile_args += list(gate) if gate is not None else [NONE_CB, 0, 0]
     for slot in range(4):  # the kernel defines four accessor sets; unused slots repeat the first tensor's
         compile_args += fp.accessor_args(streams[min(slot, len(streams) - 1)][0])
     return fp.reader_kernel(
@@ -747,54 +750,88 @@ def _topology(module, tensor, shard_dim: int | None) -> None:
 
 
 def gr_read_fused(
-    module, residual, *, scaler_mode: str = "chain", merged: bool | None = None, matmul: str | None = None
+    module,
+    residual,
+    *,
+    scaler_mode: str = "chain",
+    merged: bool | None = None,
+    matmul: str | None = None,
+    stats_gather=None,
+    partial_gather=None,
+    read_front=None,
 ):
     """The model-level read: the fused programs around the chain's two collectives; returns (block input, state).
     ``merged`` (default: on, unless the QWEN38_FUSED_GR_READ_MERGED=0 switch) runs normalize+down and low_rank+gate
-    as one program each."""
+    as one program each.  ``stats_gather(residual)`` replaces ``stats`` + ``ttnn.all_gather`` with a program that
+    gathers inside itself (ttnn/fused/gr_fold); it returns the same ``[1, 4, rows, 128]`` bf16 tiles.
+    ``partial_gather(residual, gathered_stats, gamma_rows, down_inject)`` likewise replaces ``normalize_down`` +
+    ``all_gather_async`` (merged forms only); it returns ``(normalized, gathered_partials)`` with the same
+    ``[4, 1, rows, 384]`` fp32 tiles.  ``read_front(residual, gamma_rows, down_inject)`` replaces all four (stats,
+    all_gather, normalize_down, all_gather_async) with one program and returns ``(normalized, gathered_partials)``."""
 
     from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import TensorPlacement
     from models.demos.blackhole.qwen38_flash_next.ttnn.gr import Qwen38TTNNGatedResidualState
 
     rows = residual_rows(residual)
     module.mesh_contract.validate_tensor(residual, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
-    stats_local = stats(residual)
-    _topology(module, stats_local, 3)
-    gathered_stats = ttnn.all_gather(stats_local, dim=3, cluster_axis=TP_AXIS, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-    ttnn.deallocate(stats_local)
-    module.mesh_contract.validate_tensor(gathered_stats, placement=TensorPlacement.REPLICATED)
     merged = merged_enabled() if merged is None else merged
     matmul = matmul_mode() if matmul is None else matmul
     gamma_rows = module.weights.norm_scale_rows
     if gamma_rows is None:
         raise RuntimeError("the fused GR read needs weights.norm_scale_rows (gamma/4 repeated over the tile rows)")
-    if merged:
-        normalized, partial = normalize_down(
-            residual, gathered_stats, gamma_rows, module.weights.down_inject, scaler_mode=scaler_mode, matmul=matmul
-        )
+    if (partial_gather is not None or read_front is not None) and not merged:
+        raise ValueError("partial_gather / read_front fold the merged normalize_down form; the split forms keep the collectives")
+    if read_front is not None:
+        normalized, gathered_partials = read_front(residual, gamma_rows, module.weights.down_inject)
+        _topology(module, normalized, 3)
+        _topology(module, gathered_partials, None)
     else:
-        normalized = normalize(residual, gathered_stats, gamma_rows, scaler_mode=scaler_mode)
-        partial = down_project(normalized, module.weights.down_inject, matmul=matmul)
-    ttnn.deallocate(gathered_stats)
-    _topology(module, normalized, 3)
-    module._mark_partial(partial, (1, 1, rows, PARTIAL_WIDTH))
-    if module.collective_topology != ttnn.Topology.Linear or module.tt_ccl is None:
-        raise RuntimeError("GR partial gather requires the TP4 Linear topology and the TT-CCL manager")
-    gathered_partials = ttnn.experimental.all_gather_async(
-        partial,
-        persistent_output_buffer=None,
-        dim=0,
-        multi_device_global_semaphore=module.tt_ccl.get_and_cycle_ag_semaphore_handles(TP_AXIS),
-        num_links=module.tt_ccl.get_num_links(TP_AXIS),
-        cluster_axis=TP_AXIS,
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        topology=ttnn.Topology.Linear,
-        barrier_semaphore=module.tt_ccl.get_and_cycle_barrier_semaphore_handle(TP_AXIS),
-        chunks_per_sync=1,
-        num_workers_per_link=1,
-        num_buffers_per_channel=2,
-    )
-    ttnn.deallocate(partial)
+        if stats_gather is None:
+            stats_local = stats(residual)
+            _topology(module, stats_local, 3)
+            gathered_stats = ttnn.all_gather(
+                stats_local, dim=3, cluster_axis=TP_AXIS, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+            ttnn.deallocate(stats_local)
+        else:
+            gathered_stats = stats_gather(residual)
+            _topology(module, gathered_stats, None)
+        module.mesh_contract.validate_tensor(gathered_stats, placement=TensorPlacement.REPLICATED)
+    if read_front is not None:
+        pass
+    elif partial_gather is not None:
+        normalized, gathered_partials = partial_gather(residual, gathered_stats, gamma_rows, module.weights.down_inject)
+        ttnn.deallocate(gathered_stats)
+        _topology(module, normalized, 3)
+        _topology(module, gathered_partials, None)
+    else:
+        if merged:
+            normalized, partial = normalize_down(
+                residual, gathered_stats, gamma_rows, module.weights.down_inject, scaler_mode=scaler_mode, matmul=matmul
+            )
+        else:
+            normalized = normalize(residual, gathered_stats, gamma_rows, scaler_mode=scaler_mode)
+            partial = down_project(normalized, module.weights.down_inject, matmul=matmul)
+        ttnn.deallocate(gathered_stats)
+        _topology(module, normalized, 3)
+        module._mark_partial(partial, (1, 1, rows, PARTIAL_WIDTH))
+        if module.collective_topology != ttnn.Topology.Linear or module.tt_ccl is None:
+            raise RuntimeError("GR partial gather requires the TP4 Linear topology and the TT-CCL manager")
+        gathered_partials = ttnn.experimental.all_gather_async(
+            partial,
+            persistent_output_buffer=None,
+            dim=0,
+            multi_device_global_semaphore=module.tt_ccl.get_and_cycle_ag_semaphore_handles(TP_AXIS),
+            num_links=module.tt_ccl.get_num_links(TP_AXIS),
+            cluster_axis=TP_AXIS,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            topology=ttnn.Topology.Linear,
+            barrier_semaphore=module.tt_ccl.get_and_cycle_barrier_semaphore_handle(TP_AXIS),
+            chunks_per_sync=1,
+            num_workers_per_link=1,
+            num_buffers_per_channel=2,
+        )
+        ttnn.deallocate(partial)
     if merged:
         block, injection = low_rank_gate(gathered_partials, normalized, module.weights.up, matmul=matmul)
     else:

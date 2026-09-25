@@ -31,6 +31,7 @@ from .registry import (
     resolve,
 )
 from . import final_mixer, gdn_step, gr_read, gr_write, greedy_tail, moe_post, ple, position_derive, qsa_block, router_tail, shared_expert, untilize_rows
+from . import gr_fold  # after gr_read: it composes gr_read's programs
 
 __all__ = [
     "ALL",

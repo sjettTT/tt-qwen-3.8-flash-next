@@ -458,7 +458,12 @@ class Qwen38TTNNGatedResidual:
 
         self._read_fused = None
         if fused_kernels.enabled("gr_read"):
-            self._read_fused = fused_kernels.kernel("gr_read").fused
+            # gr_fold (on by default) is gr_read's read with its collectives folded into the programs; it needs the mesh's
+            # global semaphores before any trace capture, so they are created here
+            name = "gr_fold" if fused_kernels.enabled("gr_fold") else "gr_read"
+            if name == "gr_fold":
+                fused_kernels.gr_fold.line_semaphores(mesh_device)
+            self._read_fused = fused_kernels.kernel(name).fused
             self.read = functools.partial(self._read_fused, self)
         # QWEN38_FUSED=gr_write: write and write_rows (one tile row) resolve to ttnn/fused/gr_write the same way.
         self._write_fused = None

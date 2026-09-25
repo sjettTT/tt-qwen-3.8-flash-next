@@ -3,8 +3,10 @@
 //
 // Streams whole tiles of up to four TILE tensors into one CB each, plus up to three generated constant tiles.
 // Stream s reads pages first + o * outer_stride + i * inner_stride for o < outer, i < inner, pushed `batch` at a time.
-// Compile-time args: 0 num_streams, 1-4 cb per stream, 5 num_consts, 6-11 (kind, cb) per const, 12.. four
-//   TensorAccessorArgs sets, chained (unused slots repeat a used tensor's).  Const kinds: 1 reduce scaler (row 0 of
+// Compile-time args: 0 num_streams, 1-4 cb per stream, 5 num_consts, 6-11 (kind, cb) per const, 12 gated stream
+//   (0xFF none), 13 gate semaphore id, 14 gate count (the stream is read once the program-local semaphore reached
+//   the count; then it is reset: a producer of the same program signals that the stream's pages are complete),
+//   15.. four TensorAccessorArgs sets, chained (unused slots repeat a used tensor's).  Const kinds: 1 reduce scaler (row 0 of
 //   every face, the CB's format), 2 broadcast column scalar (column 0, bf16 upper half of the bits), 3 zero tile.
 //   Tiles are streamed as they are: a one-row operand of a row-broadcast op is stored row-repeated on the host side
 //   (copying tile row 0 into 31 rows on the RISC cost 175 us for the 20 gamma tiles of one read).
@@ -14,6 +16,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/dataflow/circular_buffer.h"
+#include "api/dataflow/noc_semaphore.h"
 #include "api/tensor/noc_traits.h"
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_dataflow.hpp"
 #include "ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp"
@@ -21,7 +24,10 @@
 
 constexpr uint32_t NUM_STREAMS = get_compile_time_arg_val(0);
 constexpr uint32_t NUM_CONSTS = get_compile_time_arg_val(5);
-constexpr uint32_t ACCESSOR_BASE = 12;
+constexpr uint32_t GATE_STREAM = get_compile_time_arg_val(12);
+constexpr uint32_t GATE_SEM = get_compile_time_arg_val(13);
+constexpr uint32_t GATE_COUNT = get_compile_time_arg_val(14);
+constexpr uint32_t ACCESSOR_BASE = 15;
 constexpr uint32_t STREAM_RT_ARGS = 7;
 
 template <typename Args>
@@ -87,14 +93,27 @@ void kernel_main() {
     constexpr auto args1 = TensorAccessorArgs<args0.next_compile_time_args_offset()>();
     constexpr auto args2 = TensorAccessorArgs<args1.next_compile_time_args_offset()>();
     constexpr auto args3 = TensorAccessorArgs<args2.next_compile_time_args_offset()>();
+    auto gate = [](uint32_t stream) {
+        if constexpr (GATE_STREAM != 0xFF) {
+            if (stream == GATE_STREAM) {
+                Semaphore<> ready(GATE_SEM);
+                ready.wait(GATE_COUNT);
+                ready.set(0);
+            }
+        }
+    };
+    gate(0);
     read_stream(args0, get_compile_time_arg_val(1), 0);
     if constexpr (NUM_STREAMS > 1) {
+        gate(1);
         read_stream(args1, get_compile_time_arg_val(2), STREAM_RT_ARGS);
     }
     if constexpr (NUM_STREAMS > 2) {
+        gate(2);
         read_stream(args2, get_compile_time_arg_val(3), 2 * STREAM_RT_ARGS);
     }
     if constexpr (NUM_STREAMS > 3) {
+        gate(3);
         read_stream(args3, get_compile_time_arg_val(4), 3 * STREAM_RT_ARGS);
     }
 }

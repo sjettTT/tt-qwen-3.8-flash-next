@@ -111,7 +111,7 @@ P150_LINE = ResidentHardwareProfile(
 
 
 def _quietbox_2_instance(instance: int) -> ResidentHardwareProfile:
-    """A p300-based box (a QuietBox 2 ran it on 2026-09-18).  Each p300 card is two Blackhole dies (two KMD nodes) joined on the card; the
+    """UNTESTED: a p300-based box.  Each p300 card is two Blackhole dies (two KMD nodes) joined on the card; the
     QuietBox 2 (2x p300c = nodes 0-3) has one ring over the on-card links and the two Warp400 links, so it is one
     instance.  A four-card host (8 dies) is two instances of four consecutive nodes.  ttnn classifies a p300
     cluster that is not exactly 2 or 4 dies as CUSTOM and refuses to open without a mesh graph descriptor, so the

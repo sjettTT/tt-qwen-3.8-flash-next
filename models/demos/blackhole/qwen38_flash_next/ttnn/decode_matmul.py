@@ -77,50 +77,6 @@ def default_decode_dram_workers(environ: Mapping[str, str] | None = None) -> int
     return int(raw)
 
 
-def mesh_dram_bank_worker_signatures(mesh_device) -> dict[tuple[int, int], tuple[tuple[int, int], ...]]:
-    """Per mesh coordinate, the DRAM bank -> worker core order the DRAM-sharded matmul reads in1 with (NOC 0)."""
-
-    rows, columns = (int(extent) for extent in mesh_device.shape)
-    signatures: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
-    for row in range(rows):
-        for column in range(columns):
-            assignment = ttnn.device.get_optimal_dram_bank_to_logical_worker_assignment_at_mesh_coordinate(
-                mesh_device, ttnn.NOC.RISCV_0_default, ttnn.MeshCoordinate(row, column)
-            )
-            signatures[(row, column)] = tuple((int(core.x), int(core.y)) for core in assignment)
-    return signatures
-
-
-def qualify_decode_dram_workers(mesh_device, requested: int) -> tuple[int, str | None]:
-    """The readers per DRAM bank this mesh admits: ``requested``, or 1 with the reason.
-
-    One DRAM-sharded matmul program is placed on every device of the mesh, so more than one reader per bank requires
-    every device to report the same bank -> worker assignment (tt-metal ``get_dram_bank_reader_assignments``: "identical
-    local device geometry and primary readers", a TT_FATAL after the weights are on the device).  Dies harvested in
-    different columns (a QuietBox 2, 2026-09-18) serve their banks from different worker columns, so they run one
-    reader per bank; the caller records the reason.  The two-reader table (``TWO_WORKER_PROJECTIONS``) was qualified on
-    eight banks, so a board with another bank count (a seven-bank Blackhole DRAM ring) runs one reader too.
-    """
-
-    validate_decode_dram_workers(requested)
-    if requested == 1:
-        return 1, None
-    banks = _dram_bank_count(mesh_device)
-    if banks != 8:
-        return 1, (
-            f"one reader per DRAM bank: the two-reader projections were qualified on 8 DRAM banks, this mesh has {banks}"
-        )
-    signatures = mesh_dram_bank_worker_signatures(mesh_device)
-    if len(set(signatures.values())) == 1:
-        return requested, None
-    reference_coordinate = min(signatures)
-    differing = sorted(coordinate for coordinate, signature in signatures.items() if signature != signatures[reference_coordinate])
-    return 1, (
-        f"one reader per DRAM bank: {requested} readers need every device to share one bank -> worker assignment, "
-        f"and the devices at mesh coordinates {differing} differ from {reference_coordinate} (differently harvested dies)"
-    )
-
-
 def bank_tiles(mesh_device, k: int, n: int, num_workers_per_dram_bank: int = 1) -> int:
     """Weight tiles per DRAM bank: ``n`` over the banks, padded to whole tiles per reader."""
 

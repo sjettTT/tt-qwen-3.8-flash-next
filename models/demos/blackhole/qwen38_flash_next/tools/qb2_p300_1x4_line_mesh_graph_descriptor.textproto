@@ -1,10 +1,8 @@
-# QuietBox 2 (2x p300c = 4 Blackhole dies in one ring: the two on-card links and
-# the two Warp400 links).  One 1x4 LINE mesh over three of the four ring links,
-# the logical shape the model's Linear collectives assume.  Channel count 2 as
-# in the upstream p300_x2 descriptor: the 4-channel p150 QuietBox descriptor
-# asserts "Expected 4 eth links" here.  Exported by run_qwen38_chat_server.sh
-# --profile qb2 and the tt-model profile c32k-quietbox2; tested on qb2
-# 2026-09-18 (standalone) and 2026-09-21 (vllm-tt-plugin, devices [1, 0, 3, 2]).
+# UNTESTED: QuietBox 2 (2x p300c = 4 Blackhole dies in one ring: the two on-card
+# links and the two Warp400 links).  One 1x4 LINE mesh over three of the four
+# ring links, the logical shape the model's Linear collectives assume.  The
+# channel count follows the upstream p300_x2 descriptor (2 per link).  Exported
+# as TT_MESH_GRAPH_DESC_PATH by run_qwen38_chat_server.sh --profile qb2.
 mesh_descriptors {
   name: "M0"
   arch: BLACKHOLE

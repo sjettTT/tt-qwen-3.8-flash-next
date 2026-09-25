@@ -49,58 +49,6 @@ def test_two_readers_are_the_default_and_the_switch_admits_one_or_two() -> None:
     assert dm.validate_decode_dram_workers(1) == 1 and dm.validate_decode_dram_workers(2) == 2
 
 
-class _Core:
-    __slots__ = ("x", "y")
-
-    def __init__(self, x: int, y: int) -> None:
-        self.x, self.y = x, y
-
-
-# A QuietBox 2 (2x p300c): three dies serve their banks from worker column 6, the fourth from column 5.
-QB2_COLUMN_6 = ((0, 9), (0, 0), (0, 7), (0, 3), (6, 9), (6, 1), (6, 6), (6, 4))
-QB2_COLUMN_5 = ((0, 9), (0, 0), (0, 7), (0, 3), (5, 9), (5, 1), (5, 6), (5, 4))
-
-
-def _qualify(per_die, requested, monkeypatch):
-    mesh = SimpleNamespace(shape=(1, len(per_die)), dram_grid_size=lambda: ttnn.CoreCoord(BANKS, 1))
-    calls = []
-
-    def assignment(device, noc, coordinate):
-        calls.append((noc, tuple(coordinate)))
-        return [_Core(x, y) for x, y in per_die[tuple(coordinate)[1]]]
-
-    monkeypatch.setattr(
-        dm.ttnn.device, "get_optimal_dram_bank_to_logical_worker_assignment_at_mesh_coordinate", assignment
-    )
-    return dm.qualify_decode_dram_workers(mesh, requested), calls
-
-
-def test_two_readers_need_one_bank_to_worker_assignment_on_every_device(monkeypatch) -> None:
-    (workers, reason), calls = _qualify([QB2_COLUMN_6] * 4, 2, monkeypatch)
-    assert (workers, reason) == (2, None)
-    assert [coordinate for _, coordinate in calls] == [(0, 0), (0, 1), (0, 2), (0, 3)]
-    assert {noc for noc, _ in calls} == {ttnn.NOC.RISCV_0_default}  # the matmul's in1 reader NOC
-    (workers, reason), _ = _qualify([QB2_COLUMN_6, QB2_COLUMN_5, QB2_COLUMN_6, QB2_COLUMN_6], 2, monkeypatch)
-    assert workers == 1 and "mesh coordinates [(0, 1)]" in reason and "differ from (0, 0)" in reason
-    (workers, reason), _ = _qualify([QB2_COLUMN_5, QB2_COLUMN_6, QB2_COLUMN_6, QB2_COLUMN_6], 2, monkeypatch)
-    assert workers == 1 and "[(0, 1), (0, 2), (0, 3)]" in reason
-    (workers, reason), calls = _qualify([QB2_COLUMN_6, QB2_COLUMN_5, QB2_COLUMN_6, QB2_COLUMN_6], 1, monkeypatch)
-    assert (workers, reason, calls) == (1, None, [])  # one reader asks the mesh nothing
-    # a seven-bank Blackhole ring (BLACKHOLE_RING_SIZES admits 7): the two-reader table is an eight-bank table
-    seven = SimpleNamespace(shape=(1, 4), dram_grid_size=lambda: ttnn.CoreCoord(7, 1))
-    workers, reason = dm.qualify_decode_dram_workers(seven, 2)
-    assert workers == 1 and "qualified on 8 DRAM banks, this mesh has 7" in reason
-    with pytest.raises(ValueError):
-        dm.qualify_decode_dram_workers(SimpleNamespace(shape=(1, 4)), 3)
-
-
-def test_the_builder_resolves_the_reader_count_against_the_live_mesh() -> None:
-    source = inspect.getsource(builder_module.Qwen38TTNNBuilder.__init__)
-    resolve = source.index("qualify_decode_dram_workers(")
-    assert source.index("qualify_live_bf4_ring(mesh_device)") < resolve < source.index("live_identity = Qwen38LiveBuildIdentity(")
-    assert "self.decode_dram_workers_fallback = decode_dram_workers_fallback" in source
-
-
 def test_the_two_reader_table_names_the_screened_projections() -> None:
     assert dm.TWO_WORKER_PROJECTIONS == {
         (2560, 4160): 8,

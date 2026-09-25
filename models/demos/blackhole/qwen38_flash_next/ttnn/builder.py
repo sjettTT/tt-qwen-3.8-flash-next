@@ -57,7 +57,6 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import (
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE, Qwen38MeshContract
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     default_decode_dram_workers,
-    qualify_decode_dram_workers,
     validate_decode_dram_workers,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import (
@@ -776,11 +775,6 @@ class Qwen38TTNNBuilder:
         if mesh_device.arch() != ttnn.Arch.BLACKHOLE:
             raise ValueError("Qwen3.8 four-P150 construction requires a Blackhole mesh")
         ring_order = qualify_live_bf4_ring(mesh_device)
-        # Two readers per bank need one bank -> worker assignment on every device (decode_matmul): a mesh of
-        # differently harvested dies runs one reader, and the one-reader caches keep their identity.
-        decode_dram_workers_per_bank, decode_dram_workers_fallback = qualify_decode_dram_workers(
-            mesh_device, decode_dram_workers_per_bank
-        )
         live_identity = Qwen38LiveBuildIdentity(
             provenance=provenance,
             mesh_shape=tuple(mesh_contract.mesh_shape),
@@ -835,7 +829,6 @@ class Qwen38TTNNBuilder:
         self.expert_residency = expert_residency
         self.qsa_cache_capacity = qsa_cache_capacity
         self.decode_dram_workers_per_bank = decode_dram_workers_per_bank
-        self.decode_dram_workers_fallback = decode_dram_workers_fallback  # None, or why the mesh runs one reader
         self.identity = live_identity
         self.component_cache_root = component_cache_root
         self.bf4_cache = bf4_cache

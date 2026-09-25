@@ -1837,7 +1837,6 @@ def main() -> int:
             "prefill_mode": session.prefill_mode,
             "sampling": chain.sampling is not None,
             "dram_workers_per_bank": chain.construction.builder.decode_dram_workers_per_bank,
-            "dram_workers_fallback": chain.construction.builder.decode_dram_workers_fallback,
             "mtp": (
                 None
                 if chain.mtp is None
@@ -1933,7 +1932,6 @@ def main() -> int:
                 "mtp": report["chain"]["mtp"],
                 "fused_kernels": sorted(fused.enabled_names()),
                 "dram_workers_per_bank": report["chain"]["dram_workers_per_bank"],
-                "dram_workers_fallback": report["chain"]["dram_workers_fallback"],
                 "route": list(hardware_profile.route),
                 "route_derivation": route_derivation["route_derivation"],
             }
