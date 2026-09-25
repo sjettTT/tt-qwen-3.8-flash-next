@@ -1634,6 +1634,8 @@ class Qwen38TracedChain:
         def dram_allocated_per_bank() -> int:
             return int(ttnn.get_memory_view(mesh, ttnn.BufferType.DRAM).total_bytes_allocated_per_bank)
 
+        if slab_rows is not None:
+            builder.enable_prefill_slab(slab_rows)  # the slab's dense-linear residents, behind the DRAM admission
         marker("before-chat-target-build")
         built_target = builder.build_target()
         marker("after-chat-target-build")

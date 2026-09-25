@@ -62,9 +62,9 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
-    prefill_linear,
     prefill_matmul_program_config,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn.prefill_dense import Qwen38TTNNPrefillDense, prefill_linear
 
 TP_AXIS = 1
 TP_SIZE = 4
@@ -416,6 +416,10 @@ class Qwen38TTNNGatedResidualState:
 class Qwen38TTNNGatedResidual:
     """One exact global-B1 TP4 gated-residual module."""
 
+    # The prefill slab's dense-linear policy (ttnn/prefill_dense: the QWEN38_PREFILL_DENSE_* switches); the decode
+    # linears never read it.
+    prefill_dense: Qwen38TTNNPrefillDense | None = None
+
     def __init__(
         self,
         mesh_device,
@@ -424,6 +428,7 @@ class Qwen38TTNNGatedResidual:
         *,
         tt_ccl,
         collective_topology=None,
+        prefill_dense: Qwen38TTNNPrefillDense | None = None,
     ) -> None:
         mesh_contract.validate_mesh(mesh_device)
         weights.validate(mesh_contract)
@@ -432,6 +437,7 @@ class Qwen38TTNNGatedResidual:
         self.weights = weights
         self.tt_ccl = tt_ccl
         self.collective_topology = collective_topology or ttnn.Topology.Linear
+        self.prefill_dense = Qwen38TTNNPrefillDense.resolve(prefill_dense, mesh_device)
         self.compute_config = ttnn.init_device_compute_kernel_config(
             mesh_device.arch(),
             math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -769,12 +775,16 @@ class Qwen38TTNNGatedResidual:
         self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
 
     def _slab_program_config(self, rows: int, k: int, n: int):
-        """The slab's 2D-multicast matmul config for one of the two linears, built once per (rows, k, n)."""
+        """The slab's 2D-multicast matmul config for one of the two linears, built once per (rows, k, n): today's
+        config, or the prefill dense policy's wide grid (QWEN38_PREFILL_DENSE_GRID=wide)."""
 
         configs = self.__dict__.setdefault("_slab_program_configs", {})
         key = (rows, k, n)
         if key not in configs:
-            configs[key] = prefill_matmul_program_config(self.mesh_device, rows, k, n)
+            if self.prefill_dense.policy.grid == "today":
+                configs[key] = prefill_matmul_program_config(self.mesh_device, rows, k, n)
+            else:
+                configs[key] = self.prefill_dense.program_config(rows, k, n)
         return configs[key]
 
     def read_rows(self, residual_rows, *, flat_views: bool = False) -> tuple[Any, Qwen38TTNNGatedResidualState]:
@@ -880,13 +890,15 @@ class Qwen38TTNNGatedResidual:
             _deallocate(partial_ws)
         partial_rows_shape = (1, 1, rows, PARTIAL_WIDTH)
         if slab:
-            # The slab: one 2D-multicast matmul over every row on an interleaved copy of the weight (fp32 out).
+            # The slab: one 2D-multicast matmul over every row on an interleaved copy of the weight (fp32 out), or on
+            # the resident prefill copy and with the prefill dense policy's fidelity when its switches say so.
             partial = prefill_linear(
                 normalized_ws,
                 self.weights.down_inject,
                 self._slab_program_config(rows, FLAT_LOCAL_WIDTH, PARTIAL_WIDTH),
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.prefill_dense.compute_config(self.compute_config),
                 dtype=ttnn.float32,
+                resident_weight=self.prefill_dense.resident("down_inject"),
             )
         elif rows == CHUNK_ROWS:
             partial = partial_tiles[0]
@@ -985,7 +997,8 @@ class Qwen38TTNNGatedResidual:
                 low_rank,
                 self.weights.up,
                 self._slab_program_config(rows, PARTIAL_WIDTH, FLAT_LOCAL_WIDTH),
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.prefill_dense.compute_config(self.compute_config),
+                resident_weight=self.prefill_dense.resident("up"),
             )
             _deallocate(low_rank, reduced_bf16)
         elif rows == CHUNK_ROWS:

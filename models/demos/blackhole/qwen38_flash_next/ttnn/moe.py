@@ -49,9 +49,9 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
-    prefill_linear,
     prefill_matmul_program_config,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn.prefill_dense import Qwen38TTNNPrefillDense, prefill_linear
 from models.tt_transformers.tt.ccl import tt_all_reduce
 
 HIDDEN_SIZE = 2560
@@ -468,6 +468,9 @@ class Qwen38TTNNMoE:
     shared_expert_fused = False
     routing_in_l1 = False
     expert_owner = None
+    # The prefill slab's dense-linear policy (ttnn/prefill_dense: the QWEN38_PREFILL_DENSE_* switches) for the shared
+    # expert's slab linears; the router and every decode linear never read it.
+    prefill_dense: Qwen38TTNNPrefillDense | None = None
 
     def __init__(
         self,
@@ -482,6 +485,7 @@ class Qwen38TTNNMoE:
         local_combine_output=None,
         routed_tokens_per_call: int | None = None,
         admitted_rows: tuple[int, ...] = SUPPORTED_ROWS,
+        prefill_dense: Qwen38TTNNPrefillDense | None = None,
     ) -> None:
         """``routed_tokens_per_call`` is the token count of one ``moe_compute`` call: the rows themselves up to 32,
         and for the 128-row form 128 (the default, ``routed_tokens_per_call_for``: one call, the chunk's expert
@@ -507,6 +511,7 @@ class Qwen38TTNNMoE:
         # layer's exact same ``weights`` object without another copy.
         self.weights = weights
         self.collective_topology = collective_topology or ttnn.Topology.Linear
+        self.prefill_dense = Qwen38TTNNPrefillDense.resolve(prefill_dense, mesh_device)
         self.row_contract = row_contract
         self.rows = self.row_contract.rows
         self.routed_tokens = (
@@ -660,6 +665,7 @@ class Qwen38TTNNMoE:
                     rows=LONG_PREFILL_CHUNK_ROWS,
                     synchronization_policy=synchronization_policy,
                     local_combine_output=self.local_combine_output,
+                    prefill_dense=self.prefill_dense,
                 )
         except BaseException as initialization_error:
             try:
@@ -1249,23 +1255,31 @@ class Qwen38TTNNMoE:
         """The slab's router logits: one 2D-multicast matmul over every row (bf16 out, as the decode linear), widened
         to fp32 for the softmax exactly as the drain of the L1 shard widens them."""
 
+        # EXACT: the logits pick the ten experts, so the router never takes the prefill dense policy (today's
+        # config, the module's HiFi4 + fp32 config, the per-slab weight copy).
         router_bf16 = prefill_linear(
             full_hidden,
             self.weights.router,
-            self._slab_program_config(HIDDEN_SIZE, ROUTED_EXPERTS),
+            self._slab_program_config(HIDDEN_SIZE, ROUTED_EXPERTS, exact=True),
             compute_kernel_config=self.compute_config,
         )
         widened = ttnn.typecast(router_bf16, ttnn.float32, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(router_bf16)
         return widened
 
-    def _slab_program_config(self, k: int, n: int):
-        """The slab's 2D-multicast matmul config for one dense linear, built once per (k, n)."""
+    def _slab_program_config(self, k: int, n: int, *, exact: bool = False):
+        """The slab's 2D-multicast matmul config for one dense linear, built once per (k, n): today's config for the
+        exact set (``exact=True``: the router) and under the default policy, else the prefill dense policy's wide grid
+        (QWEN38_PREFILL_DENSE_GRID=wide)."""
 
         configs = self.__dict__.setdefault("_slab_program_configs", {})
-        if (k, n) not in configs:
-            configs[(k, n)] = prefill_matmul_program_config(self.mesh_device, self.rows, k, n)
-        return configs[(k, n)]
+        key = (k, n, exact)
+        if key not in configs:
+            if exact or self.prefill_dense.policy.grid == "today":
+                configs[key] = prefill_matmul_program_config(self.mesh_device, self.rows, k, n)
+            else:
+                configs[key] = self.prefill_dense.program_config(self.rows, k, n)
+        return configs[key]
 
     def _routed_partial_blocks(self, full_hidden, routing: Qwen38TTNNRouting, packed_w0_w1, packed_w2, phase_observer):
         """The slab's routed stream: the 128-row instance's call (``moe_compute`` on 128 tokens, the tilize, the
@@ -1403,22 +1417,40 @@ class Qwen38TTNNMoE:
 
     def _shared_partial_slab(self, full_hidden):
         """The shared-expert chain over every slab row: the four linears as 2D-multicast matmuls on interleaved
-        weight copies, the activations interleaved (the same element arithmetic as the per-tile form)."""
+        weight copies, the activations interleaved (the same element arithmetic as the per-tile form).  Under the
+        prefill dense policy's switches the linears read their resident prefill copies and the policy's fidelity, and
+        gate and up run as one [gate | up] linear cut into two whole-tile slices (the prefill dense design note)."""
 
         dram = ttnn.DRAM_MEMORY_CONFIG
         local_intermediate = INTERMEDIATE_SIZE // MESH_SHAPE[1]
-        gate = prefill_linear(
-            full_hidden,
-            self.weights.shared_gate,
-            self._slab_program_config(HIDDEN_SIZE, local_intermediate),
-            compute_kernel_config=self.shared_compute_config,
-        )
-        up = prefill_linear(
-            full_hidden,
-            self.weights.shared_up,
-            self._slab_program_config(HIDDEN_SIZE, local_intermediate),
-            compute_kernel_config=self.shared_compute_config,
-        )
+        dense = self.prefill_dense
+        if dense.resident("shared_gate_up") is not None:
+            # QWEN38_PREFILL_DENSE_GRID=wide: gate and up as one [gate | up] linear on the resident prefill weight, cut
+            # into two whole-tile column slices with literal bounds (the captured body admits no host-integer shape op).
+            fused = dense.fused_linear(
+                full_hidden, "shared_gate_up", self.rows, compute_kernel_config=self.shared_compute_config
+            )
+            gate = ttnn.slice(fused, (0, 0, 0, 0), (1, 1, self.rows, local_intermediate), memory_config=dram)
+            up = ttnn.slice(
+                fused, (0, 0, 0, local_intermediate), (1, 1, self.rows, 2 * local_intermediate), memory_config=dram
+            )
+            _deallocate(fused)
+            dense.retag_sharded(gate, up, reference=full_hidden, shard_dim=3)
+        else:
+            gate = prefill_linear(
+                full_hidden,
+                self.weights.shared_gate,
+                self._slab_program_config(HIDDEN_SIZE, local_intermediate),
+                compute_kernel_config=self.prefill_dense.compute_config(self.shared_compute_config),
+                resident_weight=dense.resident("shared_gate"),
+            )
+            up = prefill_linear(
+                full_hidden,
+                self.weights.shared_up,
+                self._slab_program_config(HIDDEN_SIZE, local_intermediate),
+                compute_kernel_config=self.prefill_dense.compute_config(self.shared_compute_config),
+                resident_weight=dense.resident("shared_up"),
+            )
         self.mesh_contract.validate_tensor(gate, placement=TensorPlacement.INTERMEDIATE_SHARDED, shard_dim=3)
         self.mesh_contract.validate_tensor(up, placement=TensorPlacement.INTERMEDIATE_SHARDED, shard_dim=3)
         gate_activated = ttnn.silu(gate, memory_config=dram)
@@ -1428,7 +1460,8 @@ class Qwen38TTNNMoE:
             intermediate,
             self.weights.shared_down,
             self._slab_program_config(local_intermediate, HIDDEN_SIZE),
-            compute_kernel_config=self.shared_compute_config,
+            compute_kernel_config=self.prefill_dense.compute_config(self.shared_compute_config),
+            resident_weight=dense.resident("shared_down"),
         )
         _deallocate(intermediate)
         self.mesh_contract.mark_local_partial(
@@ -1438,7 +1471,8 @@ class Qwen38TTNNMoE:
             full_hidden,
             self.weights.shared_scalar_gate,
             self._slab_program_config(HIDDEN_SIZE, 1),
-            compute_kernel_config=self.shared_compute_config,
+            compute_kernel_config=self.prefill_dense.compute_config(self.shared_compute_config),
+            resident_weight=dense.resident("shared_scalar_gate"),
         )
         self.mesh_contract.validate_tensor(scalar, placement=TensorPlacement.REPLICATED)
         scalar_gate = ttnn.sigmoid(scalar, memory_config=dram)

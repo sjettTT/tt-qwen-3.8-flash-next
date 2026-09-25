@@ -48,12 +48,12 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
-    prefill_linear,
     prefill_matmul_program_config,
     validate_decode_dram_workers,
     validate_dram_sharded_weight,
     weight_layout_tag,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn.prefill_dense import Qwen38TTNNPrefillDense, prefill_linear
 
 TP_SIZE = 4
 TP_AXIS = 1
@@ -1139,6 +1139,10 @@ class Qwen38TTNNGDNRowsResult:
 class Qwen38TTNNGDN:
     """One exact TP4 Qwen3.8 Gated DeltaNet layer."""
 
+    # The prefill slab's dense-linear policy (ttnn/prefill_dense: the QWEN38_PREFILL_DENSE_* switches); the decode
+    # linears never read it.
+    prefill_dense: Qwen38TTNNPrefillDense | None = None
+
     def __init__(
         self,
         mesh_device,
@@ -1146,9 +1150,11 @@ class Qwen38TTNNGDN:
         weights: Qwen38TTNNGDNWeights,
         *,
         collective_topology=None,
+        prefill_dense: Qwen38TTNNPrefillDense | None = None,
     ) -> None:
         mesh_contract.validate_mesh(mesh_device)
         weights.validate(mesh_contract)
+        self.prefill_dense = Qwen38TTNNPrefillDense.resolve(prefill_dense, mesh_device)
         workers = validate_decode_dram_workers(weights.decode_dram_workers_per_bank)
         validate_dram_sharded_weight(
             weights.qkvzab,
@@ -1713,12 +1719,14 @@ class Qwen38TTNNGDN:
             projected = ttnn.to_memory_config(projected_ws, ttnn.L1_MEMORY_CONFIG)
             _deallocate(projected_ws)
         elif is_slab_rows(tile_rows):
-            # The slab: one 2D-multicast matmul over every row on an interleaved copy of the weight.
+            # The slab: one 2D-multicast matmul over every row on an interleaved copy of the weight, or on the
+            # resident prefill copy and with the prefill dense policy's fidelity when its switches say so.
             projected = prefill_linear(
                 full_hidden,
                 self.weights.qkvzab,
                 self._slab_program_config(tile_rows, HIDDEN_SIZE, PROJECTION_WIDTH_PER_DEVICE),
-                compute_kernel_config=self.projection_compute_config,
+                compute_kernel_config=self.prefill_dense.compute_config(self.projection_compute_config),
+                resident_weight=self.prefill_dense.resident("qkvzab"),
             )
         else:
             projected_tiles = []
@@ -1789,12 +1797,16 @@ class Qwen38TTNNGDN:
         return selected
 
     def _slab_program_config(self, rows: int, k: int, n: int):
-        """The slab's 2D-multicast matmul config for one linear, built once per (rows, k, n)."""
+        """The slab's 2D-multicast matmul config for one linear, built once per (rows, k, n): today's config, or the
+        prefill dense policy's wide grid (QWEN38_PREFILL_DENSE_GRID=wide)."""
 
         configs = self.__dict__.setdefault("_slab_program_configs", {})
         key = (rows, k, n)
         if key not in configs:
-            configs[key] = prefill_matmul_program_config(self.mesh_device, rows, k, n)
+            if self.prefill_dense.policy.grid == "today":
+                configs[key] = prefill_matmul_program_config(self.mesh_device, rows, k, n)
+            else:
+                configs[key] = self.prefill_dense.program_config(rows, k, n)
         return configs[key]
 
     def _shifted_rows_slab(self, rows_state: Qwen38TTNNGDNRowsState):
@@ -2054,7 +2066,8 @@ class Qwen38TTNNGDN:
                 gated,
                 self.weights.out,
                 self._slab_program_config(tile_rows, VALUE_WIDTH_PER_DEVICE, HIDDEN_SIZE),
-                compute_kernel_config=self.projection_compute_config,
+                compute_kernel_config=self.prefill_dense.compute_config(self.projection_compute_config),
+                resident_weight=self.prefill_dense.resident("out"),
             )
             _deallocate(gated)
             self.mesh_contract.mark_local_partial(

@@ -54,7 +54,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import (
     bf4_converter_source_identity,
     qualify_live_bf4_ring,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE, Qwen38MeshContract
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE, Qwen38MeshContract, is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     DenseWeightPlan,
     TWO_READER_QUALIFIED_DTYPES,
@@ -86,6 +86,14 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.moe import (
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.mtp import Qwen38TTNNMTPInput, Qwen38TTNNMTPInputWeights
 from models.demos.blackhole.qwen38_flash_next.ttnn.ple import Qwen38TTNNPLE, Qwen38TTNNPLEWeights
+from models.demos.blackhole.qwen38_flash_next.ttnn.prefill_dense import (
+    Qwen38PrefillDensePolicy,
+    Qwen38TTNNPrefillDense,
+    admit_prefill_dense_dram,
+    build_prefill_dense_weights,
+    slab_working_set_bytes,
+    weight_dtype_name,
+)
 from models.demos.blackhole.qwen38_flash_next.ttnn.qsa import (
     CACHE_WRITE_ROWS,
     COMPRESS_RATIO,
@@ -732,6 +740,16 @@ def validate_checkpoint_and_placement(checkpoint: Qwen38Checkpoint, placement: Q
 class Qwen38TTNNBuilder:
     """One-shot, provenance-bound component builder for one admitted mesh."""
 
+    # The prefill slab's dense-linear switches (ttnn/prefill_dense), read once per builder; the default is the wide grid
+    # on today's arithmetic (prefill_dense.DEFAULTS).
+    prefill_dense_policy: Qwen38PrefillDensePolicy = Qwen38PrefillDensePolicy()
+    # The prefill slab the target will run (enable_prefill_slab, before the target is built); None = no slab, and
+    # then the switches are inert: no resident prefill weight is built and nothing is admitted.
+    prefill_slab_rows: int | None = None
+    # The numbers the resident prefill weights were admitted on (prefill_dense.admit_prefill_dense_dram); None when
+    # the policy allocates nothing or the build runs no slab.
+    prefill_dense_admission: dict | None = None
+
     def __init__(
         self,
         *,
@@ -759,6 +777,9 @@ class Qwen38TTNNBuilder:
             dense_weight_plan = default_dense_weight_plan()
         if not isinstance(dense_weight_plan, DenseWeightPlan):
             raise TypeError("dense_weight_plan must be a DenseWeightPlan")
+        # The prefill slab's dense-linear switches (QWEN38_PREFILL_DENSE_*, ttnn/prefill_dense); an unknown value
+        # raises here.
+        self.prefill_dense_policy = Qwen38PrefillDensePolicy.from_environ()
         validate_checkpoint_and_placement(checkpoint, placement)
         if not isinstance(mesh_contract, Qwen38MeshContract):
             raise TypeError("mesh_contract must be Qwen38MeshContract")
@@ -1055,7 +1076,77 @@ class Qwen38TTNNBuilder:
             weights,
             tt_ccl=self.tt_ccl,
             collective_topology=self.collective_topology,
+            prefill_dense=self._prefill_dense(),
         )
+
+    def _prefill_dense(self) -> Qwen38TTNNPrefillDense:
+        """One module's prefill dense object: the builder's policy, its resident prefill weights attached by
+        :meth:`_attach_prefill_dense_weights` once every other resident allocation is done."""
+
+        return Qwen38TTNNPrefillDense(self.prefill_dense_policy, self.mesh_device)
+
+    def enable_prefill_slab(self, rows: int) -> None:
+        """Tell the builder the target will run a prefill slab of ``rows`` (``--prefill-slab``), before the target is
+        built: the slab's dense-linear policy then builds its resident prefill weights behind the DRAM admission.
+        Without this call the QWEN38_PREFILL_DENSE_* switches are inert (no slab linear runs), nothing is allocated
+        and nothing is admitted: a build without a slab is today's build."""
+
+        if not is_slab_rows(rows):
+            raise ValueError(f"a prefill slab takes a multiple of 128 rows in 256..4096, got {rows!r}")
+        if self._target_components is not None or self._built_target:
+            raise RuntimeError("the prefill slab must be enabled before the target is built")
+        self.prefill_slab_rows = rows
+
+    def _attach_prefill_dense_weights(self, layers: Sequence[Qwen38TTNNDecoderLayer]) -> None:
+        """The resident prefill-only weights of the slab's dense linears (the bfloat8_b copies under
+        QWEN38_PREFILL_DENSE_DTYPE=bf8, the fused [k | v] and [gate | up] siblings under
+        QWEN38_PREFILL_DENSE_GRID=wide, the default), only for a build that runs a slab (enable_prefill_slab):
+        nothing without one, nothing under GRID=today with DTYPE=bf16.  Built after the decode weights and the
+        resident experts so the DRAM admission sees the real free bytes; refused, with the numbers, when they plus
+        the context-scaled state, the slab's measured working set and the margin exceed the free DRAM
+        (prefill_dense.admit_prefill_dense_dram)."""
+
+        policy = self.prefill_dense_policy
+        if self.prefill_slab_rows is None or not policy.resident_weights:
+            return
+        try:
+            context = Qwen38ResidentContext(self.qsa_cache_capacity)
+        except ValueError:
+            context = Qwen38ResidentContext()
+        # The fused siblings in their module's dense weight format (the same tiles the separate linears read).
+        weight_dtypes = {
+            "qsa": weight_dtype_name(self.dense_weight_plan.dtype("qsa")),
+            "moe": weight_dtype_name(self.dense_weight_plan.dtype("shared_expert")),
+        }
+        self.prefill_dense_admission = admit_prefill_dense_dram(
+            self.mesh_device,
+            plan_bytes=policy.plan_bytes_per_device(weight_dtypes),
+            context_state_bytes=context.context_state_bytes_per_device,
+            slab_working_set=slab_working_set_bytes(self.prefill_slab_rows),
+        )
+        for layer in layers:
+            attention_module = "gdn" if isinstance(layer.attention, Qwen38TTNNGDN) else "qsa"
+            for module, kind, block in (
+                (layer.attention, attention_module, None),
+                (layer.attention_gr, "gr", "attn"),
+                (layer.mlp, "moe", None),
+                (layer.mlp_gr, "gr", "mlp"),
+            ):
+                module.prefill_dense.attach(
+                    build_prefill_dense_weights(
+                        policy,
+                        kind,
+                        self.mesh_device,
+                        self.mesh_contract,
+                        self.checkpoint,
+                        self.placement,
+                        self.component_cache_root,
+                        layer_index=layer.layer_index,
+                        tt_metal_sha=self.provenance.tt_metal_sha,
+                        block=block,
+                        weight_dtype=weight_dtypes.get(kind, "bf16"),
+                    )
+                )
 
     def _build_moe(self, *, namespace: Namespace, layer_index: int) -> Qwen38TTNNMoE:
         weights = Qwen38TTNNMoEWeights.from_checkpoint(
@@ -1080,6 +1171,7 @@ class Qwen38TTNNBuilder:
                 if self.expert_residency == "resident"
                 else Qwen38TTNNMoESyncPolicy.CORRECTNESS_FENCED
             ),
+            prefill_dense=self._prefill_dense(),
         )
 
     def _build_backbone_attention(self, spec: Qwen38LayerBuildSpec) -> Qwen38TTNNGDN | Qwen38TTNNQSA:
@@ -1101,6 +1193,7 @@ class Qwen38TTNNBuilder:
                 self.mesh_contract,
                 weights,
                 collective_topology=self.collective_topology,
+                prefill_dense=self._prefill_dense(),
             )
         weights = Qwen38TTNNQSAWeights.from_checkpoint(
             self.checkpoint,
@@ -1124,6 +1217,7 @@ class Qwen38TTNNBuilder:
             allocated_context=self.qsa_cache_capacity,
             collective_topology=self.collective_topology,
             decode_dram_workers_per_bank=self.decode_dram_workers_per_bank,
+            prefill_dense=self._prefill_dense(),
         )
 
     def _build_ple(self) -> Qwen38TTNNPLE:
@@ -1251,6 +1345,7 @@ class Qwen38TTNNBuilder:
             if not isinstance(self.expert_streamer, Qwen38BF4ResidentSet):
                 raise RuntimeError("resident builder did not retain the exact BF4 resident owner")
             self.expert_streamer.preload_backbone()
+        self._attach_prefill_dense_weights(layers)
         result = Qwen38TTNNTargetComponents(
             identity=self.identity,
             bf4_cache=self.bf4_cache,

@@ -1266,6 +1266,7 @@ class Qwen38TTNNDecoderLayer:
                 synchronization_policy=self.mlp.synchronization_policy,
                 local_combine_output=local_combine_output,
                 admitted_rows=SUPPORTED_ROWS + ((rows,) if is_slab_rows(rows) else ()),
+                prefill_dense=self.mlp.prefill_dense,  # the layer's policy and resident prefill weights, shared
             )
             result = Qwen38TTNNDecoderLayerChunkState(self.namespace, self.layer_index, attention, ple, moe, rows)
             self._validate_chunk_state(result)

@@ -64,11 +64,11 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
-    prefill_linear,
     prefill_matmul_program_config,
     validate_decode_dram_workers,
     validate_dram_sharded_weight,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn.prefill_dense import Qwen38TTNNPrefillDense, prefill_linear
 
 TP_SIZE = 4
 # The slab scores and selects its blocks in row blocks of this many query rows: the score all-reduce's [4, rows,
@@ -1964,6 +1964,9 @@ class Qwen38TTNNQSA:
     _widen_partial_fused = None
     _selection_row_fused = None
     _score_merge_fused = None
+    # The prefill slab's dense-linear policy (ttnn/prefill_dense: the QWEN38_PREFILL_DENSE_* switches) for the slab's
+    # query-gate / K / V / output projections; the index projections and every decode linear never read it.
+    prefill_dense: Qwen38TTNNPrefillDense | None = None
 
     def __init__(
         self,
@@ -1978,9 +1981,11 @@ class Qwen38TTNNQSA:
         collective_topology=None,
         regime_split: bool | None = None,
         decode_dram_workers_per_bank: int = 1,
+        prefill_dense: Qwen38TTNNPrefillDense | None = None,
     ) -> None:
         mesh_contract.validate_mesh(mesh_device)
         weights.validate(mesh_contract)
+        self.prefill_dense = Qwen38TTNNPrefillDense.resolve(prefill_dense, mesh_device)
         if regime_split is not None and not isinstance(regime_split, bool):
             raise TypeError(f"regime_split must be a bool or None, got {regime_split!r}")
         self.regime_split = QSA_INDEXER_REGIME_SPLIT if regime_split is None else regime_split
@@ -4183,28 +4188,43 @@ class Qwen38TTNNQSA:
             return None
         return dram_sharded_row_tiles(full_hidden, self.hidden_act_memory_config)
 
-    def _slab_program_config(self, rows: int, k: int, n: int):
-        """The slab's 2D-multicast matmul config for one linear, built once per (rows, k, n)."""
+    def _slab_program_config(self, rows: int, k: int, n: int, *, exact: bool = False):
+        """The slab's 2D-multicast matmul config for one linear, built once per (rows, k, n): today's config for the
+        exact set (``exact=True``: the index projections) and under the default policy, else the prefill dense
+        policy's wide grid (QWEN38_PREFILL_DENSE_GRID=wide)."""
 
         configs = self.__dict__.setdefault("_slab_program_configs", {})
-        key = (rows, k, n)
+        key = (rows, k, n, exact)
         if key not in configs:
-            configs[key] = prefill_matmul_program_config(self.mesh_device, rows, k, n)
+            if exact or self.prefill_dense.policy.grid == "today":
+                configs[key] = prefill_matmul_program_config(self.mesh_device, rows, k, n)
+            else:
+                configs[key] = self.prefill_dense.program_config(rows, k, n)
         return configs[key]
 
-    def _linear_rows(self, full_hidden, weight, program_config, hidden_tiles):
+    def _linear_rows(self, full_hidden, weight, program_config, hidden_tiles, *, dense: str | None = None):
         """A DRAM-sharded decode linear over the chunk rows: one call on the gathered shard at 32 rows, one
         call per row tile (``hidden_tiles``, from :meth:`_hidden_row_tiles`) at 128 rows, the outputs
-        concatenated interleaved."""
+        concatenated interleaved.  ``dense`` names the linear in the prefill dense policy (the slab's query-gate,
+        K, V, output projections); None is the exact set (the index projections), which the policy never touches."""
 
         rows = _shape(full_hidden)[2]
         if is_slab_rows(rows):
             # The slab: one 2D-multicast matmul over every row on an interleaved copy of the weight.
+            if dense is None:
+                return prefill_linear(
+                    full_hidden,
+                    weight,
+                    self._slab_program_config(rows, _shape(weight)[2], _shape(weight)[3], exact=True),
+                    compute_kernel_config=self.projection_compute_config,
+                )
+            # ... or on the resident prefill copy and with the policy's fidelity when its switches say so.
             return prefill_linear(
                 full_hidden,
                 weight,
                 self._slab_program_config(rows, _shape(weight)[2], _shape(weight)[3]),
-                compute_kernel_config=self.projection_compute_config,
+                compute_kernel_config=self.prefill_dense.compute_config(self.projection_compute_config),
+                resident_weight=self.prefill_dense.resident(dense),
             )
         if hidden_tiles is None:
             projected_ws = ttnn.linear(
@@ -4528,11 +4548,31 @@ class Qwen38TTNNQSA:
         self.mesh_contract.validate_tensor(sparse_indices, placement=TensorPlacement.REPLICATED)
         return sparse_indices
 
+    def _fused_kv_rows(self, full_hidden, rows: int):
+        """QWEN38_PREFILL_DENSE_GRID=wide: the slab's pair-grouped K and V as one [k | v] linear on the resident prefill
+        weight, cut into two whole-tile column slices (literal bounds, as the projection's head slices)."""
+
+        kv = self.prefill_dense.fused_linear(
+            full_hidden, "kv", rows, compute_kernel_config=self.projection_compute_config
+        )
+        k = ttnn.slice(kv, (0, 0, 0, 0), (1, 1, rows, HEAD_DIM), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        v = ttnn.slice(kv, (0, 0, 0, HEAD_DIM), (1, 1, rows, 2 * HEAD_DIM), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(kv)
+        self.prefill_dense.retag_sharded(k, v, reference=full_hidden, shard_dim=3)
+        return k, v
+
     def _main_projection_rows(self, full_hidden, hidden_tiles, cos, sin, constants: Qwen38TTNNQSAChunkConstants):
         rows = constants.rows
-        qg = self._linear_rows(full_hidden, self.weights.qg, self.qg_program_config, hidden_tiles)
-        k = self._linear_rows(full_hidden, self.weights.k_pair_grouped, self.kv_program_config, hidden_tiles)
-        v = self._linear_rows(full_hidden, self.weights.v_pair_grouped, self.kv_program_config, hidden_tiles)
+        qg = self._linear_rows(full_hidden, self.weights.qg, self.qg_program_config, hidden_tiles, dense="qg")
+        if is_slab_rows(rows) and self.prefill_dense.resident("kv") is not None:
+            k, v = self._fused_kv_rows(full_hidden, rows)
+        else:
+            k = self._linear_rows(
+                full_hidden, self.weights.k_pair_grouped, self.kv_program_config, hidden_tiles, dense="k"
+            )
+            v = self._linear_rows(
+                full_hidden, self.weights.v_pair_grouped, self.kv_program_config, hidden_tiles, dense="v"
+            )
         self.mesh_contract.validate_tensor(qg, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
         self.mesh_contract.validate_tensor(k, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=3)
         self.mesh_contract.validate_tensor(v, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=3)
@@ -4720,7 +4760,8 @@ class Qwen38TTNNQSA:
                 local_attention,
                 self.weights.out,
                 self._slab_program_config(rows, LOCAL_QUERY_WIDTH, HIDDEN_SIZE),
-                compute_kernel_config=self.projection_compute_config,
+                compute_kernel_config=self.prefill_dense.compute_config(self.projection_compute_config),
+                resident_weight=self.prefill_dense.resident("out"),
             )
         _deallocate(local_attention)
         if slab:

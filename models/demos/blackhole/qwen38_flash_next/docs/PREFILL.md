@@ -112,3 +112,50 @@ models/demos/blackhole/qwen38_flash_next/tools/run_qwen38_chat_server.sh --profi
 
 The first start compiles the slab body's programs in the warm pass (an eager slab from the reset state) and captures
 its trace after the 128-row chunk trace; `/health` reports `prefill_slab_rows`.
+
+### The dense-linear switches
+
+Four environment variables, read once when the model is built, move the slab's dense linears (the GDN in/out
+projections, the gated-residual down+inject and up, the shared expert's gate/up/down/scalar, the QSA query-gate / K /
+V / output projections) and nothing else.  The dtype, fidelity and accumulation defaults keep the slab's arithmetic
+(the decode weights copied per slab in their format, `QWEN38_DENSE_WEIGHT_DTYPE`, with the module's compute config
+for it; fp32 accumulation); the grid's default is `wide`, and
+`QWEN38_PREFILL_DENSE_GRID=today` restores the earlier slab bitwise (the grids of
+`decode_matmul.prefill_matmul_program_config`, no resident copy):
+
+| variable | values | default | what it changes |
+|---|---|---|---|
+| `QWEN38_PREFILL_DENSE_DTYPE` | `bf16`, `bf8` | `bf16` | `bf8`: a resident DRAM-interleaved bfloat8_b copy of each weight, read in place by the slab (no per-slab copy); the decode weights stay bf16 |
+| `QWEN38_PREFILL_DENSE_FIDELITY` | `hifi4`, `hifi2`, `lofi` | `hifi4` | `hifi4`: the module's own compute config (the fidelity of its weight format: HiFi4 for bf16, HiFi2 for the bf8 default, LoFi for bf4); `hifi2` / `lofi`: that fidelity for the slab's dense linears instead (`lofi` reads a 5-bit weight mantissa: a quality point to measure, not a free speed knob) |
+| `QWEN38_PREFILL_DENSE_GRID` | `today`, `wide` | `wide` | `wide`: more columns for the narrow-N shapes (the query-gate 80 -> 110 cores, the gated-residual down+inject 30 -> 60), and the pair-grouped K/V and the shared expert's gate/up as one linear each on resident copies in the weights' own format (the same tiles the separate linears read: about 58 MB per device as bf8, 110 MB as bf16); `today`: the earlier grids and per-slab copies |
+| `QWEN38_PREFILL_DENSE_FP32_ACC` | `1`, `0` | `1` | fp32 accumulation across the K blocks |
+
+The wide grid, measured on the 4-chip line (1x4 p150, a 32k context, `--prefill-slab 2048`, 2026-09-25, with the
+bf16 dense weights of record then) against `today` in the same process form: the device column of the agreement corpus's two long windows is identical at all
+160 scored positions (KL 0.0, top-1 1.0 between the two columns; both 0.9812 / 0.0225 top-1 / KL against the HF
+reference) and the 16-token completions of the long-prompt probe (2k to 32k tokens) are byte-identical; the dense
+family (the Matmul class of the slab's device profile) 92.57 -> 75.84 ms per 2048-row slab (-18 %), the slab's
+kernel time 1584.3 -> 1567.7 ms (-16.6 ms, -1.05 %: 1284 -> 1297 prompt tokens per second on the body, TTFT at
+32k 27.56 -> 27.32 s); 60 fewer programs per slab (the fused siblings); +13.8 MB of DRAM per bank for the two
+resident bf16 siblings and no other resident; the acceptance pins 12/12 identical.  The wide grid changes the
+block order over the cores and fuses two pairs of sibling linears whose per-column arithmetic is the same (the
+siblings are the separate linears' tiles in the same format), so its numerics class is `today`'s under any
+`QWEN38_DENSE_WEIGHT_DTYPE`; the grid alone does not touch the fidelity or the accumulation.
+
+The MoE router and the QSA index projections never read the switches: their outputs pick the routed experts and the
+attended blocks, so they keep today's config, fidelity and per-slab weight copy under every setting.  The resident
+copies (about 950 MB per device as bfloat8_b; the fused siblings alone about 58 MB as bf8) are allocated after the decode
+weights and the resident experts and refused, with the numbers, when the DRAM free at that point would not hold
+them plus what the slab process allocates after the build: the context-scaled state (417 MiB at 32k), the 2048-row
+slab's working set and a 512 MiB margin.  The working set is a measured band (the 4-chip line, 32k, 2026-09-25):
+the slab ran with 251.3 MB per bank free after the build and failed in its first layer with 141.0 (the bf8 copies
+under the device profiler's default 64,000-program DRAM reservation), and the admission takes the band's upper end,
+the only value known to fit, so at 32k it asks for 251.3 MB per bank after the weights.  The bf8 copies fit the
+served process at 32k (443 MB per bank after them) and the profiler at a 32,000-program reservation (295 MB), not
+the profiler's default (141 MB: refused with the numbers).  The switches act only on a build that runs a slab (the
+chain tells the builder the `--prefill-slab` rows before the target is built; a slab above 2048 rows scales the
+working-set term with its rows): a build without a slab, such as the single-user 256k server that prefills in
+chunks, allocates no resident copy, runs no admission and is unchanged.  The acceptance gate's prompts are
+shorter than a slab, so a non-default setting is judged on long prompts: the agreement corpus's long windows and the full-model
+gate's 4k / 8k synthetic prompts with `--prefill-slab`.  The design, the arms and their expected gains: the prefill
+dense design note (a development document, not shipped).

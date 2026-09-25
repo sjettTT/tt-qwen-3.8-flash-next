@@ -111,7 +111,16 @@ def _check_module(
     source = inspect.getsource(module)
     converted = [b for b in _call_blocks(source, calls) if any(w in b for w in weights)]
     assert len(converted) == expected, (len(converted), expected)
-    assert all(f"compute_kernel_config=self.{attribute}" in b for b in converted)
+    # The decode linears take the module's config; the prefill slab's dense linears take it through the slab policy
+    # (ttnn/prefill_dense: the same object under the default QWEN38_PREFILL_DENSE_* switches, the policy's fidelity
+    # otherwise; test_ttnn_prefill_dense_no_device pins that resolution).
+    forms = (
+        f"compute_kernel_config=self.{attribute}",
+        f"compute_kernel_config=self.prefill_dense.compute_config(self.{attribute})",
+    )
+    assert all(any(form in b for form in forms) for b in converted), [
+        b for b in converted if not any(form in b for form in forms)
+    ]
     assert not any("compute_kernel_config=self.compute_config" in b for b in converted)
     return source
 
