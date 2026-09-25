@@ -13,7 +13,7 @@ its caches.  Nothing else is required: no prebuilt archive, no pinned binary, no
 |---|---|---|
 | QuietBox, 4x p150c (fw 19.4.1.0) | `tt-quietbox` | verified 2026-09-04: startup acceptance 96/96 tokens against the CPU, 19.6 tokens/s at 32k context; `docs/PROOFS.md`: the fresh-clone proof of 2026-09-06 |
 | 4x p150 in one host, ethernet line | `p150-line` | section 9: what was verified and where |
-| QuietBox 2, 2x p300c (4 dies) | `qb2` | **untested**: designed from the p300 ring topology, should run fine |
+| QuietBox 2, 2x p300c (4 dies) | `qb2` | verified 2026-09-19 (first start from the public tree, acceptance identical to the 4x p150 boxes; one DRAM reader per bank on mixed-harvest dies) and 2026-09-23 (the compact expert layout's four-die run); `docs/PROOFS.md` |
 
 Every number below was measured on 4x p150.
 
@@ -210,7 +210,7 @@ contract (hang-ups, stalled readers, deadlines, the stall watchdog, `/health` fi
   stream keeps plain sampling's law on the verify rows' logits and a `seed` reproduces the drafting stream (the
   fingerprint carries the switch and `k`), not the 1-row loop's; `QWEN38_MTP_SAMPLED=0` restores the plain path (`docs/SERVER.md`).
 
-## 7. QuietBox 2 (untested)
+## 7. QuietBox 2
 
 A p300 card is two Blackhole dies joined on the card; a QuietBox 2 (2x p300c) has four dies in one ring (the two
 on-card links and the two Warp400 links), so it is one 1x4 instance:
@@ -220,7 +220,9 @@ on-card links and the two Warp400 links), so it is one 1x4 instance:
 The profile exports `tools/qb2_p300_1x4_line_mesh_graph_descriptor.textproto` (a 1x4 LINE over three of the four ring
 links, two channels per link as in tt-metal's `p300_x2` descriptor); tt-metal classifies a p300 cluster that is not
 exactly two or four dies as CUSTOM and refuses to open without a descriptor, so the launcher always exports one.  The
-route is derived from the cluster descriptor at start and recorded.  A QuietBox 2 (2x p300c) ran it from a fresh clone on 2026-09-07 (`docs/PROOFS.md`); we have not run p300 hardware ourselves.
+route is derived at start from the fabric's chip order and recorded in `READY` with the ring walk beside it (on a QuietBox 2 the fabric embeds the line as `(1, 0, 3, 2)` where the ring walk gives `(0, 1, 2, 3)`).
+Verified on our own QuietBox 2 (`docs/PROOFS.md`; a contributor's box had run it from a fresh clone on 2026-09-07): on 2026-09-19 the public tree reached `READY` 194 s after launch with `json` 96/96 and the divergence table identical to the 4x p150 boxes;
+on 2026-09-23 the compact expert layout's four-die run kept that table and freed 9.17 GB per device at that head.  Its four dies are harvested differently, so the server uses one DRAM reader per bank there: two readers per bank need every die to share one bank-to-worker assignment, which the builder checks at start, recording the fallback and its reason in `READY` (`dram_workers_fallback`).
 
 ## 8. Layout
 
@@ -262,7 +264,7 @@ Run the tests from the repository root (`docs/TESTING.md` has the regression har
   digest, the first-start expert conversion, the acceptance replay) and the hardware it ran on.
 - Numerics, 2026-09-06 on 4x p150: `json` 96/96 against the CPU, the other eleven records leave the CPU greedy stream
   between token 6 and 75 (`docs/NUMERICS.md`); MTP is not bitwise with plain decode on 4 of 12 prompts (near-ties).
-- `qb2`: designed, never run.
+- `qb2`: our QuietBox 2 (2x p300c) served the model on 2026-09-19 from the public tree (acceptance identical to the 4x p150 boxes, one DRAM reader per bank on its mixed-harvest dies) and on 2026-09-23 with the compact expert layout (`docs/PROOFS.md`).
 - 256k context is single-user; MTP is not available at 256k.
 - One request decodes at a time (the traced chain is single-stream); the queue holds four more.
 - The first start is long (the 107 GB expert conversion); a host that kills long jobs needs `--prepare-only

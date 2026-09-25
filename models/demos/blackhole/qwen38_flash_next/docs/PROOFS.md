@@ -75,10 +75,39 @@ multilingual 9, prose 13, refactor 22, sky 19, story 6, summary 75), identical o
 the differently harvested die reproduced the 4x p150 device streams.  19.9 tokens/s at 32k; 17.4 tokens/s end to end
 with 256k allocated context.  The `qb2` route derived as `[0, 1, 2, 3]`.
 
+## Our QuietBox 2, 2026-09-19 (the public tree; the fabric-order route)
+
+Our own QuietBox 2 (2x p300c, four dies whose harvested Tensix columns differ die by die) served the model on 2026-09-19
+from the public tree at 864c13307b, together with the route derivation that landed the same day (`archive/q38-qb2-route`,
+66a67f0dc8): the fabric embeds the 1x4 line onto this ring as chips `(1, 0, 3, 2)` while the ring walk from chip 0 gives
+`(0, 1, 2, 3)`, and with the walk's order the first all-gather found no forwarding direction; the profile now derives the
+route from the fabric's chip order at start and `READY` records it with the walk beside it (`route_ring_walk_agrees`
+false on this box).  With warm caches `READY` came 194 s after launch (prewarm 19 s, mesh and fabric 2 s, target build
+21 s, cold JIT about 120 s, captures and the acceptance replay about 45 s): `json` 96/96, the twelve divergence indices
+identical to the pinned table of the 4x p150 boxes (chat 43, code 32, fact 15, json none, list 56, math 61,
+multilingual 9, prose 13, refactor 24, sky 19, story 6, summary 75; bitwise with them), 14 fused kernels,
+465,231,616 bytes free per bank, 24.3 to 24.7 tokens/s at 32k in the replay (median 24.6) at that head.  The expert
+cache converted the 49 layers in 15.5 minutes (18.8 s per layer) with the bank order `[4, 0, 2, 6, 7, 3, 5, 1]` on all
+four dies.  One DRAM reader per bank: one die serves its banks from another worker column than the other three, and two
+readers per bank need one bank-to-worker assignment on every die; the rule that decides this at build time (two readers
+only when every die's assignment agrees, otherwise one, the reason recorded in `READY`) landed on 2026-09-22.  The host
+ran with its IOMMU in identity mode; in the translated mode the first weight upload had stalled in the driver's page pinning.
+
+## Our QuietBox 2, 2026-09-23 (the compact expert weight layout, four dies)
+
+The same box served the model on 2026-09-23 with tt-metal's compact expert weight layout for `moe_compute` (the
+owned-column layout, upstream pull request 57564, at that head): the acceptance table equal to the run above, `READY`
+free bytes per bank 465,223,424 -> 1,611,841,280 (9.17 GB more per device: the expert weights 26.2 -> 17.0 GB per
+device), served time per output token 40.03 -> 39.44 ms, replay decode 25.70 -> 26.12 tokens/s, prefill 3 to 6 %
+faster, at that head.  A drained decode-step census on the same box the same day (20 traced steps, chip 0): span
+39.02 -> 38.34 ms, kernel 34.61 -> 33.88 ms, `moe_compute` 3.54 -> 3.19 ms per step, 3,370 programs in both, every
+other module equal.
+
 ## What the other profiles have
 
 - `p150-line` (4x p150 in one host, ethernet line): the README's numbers were measured on 4x p150 hosts (the
   performance table of 2026-09-04, the pinned divergence tables of 2026-09-06 in `NUMERICS.md`, the conversion rate of
   2026-09-05 above); a fresh-clone run of the form recorded above for the QuietBox is not recorded for a p150 line.
-- `qb2` (QuietBox 2, 2x p300c): the contributor's run of 2026-09-07 above; the route it derived, `[0, 1, 2, 3]`, is
-  recorded there and not yet pinned in the profile.
+- `qb2` (QuietBox 2, 2x p300c): the contributor's run of 2026-09-07 and our runs of 2026-09-19 and 2026-09-23 above;
+  the route is derived from the fabric's chip order at start (`(1, 0, 3, 2)` on our box, where the ring walk gives
+  `(0, 1, 2, 3)`) and recorded in `READY` with the walk beside it.
