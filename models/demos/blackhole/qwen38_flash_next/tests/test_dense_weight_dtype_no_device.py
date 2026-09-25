@@ -140,7 +140,8 @@ def test_qsa_projection_linears_run_the_weight_fidelity() -> None:
     assert rows.count("compute_kernel_config=self.projection_compute_config") == 3
     assert "compute_kernel_config=self.compute_config" not in rows
     loader = inspect.getsource(qsa_module.Qwen38TTNNQSAWeights.from_checkpoint)
-    assert len(re.findall(r"(?<!\w)dtype=weight_dtype,", loader)) == 6  # the six projection uploads
+    # the six projection uploads and the merged projections shard (the served fused path's one linear)
+    assert len(re.findall(r"(?<!\w)dtype=weight_dtype,", loader)) == 7
     assert "cache / dense_weight_name(name, dtype)" in loader
     validate = inspect.getsource(qsa_module.Qwen38TTNNQSAWeights.validate)
     assert "tensor.dtype != self.weight_dtype" in validate and 'if name == "index_k"' in validate
