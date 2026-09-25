@@ -14,9 +14,13 @@ function(ParseGitDescribe)
 
     find_package(Git)
     if(Git_FOUND)
+        # Only version-shaped tags (v<major>.<minor>...) name the build: a checkout that carries other tags (archive/*,
+        # topic or experiment tags) would otherwise describe against the nearest of them, fail the tag parse below and
+        # leave the project without a version (write_basic_package_version_file: No VERSION).  With no version tag
+        # reachable, describe fails and the fallback below names the build from its hash.
         execute_process(
             COMMAND
-                ${GIT_EXECUTABLE} describe --abbrev=10 --first-parent --dirty=-dirty
+                ${GIT_EXECUTABLE} describe --abbrev=10 --first-parent --dirty=-dirty --match "v[0-9]*"
             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
             OUTPUT_VARIABLE version
             OUTPUT_STRIP_TRAILING_WHITESPACE
