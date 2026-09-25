@@ -22,6 +22,7 @@ output contract.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,17 +32,16 @@ import torch
 import ttnn
 from models.demos.blackhole.qwen38_flash_next.checkpoint import INDEX_SHA256, Qwen38Checkpoint
 from models.demos.blackhole.qwen38_flash_next.tt.gdn import Qwen38GDNWeights
-from models.demos.blackhole.qwen38_flash_next.ttnn import fused
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused, prefill_glue
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     LONG_CHUNK_ROWS,
     MESH_SHAPE,
     Qwen38MeshContract,
     TensorPlacement,
+    is_slab_rows,
     replicate_tensor_2d_mesh_mapper,
     require_lane_count,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
-from models.demos.blackhole.qwen38_flash_next.ttnn import prefill_glue
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     DENSE_DTYPE_TAGS,
     TWO_READER_QUALIFIED_DTYPES,
@@ -149,9 +149,9 @@ def rows_window_select_tiles(rows: int) -> dict[str, torch.Tensor]:
     for head in range(QK_HEADS_PER_DEVICE):
         for repeat in range(QK_REPEAT_FACTOR):
             value_head = head * QK_REPEAT_FACTOR + repeat
-            expand[head * HEAD_DIM : (head + 1) * HEAD_DIM, value_head * HEAD_DIM : (value_head + 1) * HEAD_DIM] = (
-                torch.eye(HEAD_DIM)
-            )
+            expand[
+                head * HEAD_DIM : (head + 1) * HEAD_DIM, value_head * HEAD_DIM : (value_head + 1) * HEAD_DIM
+            ] = torch.eye(HEAD_DIM)
     return {
         "conv_taps": taps,
         "history_select_stack": stack,
@@ -1656,6 +1656,10 @@ class Qwen38TTNNGDN:
         self._step = fused.resolve("gdn_step")
         # The prefill glue policy (QWEN38_PREFILL_GLUE), resolved once; read when a slab rows state is allocated.
         self.glue = prefill_glue.policy()
+        # The lane body runs the same program on its B rows (one item per (lane, value head), one state slot per
+        # lane); with the kernel off it stays the lane chain, the class attribute.
+        if fused.enabled("gdn_step"):
+            self.forward_decode_lanes = functools.partial(type(self)._forward_decode_lanes_fused, self)
 
     def allocate_state(self) -> Qwen38TTNNGDNState:
         return Qwen38TTNNGDNState.allocate(
@@ -2064,8 +2068,9 @@ class Qwen38TTNNGDN:
         _require_shape(full_hidden, (1, 1, lanes, HIDDEN_SIZE), label="GDN lanes gathered hidden")
         return full_hidden
 
-    def _project_lanes(self, full_hidden, newest, lanes: int):
-        """``_project`` on B rows; row u's q/k/v columns land in row u of ``newest``, the ring slot of this step."""
+    def _project_lanes_unsplit(self, full_hidden, lanes: int):
+        """``_project`` on B rows: the ``[1,1,B,4160]`` L1 row tile, row u = lane u's q|k|v|z|a|b, before the ring-slot
+        write and the z/a/b split (the fused ``gdn_step`` program takes this tile whole and does both itself)."""
 
         projected_ws = ttnn.linear(
             full_hidden,
@@ -2078,6 +2083,12 @@ class Qwen38TTNNGDN:
         _deallocate(projected_ws)
         self.mesh_contract.validate_tensor(projected, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
         _require_shape(projected, (1, 1, lanes, PROJECTION_WIDTH_PER_DEVICE), label="GDN lanes fused projection")
+        return projected
+
+    def _project_lanes(self, full_hidden, newest, lanes: int):
+        """``_project`` on B rows; row u's q/k/v columns land in row u of ``newest``, the ring slot of this step."""
+
+        projected = self._project_lanes_unsplit(full_hidden, lanes)
         landed = ttnn.slice(projected, (0, 0, 0, 0), (1, 1, lanes, QKV_WIDTH_PER_DEVICE), output_tensor=newest)
         _require_landed(landed, newest, label="GDN lanes ring slot write")
         pieces = {}
@@ -2244,6 +2255,11 @@ class Qwen38TTNNGDN:
         _deallocate(normalized, sigmoid_bf16)
         self.mesh_contract.validate_tensor(gated, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
         _require_shape(gated, (1, 1, lanes, VALUE_WIDTH_PER_DEVICE), label="GDN lanes sigmoid-gated output")
+        return self._out_project_lanes(gated, full_hidden, lanes)
+
+    def _out_project_lanes(self, gated, full_hidden, lanes: int):
+        """``_out_project`` on B rows: the out linear on the gated ``[1,1,B,1536]`` rows and the line reduce-scatter
+        into the ``[1,1,B,640]`` hidden-sharded rows; frees ``gated``, the partial and ``full_hidden``."""
 
         partial_ws = ttnn.linear(
             gated,
@@ -2286,6 +2302,23 @@ class Qwen38TTNNGDN:
         q, k, v, beta, log_decay, beta_producers = self._make_recurrent_inputs_lanes(conv, a, b, lanes)
         recurrent_output = self._recurrent_decode_lanes(q, k, v, beta, log_decay, beta_producers, state, lanes)
         output = self._gate_and_project_lanes(recurrent_output, z, full_hidden, lanes)
+        return Qwen38TTNNGDNResult(output, state)
+
+    def _forward_decode_lanes_fused(self, hidden_lanes, state: Qwen38TTNNGDNState) -> Qwen38TTNNGDNResult:
+        """:meth:`forward_decode_lanes` with the fused ``gdn_step`` program on the B rows in place of the lane chain
+        from the projection to the gated output (ttnn/fused/gdn_step: one core per (lane, value head) item, lane u's
+        state slot updated in place); bound to ``forward_decode_lanes`` at construction when ``QWEN38_FUSED`` names
+        gdn_step (the class body stays the fallback).  The ring order is the chain's: the window is read before the
+        step, the program lands row u's q/k/v in row u of the window's last slot, and the phase advances once after.
+        """
+
+        lanes = self._validate_lane_state(state)
+        full_hidden = self._all_gather_hidden_lanes(hidden_lanes, lanes)
+        window = state.conv_window()
+        projected = self._project_lanes_unsplit(full_hidden, lanes)
+        gated = fused.gdn_step.gdn_step(self, projected, window, state)
+        state.advance_conv_window()
+        output = self._out_project_lanes(gated, full_hidden, lanes)
         return Qwen38TTNNGDNResult(output, state)
 
     # ------------------------------------------------------------------ rows path (MTP v2 verify)

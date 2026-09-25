@@ -10,7 +10,8 @@ fake are the reference.  Twelve steps (three ring cycles) per lane count, lane u
 rows and its output row bitwise the chain's after every step; a lane admitted mid-run at a step of its residue class
 (``reset_lane_inplace`` then a fresh chain) stays bitwise, the misaligned control differs and the position row
 refuses it.  The final mixer rows path runs against the 1-row mixer row for row on the GR fake.  The source pins hold
-the 1-row bodies untouched and the lane bodies free of host I/O.
+the 1-row bodies untouched and the lane bodies free of host I/O, and the fused lane body (the ``gdn_step`` program on B
+rows, bound over the class body under ``QWEN38_FUSED``) the 1-row fused walk on B rows in the composed ring order.
 """
 
 from __future__ import annotations
@@ -18,8 +19,8 @@ from __future__ import annotations
 import ast
 import importlib.util
 import inspect
+import textwrap
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -147,7 +148,9 @@ def _one_row_image(state: gdn_module.Qwen38TTNNGDNState) -> dict[str, torch.Tens
 
 
 @pytest.mark.parametrize("lanes", LANE_COUNTS)
-def test_gdn_lanes_equal_b_one_row_chains_over_twelve_steps_with_an_aligned_admission(fake, gdn, lanes: int) -> None:
+def test_gdn_lanes_equal_b_one_row_chains_over_twelve_steps_with_an_aligned_admission(
+    fake, gdn, lanes: int, expect_error
+) -> None:
     torch.manual_seed(100 + lanes)
     hidden = torch.randn(STEPS, lanes, 2560).to(torch.bfloat16)  # step t, lane u
     lane_state = gdn.allocate_lane_state(lanes)
@@ -176,11 +179,11 @@ def test_gdn_lanes_equal_b_one_row_chains_over_twelve_steps_with_an_aligned_admi
     if lanes > 1:
         # The lanes differ from each other (the comparison is not vacuous) and the 1-row body refuses the state.
         assert not _equal(_lane_image(lane_state, 0)["recurrent"], _lane_image(lane_state, 1)["recurrent"])
-        with pytest.raises(ValueError, match="the 1-row GDN decode body admits a batch-1 state"):
+        with expect_error(ValueError, match="the 1-row GDN decode body admits a batch-1 state"):
             gdn.forward_decode(step4._hidden_sharded(hidden[:1, :1]), lane_state)
 
 
-def test_misaligned_admission_differs_and_the_position_row_refuses_it(fake, gdn, monkeypatch) -> None:
+def test_misaligned_admission_differs_and_the_position_row_refuses_it(fake, gdn, monkeypatch, expect_error) -> None:
     torch.manual_seed(7)
     hidden = torch.randn(STEPS, 2, 2560).to(torch.bfloat16)
     lane_state = gdn.allocate_lane_state(2)
@@ -201,7 +204,7 @@ def test_misaligned_admission_differs_and_the_position_row_refuses_it(fake, gdn,
     monkeypatch.setattr(contracts_module, "ttnn", lane_fake)
     monkeypatch.setattr(contracts_module, "replicate_tensor_2d_mesh_mapper", lambda device: "replicate")
     row = Qwen38TTNNDevicePositionRow.allocate("mesh", FakeContract(), [5, 5], lanes=2)
-    with pytest.raises(ValueError, match="residue 0, expected the row's residue 1; admit it 3 steps later"):
+    with expect_error(ValueError, match="residue 0, expected the row's residue 1; admit it 3 steps later"):
         row.admit(1, 0)
     for _ in range(3):
         row.advance()
@@ -212,7 +215,7 @@ def test_misaligned_admission_differs_and_the_position_row_refuses_it(fake, gdn,
 # --------------------------------------------------------------------------- lane resets and the snapshot at B
 
 
-def test_lane_reset_zeroes_one_lane_and_keeps_the_others_bitwise(fake, gdn) -> None:
+def test_lane_reset_zeroes_one_lane_and_keeps_the_others_bitwise(fake, gdn, expect_error) -> None:
     lanes = 4
     torch.manual_seed(3)
     state = gdn.allocate_lane_state(lanes)
@@ -231,7 +234,7 @@ def test_lane_reset_zeroes_one_lane_and_keeps_the_others_bitwise(fake, gdn) -> N
             else:
                 assert _equal(value, before[lane][name]), (lane, name)
     for bad in (-1, 4, True, 1.0):
-        with pytest.raises(ValueError, match=r"lane must be an int in \[0,4\)"):  # allow-pytest.raises: contract
+        with expect_error(ValueError, match=r"lane must be an int in \[0,4\)"):  # allow-pytest.raises: contract
             state.reset_lane_inplace(bad)
     # The snapshot follows the batch: capture, mutate, restore round trip.
     snapshot = state.allocate_snapshot()
@@ -244,7 +247,7 @@ def test_lane_reset_zeroes_one_lane_and_keeps_the_others_bitwise(fake, gdn) -> N
         for name, value in _lane_image(state, lane).items():
             assert _equal(value, before[lane][name]) if lane != 2 else int(torch.count_nonzero(value)) == 0, name
     snapshot.batch_size = 1
-    with pytest.raises(RuntimeError, match=r"GDN snapshot recurrent state local shape must be \(1, 12, 128, 128\)"):
+    with expect_error(RuntimeError, match=r"GDN snapshot recurrent state local shape must be \(1, 12, 128, 128\)"):
         snapshot.validate(state.mesh_contract)
 
 
@@ -279,7 +282,7 @@ def test_ple_lanes_at_one_lane_equal_the_one_row_path(fake) -> None:
         prepared.release()
 
 
-def test_ple_lane_reset_zeroes_one_lane_and_clears_its_context(fake) -> None:
+def test_ple_lane_reset_zeroes_one_lane_and_clears_its_context(fake, expect_error) -> None:
     module = step4._ple_module()
     module._resident_lookup = _LaneLookup()
     module.host_embedding = module._resident_lookup
@@ -302,7 +305,7 @@ def test_ple_lane_reset_zeroes_one_lane_and_clears_its_context(fake) -> None:
         assert int(torch.count_nonzero(after[:, 1])) == 0, index
         assert _equal(after[:, 0], before[index][:, 0]) and _equal(after[:, 2], before[index][:, 2]), index
     assert state.token_contexts == (contexts[0], None, contexts[2])
-    with pytest.raises(ValueError, match=r"PLE lane must be an int in \[0,3\), got 3"):  # allow-pytest.raises
+    with expect_error(ValueError, match=r"PLE lane must be an int in \[0,3\), got 3"):  # allow-pytest.raises
         state.reset_lane_inplace(3)
 
 
@@ -359,7 +362,7 @@ def _mixer_module(fake) -> Qwen38TTNNFinalMixer:
 
 
 @pytest.mark.parametrize("rows", [1, 3, 8, 32])
-def test_final_mixer_rows_equal_the_one_row_mixer_row_for_row(monkeypatch, rows: int) -> None:
+def test_final_mixer_rows_equal_the_one_row_mixer_row_for_row(monkeypatch, rows: int, expect_error) -> None:
     fake = _mixer_fake()
     monkeypatch.setattr(mixer_module, "ttnn", fake)
     module = _mixer_module(fake)
@@ -376,13 +379,13 @@ def test_final_mixer_rows_equal_the_one_row_mixer_row_for_row(monkeypatch, rows:
             dim=2,
             label=f"final mixer rows row {row}",
         )
-    with pytest.raises(
+    with expect_error(
         ValueError, match=r"final mixer residual rows must be in \[1,32\], got 33"
     ):  # allow-pytest.raises
         module.rows(
             gr_test.FakeTensor([gr_test._bf16(1, 4, 33, 640) for _ in range(TP)], gr_test.BF16, gr_test.TILE, 3)
         )
-    with pytest.raises(ValueError, match=r"must be rank 4"):  # allow-pytest.raises: contract
+    with expect_error(ValueError, match=r"must be rank 4"):  # allow-pytest.raises: contract
         module.rows(gr_test.FakeTensor([gr_test._bf16(4, 1, 640) for _ in range(TP)], gr_test.BF16, gr_test.TILE, 2))
 
 
@@ -433,25 +436,34 @@ def test_gdn_lanes_body_is_the_one_row_walk_with_the_lanes_suffix_and_the_one_ro
         "_gate_and_project_lanes",
     ]
     # The same ttnn ops per stage (the lane stage is the 1-row stage on B rows, nothing added or removed): the 1-row
-    # projection and its z/a/b split, and its gate and out-projection, are one lane method each; the z/a/b slices are
-    # one call site in a loop on the lanes side.
+    # projection and its z/a/b split are the lanes projection (its linear split out as ``_project_lanes_unsplit``, the
+    # fused program's input), its gate and out-projection the lanes gate (its tail split out as ``_out_project_lanes``,
+    # the fused program's successor); the z/a/b slices are one call site in a loop on the lanes side.
     stages = (
-        ("_all_gather_hidden",),
-        ("_project", "_split_projection"),
-        ("_causal_conv_decode",),
-        ("_make_recurrent_inputs",),
-        ("_recurrent_decode",),
-        ("_gate", "_out_project"),
+        (("_all_gather_hidden",), ("_all_gather_hidden_lanes",)),
+        (("_project", "_split_projection"), ("_project_lanes_unsplit", "_project_lanes")),
+        (("_causal_conv_decode",), ("_causal_conv_lanes",)),
+        (("_make_recurrent_inputs",), ("_make_recurrent_inputs_lanes",)),
+        (("_recurrent_decode",), ("_recurrent_decode_lanes",)),
+        (("_gate", "_out_project"), ("_out_project_lanes", "_gate_and_project_lanes")),
     )
-    for one_names, lane in zip(stages, lanes[1:]):
+    assert [lane_names[-1] for _, lane_names in stages] == lanes[1:]
+    for one_names, lane_names in stages:
         one_calls = {
             c for name in one_names for c in _calls(getattr(gdn_module.Qwen38TTNNGDN, name)) if c.startswith("ttnn.")
         }
-        lane_calls = {c for c in _calls(getattr(gdn_module.Qwen38TTNNGDN, lane)) if c.startswith("ttnn.")}
-        assert one_calls == lane_calls, (one_names, lane)
+        lane_calls = {
+            c for name in lane_names for c in _calls(getattr(gdn_module.Qwen38TTNNGDN, name)) if c.startswith("ttnn.")
+        }
+        assert one_calls == lane_calls, (one_names, lane_names)
+    assert _self_walk(gdn_module.Qwen38TTNNGDN._project_lanes)[0] == "_project_lanes_unsplit"
+    assert _self_walk(gdn_module.Qwen38TTNNGDN._gate_and_project_lanes)[-1] == "_out_project_lanes"
     for function in (
         gdn_module.Qwen38TTNNGDN.forward_decode_lanes,
         *(getattr(gdn_module.Qwen38TTNNGDN, name) for name in lanes),
+        gdn_module.Qwen38TTNNGDN._project_lanes_unsplit,
+        gdn_module.Qwen38TTNNGDN._out_project_lanes,
+        gdn_module.Qwen38TTNNGDN._forward_decode_lanes_fused,
         layer_module.Qwen38TTNNDecoderLayer.forward_decode_lanes,
         model_module.Qwen38TTNNTextModel.forward_decode_lanes,
         model_module.Qwen38TTNNTextModel._embed_residual_lanes_from_device_token,
@@ -471,6 +483,79 @@ def test_gdn_lanes_body_is_the_one_row_walk_with_the_lanes_suffix_and_the_one_ro
         calls = _calls(function)
         assert "ttnn.multiply" in calls and "ttnn.from_torch" in calls, function
         assert "ttnn.copy" in calls or "_copy_inplace" in calls, function
+
+
+def test_gdn_fused_lanes_body_is_the_one_row_fused_walk_on_b_rows_and_binds_under_the_switch() -> None:
+    """The fused lane body (``QWEN38_FUSED=gdn_step``) is ``forward_decode``'s walk with the lanes suffix around the
+    fused ``gdn_step`` program at rows = B: the gather, the unsplit projection, the program, the out-projection.  Its
+    ring order is the composed lanes body's (the window read before the step, the token landing in the window's last
+    slot, the phase advanced once after the step); it is bound over the class body at construction only when the kernel
+    is on, and the class body, the fallback, still runs the lane chain."""
+
+    from models.demos.blackhole.qwen38_flash_next.ttnn import fused
+    from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_step as gdn_step_module
+
+    cls = gdn_module.Qwen38TTNNGDN
+    fused_body = cls._forward_decode_lanes_fused
+    assert [name for name in _self_walk(fused_body) if name.startswith("_")] == [
+        "_validate_lane_state",
+        "_all_gather_hidden_lanes",
+        "_project_lanes_unsplit",
+        "_out_project_lanes",
+    ]
+    calls = _calls(fused_body)
+    assert "fused.gdn_step.gdn_step" in calls and "state.conv_window" in calls and "state.advance_conv_window" in calls
+    assert not any(call.startswith("ttnn.") for call in calls)  # every device op is in the helpers or the program
+    assert not any(call.startswith(HOST_IO) for call in calls)
+    source = inspect.getsource(fused_body)
+    order = (
+        "window = state.conv_window()",
+        "projected = self._project_lanes_unsplit(full_hidden, lanes)",
+        "gated = fused.gdn_step.gdn_step(self, projected, window, state)",
+        "state.advance_conv_window()",
+        "output = self._out_project_lanes(gated, full_hidden, lanes)",
+    )
+    positions = [source.index(marker) for marker in order]
+    assert positions == sorted(positions) and len(set(positions)) == len(positions)
+    # The ring order of the 1-row body and of the composed lanes body: the window is read at the old phase, this
+    # token's q/k/v land in its last slot (the program writes ``window[3]``; the chain slices into ``window[-1]``),
+    # the phase advances once after the write.
+    one_row = inspect.getsource(cls.forward_decode)
+    assert (
+        one_row.index("window = state.conv_window()")
+        < one_row.index("gated = step(self, projected, window, state)")
+        < one_row.index("state.advance_conv_window()")
+    )
+    composed = inspect.getsource(cls.forward_decode_lanes)
+    assert (
+        composed.index("window = state.conv_window()")
+        < composed.index("z, a, b = self._project_lanes(full_hidden, window[-1], lanes)")
+        < composed.index("state.advance_conv_window()")
+    )
+    wrapper = "".join(inspect.getsource(gdn_step_module.gdn_step).split())  # wrapping-agnostic
+    assert "run(projected,window[:3],window[3]," in wrapper and "ttnn.deallocate(projected)" in wrapper
+    assert "the last slot receives that token" in inspect.getsource(gdn_module.Qwen38TTNNGDNState.conv_window)
+    # The unsplit projection writes no ring slot and takes no z/a/b slice (the program does both); the out-projection
+    # is the one reduce-scatter of the lanes body.
+    unsplit = _calls(cls._project_lanes_unsplit)
+    assert "ttnn.slice" not in unsplit and unsplit.count("ttnn.linear") == 1
+    assert _calls(cls._out_project_lanes).count("ttnn.reduce_scatter") == 1
+    assert "lanes" in fused.kernel("gdn_step").replaces and "_forward_decode_lanes_fused" in gdn_step_module.__doc__
+    # The binding: the one ``if fused.enabled("gdn_step")`` of the constructor assigns the partial over the class
+    # attribute; the switch is off by default and on under QWEN38_FUSED; the class body still runs the lane chain.
+    init = ast.parse(textwrap.dedent(inspect.getsource(cls.__init__)))
+    binds = [
+        node
+        for node in ast.walk(init)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "fused.enabled('gdn_step')"
+    ]
+    assert len(binds) == 1 and len(binds[0].body) == 1 and not binds[0].orelse
+    assert ast.unparse(binds[0].body[0]) == (
+        "self.forward_decode_lanes = functools.partial(type(self)._forward_decode_lanes_fused, self)"
+    )
+    assert not fused.enabled("gdn_step", {}) and fused.enabled("gdn_step", {"QWEN38_FUSED": "gdn_step"})
+    assert "_recurrent_decode_lanes" in _self_walk(cls.forward_decode_lanes)
+    assert "fused" not in _self_walk(cls.forward_decode_lanes) and "gdn_step" not in composed
 
 
 def test_layer_and_model_lane_bodies_are_the_generic_walk_over_lanes() -> None:

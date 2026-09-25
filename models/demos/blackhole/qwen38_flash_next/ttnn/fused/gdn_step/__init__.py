@@ -7,7 +7,9 @@ Replaces programs 4-52 of the GDN block (the slice into the conv ring slot, the 
 split, the decay and write gates, both l2 norms, the fp32 delta-rule state update, the read-out, the gated RMSNorm
 and the sigmoid gate: 49 programs, 119 us kernel / 213 us occupancy per layer in the 2026-09-12 census).  One core
 per (lane, value head) item; the state stays fp32 and is updated in place; the newest ring slot is written from the
-projection.  Rounding follows tt/gdn.py (the oracle), not today's chain, so the tolerance class is COMPONENT (note
+projection.  The 1-row body runs it at rows = 1 and the batched-lanes body at rows = B (``_forward_decode_lanes_fused``
+in ttnn/gdn.py: lane u = state slot u and ring row u, so B independent users are 12 B items of one program).
+Rounding follows tt/gdn.py (the oracle), not today's chain, so the tolerance class is COMPONENT (note
 work/FUSE-GDN-STEP-20260913.md section 1).  ``reference_step`` is the kernel's arithmetic in torch for the tests.
 """
 
@@ -215,9 +217,10 @@ def _constants(gdn):
 
 
 def gdn_step(gdn, projected, window, state):
-    """The fused step at the chain site: ``projected`` from ``_project``, ``window`` the conv ring (oldest first,
-    the last slot receives this token), ``state`` the layer's GDN state; returns the gated output in the
-    out-projection's activation layout and updates ``state.recurrent`` and the newest slot in place."""
+    """The fused step at the chain site: ``projected`` from ``_project`` (one row) or ``_project_lanes_unsplit`` (B
+    lane rows), ``window`` the conv ring (oldest first, the last slot receives this token), ``state`` the layer's GDN
+    state at the same rows; returns the gated output in the out-projection's activation layout and updates
+    ``state.recurrent`` and the newest slot in place."""
 
     rows = fp.rows_of(projected)
     out = fp.allocate(
@@ -302,7 +305,8 @@ register(
     FusedKernel(
         name=NAME,
         replaces="GDN decode programs 4-52: ring-slot slice, z/a/b slices, conv + SiLU, head split, gates, l2 norms, "
-        "fp32 delta-rule update, read-out, gated RMSNorm, sigmoid gate (49 programs per layer)",
+        "fp32 delta-rule update, read-out, gated RMSNorm, sigmoid gate (49 programs per layer); the same programs of "
+        "the batched-lanes body on B rows (one item per (lane, value head))",
         tolerance=COMPONENT,
         fused=gdn_step,
         composed=gdn_step_composed,

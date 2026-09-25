@@ -48,7 +48,12 @@ the GDN decode step from the projection to the gated output as one program (the 
 l2 norms, the fp32 delta-rule update, the read-out, the gated RMSNorm and the sigmoid gate: 49 programs per layer as 1),
 a COMPONENT-class kernel that serves by default on its component-gate proof against the CPU oracle (layer-0 probe, four
 p150: state error 0.0048 and gated output 0.0098 for the fused step, 0.0081 and 0.0234 for the composed chain) and
-runs only where its input contract holds (the one-row step; the MTP draft body and verify rows keep the chain).  Opt-in
+runs where its input contract holds (the one-row step and, since 2026-09-25, the batched-decode lanes body on B rows,
+one item per (lane, value head) and one state slot per lane: 40.9 -> 35.0 ms per step at 4 lanes and 50.4 -> 43.3 ms at
+8 on the 200-replay lane sweep, 28.5 and 23.1 tok/s per user, 114 and 185 aggregate, the one-row step unchanged; the MTP
+draft body and verify rows keep the chain).  The composite lane body, kept as the fallback when the fused GDN step is
+not admitted, differs from the one-row fused body at one near-tie in the acceptance chain (219/225 at 4 and 8 lanes);
+the fused lanes form matches 225/225.  Opt-in
 through `QWEN38_FUSED=<name>`: `final_mixer`, `position_advance`.  The kernels cover rows 1..32 (decode, the MTP
 verify rows); the 128-row prefill chunk and the slab keep their chains.  `QWEN38_FUSED_OFF=<name>[,...]` (or `all`) in
 the server's environment falls back to the composed chains; an unknown name in either variable refuses to start;
