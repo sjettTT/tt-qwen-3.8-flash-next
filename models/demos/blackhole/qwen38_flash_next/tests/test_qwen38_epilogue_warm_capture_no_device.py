@@ -38,7 +38,7 @@ class FakeLMHead:
         self.resolves.append("into=None" if into is None else f"into={into.role}")
         return FakeTensor("resolved token row")
 
-    def sampling_candidates(self, logits, constants):
+    def sampling_candidates(self, logits, constants, *, candidates=None):
         return FakeTensor("candidate row", "fp32 ROW_MAJOR DRAM [1,1,1,256]")
 
 
@@ -82,6 +82,7 @@ def extension_with_fakes(monkeypatch):
     ext.constants = SimpleNamespace(readback_row=FakeTensor("readback row"))
     ext.sampler = FakeSamplerConstants()
     ext.presence_on_device = False
+    ext.candidate_row = False  # the chain's candidate row (the fold has its own program-key test)
     ext.trace_rows, ext.trace_logits = [], []
     keys: list[tuple[str, str, str]] = []
 

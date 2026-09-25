@@ -26,6 +26,8 @@ from .. import program as fp
 from ..registry import BITWISE, FusedKernel, register
 
 NAME = "greedy_tail"
+CANDIDATE_ROW = "candidate_row"  # the sampling server's per-shard top-k row, folded into the scan and the merge
+CANDIDATES = 32  # = embedding.SAMPLING_CANDIDATES_PER_DEVICE (pinned by the static test)
 TILE = fp.TILE
 KERNELS = {name: fp.kernel_source(NAME, f"{name}.cpp") for name in ("scan", "merge", "resolve")}
 CB_STAGE = 0
@@ -44,13 +46,30 @@ def scan_cores(environ=None) -> int:
 
 SCAN_STAGE_PAGES = 4  # 49 tiles x 128 bytes of face rows + the 16-byte pair
 MERGE_STAGE_PAGES = 2  # zero tile + pairs + out
+LIST_BYTES = 8 * CANDIDATES  # a core's candidate list: fp32 [values | ids]
 RESOLVE_STAGE_PAGES = 3  # fp32 zero tile (4 KB) + three 64-byte reads
 PACKED_LANES = 2  # the two-lane packed row [value | float(id)] (the composed chain's form; the kernels' rows == 1 path)
 PACKED_LANES_ROWS = (
     16  # the 64-byte packed rows (the DRAM grain), [value | float(id) | zeros]: the lanes and the decode step
 )
-SCAN_ARGS = ("logits_addr", "pairs_addr", "first_tile", "tile_count", "core_index")
-MERGE_ARGS = ("pairs_addr", "zero_tile_addr", "values_addr", "indices_addr", "packed_addr")
+SCAN_ARGS = (
+    "logits_addr",
+    "pairs_addr",
+    "first_tile",
+    "tile_count",
+    "core_index",
+    "lists_addr",
+)  # the last with candidates
+MERGE_ARGS = (
+    "pairs_addr",
+    "zero_tile_addr",
+    "values_addr",
+    "indices_addr",
+    "packed_addr",
+    "lists_addr",
+    "vocab_start_addr",
+    "row_addr",
+)
 RESOLVE_ARGS = ("gathered_addr", "tie_break_addr", "vocab_starts_addr", "zero_tile_addr", "token_row_addr", "into_addr")
 _ZERO_TILES: dict[int, tuple] = {}
 
@@ -95,25 +114,47 @@ def _rows_of(logits) -> int:
     return shape[2]
 
 
-def merge_stage_pages(rows: int, cores: int, packed_lanes: int) -> int:
-    """The merge's staging for ``rows`` rows: the zero tile, the pairs rows, the packed rows and the indices row."""
+def merge_stage_pages(rows: int, cores: int, packed_lanes: int, candidates: int = 0) -> int:
+    """The merge's staging for ``rows`` rows: the zero tile, the pairs rows, the packed rows and the indices row; with
+    ``candidates`` the cores' lists, the vocab-start read and the shard row after them (merge.cpp's layout)."""
 
-    if rows == 1 and packed_lanes == PACKED_LANES:
+    if rows == 1 and packed_lanes == PACKED_LANES and not candidates:
         return MERGE_STAGE_PAGES
     pairs_bytes = ((16 * cores) + 63) & ~63
-    return -(-(2048 + rows * pairs_bytes + rows * 4 * packed_lanes + 64) // 2048)
+    if not candidates:
+        return -(-(2048 + rows * pairs_bytes + rows * 4 * packed_lanes + 64) // 2048)
+    lists = ((2048 + rows * pairs_bytes + rows * 4 * packed_lanes + 128) + 63) & ~63
+    return -(-(lists + cores * 8 * candidates + 64 + 8 * candidates) // 2048)
 
 
-def greedy_candidates(logits, *, memory_config=ttnn.DRAM_MEMORY_CONFIG, packed_lanes: int = PACKED_LANES) -> tuple:
+def greedy_candidates(
+    logits,
+    *,
+    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    packed_lanes: int = PACKED_LANES,
+    candidates: int = 0,
+    vocab_start=None,
+) -> tuple:
     """``(local_values bf16 TILE [1,1,rows,1], local_indices uint32 [1,1,rows], packed fp32 ROW_MAJOR
     [1,1,rows,packed_lanes])`` of the ``rows`` valid rows (1 = the decode step, whose packed row is [value | id];
-    the lanes pass ``PACKED_LANES_ROWS`` for 64-byte rows).  Row r's lane of the value tile is (r, 0)."""
+    the lanes pass ``PACKED_LANES_ROWS`` for 64-byte rows).  Row r's lane of the value tile is (r, 0).
+
+    ``candidates`` = ``CANDIDATES`` (rows = 1, the sampling server): the same two programs also produce the shard's
+    candidate row, fp32 ROW_MAJOR ``[1,1,1,2 * candidates]`` = [values | global ids] (the ids rebased by
+    ``vocab_start``, the shard's fp32 TILE ``[1,1,1,1]`` first global id), returned as a fourth tensor: each scan core
+    keeps its sorted top ``candidates`` behind the argmax's compare, the merge takes the shard's from the lists."""
 
     rows = _rows_of(logits)
     if not 1 <= rows <= TILE:
         raise ValueError(f"greedy_tail candidates take 1..{TILE} rows (one row tile), got {rows}")
     if packed_lanes not in (PACKED_LANES, PACKED_LANES_ROWS):
         raise ValueError(f"packed_lanes must be {PACKED_LANES} or {PACKED_LANES_ROWS}, got {packed_lanes}")
+    if candidates not in (0, CANDIDATES):
+        raise ValueError(f"candidates is 0 or {CANDIDATES}, got {candidates}")
+    if candidates and rows != 1:
+        raise ValueError("the candidate row folds into the one-row scan (the decode step)")
+    if candidates and vocab_start is None:
+        raise ValueError("the candidate row needs the shard's vocab-start tile")
     mesh = logits.device()
     tiles = int(logits.shape[3]) // TILE
     zero_bf16, _zero_fp32 = prepare(mesh)
@@ -122,43 +163,70 @@ def greedy_candidates(logits, *, memory_config=ttnn.DRAM_MEMORY_CONFIG, packed_l
     grid = fp.core_rectangle(work, mesh)
     pairs_lanes = -(-4 * len(work) // 16) * 16  # 16 bytes per core, the row padded to the 64-byte DRAM read grain
     pairs = fp.allocate((1, 1, rows, pairs_lanes), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, mesh, memory_config)
+    lists = row = None
+    if candidates:
+        if 128 * max(w.count for w in work) + 16 + 8 * candidates > 2048 * SCAN_STAGE_PAGES:
+            raise ValueError("the scan's staging cannot hold its tiles' face rows, the pair and the candidate list")
+        lists = fp.allocate((1, 1, len(work), 2 * candidates), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, mesh, memory_config)
+        row = fp.allocate((1, 1, 1, 2 * candidates), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, mesh, memory_config)
+    scan_tensors = [logits, pairs] + ([lists] if candidates else [])
+    defines = [("GT_CANDIDATE_ROW", "1")] if candidates else []  # the kernels' list / row branches (see scan.cpp)
     scan = fp.reader_kernel(
         KERNELS["scan"],
         grid,
-        fp.accessor_args(logits) + fp.accessor_args(pairs),
-        [(w.core, [logits.buffer_address(), pairs.buffer_address(), w.start, w.count, i]) for i, w in enumerate(work)],
-        named={"cb_stage": CB_STAGE, "lanes_per_tile": TILE, "rows": rows},
+        [a for t in scan_tensors for a in fp.accessor_args(t)],
+        [
+            (
+                w.core,
+                [logits.buffer_address(), pairs.buffer_address(), w.start, w.count, i]
+                + ([lists.buffer_address()] if candidates else []),
+            )
+            for i, w in enumerate(work)
+        ],
+        defines=defines,
+        named={"cb_stage": CB_STAGE, "lanes_per_tile": TILE, "rows": rows, "candidates": candidates},
     )
     scan_pages = SCAN_STAGE_PAGES if rows == 1 else max(w.count for w in work) + 1  # one 2 KB slot per tile + the pairs
     fp.run_program(
-        [logits, pairs],
+        scan_tensors,
         fp.program_descriptor([scan], cbs=[fp.cb_descriptor(CB_STAGE, ttnn.bfloat16, 2048, scan_pages, grid)]),
     )
     values = fp.allocate((1, 1, rows, 1), ttnn.bfloat16, ttnn.TILE_LAYOUT, mesh, memory_config)
     indices = fp.allocate((1, 1, rows), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, mesh, memory_config)
     packed = fp.allocate((1, 1, rows, packed_lanes), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, mesh, memory_config)
     core, one = _one_core(mesh)
-    tensors = [pairs, zero_bf16, values, indices, packed]
+    tensors = [pairs, zero_bf16, values, indices, packed] + ([lists, vocab_start, row] if candidates else [])
     merge = fp.reader_kernel(
         KERNELS["merge"],
         one,
         [a for t in tensors for a in fp.accessor_args(t)],
         [(core, [t.buffer_address() for t in tensors])],
-        named={"cb_stage": CB_STAGE, "cores": len(work), "rows": rows, "packed_lanes": packed_lanes},
+        defines=defines,
+        named={
+            "cb_stage": CB_STAGE,
+            "cores": len(work),
+            "rows": rows,
+            "packed_lanes": packed_lanes,
+            "candidates": candidates,
+        },
     )
     fp.run_program(
         tensors,
         fp.program_descriptor(
             [merge],
             cbs=[
-                fp.cb_descriptor(CB_STAGE, ttnn.bfloat16, 2048, merge_stage_pages(rows, len(work), packed_lanes), one)
+                fp.cb_descriptor(
+                    CB_STAGE, ttnn.bfloat16, 2048, merge_stage_pages(rows, len(work), packed_lanes, candidates), one
+                )
             ],
         ),
     )
     ttnn.deallocate(pairs)
-    for tensor in (values, indices, packed):
+    if candidates:
+        ttnn.deallocate(lists)
+    for tensor in (values, indices, packed) + ((row,) if candidates else ()):
         tensor.update_tensor_topology(logits.tensor_topology())  # local partials, as the chain's argmax / max outputs
-    return values, indices, packed
+    return (values, indices, packed, row) if candidates else (values, indices, packed)
 
 
 def greedy_candidates_composed(logits, *, memory_config=ttnn.DRAM_MEMORY_CONFIG) -> tuple:
@@ -356,8 +424,12 @@ def resolve_greedy_lanes_on_device_fused(lm_head, candidates):
     return token_row
 
 
-def greedy_candidates_fused(lm_head, logits, *, values_by_gather: bool = False):
-    """``Qwen38TTNNLMHead.greedy_candidates`` on the fused programs for one row; other rows keep the chain."""
+def greedy_candidates_fused(lm_head, logits, *, values_by_gather: bool = False, candidate_row=None):
+    """``Qwen38TTNNLMHead.greedy_candidates`` on the fused programs for one row; other rows keep the chain.
+
+    ``candidate_row`` (the sampling chain's ``Qwen38TTNNSamplingCandidateConstants``): the one-row programs also produce
+    the shard's candidate row (``shard_row``, ``sampling_candidates_fused`` gathers it); other rows keep the chain and
+    leave it ``None``."""
 
     embedding = _embedding()
     rows = lm_head._validate_logits(logits)
@@ -365,14 +437,69 @@ def greedy_candidates_fused(lm_head, logits, *, values_by_gather: bool = False):
         return type(lm_head).greedy_candidates(lm_head, logits, values_by_gather=values_by_gather)
     # the 64-byte packed row: an 8-byte row is padded to the 64-byte alignment and its all_gather falls back to the
     # slower composite ("input rows (8 B) are padded to the 64 B memory alignment"); the row's content is unchanged
-    values, indices, packed = greedy_candidates(logits.tensor, packed_lanes=PACKED_LANES_ROWS)
-    for tensor, shape in ((indices, (1, 1, rows)), (values, (1, 1, rows, 1)), (packed, (1, 1, 1, PACKED_LANES_ROWS))):
+    if candidate_row is None:
+        values, indices, packed = greedy_candidates(logits.tensor, packed_lanes=PACKED_LANES_ROWS)
+        row = None
+    else:
+        values, indices, packed, row = greedy_candidates(
+            logits.tensor,
+            packed_lanes=PACKED_LANES_ROWS,
+            candidates=CANDIDATES,
+            vocab_start=candidate_row.shard_vocab_start,
+        )
+    marked = [(indices, (1, 1, rows)), (values, (1, 1, rows, 1)), (packed, (1, 1, 1, PACKED_LANES_ROWS))]
+    if row is not None:
+        marked.append((row, (1, 1, 1, 2 * CANDIDATES)))
+    for tensor, shape in marked:
         lm_head.mesh_contract.mark_local_partial(
             tensor, replicated_reference=lm_head.weights.replicated_anchor, expected_shape=shape
         )
     return embedding.Qwen38GreedyCandidates(
-        local_indices=indices, local_values=values, rows=rows, vocab_ranges=lm_head.weights.vocab_ranges, packed=packed
+        local_indices=indices,
+        local_values=values,
+        rows=rows,
+        vocab_ranges=lm_head.weights.vocab_ranges,
+        packed=packed,
+        shard_row=row,
     )
+
+
+def sampling_candidates_fused(lm_head, logits, constants, *, into=None, candidates=None):
+    """``Qwen38TTNNLMHead.sampling_candidates`` from the scan's shard row: one all_gather of the four shards' [values |
+    global ids] rows into the replicated candidate row, copied into ``into`` (``constants.readback_row`` by default).
+    Callers without the scan's row (``candidates`` is ``None`` or has none: the verify rows, tools that build the row
+    on its own) take the chain."""
+
+    embedding = _embedding()
+    if candidates is None or getattr(candidates, "shard_row", None) is None:
+        return type(lm_head).sampling_candidates(lm_head, logits, constants, into=into)
+    rows = lm_head._validate_logits(logits)
+    if rows != 1:
+        raise ValueError(f"the scan's candidate row is the one-row step's, got {rows} rows")
+    constants.validate(lm_head.mesh_contract)
+    target = constants.readback_row if into is None else into
+    row = ttnn.all_gather(
+        candidates.shard_row, dim=3, cluster_axis=embedding.TP_AXIS, memory_config=ttnn.DRAM_MEMORY_CONFIG
+    )
+    ttnn.deallocate(candidates.shard_row)
+    shape = tuple(int(v) for v in row.shape)
+    if (
+        shape != embedding.SAMPLING_CANDIDATE_ROW_SHAPE
+        or row.dtype != ttnn.float32
+        or row.layout != ttnn.ROW_MAJOR_LAYOUT
+    ):
+        raise RuntimeError(
+            f"the gathered candidate row must be fp32 ROW_MAJOR {embedding.SAMPLING_CANDIDATE_ROW_SHAPE}, got {row.dtype} {row.layout} {shape}"
+        )
+    lm_head.mesh_contract.validate_tensor(row, placement=embedding.TensorPlacement.REPLICATED)
+    ttnn.copy(row, target)
+    return row
+
+
+def sampling_candidates_chain(lm_head, logits, constants, *, into=None, candidates=None):
+    """The chain: per shard ``ttnn.topk``, the typecasts, the rebase, the pack and its all_gather (``candidates`` unused)."""
+
+    return type(lm_head).sampling_candidates(lm_head, logits, constants, into=into)
 
 
 def resolve_greedy_on_device_fused(lm_head, candidates, *, into=None):
@@ -417,5 +544,16 @@ register(
         fused=greedy_candidates_fused,
         composed=greedy_candidates_chain,
         gate=None,  # the single-chip device test is the component gate (random logits with ties vs the chain's ops)
+    )
+)
+register(
+    FusedKernel(
+        name=CANDIDATE_ROW,
+        replaces="the candidate row's per-shard ttnn.topk, two typecasts, the rebase add, the concat and its relayout "
+        "(9 programs before the row's all_gather), folded into greedy_tail's scan and merge",
+        tolerance=BITWISE,
+        fused=sampling_candidates_fused,
+        composed=sampling_candidates_chain,
+        gate=None,  # values bitwise, ids equal up to the boundary tie set (the candidate row's agreement rule)
     )
 )

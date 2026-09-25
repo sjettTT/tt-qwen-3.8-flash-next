@@ -51,6 +51,7 @@ DEFAULT_ON: frozenset[str] = frozenset(
         "qsa_widen_partial",
         "router_tail",
         "sampler_tail",
+        "candidate_row",
         "shared_expert",
     }
 )

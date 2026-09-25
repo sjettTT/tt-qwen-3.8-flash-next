@@ -156,6 +156,15 @@ device token against the integer-exact host reference (`device_sampler_reference
 penalty runs on the device from the request's own history.  Verdict 2026-09-25: PASS: every position passes the G-test
 (minimum p 0.0740), the largest empirical TV is 0.0079, the largest device-law TV is 0.0000022, mismatches 0.
 
+The candidate row itself (`candidate_row`, 2026-09-25) is folded into greedy_tail's scan and merge: each scan core keeps
+its sorted top-32 behind the argmax's compare (a stable insertion, so ties keep the lowest ids and the list's first
+entry is the argmax pair; the greedy outputs are unchanged), and the merge takes the shard's 32 from the cores' lists in
+core order and writes the fp32 row [values | global ids] the row's all_gather takes: the row's 10 programs and 312 us
+per step become 2 and 8 (the gather and the copy) while the scan and merge grow 66 -> 128 us (net -242 us on the tail),
+the sampled step 27.57 -> 27.37 ms. The values are bitwise the chain's (ttnn.topk's) and the ids equal above the kth
+value; the boundary group is the lowest ids among the ties, where ttnn.topk's pick is implementation-defined (the
+candidate row's agreement rule tolerates boundary ties). `QWEN38_FUSED_OFF=candidate_row` restores the chain's row.
+
 Profile `thinking`:
 
 | prompt | offset | kept lanes | G | df | p | TV empirical vs host | TV null expectation | TV device law vs host | draws | mismatches |

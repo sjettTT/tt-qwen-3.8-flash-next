@@ -262,6 +262,8 @@ class Qwen38SamplingChainExtension:
         # The sampler: the one-program fused kernel when the registry serves it (its constants carry the presence
         # history), else the composite on its constants; both take (row, greedy row, constants).
         self.sample = fused.resolve(fused.sampler_tail.NAME)
+        # QWEN38_FUSED=candidate_row: the scan's shard row feeds the candidate row's gather (greedy_tail on)
+        self.candidate_row = fused.enabled("candidate_row")
         fused_sampler = self.sample is fused.kernel(fused.sampler_tail.NAME).fused
         if not device_sampler:
             self.sampler = None
@@ -282,9 +284,12 @@ class Qwen38SamplingChainExtension:
         the flag) copied into the resident row.  Returns ``(candidates, row, greedy_row, token_row)``; without the
         sampler the token row is the greedy row."""
 
-        candidates = self.lm_head.greedy_candidates(logits)
+        if self.candidate_row:
+            candidates = self.lm_head.greedy_candidates(logits, candidate_row=self.constants)
+        else:
+            candidates = self.lm_head.greedy_candidates(logits)
         greedy_row = self.lm_head.resolve_greedy_on_device(candidates, into=token_row_io)
-        row = self.lm_head.sampling_candidates(logits, self.constants)
+        row = self.lm_head.sampling_candidates(logits, self.constants, candidates=candidates)
         if self.sampler is None:
             return candidates, row, greedy_row, greedy_row
         token_row = self.sample(row, greedy_row, self.sampler)

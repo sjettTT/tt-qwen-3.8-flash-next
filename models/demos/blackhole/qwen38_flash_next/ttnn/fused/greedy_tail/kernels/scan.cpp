@@ -8,8 +8,12 @@
 // is staged at its own 2 KB slot and every row is scanned in id order.  The pair (value as fp32 bits, id) of row r goes
 // to lanes 4c..4c+1 of row r of the fp32 pairs rows (16 bytes per core per row).  bf16 values compare through a
 // sign-magnitude key (zeros canonicalized to +0.0): the first strict maximum in id order is the lowest id.
-// Named compile-time args: cb_stage, lanes_per_tile, rows.  Compile-time args: TensorAccessorArgs(logits), (pairs).
-// Runtime args: 0 logits addr, 1 pairs addr, 2 first tile, 3 tile count, 4 core index.
+// With candidates > 0 (the decode step of a sampling server) each core also keeps its top `candidates` pairs in key
+// order, lowest id first among equal keys, and writes them as one fp32 ROW_MAJOR page [values | ids] of the lists
+// tensor (page = core); the argmax pair is the list's first entry, so the greedy outputs are unchanged.
+// Named compile-time args: cb_stage, lanes_per_tile, rows, candidates.  Compile-time args: TensorAccessorArgs(logits),
+// (pairs), (lists when candidates > 0).  Runtime args: 0 logits addr, 1 pairs addr, 2 first tile, 3 tile count,
+// 4 core index, 5 lists addr (candidates > 0).
 
 #include <cstdint>
 
@@ -22,6 +26,16 @@
 constexpr uint32_t CB_STAGE = get_named_compile_time_arg_val("cb_stage");
 constexpr uint32_t LANES = get_named_compile_time_arg_val("lanes_per_tile");
 constexpr uint32_t ROWS = get_named_compile_time_arg_val("rows");
+constexpr uint32_t CANDIDATES = get_named_compile_time_arg_val("candidates");
+static_assert(CANDIDATES == 0 || ROWS == 1, "the candidate row folds into the one-row scan");
+// GT_CANDIDATE_ROW (the host defines it with candidates > 0) compiles the list branch: a discarded `if constexpr`
+// branch is still checked in this non-template function, and its TensorAccessorArgs index is out of range without
+// the lists tensor.
+#ifdef GT_CANDIDATE_ROW
+static_assert(CANDIDATES > 0, "GT_CANDIDATE_ROW needs candidates > 0");
+#else
+static_assert(CANDIDATES == 0, "candidates > 0 needs GT_CANDIDATE_ROW");
+#endif
 constexpr uint32_t GRAIN = 64;
 constexpr uint32_t FACE1_OFFSET = 512;
 constexpr uint32_t TILE_BYTES = 2048, FACE_BYTES = 512, ROW_BYTES = 32;
@@ -55,28 +69,83 @@ void kernel_main() {
         }
         noc.async_read_barrier();
 
-        uint32_t best_key = 0, best_id = 0, best_bits = 0;
-        bool any = false;
-        for (uint32_t t = 0; t < count; ++t) {
-            for (uint32_t lane = 0; lane < LANES; ++lane) {
-                const uint32_t word = 64 * t + (lane < 16 ? lane : 32 + (lane - 16));  // face 0 row 0, then face 1 row 0
-                const uint16_t bits = canonical(halves[word]);
-                const uint32_t key = key_of(bits);
-                if (!any || key > best_key) {
-                    any = true;
-                    best_key = key;
-                    best_bits = bits;
-                    best_id = (first + t) * LANES + lane;
-                }
-            }
-        }
         const uint32_t out_offset = ((128 * count) + 15) & ~15u;
         volatile tt_l1_ptr uint32_t* out = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(base + out_offset);
-        out[0] = best_bits << 16;  // the bf16 maximum widened to fp32 (exact)
-        out[1] = best_id;
-        out[2] = 0;
-        out[3] = 0;
-        noc.async_write(stage, pairs, 16, {.offset_bytes = out_offset}, {.page_id = 0, .offset_bytes = 16 * core});
+#ifndef GT_CANDIDATE_ROW
+        {
+            uint32_t best_key = 0, best_id = 0, best_bits = 0;
+            bool any = false;
+            for (uint32_t t = 0; t < count; ++t) {
+                for (uint32_t lane = 0; lane < LANES; ++lane) {
+                    const uint32_t word =
+                        64 * t + (lane < 16 ? lane : 32 + (lane - 16));  // face 0 row 0, then face 1 row 0
+                    const uint16_t bits = canonical(halves[word]);
+                    const uint32_t key = key_of(bits);
+                    if (!any || key > best_key) {
+                        any = true;
+                        best_key = key;
+                        best_bits = bits;
+                        best_id = (first + t) * LANES + lane;
+                    }
+                }
+            }
+            out[0] = best_bits << 16;  // the bf16 maximum widened to fp32 (exact)
+            out[1] = best_id;
+            out[2] = 0;
+            out[3] = 0;
+            noc.async_write(stage, pairs, 16, {.offset_bytes = out_offset}, {.page_id = 0, .offset_bytes = 16 * core});
+        }
+#else
+        {
+            constexpr auto a_lists = TensorAccessorArgs<a_pairs.next_compile_time_args_offset()>();
+            const auto lists = TensorAccessor(a_lists, get_arg_val<uint32_t>(5));
+            // The core's top CANDIDATES in key order, lowest id first among equal keys: an element enters only when its
+            // key is strictly above the last kept one (an earlier id keeps a boundary slot) and moves left only past
+            // strictly smaller keys (the stable insertion), so entry 0 is the first strict maximum in id order: the
+            // argmax pair above.
+            uint32_t ckey[CANDIDATES], cid[CANDIDATES];
+            uint16_t cbits[CANDIDATES];
+            uint32_t n = 0;
+            for (uint32_t t = 0; t < count; ++t) {
+                for (uint32_t lane = 0; lane < LANES; ++lane) {
+                    const uint32_t word = 64 * t + (lane < 16 ? lane : 32 + (lane - 16));
+                    const uint16_t bits = canonical(halves[word]);
+                    const uint32_t key = key_of(bits);
+                    if (n == CANDIDATES && key <= ckey[CANDIDATES - 1]) {
+                        continue;
+                    }
+                    uint32_t j = n < CANDIDATES ? n : CANDIDATES - 1;
+                    while (j > 0 && ckey[j - 1] < key) {
+                        ckey[j] = ckey[j - 1];
+                        cbits[j] = cbits[j - 1];
+                        cid[j] = cid[j - 1];
+                        --j;
+                    }
+                    ckey[j] = key;
+                    cbits[j] = bits;
+                    cid[j] = (first + t) * LANES + lane;
+                    if (n < CANDIDATES) {
+                        ++n;
+                    }
+                }
+            }
+            out[0] = static_cast<uint32_t>(cbits[0]) << 16;
+            out[1] = cid[0];
+            out[2] = 0;
+            out[3] = 0;
+            constexpr uint32_t LIST_BYTES = 8 * CANDIDATES;
+            const uint32_t list_offset = out_offset + 16;
+            volatile tt_l1_ptr uint32_t* list = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(base + list_offset);
+            for (uint32_t i = 0; i < CANDIDATES; ++i) {
+                list[i] = i < n ? static_cast<uint32_t>(cbits[i]) << 16 : 0u;  // the bf16 value widened to fp32 (exact)
+                list[CANDIDATES + i] =
+                    i < n ? cid[i] : 0xFFFFFFFFu;  // no id: an unfilled slot (a core with under CANDIDATES lanes)
+            }
+            noc.async_write(stage, pairs, 16, {.offset_bytes = out_offset}, {.page_id = 0, .offset_bytes = 16 * core});
+            noc.async_write(
+                stage, lists, LIST_BYTES, {.offset_bytes = list_offset}, {.page_id = core, .offset_bytes = 0});
+        }
+#endif
         noc.async_write_barrier();
     } else {
         // tile t at slot 2048 t: rows 0..15 of faces 0 and 1 (their first LO_BYTES), rows 16.. of faces 2 and 3

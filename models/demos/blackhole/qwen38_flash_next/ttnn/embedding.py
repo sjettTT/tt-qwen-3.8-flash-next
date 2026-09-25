@@ -38,9 +38,8 @@ inventing one.
 
 from __future__ import annotations
 
-import functools
-
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -1125,6 +1124,9 @@ class Qwen38GreedyCandidates:
     rows: int
     vocab_ranges: tuple[tuple[int, int], ...]
     packed: Any = None  # fused greedy tail: the fp32 ROW_MAJOR [value | local id] row its resolve gathers
+    shard_row: Any = (
+        None  # fused candidate row: the shard's fp32 ROW_MAJOR [values | global ids] the sampler's gather takes
+    )
 
 
 @dataclass(frozen=True)
@@ -1855,6 +1857,13 @@ class Qwen38TTNNLMHead:
             self.resolve_greedy_lanes_on_device = functools.partial(
                 fused_greedy_tail.resolve_greedy_lanes_on_device_fused, self
             )
+            # QWEN38_FUSED=candidate_row: the sampling server's candidate row from the scan's shard row
+            if fused_kernels.enabled(fused_greedy_tail.CANDIDATE_ROW):
+                self.sampling_candidates = functools.partial(fused_greedy_tail.sampling_candidates_fused, self)
+        elif fused_kernels.enabled("candidate_row"):
+            raise RuntimeError(
+                "candidate_row folds into greedy_tail's scan: QWEN38_FUSED_OFF=greedy_tail must take it off too"
+            )
 
     def _mark_vocab_shard(self, tensor, *, rows: int) -> None:
         expected = (1, 1, rows, LOCAL_VOCAB_SIZE)
@@ -2146,9 +2155,17 @@ class Qwen38TTNNLMHead:
         return token_row
 
     def sampling_candidates(
-        self, logits: Qwen38ShardedLogits, constants: Qwen38TTNNSamplingCandidateConstants, *, into=None
+        self,
+        logits: Qwen38ShardedLogits,
+        constants: Qwen38TTNNSamplingCandidateConstants,
+        *,
+        into=None,
+        candidates=None,
     ):
         """Optional TAIL epilogue after the greedy resolve: the host sampler's candidate row.
+
+        ``candidates`` (the step's greedy candidates) is the fused candidate row's input (``QWEN38_FUSED=candidate_row``
+        binds :func:`ttnn.fused.greedy_tail.sampling_candidates_fused` here); the chain does not read it.
 
         Per shard ``ttnn.topk`` over the TILE bf16 logits (k = ``SAMPLING_CANDIDATES_PER_DEVICE``,
         sorted descending: bf16 values and UINT16 local ids, the stock path without an

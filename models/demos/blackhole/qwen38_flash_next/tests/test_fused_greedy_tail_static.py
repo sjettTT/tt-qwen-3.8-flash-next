@@ -58,24 +58,23 @@ def test_registered_bitwise():
     assert fused.resolve("greedy_tail", {}) is default  # the registry list decides
     assert fused.resolve("greedy_tail", {fused.OFF_ENV: "greedy_tail"}) is gt.greedy_candidates_chain
     assert fused.resolve("greedy_tail", {fused.ENV: "greedy_tail"}) is gt.greedy_candidates_fused
-    assert (
-        inspect.signature(gt.greedy_candidates_fused).parameters.keys()
-        == inspect.signature(gt.greedy_candidates_chain).parameters.keys()
-    )
+    fused_params = dict(inspect.signature(gt.greedy_candidates_fused).parameters)
+    assert fused_params.pop("candidate_row").default is None  # the fold's input; the chain has no candidate row
+    assert fused_params.keys() == inspect.signature(gt.greedy_candidates_chain).parameters.keys()
 
 
 @pytest.mark.parametrize(
     "kernel, runtime_args, tensors, named",
     [
-        ("scan", gt.SCAN_ARGS, 2, {"cb_stage", "lanes_per_tile", "rows"}),
-        ("merge", gt.MERGE_ARGS, 5, {"cb_stage", "cores", "rows", "packed_lanes"}),
+        ("scan", gt.SCAN_ARGS, 3, {"cb_stage", "lanes_per_tile", "rows", "candidates"}),
+        ("merge", gt.MERGE_ARGS, 8, {"cb_stage", "cores", "rows", "packed_lanes", "candidates"}),
         ("resolve", gt.RESOLVE_ARGS, 6, {"cb_stage", "devices", "copy_into", "rows", "stride"}),
     ],
 )
 def test_kernel_arg_contracts(kernel, runtime_args, tensors, named):
     source = SOURCES[kernel]
     used = sorted({int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d+)\)", source)})
-    assert used == list(range(len(runtime_args)))
+    assert used == list(range(len(runtime_args)))  # the candidate-row tensors' args sit last (read with candidates > 0)
     assert "TensorAccessorArgs<0>()" in source and source.count("next_compile_time_args_offset()") == tensors - 1
     assert set(re.findall(r'get_named_compile_time_arg_val\("([a-z_0-9]+)"\)', source)) == named
     assert "void kernel_main()" in source
@@ -84,8 +83,8 @@ def test_kernel_arg_contracts(kernel, runtime_args, tensors, named):
 def test_python_side_named_args_match_the_kernels():
     source = inspect.getsource(gt)
     for kernel, expected in (
-        ("scan", {"cb_stage", "lanes_per_tile", "rows"}),
-        ("merge", {"cb_stage", "cores", "rows", "packed_lanes"}),
+        ("scan", {"cb_stage", "lanes_per_tile", "rows", "candidates"}),
+        ("merge", {"cb_stage", "cores", "rows", "packed_lanes", "candidates"}),
         ("resolve", {"cb_stage", "devices", "copy_into", "rows", "stride"}),
     ):
         block = source.split(f'KERNELS["{kernel}"]')[1].split("named={")[1].split("}")[0]
