@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from loguru import logger
 
 import ttnn
 from models.demos.blackhole.qwen36.tt.attention.rope_tp import apply_partial_rope_prefill
@@ -60,6 +61,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     require_lane_count,
     tensor_metadata,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn import prefill_glue
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dense_dtype_tag,
     dense_math_fidelity_name,
@@ -72,6 +74,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     validate_dram_sharded_weight,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.prefill_dense import Qwen38TTNNPrefillDense, prefill_linear
+from models.demos.blackhole.qwen38_flash_next.ttnn.prefill_dense import slab_working_set_bytes
 
 TP_SIZE = 4
 # The slab scores and selects its blocks in row blocks of this many query rows: the score all-reduce's [4, rows,
@@ -140,6 +143,10 @@ SPARSE_INDEX_CAPACITY = math.ceil(MAX_SELECTED_TOKENS / ttnn.TILE_SIZE) * ttnn.T
 # complete-block count are hidden by adding the most negative finite BF16
 # value to their scores.
 INDEXER_MASK_VALUE = -3.3895313892515355e38
+# The qsa_scores_rs_ag form masks every device's local scores before the reduce-scatter sums them: -2^100 is
+# exact in BF16, absorbs any score (|s| < 2^92 rounds away) and sums over four devices to -2^102 exactly, below
+# every visible score sum; four INDEXER_MASK_VALUE terms would overflow.
+SLAB_SCORES_RS_MASK_VALUE = -(2.0**100)
 KV_ROW_MASK = CACHE_WRITE_ROWS - 1
 KV_BLOCK_START_MASK = 0xFFFFFFFF ^ KV_ROW_MASK
 ALL_ONES_U32 = 0xFFFFFFFF
@@ -1151,6 +1158,127 @@ def qsa_chunk_constant_rows(allocated_compressed_blocks: int, rows: int = CHUNK_
     }
 
 
+# qsa_mask_hoist keeps at most this many bytes of hoisted masks per slab (rows / 512 masks of [512, blocks] BF16 at
+# 2048 rows: 32 MB at a 32k context, 64 MB at 64k, 128 MB at 128k); past it, or when the free DRAM after the build would
+# not hold the masks plus the slab's working set, the slab derives the masks per layer (the previous form) instead of
+# taking the slab body's transient headroom.
+HOISTED_MASK_BYTES_MAX = 64 << 20
+
+
+def _mib(value: int) -> str:
+    return f"{value / 2**20:.1f} MiB"
+
+
+def hoisted_mask_bytes(rows: int, blocks: int) -> int:
+    """The bytes of a slab's hoisted block masks: one BF16 ``[512, blocks]`` mask per 512-row score block."""
+
+    return (rows // SLAB_SCORE_BLOCK_ROWS) * SLAB_SCORE_BLOCK_ROWS * blocks * 2
+
+
+@dataclass(frozen=True)
+class Qwen38HoistedMaskAdmission:
+    """Whether a slab hoists its QSA block masks (the ``qsa_mask_hoist`` form) and the numbers the decision was taken
+    on: the masks' bytes against ``HOISTED_MASK_BYTES_MAX``, and the free DRAM per device after the build against the
+    masks plus the slab's working set (``prefill_dense.slab_working_set_bytes``, the dense admission's term).  ``hoist``
+    False leaves the masks to the per-layer derivation; ``reason`` says why either way."""
+
+    hoist: bool
+    rows: int
+    blocks: int
+    mask_bytes: int
+    limit_bytes: int
+    free_bytes_per_device: int | None
+    slab_working_set_bytes: int | None
+    reason: str
+
+
+def admit_hoisted_masks(
+    rows: int,
+    blocks: int,
+    *,
+    free_bytes_per_device: int | None = None,
+    slab_working_set: int | None = None,
+    limit: int = HOISTED_MASK_BYTES_MAX,
+) -> Qwen38HoistedMaskAdmission:
+    """The hoist admission on numbers alone (no device): the masks fit the cap and, when the free DRAM is given, the
+    free bytes hold the masks plus the slab's working set; otherwise the per-layer form, with the numbers."""
+
+    mib = _mib
+    mask_bytes = hoisted_mask_bytes(rows, blocks)
+    numbers = dict(
+        rows=rows,
+        blocks=blocks,
+        mask_bytes=mask_bytes,
+        limit_bytes=limit,
+        free_bytes_per_device=free_bytes_per_device,
+        slab_working_set_bytes=slab_working_set,
+    )
+    masks = f"{mib(mask_bytes)} of hoisted QSA block masks per slab ({rows} rows, {blocks} blocks)"
+    if mask_bytes > limit:
+        return Qwen38HoistedMaskAdmission(
+            hoist=False,
+            reason=f"{masks} exceed the {mib(limit)} cap (HOISTED_MASK_BYTES_MAX): the masks are derived per layer",
+            **numbers,
+        )
+    if free_bytes_per_device is not None:
+        if slab_working_set is None:
+            raise ValueError("the hoist admission on free DRAM needs the slab's working-set term")
+        needed = mask_bytes + slab_working_set
+        if free_bytes_per_device < needed:
+            return Qwen38HoistedMaskAdmission(
+                hoist=False,
+                reason=(
+                    f"{masks} plus the slab's {mib(slab_working_set)} working set = {mib(needed)} exceed the "
+                    f"{mib(free_bytes_per_device)} of DRAM free per device after the build: the masks are derived "
+                    "per layer"
+                ),
+                **numbers,
+            )
+        return Qwen38HoistedMaskAdmission(
+            hoist=True,
+            reason=(
+                f"{masks} within the {mib(limit)} cap; {mib(free_bytes_per_device)} free per device hold them plus "
+                f"the slab's {mib(slab_working_set)} working set"
+            ),
+            **numbers,
+        )
+    return Qwen38HoistedMaskAdmission(hoist=True, reason=f"{masks} within the {mib(limit)} cap", **numbers)
+
+
+def slab_hoisted_mask_admission(
+    mesh_device, rows: int, blocks: int, glue: prefill_glue.PrefillGluePolicy | None = None
+) -> Qwen38HoistedMaskAdmission | None:
+    """The slab's hoist decision, taken once when its QSA chunk constants are built (after the build, before the
+    slab runs): None when the rows are not a slab's or the policy does not name ``qsa_mask_hoist``, else
+    :func:`admit_hoisted_masks` on the allocator's free DRAM per device at that point and the slab's working-set
+    term.  Every slab of the process then follows the one decision (the trace never branches on it)."""
+
+    glue = prefill_glue.policy() if glue is None else glue
+    if not is_slab_rows(rows):
+        return None
+    if not glue.enabled("qsa_mask_hoist"):
+        # The one build-time line of the decision (the served log carries it beside the runtime's own lines).
+        logger.info(
+            "prefill slab QSA block masks derived per layer: qsa_mask_hoist is not named by {} "
+            "({} of masks per slab ({} rows, {} blocks), cap {})",
+            prefill_glue.ENV,
+            _mib(hoisted_mask_bytes(rows, blocks)),
+            rows,
+            blocks,
+            _mib(HOISTED_MASK_BYTES_MAX),
+        )
+        return None
+    view = ttnn.get_memory_view(mesh_device, ttnn.BufferType.DRAM)
+    free = int(view.total_bytes_free_per_bank) * int(view.num_banks)
+    admission = admit_hoisted_masks(
+        rows, blocks, free_bytes_per_device=free, slab_working_set=slab_working_set_bytes(rows)
+    )
+    logger.info(
+        "prefill slab QSA block masks {}: {}", "hoisted" if admission.hoist else "derived per layer", admission.reason
+    )
+    return admission
+
+
 @dataclass(frozen=True)
 class Qwen38TTNNQSAChunkConstants:
     """Replicated constants of one chunk form, one set per model per row count (about 2.3 MB at 8192 resident
@@ -1186,6 +1314,10 @@ class Qwen38TTNNQSAChunkConstants:
     arange_blocks_row: Any = None
     row_index_col: Any = None
     page_offsets: Any = None
+    # The slab's hoist decision for its QSA block masks (qsa_mask_hoist), taken once here by
+    # slab_hoisted_mask_admission; None for the chunk forms and when the policy does not name the form.
+    # derive_qsa_chunk_inputs hoists the masks when it says so and leaves them to the layers otherwise.
+    hoist_masks: Qwen38HoistedMaskAdmission | None = None
 
     @property
     def block_tiles(self) -> int:
@@ -1195,11 +1327,21 @@ class Qwen38TTNNQSAChunkConstants:
 
     @classmethod
     def build(
-        cls, mesh_device, mesh_contract: Qwen38MeshContract, allocated_compressed_blocks: int, *, rows: int = CHUNK_ROWS
+        cls,
+        mesh_device,
+        mesh_contract: Qwen38MeshContract,
+        allocated_compressed_blocks: int,
+        *,
+        rows: int = CHUNK_ROWS,
+        glue: prefill_glue.PrefillGluePolicy | None = None,
     ) -> "Qwen38TTNNQSAChunkConstants":
+        """``glue`` is the prefill glue policy (the process's by default): a slab's hoist admission is taken here."""
+
         mesh_contract.validate_mesh(mesh_device)
         host = qsa_chunk_constant_rows(allocated_compressed_blocks, rows)
         slab = is_slab_rows(rows)
+        blocks = int((host["arange_blocks_row"] if slab else host["row_index_blocks"]).shape[-1])
+        hoist_masks = slab_hoisted_mask_admission(mesh_device, rows, blocks, glue) if slab else None
         uploaded: list[Any] = []
 
         def upload_uint32(name: str, layout=ttnn.ROW_MAJOR_LAYOUT):
@@ -1225,9 +1367,7 @@ class Qwen38TTNNQSAChunkConstants:
 
         try:
             return cls(
-                allocated_compressed_blocks=int(
-                    (host["arange_blocks_row"] if slab else host["row_index_blocks"]).shape[-1]
-                ),
+                allocated_compressed_blocks=blocks,
                 rows=rows,
                 arange32_lanes=upload_uint32("arange32_lanes"),
                 block_start_lanes=upload_uint32("block_start_lanes"),
@@ -1249,6 +1389,7 @@ class Qwen38TTNNQSAChunkConstants:
                 arange_blocks_row=upload_uint32("arange_blocks_row", ttnn.TILE_LAYOUT),
                 row_index_col=upload_uint32("row_index_col"),
                 page_offsets=upload_uint32("page_offsets"),
+                hoist_masks=hoist_masks,
             )
         except BaseException:
             _deallocate(*uploaded)
@@ -1301,6 +1442,9 @@ class Qwen38TTNNQSAChunkInputs:
     # The slab: per row j the complete-block count (P + j + 1) // 4 as a UINT32 TILE column ``[1,1,rows,1]``; its
     # block mask is derived from it per score block (``indexer_neg_mask`` is None).
     complete_blocks_col: Any = None
+    # The slab under qsa_mask_hoist: the causal block mask of every SLAB_SCORE_BLOCK_ROWS-row score block, BF16
+    # ROW_MAJOR ``[1,1,512,blocks]``, derived once from ``complete_blocks_col`` and read by every QSA layer.
+    block_masks: tuple[Any, ...] = ()
 
     def deallocate(self) -> None:
         _deallocate(
@@ -1311,6 +1455,7 @@ class Qwen38TTNNQSAChunkInputs:
             self.row_fill,
             self.compressed_tile_i32,
             self.complete_blocks_col,
+            *self.block_masks,
         )
 
 
@@ -1335,19 +1480,49 @@ def _derive_slab_tile_inputs(position_scalar, chunk: Qwen38TTNNQSAChunkConstants
     return compressed_tile_i32, complete_blocks_col
 
 
+def slab_block_mask(complete_blocks_col, arange_blocks_row, start: int, value: float):
+    """The causal block mask of the SLAB_SCORE_BLOCK_ROWS-row score block at ``start``: block b of row j is hidden
+    when b >= complete(j), the comparison broadcasting the block index row against the block's complete-block column
+    (bitwise the chunk forms' row templates, measured 2026-09-09); ``value`` is what a hidden block's score gains.
+    The per-layer derivation and the per-slab hoist run this one function, so the hoisted masks are bitwise the
+    per-layer ones."""
+
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    complete_col = ttnn.slice(
+        complete_blocks_col, (0, 0, start, 0), (1, 1, start + SLAB_SCORE_BLOCK_ROWS, 1), memory_config=dram
+    )
+    invalid_bits = ttnn.ge(arange_blocks_row, complete_col, dtype=ttnn.uint32, memory_config=dram)
+    invalid = ttnn.typecast(invalid_bits, ttnn.bfloat16, memory_config=dram)
+    mask_tiled = ttnn.multiply(invalid, value, memory_config=dram)
+    mask = ttnn.to_layout(mask_tiled, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+    _deallocate(complete_col, invalid_bits, invalid, mask_tiled)
+    return mask
+
+
+def slab_scores_mask_value(glue: prefill_glue.PrefillGluePolicy) -> float:
+    """What a hidden block's score gains under the policy: the finite BF16 minimum after the all-reduce (the default
+    form), or the pre-reduce-scatter value of qsa_scores_rs_ag (added on every device before the sum)."""
+
+    return SLAB_SCORES_RS_MASK_VALUE if glue.enabled("qsa_scores_rs_ag") else INDEXER_MASK_VALUE
+
+
 def derive_qsa_chunk_inputs(
     position_scalar,
     constants: Qwen38TTNNQSAPositionConstants,
     chunk: Qwen38TTNNQSAChunkConstants,
     *,
     completed_blocks: int | None = None,
+    glue: prefill_glue.PrefillGluePolicy | None = None,
 ) -> Qwen38TTNNQSAChunkInputs:
     """:func:`derive_qsa_position_inputs` for the rows of a chunk: the same exact UINT32 ops on the
     same-shape templates, with ``P`` the only broadcast operand (``pos = row_index + P``).  The staging
     and ring one-hots have no chunk form: the slab and the compressed blocks are written whole.
     ``completed_blocks`` is the number of compressed block indices derived (P // 4 + i): the chunk's (eight at 32
-    rows, 32 at 128 rows: the default), or the two a verify pass can complete."""
+    rows, 32 at 128 rows: the default), or the two a verify pass can complete.  ``glue`` is the prefill glue policy
+    (the process's by default): it sets the mask value (``qsa_scores_rs_ag``); a slab's block masks are derived here,
+    once, when the chunk constants' hoist admission says so (``qsa_mask_hoist``, ``chunk.hoist_masks``)."""
 
+    glue = prefill_glue.policy() if glue is None else glue
     _require_shape(position_scalar, (1, 1, 1, 1), "QSA position scalar")
     if position_scalar.dtype != ttnn.uint32 or position_scalar.layout != ttnn.ROW_MAJOR_LAYOUT:
         raise RuntimeError(f"QSA position scalar must be UINT32 ROW_MAJOR, got {tensor_metadata(position_scalar)}")
@@ -1379,8 +1554,25 @@ def derive_qsa_chunk_inputs(
     compressed_tile_i32 = None
     complete_blocks_col = None
     slab = is_slab_rows(template_rows)
+    block_masks: tuple[Any, ...] = ()
     if slab:
         compressed_tile_i32, complete_blocks_col = _derive_slab_tile_inputs(position_scalar, chunk)
+        admission = chunk.hoist_masks
+        if admission is not None and admission.hoist:
+            # qsa_mask_hoist (a default): the masks depend on P and the row index only, so they are derived once per
+            # slab (bitwise the per-layer derivation: the same function on the same operands) and read by all QSA
+            # layers.  The admission (slab_hoisted_mask_admission, taken once with the chunk constants) leaves them
+            # to the layers past the byte cap or without the DRAM headroom.
+            if (admission.rows, admission.blocks) != (template_rows, blocks):
+                raise ValueError(
+                    f"the hoist admission was taken for {admission.rows} rows x {admission.blocks} blocks, the slab "
+                    f"derives {template_rows} x {blocks}"
+                )
+            value = slab_scores_mask_value(glue)
+            block_masks = tuple(
+                slab_block_mask(complete_blocks_col, chunk.arange_blocks_row, start, value)
+                for start in range(0, template_rows, SLAB_SCORE_BLOCK_ROWS)
+            )
     elif template_rows == LONG_CHUNK_ROWS:
         # P % 128 == 0: the chunk's 32 compressed rows are the cache's tile P / 128, one paged_fill_cache page.
         tile_index = ttnn.bitwise_right_shift(position_scalar, 7, memory_config=dram)
@@ -1456,6 +1648,7 @@ def derive_qsa_chunk_inputs(
         row_fill=row_fill,
         compressed_tile_i32=compressed_tile_i32,
         complete_blocks_col=complete_blocks_col,
+        block_masks=block_masks,
     )
     for name, tensor, shape, dtype, layout in (
         ("kv_block_start", kv_block_start, (1, 1, 1, 1), u32, ttnn.ROW_MAJOR_LAYOUT),
@@ -1471,6 +1664,10 @@ def derive_qsa_chunk_inputs(
             )
             if indexer_neg_mask is not None
             else (("complete_blocks_col", complete_blocks_col, (1, 1, template_rows, 1), u32, ttnn.TILE_LAYOUT),)
+        ),
+        *(
+            (f"block_masks[{i}]", mask, (1, 1, SLAB_SCORE_BLOCK_ROWS, blocks), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
+            for i, mask in enumerate(block_masks)
         ),
         ("row_keep_bits", row_keep_bits, (1, 1, template_rows, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
         ("row_fill", row_fill, (1, 1, template_rows, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
@@ -3029,6 +3226,8 @@ class Qwen38TTNNQSA:
         self.allocated_context = allocated_context
         self.allocated_compressed_blocks = allocated_context // COMPRESS_RATIO
         self.collective_topology = collective_topology or ttnn.Topology.Linear
+        # The prefill glue policy (QWEN38_PREFILL_GLUE), resolved once; read by the slab's block selection only.
+        self.glue = prefill_glue.policy()
         self._next_epoch = 1
         self._live_epochs: set[int] = set()
         self._next_view_id = 1
@@ -5141,8 +5340,17 @@ class Qwen38TTNNQSA:
             raise ValueError(f"the {rows}-row QSA chunk inputs carry no compressed tile index")
         if slab != (chunk.indexer_neg_mask is None) or slab != (chunk.complete_blocks_col is not None):
             raise ValueError("the slab's QSA chunk inputs carry the complete-block column, the chunks' the block mask")
+        if chunk.block_masks and (not slab or len(chunk.block_masks) != rows // SLAB_SCORE_BLOCK_ROWS):
+            raise ValueError(
+                f"hoisted QSA block masks are a slab form, one per {SLAB_SCORE_BLOCK_ROWS}-row score block; "
+                f"got {len(chunk.block_masks)} for {rows} rows"
+            )
         expected = (
             ("kv_block_start", chunk.kv_block_start, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
+            *(
+                (f"block_masks[{i}]", mask, (1, 1, SLAB_SCORE_BLOCK_ROWS, blocks), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
+                for i, mask in enumerate(chunk.block_masks)
+            ),
             *(
                 (
                     (
@@ -5469,12 +5677,20 @@ class Qwen38TTNNQSA:
     ):
         """The slab's block selection in ``SLAB_SCORE_BLOCK_ROWS``-row blocks: per block the query tiles scored
         (Sq = 32 calls), the score all-reduce, the causal block mask from the complete-block column by a broadcast
-        comparison, ``topk_large_indices``; then the sparse index rows over every row as the chunk forms build them."""
+        comparison, ``topk_large_indices``; then the sparse index rows over every row as the chunk forms build them.
+
+        Glue forms (``prefill_glue``, slab only): ``qsa_mask_hoist`` (a default) reads the masks ``chunk.block_masks``
+        carries (derived once per slab, bitwise these; the per-layer derivation below is the previous form and the
+        fallback when the hoist is not admitted); ``qsa_scores_rs_ag`` (tolerance) masks the local scores, sums them
+        by a reduce-scatter over the block's rows (hop order, in place of the all-broadcast + device-order local sum),
+        ranks each device's 128 rows and gathers the block ids: 1/3 of the score payload crosses the line."""
 
         dram = ttnn.DRAM_MEMORY_CONFIG
         rows = constants.rows
         blocks = self.allocated_compressed_blocks
         block_ids_parts = []
+        scores_rs_ag = self.glue.enabled("qsa_scores_rs_ag")
+        mask_value = slab_scores_mask_value(self.glue)
         for start in range(0, rows, SLAB_SCORE_BLOCK_ROWS):
             score_tiles = []
             for tile_start in range(start, start + SLAB_SCORE_BLOCK_ROWS, CHUNK_ROWS):
@@ -5504,25 +5720,47 @@ class Qwen38TTNNQSA:
                 replicated_reference=state.compressed_index_cache,
                 expected_shape=(1, 1, SLAB_SCORE_BLOCK_ROWS, blocks),
             )
+            # The mask: block b of row j is hidden when b >= complete(j) (slab_block_mask), the layer's own or
+            # the hoisted one (bitwise: the same function on the same operands, once per slab).  The per-layer form
+            # (``today``, and the fallback) derives it after the all-reduce, as before the forms; the payload cut
+            # needs it before its sum.
+            hoisted = bool(chunk.block_masks)
+            if scores_rs_ag:
+                # Tolerance: the four devices' scores summed in the reduce-scatter's hop order (BF16), not by the
+                # composite's fp32 device-order local sum.  Masked before the sum on every device (a hidden block
+                # is exactly -2^100 per device, -2^102 after: SLAB_SCORES_RS_MASK_VALUE); visible blocks gain 0.0.
+                mask = (
+                    chunk.block_masks[start // SLAB_SCORE_BLOCK_ROWS]
+                    if hoisted
+                    else slab_block_mask(chunk.complete_blocks_col, constants.arange_blocks_row, start, mask_value)
+                )
+                masked_local = ttnn.add(score_rows, mask, memory_config=dram, fast_and_approximate_mode=False)
+                _deallocate(score_rows, *(() if hoisted else (mask,)))
+                masked_tiled = ttnn.to_layout(masked_local, ttnn.TILE_LAYOUT, memory_config=dram)
+                _deallocate(masked_local)
+                summed_rows = ttnn.reduce_scatter(
+                    masked_tiled, dim=2, cluster_axis=TP_AXIS, memory_config=dram, topology=self.collective_topology
+                )
+                _deallocate(masked_tiled)
+                masked = ttnn.to_layout(summed_rows, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+                _deallocate(summed_rows)
+                _require_shape(masked, (1, 1, SLAB_SCORE_BLOCK_ROWS // TP_SIZE, blocks), "masked QSA slab score rows")
+                local_ids = ttnn.experimental.topk_large_indices(masked, k=BLOCK_TOPK)
+                _deallocate(masked)
+                block_ids_parts.append(ttnn.all_gather(local_ids, dim=2, cluster_axis=TP_AXIS, memory_config=dram))
+                _deallocate(local_ids)
+                continue
             scores = ttnn.all_reduce(
                 score_rows, cluster_axis=TP_AXIS, memory_config=dram, topology=self.collective_topology
             )
             _deallocate(score_rows)
-            # The mask: block b of row j is hidden when b >= complete(j); the comparison broadcasts the block index
-            # row against the block's complete-block column (bitwise the row templates, measured 2026-09-09).
-            complete_col = ttnn.slice(
-                chunk.complete_blocks_col,
-                (0, 0, start, 0),
-                (1, 1, start + SLAB_SCORE_BLOCK_ROWS, 1),
-                memory_config=dram,
+            mask = (
+                chunk.block_masks[start // SLAB_SCORE_BLOCK_ROWS]
+                if hoisted
+                else slab_block_mask(chunk.complete_blocks_col, constants.arange_blocks_row, start, mask_value)
             )
-            invalid_bits = ttnn.ge(constants.arange_blocks_row, complete_col, dtype=ttnn.uint32, memory_config=dram)
-            invalid = ttnn.typecast(invalid_bits, ttnn.bfloat16, memory_config=dram)
-            mask_tiled = ttnn.multiply(invalid, INDEXER_MASK_VALUE, memory_config=dram)
-            mask = ttnn.to_layout(mask_tiled, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
-            _deallocate(complete_col, invalid_bits, invalid, mask_tiled)
             masked = ttnn.add(scores, mask, memory_config=dram, fast_and_approximate_mode=False)
-            _deallocate(scores, mask)
+            _deallocate(scores, *(() if hoisted else (mask,)))
             _require_shape(masked, (1, 1, SLAB_SCORE_BLOCK_ROWS, blocks), "masked QSA slab block scores")
             block_ids_parts.append(ttnn.experimental.topk_large_indices(masked, k=BLOCK_TOPK))
             _deallocate(masked)

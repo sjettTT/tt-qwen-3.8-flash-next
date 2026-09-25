@@ -166,12 +166,16 @@ def test_chunk_constants_and_inputs_declare_the_device_fields() -> None:
         "arange_blocks_row",
         "row_index_col",
         "page_offsets",
+        # The slab's hoist decision for its block masks (qsa_mask_hoist; None for the chunk forms).
+        "hoist_masks",
     )
     # compressed_tile_i32: the 128-row chunk's / the slab's page table (None for the 32-row forms);
-    # complete_blocks_col: the slab's mask column (None for the chunk forms).
+    # complete_blocks_col: the slab's mask column (None for the chunk forms); block_masks: the slab's hoisted
+    # block masks under the qsa_mask_hoist glue form (empty otherwise).
     assert tuple(Qwen38TTNNQSAChunkInputs.__dataclass_fields__) == ("rows",) + CHUNK_INPUT_FIELDS + (
         "compressed_tile_i32",
         "complete_blocks_col",
+        "block_masks",
     )
     build = inspect.getsource(Qwen38TTNNQSAChunkConstants.build)
     assert "_upload_uint32(" in build and "replicate_tensor_2d_mesh_mapper(mesh_device)" in build

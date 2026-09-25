@@ -1037,10 +1037,12 @@ def test_rows_paths_never_upload_or_take_per_pass_host_ints() -> None:
     assert keywords["output_head_major"] == "True"  # the kernel's TILE layout; no untilize / RM permute
     assert keywords["initial_state"] == "initial_state" and keywords["scale"] == "HEAD_DIM ** (-0.5)"
     assert all(keywords[name] == f"constants.{name}" for name in ("eye", "tril", "ones", "masks"))
+    # q_rows / k_rows are rows_state.q / rows_state.k, or their rank-3 token-major flat views under the slab's
+    # gdn_qk_flat glue form (test_ttnn_prefill_glue_no_device pins the conditional); v_rows is the flat view of v.
     assert [ast.unparse(argument) for argument in chunk_call.args] == [
-        "rows_state.q",
-        "rows_state.k",
-        "v_rows",  # the rank-3 token-major flat view of rows_state.v
+        "q_rows",
+        "k_rows",
+        "v_rows",
         "g_rows",
         "beta_rows",
     ]

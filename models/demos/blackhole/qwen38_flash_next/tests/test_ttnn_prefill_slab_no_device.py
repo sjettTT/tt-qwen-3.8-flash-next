@@ -369,8 +369,18 @@ def test_slab_source_pins() -> None:
         in blocks
     )
     slab_select = inspect.getsource(qsa_module.Qwen38TTNNQSA._sparse_indices_slab)
-    assert "ttnn.all_reduce(" in slab_select and "ttnn.ge(constants.arange_blocks_row, complete_col" in slab_select
-    assert "ttnn.experimental.topk_large_indices(masked, k=BLOCK_TOPK)" in slab_select
+    assert (
+        "ttnn.all_reduce(" in slab_select
+        and "ttnn.experimental.topk_large_indices(masked, k=BLOCK_TOPK)" in slab_select
+    )
+    # Re-pinned with the prefill glue forms: the broadcast comparison moved into slab_block_mask so that the per-slab
+    # hoist (qsa_mask_hoist, a default) and the per-layer derivation (``today``, and the fallback when the hoist is
+    # not admitted) run one function; the per-layer branch of _sparse_indices_slab still derives it per block after
+    # the all-reduce.
+    assert "slab_block_mask(chunk.complete_blocks_col, constants.arange_blocks_row, start, mask_value)" in slab_select
+    block_mask = inspect.getsource(qsa_module.slab_block_mask)
+    assert "ttnn.ge(arange_blocks_row, complete_col" in block_mask and "ttnn.multiply(invalid, value" in block_mask
+    assert slab_select.index("ttnn.all_reduce(") < slab_select.rindex("slab_block_mask(")
     assert qsa_module.SLAB_SCORE_BLOCK_ROWS == 512
     forward = inspect.getsource(qsa_module.Qwen38TTNNQSA.forward_chunk_generic)
     assert (

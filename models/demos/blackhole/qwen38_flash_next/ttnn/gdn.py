@@ -41,6 +41,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     require_lane_count,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
+from models.demos.blackhole.qwen38_flash_next.ttnn import prefill_glue
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     DENSE_DTYPE_TAGS,
     TWO_READER_QUALIFIED_DTYPES,
@@ -1050,6 +1051,15 @@ def build_rows_selectors(accepted, constants: Qwen38TTNNGDNRowsConstants) -> Qwe
     return selectors
 
 
+def rows_qk_layout(tile_rows: int, flat_qk: bool) -> tuple[tuple[int, ...], int]:
+    """The rows state's q/k local shape and mesh shard dim: token-major heads ``[1, T, 12, 128]`` (shard dim 2), or
+    under the slab's gdn_qk_flat form the raw conv rows ``[1, 1, T, 512]`` (shard dim 3), the kernel's flat form."""
+
+    if flat_qk:
+        return (1, 1, tile_rows, QK_WIDTH_PER_DEVICE), 3
+    return (1, tile_rows, VALUE_HEADS_PER_DEVICE, HEAD_DIM), 2
+
+
 @dataclass
 class Qwen38TTNNGDNRowsState:
     """Per-layer persistent buffers of the ``rows``-row path (fixed addresses across passes).
@@ -1067,7 +1077,9 @@ class Qwen38TTNNGDNRowsState:
     constants: Qwen38TTNNGDNRowsConstants
     history: Any  # [1, 1, CHUNK_SIZE, QKV_WIDTH_PER_DEVICE] BF16, rows 0..CONV_HISTORY_ROWS-1 valid
     qkv: Any  # [1, 1, T, QKV_WIDTH_PER_DEVICE] BF16
-    q: Any  # [1, T, VALUE_HEADS_PER_DEVICE, HEAD_DIM] BF16, l2-normalized, GQA-expanded
+    # [1, T, VALUE_HEADS_PER_DEVICE, HEAD_DIM] BF16, l2-normalized, GQA-expanded; under flat_qk (the slab's
+    # gdn_qk_flat form) [1, 1, T, QK_WIDTH_PER_DEVICE] BF16, the raw conv q/k the kernel normalizes itself
+    q: Any
     k: Any
     v: Any  # [1, 1, T, VALUE_WIDTH_PER_DEVICE] BF16, token-major flat (head h at columns 128h..)
     beta: Any  # [1, 1, T, VALUE_HEADS_PER_DEVICE] FP32
@@ -1080,6 +1092,8 @@ class Qwen38TTNNGDNRowsState:
     # False: the pass buffers (qkv, q, k, v, beta, g, output) are another layer's slab rows state's; the slab's
     # layers run one after another, so the 35 GDN layers share one set (52 MB at 2048 rows) and keep their histories.
     owns_body: bool = True
+    # The slab's gdn_qk_flat form (prefill_glue, tolerance): q/k are the raw conv rows in the kernel's flat form.
+    flat_qk: bool = False
 
     @classmethod
     def allocate(
@@ -1091,16 +1105,22 @@ class Qwen38TTNNGDNRowsState:
         layer_index: int,
         history=None,
         body: "Qwen38TTNNGDNRowsState | None" = None,
+        flat_qk: bool = False,
     ) -> "Qwen38TTNNGDNRowsState":
         """``history`` hands over another rows state's history buffer (same layer): the two row forms then carry
         one FIR history and need no sync between them.  ``body`` hands over another layer's slab rows state whose
-        pass buffers this layer reuses (slab rows only)."""
+        pass buffers this layer reuses (slab rows only).  ``flat_qk`` allocates q/k in the kernel's flat form (slab
+        rows only; a shared body carries its own setting)."""
 
         mesh_contract.validate_mesh(mesh_device)
         if constants.mesh_contract != mesh_contract:
             raise ValueError("GDN rows constants belong to a different physical mesh contract")
         if body is not None and (not is_slab_rows(constants.rows) or body.constants is not constants):
             raise ValueError("a shared GDN rows body is a slab option over the same constants")
+        if flat_qk and not is_slab_rows(constants.rows):
+            raise ValueError("flat q/k rows buffers are a slab option (gdn_qk_flat)")
+        if body is not None and body.flat_qk != flat_qk:
+            raise ValueError("a shared GDN rows body and its layer disagree on flat q/k")
         allocated: list[Any] = []
 
         def zero(local_shape: tuple[int, ...], dtype, shard_dim: int, label: str):
@@ -1111,7 +1131,7 @@ class Qwen38TTNNGDNRowsState:
             return tensor
 
         tile_rows = constants.tile_rows
-        qk_shape = (1, tile_rows, VALUE_HEADS_PER_DEVICE, HEAD_DIM)
+        qk_shape, qk_shard_dim = rows_qk_layout(tile_rows, flat_qk)
         try:
             result = cls(
                 layer_index=layer_index,
@@ -1126,8 +1146,8 @@ class Qwen38TTNNGDNRowsState:
                     if body is not None
                     else zero((1, 1, tile_rows, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows qkv")
                 ),
-                q=body.q if body is not None else zero(qk_shape, ttnn.bfloat16, 2, "GDN rows q"),
-                k=body.k if body is not None else zero(qk_shape, ttnn.bfloat16, 2, "GDN rows k"),
+                q=body.q if body is not None else zero(qk_shape, ttnn.bfloat16, qk_shard_dim, "GDN rows q"),
+                k=body.k if body is not None else zero(qk_shape, ttnn.bfloat16, qk_shard_dim, "GDN rows k"),
                 v=(
                     body.v
                     if body is not None
@@ -1151,6 +1171,7 @@ class Qwen38TTNNGDNRowsState:
                 mesh_contract=mesh_contract,
                 owns_history=history is None,
                 owns_body=body is None,
+                flat_qk=flat_qk,
             )
             result.validate()
             return result
@@ -1163,11 +1184,12 @@ class Qwen38TTNNGDNRowsState:
         if len({_tensor_key(tensor) for tensor in owned}) != len(owned):
             raise RuntimeError("GDN rows state requires eight distinct backing tensors")
         tile_rows = self.constants.tile_rows
+        qk_shape, qk_shard_dim = rows_qk_layout(tile_rows, self.flat_qk)
         expected = {
             "history": ((1, 1, CHUNK_SIZE, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3),
             "qkv": ((1, 1, tile_rows, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3),
-            "q": ((1, tile_rows, VALUE_HEADS_PER_DEVICE, HEAD_DIM), ttnn.bfloat16, 2),
-            "k": ((1, tile_rows, VALUE_HEADS_PER_DEVICE, HEAD_DIM), ttnn.bfloat16, 2),
+            "q": (qk_shape, ttnn.bfloat16, qk_shard_dim),
+            "k": (qk_shape, ttnn.bfloat16, qk_shard_dim),
             "v": ((1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE), ttnn.bfloat16, 3),
             "beta": ((1, 1, tile_rows, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3),
             "g": ((1, 1, tile_rows, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3),
@@ -1632,6 +1654,8 @@ class Qwen38TTNNGDN:
         )
         # projection -> gated output: the composed chain, or the fused kernel when QWEN38_FUSED names gdn_step
         self._step = fused.resolve("gdn_step")
+        # The prefill glue policy (QWEN38_PREFILL_GLUE), resolved once; read when a slab rows state is allocated.
+        self.glue = prefill_glue.policy()
 
     def allocate_state(self) -> Qwen38TTNNGDNState:
         return Qwen38TTNNGDNState.allocate(
@@ -2282,6 +2306,8 @@ class Qwen38TTNNGDN:
     def allocate_rows_state(
         self, constants: Qwen38TTNNGDNRowsConstants, *, history=None, body: Qwen38TTNNGDNRowsState | None = None
     ) -> Qwen38TTNNGDNRowsState:
+        # gdn_qk_flat (prefill_glue, tolerance) is a slab form: the chunk rows states keep the head-major q/k.
+        flat_qk = is_slab_rows(constants.rows) and self.glue.enabled("gdn_qk_flat")
         return Qwen38TTNNGDNRowsState.allocate(
             self.mesh_device,
             self.mesh_contract,
@@ -2289,6 +2315,7 @@ class Qwen38TTNNGDN:
             layer_index=self.weights.layer_index,
             history=history,
             body=body,
+            flat_qk=flat_qk,
         )
 
     def _validate_rows_state(self, rows_state: Qwen38TTNNGDNRowsState) -> int:
@@ -2562,8 +2589,16 @@ class Qwen38TTNNGDN:
         )
         _deallocate(conv)
         # Heads on dim 2 ([B, T, H, K], the kernel's token-major form); the tile padding of the head
-        # axis is zeroed so no padding value reaches the kernel's head split.
+        # axis is zeroed so no padding value reaches the kernel's head split.  Under the slab's gdn_qk_flat form
+        # (prefill_glue, tolerance) the raw conv q/k land token-major [1, 1, T, 512] instead: the kernel's flat
+        # form maps value head hv to key head hv // 3 at read time and l2-normalizes q/k over K in fp32 with the
+        # scale folded in, in place of the chain's 0/1 expand, BF16 rms_norm and BF16 scale below.
         for name, source, target in (("query", q_slice, rows_state.q), ("key", k_slice, rows_state.k)):
+            if rows_state.flat_qk:
+                landed = ttnn.multiply(source, constants.row_mask_bf16_col, output_tensor=target)
+                _require_landed(landed, target, label=f"GDN rows flat {name}")
+                _deallocate(source)
+                continue
             expanded = ttnn.matmul(
                 source, constants.qk_expand, memory_config=l1, compute_kernel_config=self.compute_config
             )
@@ -2640,9 +2675,13 @@ class Qwen38TTNNGDN:
         beta_rows = ttnn.reshape(beta, (1, tile_rows, VALUE_HEADS_PER_DEVICE))
         g_rows = ttnn.reshape(g, (1, tile_rows, VALUE_HEADS_PER_DEVICE))
         v_rows = ttnn.reshape(rows_state.v, (1, tile_rows, VALUE_WIDTH_PER_DEVICE))
+        # gdn_qk_flat: the rank-3 views [1, T, 512] select the composite's flat q/k form (its own reader mapping
+        # and in-kernel l2 norm with ``scale`` folded in); otherwise the head-major buffers as they are.
+        q_rows = ttnn.reshape(rows_state.q, (1, tile_rows, QK_WIDTH_PER_DEVICE)) if rows_state.flat_qk else rows_state.q
+        k_rows = ttnn.reshape(rows_state.k, (1, tile_rows, QK_WIDTH_PER_DEVICE)) if rows_state.flat_qk else rows_state.k
         output, final_state = ttnn.transformer.chunk_gated_delta_rule(
-            rows_state.q,
-            rows_state.k,
+            q_rows,
+            k_rows,
             v_rows,
             g_rows,
             beta_rows,
@@ -2887,9 +2926,12 @@ class Qwen38TTNNGDN:
 
         The rows buffers already hold the l2-normalized, GQA-expanded BF16 q/k (the 12 head rows the 1-row
         path's repeat_interleave produces), so this starts at the step's FP32 promotion: the same ops,
-        program and compute configs from there on (bitwise the 1-row path's state update).
+        program and compute configs from there on (bitwise the 1-row path's state update).  A flat q/k rows
+        state (the slab's gdn_qk_flat form) holds raw conv rows and has no 1-row step.
         """
 
+        if rows_state.flat_qk:
+            raise ValueError("the 1-row step reads head-major normalized q/k: not a flat q/k (gdn_qk_flat) rows state")
         l1 = ttnn.L1_MEMORY_CONFIG
         # Only the state update is needed (no q read): k, v, beta and the log decay of the row.
         k_row_tile = ttnn.slice(

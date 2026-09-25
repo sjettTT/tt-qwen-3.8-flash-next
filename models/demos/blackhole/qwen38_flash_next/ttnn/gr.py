@@ -59,6 +59,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     require_lane_count,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
+from models.demos.blackhole.qwen38_flash_next.ttnn import prefill_glue
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
@@ -466,6 +467,8 @@ class Qwen38TTNNGatedResidual:
         self.tt_ccl = tt_ccl
         self.collective_topology = collective_topology or ttnn.Topology.Linear
         self.prefill_dense = Qwen38TTNNPrefillDense.resolve(prefill_dense, mesh_device)
+        # The prefill glue policy (QWEN38_PREFILL_GLUE), resolved once; read by read_rows' slab branch only.
+        self.glue = prefill_glue.policy()
         self.compute_config = ttnn.init_device_compute_kernel_config(
             mesh_device.arch(),
             math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -953,26 +956,47 @@ class Qwen38TTNNGatedResidual:
                 f"got {_shape(partial)}/{_padded_shape(partial)} {partial.dtype} {partial.layout}"
             )
         # The 1-row partial reduction over the row tiles: the same gather + fast reduce, the logical shape
-        # already the padded one.
-        gathered = ttnn.experimental.all_gather_async(
-            partial,
-            persistent_output_buffer=None,
-            dim=0,
-            multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(TP_AXIS),
-            num_links=self.tt_ccl.get_num_links(TP_AXIS),
-            cluster_axis=TP_AXIS,
-            memory_config=dram,
-            topology=ttnn.Topology.Linear,
-            barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(TP_AXIS),
-            chunks_per_sync=1,
-            num_workers_per_link=1,
-            num_buffers_per_channel=2,
-        )
-        _deallocate(partial)
-        reduced = ttnn.experimental.fast_reduce_nc(
-            gathered, dims=[0], output=None, compute_kernel_config=self.compute_config, memory_config=dram
-        )
-        _deallocate(gathered)
+        # already the padded one.  Slab glue forms (prefill_glue): gr_gather_generic (a default; 0.23 ms per read
+        # against the async op's 0.59 at one worker and one chunk per sync, ``today``) / gr_gather_tuned gather the
+        # same [4, rows, 384] fp32 bytes into the same page order by the generic op or by the async op with two
+        # workers per link and ten chunks per sync, and fast_reduce_nc reads the same tensor (bitwise: data
+        # movement); gr_partial_rs_ag (tolerance) sums the partials by a reduce-scatter over the rows + all-gather,
+        # in the collective's hop order instead of fast_reduce_nc's device order.
+        if slab and self.glue.enabled("gr_partial_rs_ag"):
+            scattered = ttnn.reduce_scatter(
+                partial, dim=2, cluster_axis=TP_AXIS, memory_config=dram, topology=ttnn.Topology.Linear
+            )
+            _deallocate(partial)
+            reduced = ttnn.all_gather(scattered, dim=2, cluster_axis=TP_AXIS, memory_config=dram)
+            _deallocate(scattered)
+        else:
+            if slab and self.glue.enabled("gr_gather_generic"):
+                gathered = ttnn.all_gather(partial, dim=0, cluster_axis=TP_AXIS, memory_config=dram)
+            else:
+                tuned = slab and self.glue.enabled("gr_gather_tuned")
+                gathered = ttnn.experimental.all_gather_async(
+                    partial,
+                    persistent_output_buffer=None,
+                    dim=0,
+                    multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(TP_AXIS),
+                    num_links=self.tt_ccl.get_num_links(TP_AXIS),
+                    cluster_axis=TP_AXIS,
+                    memory_config=dram,
+                    topology=ttnn.Topology.Linear,
+                    barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(TP_AXIS),
+                    chunks_per_sync=10 if tuned else 1,
+                    num_workers_per_link=2 if tuned else 1,
+                    num_buffers_per_channel=2,
+                )
+            _deallocate(partial)
+            if slab and _shape(gathered) != (TP_SIZE, 1, rows, PARTIAL_WIDTH):
+                raise RuntimeError(
+                    f"GR rows partial gather returned {_shape(gathered)}, expected [4,1,{rows},{PARTIAL_WIDTH}]"
+                )
+            reduced = ttnn.experimental.fast_reduce_nc(
+                gathered, dims=[0], output=None, compute_kernel_config=self.compute_config, memory_config=dram
+            )
+            _deallocate(gathered)
         if rows < CHUNK_ROWS and _shape(reduced) == partial_rows_padded:
             reduced = ttnn.reshape(reduced, partial_rows_shape, reduced.padded_shape)  # the tile reported as rows
         self.mesh_contract.validate_tensor(reduced, placement=TensorPlacement.REPLICATED)

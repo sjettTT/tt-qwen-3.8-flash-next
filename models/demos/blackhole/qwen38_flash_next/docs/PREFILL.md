@@ -103,6 +103,57 @@ Memory: the slab state adds about 200 MB per device at 32k (one set of GDN pass 
 the PLE rows, the QSA slab constants and kept rows, the slab trace); the transients inside a layer peak around
 150 MB (about 350 MB at 256k, where the score all-reduce per 512-row block is the largest).
 
+## Glue forms (`QWEN38_PREFILL_GLUE`)
+
+Read program by program, the slab body's non-MoE time is glue around a few kernels: the gated-residual read's
+gather, the QSA block selection's masks and score sums, the GDN q/k preparation.  The glue forms are other
+arrangements of the same ops for those terms, read only by the slab body (the decode path and the 32/128-row bodies
+never see one).  Bitwise forms keep every output element's arithmetic and reduction order; tolerance forms move a
+summation order or a rounding point and are judged like the slab itself (`NUMERICS.md`, the long windows against the
+references).
+
+The two bitwise forms run by default.  Measured on the 4-chip line (1x4 p150, a 32k context, `--prefill-slab 2048`,
+2026-09-25) against the previous slab body in the same process form: the acceptance pins 12/12 identical; the device
+column of the agreement corpus's two long windows identical at all 160 scored positions (KL 0.0, top-1 1.0 between
+the two columns; both 0.9812 / 0.0225 top-1 / KL against the HF reference); the slab's kernel time 1584.6 -> 1524.3 ms
+per 2048-row slab (-60.3 ms, -3.8 %: the gather 34.0 of it, the hoist 26.5, additive to 0.2 ms), 1283 -> 1334 prompt
+tokens per second on the body, TTFT at 32k 27.57 -> 26.64 s (-3.4 %), 220 fewer programs per slab.  On the landed
+base (BF8 dense weights, the compact expert layout, two DRAM readers per bank; 2026-09-25) the same pair measured in
+the served path: TTFT 24.55 -> 23.64 s at 31,716 tokens (0.773 -> 0.744 ms per prompt token, -3.7 %) and 1.979 ->
+1.910 s at 2,118 tokens, with the acceptance pins 12/12, all 3,232 scored positions of the agreement corpus and the
+four probe completions identical between the two bodies.
+`QWEN38_PREFILL_GLUE=today` restores the previous slab body; `QWEN38_PREFILL_GLUE=<name>[,...]` runs exactly the
+named forms (a list that wants a default form names it); an unknown name, an exclusive pair or `today` beside a name
+refuses to start.
+
+- `gr_gather_generic` (bitwise, default) / `gr_gather_tuned` (bitwise, exclusive with it): the gated-residual read
+  gathers its fp32 partials with the generic `all_gather` (0.23 ms per read at 42 GB/s of ingress), or with the async
+  op at two workers per link and ten chunks per sync, instead of `today`'s async op at one worker and one chunk per
+  sync (the slowest collective of the slab: 0.59 ms per read at 16 GB/s of ingress, 96 reads per slab).  The gathered
+  bytes and their page order are the same; the reduce that follows reads the same tensor.
+- `qsa_mask_hoist` (bitwise, default): the QSA block selection's causal block masks depend on the position and the row
+  index only, so they are derived once per slab and read by all twelve QSA layers instead of derived in each (26.5 ms
+  per slab of mask ops).  The masks hold 1 KiB per token of context at 2048 rows: 32 MiB at a 32k context, 64 MiB at
+  64k, 128 MiB at 128k, 256 MiB at 256k.  The hoist is admitted once, when the slab's QSA chunk constants are built
+  after the model (`hoist_masks` on them, with the numbers; one log line at the build names the decision and
+  its numbers in the same words): the masks must be within the 64 MiB cap
+  (`HOISTED_MASK_BYTES_MAX`) and the DRAM free per device at that point must hold them plus the slab's working set
+  (the dense-linear admission's term: 988.5 MiB at 2048 rows).  So contexts to 64k hoist their masks when that DRAM
+  is free; 128k and 256k contexts, or a process short of the headroom, derive the masks per layer as before (the
+  bitwise slab body either way; only the mask programs' count differs).
+- `qsa_scores_rs_ag` (tolerance, off): each 512-row score block's four device partials are masked on every device,
+  summed by a `reduce_scatter` over the block's rows, ranked per device on its 128 rows and the block ids gathered, in
+  place of broadcasting every device's scores to every device and summing locally.  A third of the score payload
+  crosses the line; the four terms are summed in the collective's hop order, so a near-tie between two blocks can
+  rank the other way and change that layer's attention set for that row.
+- `gr_partial_rs_ag` (tolerance, off): the gated-residual partials are summed by `reduce_scatter` + `all_gather`
+  instead of the gather + device-order reduce; the four fp32 terms are summed in hop order.  It supersedes the gather
+  forms when both are named.
+- `gdn_qk_flat` (tolerance, off): the GDN chunk kernel takes the raw convolution q/k rows in its flat form and maps
+  value heads to key heads and l2-normalizes them itself, in fp32 with the scale folded in, in place of the model's
+  0/1 expand, bf16 `rms_norm` and bf16 scale (about 66 ms per slab of the model's and the kernel adapter's glue).  The
+  normalized values differ by bf16 rounding and the recurrent state carries the difference into the decode.
+
 ## Running it
 
 ```
