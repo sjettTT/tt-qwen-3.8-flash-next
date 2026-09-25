@@ -164,6 +164,25 @@ def _log(event: str, **fields: Any) -> None:
     print(json.dumps({"utc": utc_now(), "event": event, **fields}, sort_keys=True), flush=True)
 
 
+# MTP drafting for sampled requests: on by default on an --mtp --sampling server (the split verify is captured and the
+# pass loop drafts for sampled requests by exact speculative sampling); QWEN38_MTP_SAMPLED=0 restores the plain sampled
+# path (the fused verify, sampled requests on the 1-row loop).  A server without --mtp or without --sampling has no
+# drafting for sampled requests: unset resolves to off there and an explicit 1 is refused at start.  Any other value is
+# refused.
+MTP_SAMPLED_VARIABLE = "QWEN38_MTP_SAMPLED"
+
+
+def mtp_sampled_switch(environment: Mapping[str, str], *, applicable: bool = True) -> bool:
+    """The switch's resolution; ``applicable``: the server runs with ``--mtp`` and ``--sampling``."""
+
+    value = environment.get(MTP_SAMPLED_VARIABLE)
+    if value is None:
+        return applicable
+    if value not in ("0", "1"):
+        raise SystemExit(f"{MTP_SAMPLED_VARIABLE} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
 # -- requests and responses ----------------------------------------------------------------------
 
 
@@ -1645,6 +1664,11 @@ def main() -> int:
     ):
         if os.environ.get(name) != expected:
             raise SystemExit(f"{name} is {os.environ.get(name)!r}, expected {expected!r}")
+    mtp_sampled = mtp_sampled_switch(os.environ, applicable=args.mtp is not None and bool(args.sampling))
+    if mtp_sampled and (args.mtp is None or not args.sampling):
+        raise SystemExit(
+            f"{MTP_SAMPLED_VARIABLE}=1 needs --mtp and --sampling (the pass loop drafts for sampled requests)"
+        )
     profiler = tuple(name for name in PROFILER_VARIABLES if os.environ.get(name) is not None)
     if profiler:
         raise SystemExit(f"profiler instrumentation is set: {profiler}")
@@ -1731,8 +1755,12 @@ def main() -> int:
             "k": args.mtp,
             "anchor": args.mtp_gdn_anchor if args.mtp is not None else None,
             "admission": mtp_admission,
+            "sampled": mtp_sampled,
         },
-        "system_fingerprint": f"{runtime['head'][:12]}-{runtime['extension_sha256'][:12]}",
+        # What a seed reproduces against: the source head and the runtime; with the pass loop drafting for sampled
+        # requests the draw order is the pass's, so the switch and k are part of the identity.
+        "system_fingerprint": f"{runtime['head'][:12]}-{runtime['extension_sha256'][:12]}"
+        + (f"-mtp{args.mtp}-sampled" if mtp_sampled else ""),
     }
     if args.validate_only:
         print(json.dumps({"status": "pass", "mesh_open_requested": False, **summary}, sort_keys=True))
@@ -1820,6 +1848,7 @@ def main() -> int:
             mtp=args.mtp,
             mtp_gdn_anchor=args.mtp_gdn_anchor,
             device_sampler=bool(args.device_sampler),
+            mtp_sampled=mtp_sampled,
         )
         if chain.allocated_context != resident_context.allocated_context:
             raise Qwen38ChatChainError(
@@ -1834,6 +1863,8 @@ def main() -> int:
             raise Qwen38ChatChainError(f"session device sampler vs requested {args.device_sampler}")
         if (session.mtp is not None) != (args.mtp is not None):
             raise Qwen38ChatChainError(f"session mtp {session.mtp is not None} vs requested {args.mtp}")
+        if session.mtp is not None and session.mtp.sampled != mtp_sampled:
+            raise Qwen38ChatChainError(f"session mtp sampled {session.mtp.sampled} vs requested {mtp_sampled}")
         if session.context_limit != resident_context.context_limit:
             raise Qwen38ChatChainError(
                 f"session context limit {session.context_limit} vs the build's {resident_context.context_limit}"
@@ -1863,6 +1894,7 @@ def main() -> int:
                 else {
                     "k": chain.mtp.drafts,
                     "anchor": chain.mtp.anchor,
+                    "sampled": chain.mtp.sampled,
                     "traces": len(chain.mtp.captured_trace_ids()),
                     "capture_ms": chain.mtp.capture_ms,
                     "trace_dram_bytes_per_bank": chain.mtp.trace_dram_bytes_per_bank,

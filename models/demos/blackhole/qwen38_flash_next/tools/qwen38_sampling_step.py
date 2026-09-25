@@ -47,6 +47,14 @@ Request fields (``parameters_from_request``; ``extra_body`` keys are merged by t
                                                                                           the full value by -log of their mass);
                                                                                           sampled requests only
     n                                        1                                            n != 1 refused (one traced chain)
+
+MTP drafting for sampled requests (the default on an ``--mtp --sampling`` server; ``QWEN38_MTP_SAMPLED=0`` turns it
+off): the pass loop of ``tools/qwen38_chat_session.py`` runs the split verify and asks :func:`accept_pass` for the
+verdict on every pass, the point-mass acceptance (``ttnn/speculative_sampling.py``) over the k + 1 rows' candidate
+distributions (the same processors as :func:`choose_token`, the row's history the committed stream plus the pass's
+earlier rows); a row the candidate guard cannot bound is sampled over the eagerly gathered verify logits.
+:func:`drafting_admission` names the requests the pass loop does not serve (``top_k`` 0, a boosting penalty, logprobs,
+the device-sampler loop): they take the 1-row loop above with the reason in ``qwen38.sampling.mtp_drafting``.
 """
 
 from __future__ import annotations
@@ -71,7 +79,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.device_sampler import (
     device_sampler_reference,
     sample_on_device,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import (
+    SAMPLING_CANDIDATE_ROW_SHAPE,
+    ZERO_EMBEDDING_TOKEN,
     Qwen38ShardedLogits,
     Qwen38TTNNLMHead,
     Qwen38TTNNSamplingCandidateConstants,
@@ -83,10 +94,17 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.sampling import (
     Qwen38CandidateFallback,
     Qwen38CandidateRow,
     Qwen38CandidateSample,
+    Qwen38RowDistribution,
     Qwen38SamplingParameters,
     UniformStream,
+    candidate_distribution,
+    full_distribution,
     sample_candidates,
     sample_full_vocabulary,
+)
+from models.demos.blackhole.qwen38_flash_next.ttnn.speculative_sampling import (
+    Qwen38SpeculativeAcceptance,
+    accept_point_mass,
 )
 
 SAMPLING_REQUEST_FIELDS = (
@@ -359,6 +377,33 @@ class Qwen38SamplingChainExtension:
 
         return self._gather(self.trace_logits[residue])
 
+    def read_full_logits_rows(self, logits: Qwen38ShardedLogits) -> torch.Tensor:
+        """The verify rows' fallback: the eager gather of the split verify's retained logits (about 2.5 MB at k = 4),
+        fp32 ``[rows, VOCAB_SIZE]``."""
+
+        return self._gather(logits).reshape(int(logits.global_shape[2]), -1)
+
+    def warm_rows(
+        self, logits: Qwen38ShardedLogits, candidate_rows: torch.Tensor, *, label: str
+    ) -> list[dict[str, Any]]:
+        """The verify head's candidate rows against torch.topk of the eager rows gather (the fallback's program
+        compiles here): per row values bitwise, ids equal up to ties at a shard's k-th value."""
+
+        full = self.read_full_logits_rows(logits)
+        if tuple(candidate_rows.shape) != (full.shape[0], SAMPLING_CANDIDATE_ROW_SHAPE[3]):
+            raise RuntimeError(f"{label}: {tuple(candidate_rows.shape)} candidate rows for {full.shape[0]} logits rows")
+        reports = []
+        for row, (host_row, full_row) in enumerate(zip(candidate_rows, full)):
+            actual = Qwen38CandidateRow.from_host_row(host_row.reshape(SAMPLING_CANDIDATE_ROW_SHAPE))
+            agreement = actual.agreement(Qwen38CandidateRow.emulate(full_row.to(torch.bfloat16)))
+            if not all(agreement["values_bitwise"]) or not all(agreement["ids_equal_up_to_boundary_ties"]):
+                raise RuntimeError(
+                    f"{label}: verify row {row} candidates {actual.values.tolist()} {actual.ids.tolist()} vs torch.topk "
+                    f"of the full gather beyond boundary ties: {agreement}"
+                )
+            reports.append(agreement)
+        return reports
+
     def _gather(self, logits: Qwen38ShardedLogits) -> torch.Tensor:
         gathered = self.lm_head.gather_full_logits(logits)
         try:
@@ -403,12 +448,60 @@ class Qwen38SamplingStepClocks:
         }
 
 
+ACCEPTANCE_HISTOGRAM_BINS = 10
+
+
+@dataclass
+class Qwen38SampledDraftingStats:
+    """The pass loop's counters of one sampled request: passes decided on the host, drafts accepted, draws consumed,
+    rows sampled over the full vocabulary (the candidate guard failed), tokens drawn from a rejection's residual,
+    and the acceptance probabilities ``p_j(d_{j+1})`` of every row drawn on (the per-row log the measurement reads)."""
+
+    passes: int = 0
+    accepted_drafts: int = 0
+    draws: int = 0
+    fallbacks: int = 0
+    resampled: int = 0
+    acceptance_probabilities: list[float] = field(default_factory=list)
+
+    def record(self, acceptance: Qwen38SpeculativeAcceptance, fallbacks: int) -> None:
+        self.passes += 1
+        self.accepted_drafts += acceptance.accepted
+        self.draws += acceptance.draws
+        self.fallbacks += fallbacks
+        self.resampled += int(acceptance.resampled)
+        self.acceptance_probabilities.extend(acceptance.acceptance_probabilities)
+
+    def as_dict(self) -> dict[str, Any]:
+        probabilities = self.acceptance_probabilities
+        histogram = [0] * ACCEPTANCE_HISTOGRAM_BINS
+        for probability in probabilities:
+            histogram[min(int(probability * ACCEPTANCE_HISTOGRAM_BINS), ACCEPTANCE_HISTOGRAM_BINS - 1)] += 1
+        return {
+            "passes": self.passes,
+            "accepted_drafts": self.accepted_drafts,
+            "tokens_per_pass": None
+            if not self.passes
+            else round((self.passes + self.accepted_drafts) / self.passes, 4),
+            "draws": self.draws,
+            "fallbacks": self.fallbacks,
+            "resampled": self.resampled,
+            "rows_drawn": len(probabilities),
+            "acceptance_probability_mean": None
+            if not probabilities
+            else round(sum(probabilities) / len(probabilities), 4),
+            "acceptance_probability_histogram": histogram,  # equal bins over [0, 1]; the last one holds 1.0
+        }
+
+
 @dataclass
 class Qwen38SamplingRequest:
     """One sampled request: its policy, the generator its seed starts, the alternatives it wants, what it produced.
 
     ``samples`` is index-aligned with the completion's token ids; a token the thinking
-    budget forced has no sample (``None``).
+    budget forced has no sample (``None``), and so has a token the MTP pass loop emitted.
+    ``mtp_drafting`` is the pass loop's verdict on the request (``drafted``, or the refusal
+    reason) once the session decided it; ``mtp`` its counters.
     """
 
     parameters: Qwen38SamplingParameters
@@ -423,6 +516,8 @@ class Qwen38SamplingRequest:
     uniforms: list[float] = field(default_factory=list)
     first_token_rewrites: int = 0
     verified_steps: int = 0
+    mtp_drafting: str | None = None
+    mtp: Qwen38SampledDraftingStats = field(default_factory=Qwen38SampledDraftingStats)
 
     def __post_init__(self) -> None:
         if not isinstance(self.parameters, Qwen38SamplingParameters) or self.parameters.temperature == 0:
@@ -447,6 +542,12 @@ class Qwen38SamplingRequest:
         self.uniforms.append(uniform)
         return uniform
 
+    def draw(self) -> float:
+        """One fp32 uniform from the request's generator: the draw the host samplers make (``sampling._draw``), so
+        the pass loop's acceptance and the 1-row sampled tail consume one stream."""
+
+        return float(torch.rand((), generator=self.generator, dtype=torch.float32))
+
     def as_dict(self) -> dict[str, Any]:
         """The response's ``qwen38.sampling`` object: the policy, its seed and the loop's counters."""
 
@@ -460,6 +561,8 @@ class Qwen38SamplingRequest:
             "draws": len(self.uniforms),
             "first_token_rewrites": self.first_token_rewrites,
             "verified_steps": self.verified_steps,
+            "mtp_drafting": self.mtp_drafting,
+            "mtp": None if self.mtp_drafting != "drafted" else self.mtp.as_dict(),
         }
 
 
@@ -508,6 +611,98 @@ def choose_token(
     return sample
 
 
+# -- the MTP pass loop's sampled decision --------------------------------------------------------------------
+
+
+def drafting_admission(mtp: Any, request: Qwen38SamplingRequest | None, *, device_loop: bool = False) -> str | None:
+    """Why the MTP pass loop does not serve a sampled request, or ``None`` when it drafts for it: the chain's switch
+    (``mtp.sampled``, ``QWEN38_MTP_SAMPLED``), ``top_k`` 0 and a boosting penalty (the candidate rows cannot bound
+    them: the 1-row loop's full-vocabulary fallback every step), logprobs (the row normaliser is not carried per
+    verify row), the device-sampler loop.  A greedy request (``None``) is always admitted."""
+
+    if request is None:
+        return None
+    if mtp is None:
+        return "refused: no MTP chain"
+    if not getattr(mtp, "sampled", False):
+        return "refused: QWEN38_MTP_SAMPLED off"
+    if device_loop:
+        return "refused: device sampler loop"
+    if request.parameters.top_k == 0:
+        return "refused: top_k 0"
+    if request.parameters.raises_logits:
+        return "refused: penalty raises logits"
+    if request.logprobs or request.top_logprobs:
+        return "refused: logprobs"
+    return None
+
+
+def accept_pass(
+    session: Any,
+    request: Qwen38SamplingRequest,
+    prompt_tokens: int,
+    tokens: Sequence[int],
+    head: mtp_v2.Qwen38TTNNVerifyHeadReadback,
+) -> mtp_v2.Qwen38TTNNVerifyDecision:
+    """The sampled request's verdict on one split pass (the chain's ``decide``): row j of ``tokens`` ``[t_P, d_1 ..
+    d_k]`` gives ``p_j`` from its candidate row under the request's processors with the history
+    ``session.committed + tokens[:j + 1]`` (the drafts accepted earlier in the pass count, as plain decode's output
+    would; ``prompt_tokens`` exempts the prompt from the additive penalties), or over the eagerly gathered verify
+    logits when the guard fails (``session.chain.mtp_read_full_logits_rows``); the point-mass acceptance draws
+    from ``request.draw``.  The alignment tokens are ``[d_1 .. d_a*, x*]`` then the zero-embedding sentinel."""
+
+    rows = len(tokens)
+    if tuple(head.candidate_rows.shape) != (rows, SAMPLING_CANDIDATE_ROW_SHAPE[3]):
+        raise ValueError(f"{tuple(head.candidate_rows.shape)} candidate rows for a {rows}-row pass")
+    committed = list(session.committed)
+    fallbacks = 0
+    full_rows: torch.Tensor | None = None
+
+    def distribution(row: int) -> Qwen38RowDistribution:
+        nonlocal fallbacks, full_rows
+        history = committed + [int(token) for token in tokens[: row + 1]]
+        candidate_row = Qwen38CandidateRow.from_host_row(head.candidate_rows[row].reshape(SAMPLING_CANDIDATE_ROW_SHAPE))
+        try:
+            return candidate_distribution(
+                candidate_row, request.parameters, token_history=history, prompt_tokens=prompt_tokens
+            )
+        except Qwen38CandidateFallback:
+            fallbacks += 1
+            if full_rows is None:
+                full_rows = session.chain.mtp_read_full_logits_rows()
+            return full_distribution(
+                full_rows[row], request.parameters, token_history=history, prompt_tokens=prompt_tokens
+            )
+
+    acceptance = accept_point_mass(distribution, tokens[1:], request.draw)
+    request.mtp.record(acceptance, fallbacks)
+    alignment = [int(token) for token in tokens[1 : acceptance.accepted + 1]] + [acceptance.token]
+    alignment += [ZERO_EMBEDDING_TOKEN] * (rows - len(alignment))
+    return mtp_v2.Qwen38TTNNVerifyDecision(
+        acceptance.accepted,
+        acceptance.token,
+        tuple(alignment),
+        {
+            "sampled": True,
+            "draws": acceptance.draws,
+            "fallbacks": fallbacks,
+            "resampled": acceptance.resampled,
+            "acceptance_probabilities": acceptance.acceptance_probabilities,
+        },
+    )
+
+
+def sample_next_token(session: Any, request: Qwen38SamplingRequest, *, prompt_tokens: int) -> Qwen38CandidateSample:
+    """The pass loop's row-0 token: sampled from the candidate row the last TAIL wrote (blocking: completes it), as
+    the 1-row sampled step would at this position; appended to ``request.samples``."""
+
+    tail_residue = (len(session.committed) - 1) % RESIDUE_CLASSES
+    row = session.sampling.read_candidate_row()
+    sample = choose_token(session, row, request, tail_residue=tail_residue, prompt_tokens=prompt_tokens)
+    request.samples.append(sample)
+    return sample
+
+
 def generate_sampled(
     session: Any,
     request: Qwen38SamplingRequest,
@@ -519,15 +714,18 @@ def generate_sampled(
     should_stop: Callable[[], str | None] | None = None,
     forced_step: Callable[[int], None] | None = None,
     clock_ns: Callable[[], int] | None = None,
+    prompt_tokens: int | None = None,
 ) -> Iterator[tuple[int | None, str | None]]:
     """The sampled A-G loop over ``session.chain`` and ``session.sampling``; yields ``(x_t, finish)`` like ``_generate``.
 
     ``session`` carries ``chain`` (the traced chain's primitives), ``sampling`` (the extension),
     ``committed`` (the host list of every input token: the prompt when the loop starts, then this
     request's output; the penalties' history, presence and frequency over the output only) and
-    ``ple_context``.  Every sampled token appends its sample to ``request.samples`` before it is
-    yielded.  A hook stop yields ``(None, reason)``; the thinking budget forces ``</think>`` through
-    ``forced_step`` (the session's) and appends ``None`` for it.
+    ``ple_context``.  ``prompt_tokens`` is the request's prompt length, the committed length when
+    the loop starts unless the caller already emitted output (the pass loop's hand-off).  Every
+    sampled token appends its sample to ``request.samples`` before it is yielded.  A hook stop
+    yields ``(None, reason)``; the thinking budget forces ``</think>`` through ``forced_step`` (the
+    session's) and appends ``None`` for it.
     """
 
     if not isinstance(request, Qwen38SamplingRequest):
@@ -536,7 +734,10 @@ def generate_sampled(
         raise TypeError("a thinking budget needs the session's forced step")
     chain, clocks = session.chain, request.clocks
     now = clock_ns or (lambda: 0)
-    prompt_tokens = len(session.committed)
+    if prompt_tokens is None:
+        prompt_tokens = len(session.committed)
+    elif type(prompt_tokens) is not int or not 0 <= prompt_tokens <= len(session.committed):
+        raise ValueError(f"prompt_tokens must be an int in [0, {len(session.committed)}], got {prompt_tokens!r}")
     produced = 0
     reasoning_tokens = 0
     thinking_open = think_budget is not None
@@ -842,19 +1043,23 @@ def run_discriminator(
 
 
 __all__ = [
+    "ACCEPTANCE_HISTOGRAM_BINS",
     "DISCRIMINATOR_PERIOD_TARGET_MS",
     "DISCRIMINATOR_ROW_TOKENS",
     "DISCRIMINATOR_SEED",
     "DISCRIMINATOR_TOKENS",
     "RESIDUE_CLASSES",
     "SAMPLING_REQUEST_FIELDS",
+    "Qwen38SampledDraftingStats",
     "Qwen38SamplingChainExtension",
     "Qwen38SamplingRequest",
     "Qwen38SamplingRequestError",
     "Qwen38SamplingStepClocks",
+    "accept_pass",
     "choose_token",
     "compare_candidate_rows_with_full_gathers",
     "device_sampler_reference_of",
+    "drafting_admission",
     "generate_sampled",
     "generate_sampled_on_device",
     "logprobs_content_item",
@@ -862,4 +1067,5 @@ __all__ = [
     "parameters_as_dict",
     "parameters_from_request",
     "run_discriminator",
+    "sample_next_token",
 ]

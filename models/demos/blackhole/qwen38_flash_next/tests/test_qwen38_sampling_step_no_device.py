@@ -261,8 +261,13 @@ def test_clocks_summary_reports_period_and_host_segment() -> None:
         "draws",
         "first_token_rewrites",
         "verified_steps",
+        "mtp_drafting",
+        "mtp",
     }
     assert request.as_dict()["logprobs_normalizer"] == "candidate_row"  # the reported logprobs are row-relative
+    assert (
+        request.as_dict()["mtp_drafting"] is None and request.as_dict()["mtp"] is None
+    )  # the 1-row loop: no pass loop verdict
 
 
 # --- the request mapping ----------------------------------------------------------------------------------------

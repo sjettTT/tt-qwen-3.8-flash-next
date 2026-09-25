@@ -52,6 +52,12 @@ different members of a tie group at the boundary.  The values are still bitwise
 the same multiset, the guard is unchanged (the k-th value is the floor either
 way), and :meth:`Qwen38CandidateRow.agreement` accepts id sets that differ only
 among candidates at the k-th value while reporting how many such ties there are.
+
+:func:`candidate_distribution` and :func:`full_distribution` are the two samplers
+stopped before their draw: the kept tokens and their probabilities as one
+:class:`Qwen38RowDistribution`, the object the speculative acceptance of the MTP
+verify rows (``ttnn/speculative_sampling.py``) reads and conditions.  The same
+``_penalize`` and ``_filter`` run in all four functions.
 """
 
 from __future__ import annotations
@@ -554,6 +560,61 @@ class Qwen38CandidateFallback(Qwen38SamplingError):
 
 
 @dataclass(frozen=True)
+class Qwen38RowDistribution:
+    """The post-processor distribution of one logits row: the kept tokens in the filter's order (descending
+    scaled score, ties by the lowest id) and their probabilities (zero where the nucleus or min-p cut removed a
+    token).  Both samplers draw from exactly this (``tokens[_inverse_cdf(probabilities, u)]``); the speculative
+    acceptance reads ``probability`` and conditions with ``without``.  The dtype is the caller's (fp32 from the
+    samplers; the algebra tests use float64)."""
+
+    tokens: torch.Tensor  # int64 [n]
+    probabilities: torch.Tensor  # floating [n], summing to 1
+
+    def __post_init__(self) -> None:
+        tokens, probabilities = self.tokens, self.probabilities
+        if (
+            not isinstance(tokens, torch.Tensor)
+            or tokens.dtype != torch.int64
+            or tokens.ndim != 1
+            or not tokens.numel()
+        ):
+            raise ValueError(f"tokens must be a nonempty int64 vector, got {getattr(tokens, 'shape', None)}")
+        if (
+            not isinstance(probabilities, torch.Tensor)
+            or not probabilities.dtype.is_floating_point
+            or tuple(probabilities.shape) != tuple(tokens.shape)
+        ):
+            raise ValueError(f"probabilities must be a floating vector of {tokens.numel()}, got {probabilities}")
+        if bool(torch.any(probabilities < 0)) or not bool(torch.all(torch.isfinite(probabilities))):
+            raise ValueError("probabilities must be finite and nonnegative")
+        if not bool(probabilities.sum() > 0):
+            raise ValueError("a distribution needs positive mass")
+        if tokens.unique().numel() != tokens.numel():
+            raise ValueError("a distribution names every token once")
+
+    def probability(self, token: int) -> float:
+        """``p(token)``: 0 for a token outside the kept set."""
+
+        hits = torch.nonzero(self.tokens == int(token))
+        return 0.0 if hits.numel() == 0 else float(self.probabilities[int(hits[0])])
+
+    def draw(self, uniform: float) -> int:
+        """The token at ``uniform`` under the inverse CDF (the samplers' rule, in this distribution's dtype)."""
+
+        return int(self.tokens[_inverse_cdf(self.probabilities, torch.tensor(uniform, dtype=self.probabilities.dtype))])
+
+    def without(self, token: int) -> "Qwen38RowDistribution":
+        """This distribution conditioned on ``token`` not being drawn: its mass zeroed, the rest renormalised
+        (the speculative rejection distribution ``norm(max(0, p - delta(token)))``)."""
+
+        remaining = self.probabilities * (self.tokens != int(token)).to(self.probabilities.dtype)
+        total = remaining.sum()
+        if not bool(total > 0):
+            raise ValueError(f"no probability mass remains without token {token}")
+        return Qwen38RowDistribution(self.tokens, remaining / total)
+
+
+@dataclass(frozen=True)
 class Qwen38CandidateSample:
     """One sampled token with its raw (pre-penalty, pre-temperature) log-probability.
 
@@ -626,6 +687,32 @@ def sample_full_vocabulary(
         int((probabilities > 0).sum()),
         float(uniform),
     )
+
+
+def full_distribution(
+    logits: torch.Tensor,
+    parameters: Qwen38SamplingParameters,
+    *,
+    token_history: Sequence[int] = (),
+    prompt_tokens: int = 0,
+) -> Qwen38RowDistribution:
+    """:func:`sample_full_vocabulary` stopped before its draw: the reference distribution of one row."""
+
+    if not isinstance(parameters, Qwen38SamplingParameters):
+        raise TypeError("parameters must be Qwen38SamplingParameters")
+    if parameters.temperature == 0:
+        raise ValueError("a distribution needs temperature > 0 (temperature 0 is the argmax)")
+    if not isinstance(logits, torch.Tensor) or tuple(logits.shape) != (VOCAB_SIZE,) or logits.device.type != "cpu":
+        raise ValueError(
+            f"full-vocabulary logits must be a CPU [{VOCAB_SIZE}] row, got {getattr(logits, 'shape', None)}"
+        )
+    raw = logits.detach().to(torch.float32)
+    if not bool(torch.all(torch.isfinite(raw))):
+        raise ValueError("host logits contain NaN or infinity")
+    history = _normalize_one_history(token_history, label="token history")
+    scores = _penalize(raw.clone(), None, history, parameters, prompt_tokens=prompt_tokens)
+    positions, _scaled, probabilities = _filter(scores, parameters)
+    return Qwen38RowDistribution(positions, probabilities)  # over the whole vocabulary a position is its id
 
 
 def sample_host_logits(
@@ -800,20 +887,9 @@ def sample_candidates(
         raise TypeError("parameters must be Qwen38SamplingParameters")
     if generator is not None:
         _validate_generator(generator, seed=parameters.seed)
-    if parameters.top_k > CANDIDATE_TOP_K_LIMIT:
-        raise Qwen38SamplingError(f"top_k {parameters.top_k} exceeds the candidate limit {CANDIDATE_TOP_K_LIMIT}")
     history = _normalize_one_history(token_history, label="token history")
-    if parameters.top_k == 0:
-        raise Qwen38CandidateFallback("top_k 0: the nucleus may extend past the candidate row")
-    if history and parameters.raises_logits:
-        raise Qwen38CandidateFallback("a penalty raises logits: unread tokens are unbounded")
-
-    # Ascending global id order first: the stable sort then breaks ties on the lowest id, as the full row does.
-    ids, order = torch.sort(row.ids.reshape(-1))
-    raw = row.values.reshape(-1)[order]
+    ids, raw, scores, floor = _candidate_scores(row, parameters, history, prompt_tokens)
     log_normalizer = row.log_normalizer
-    scores = _penalize(raw.clone(), ids, history, parameters, prompt_tokens=prompt_tokens)
-    floor = row.shard_floor
     if parameters.temperature == 0:
         position = int(torch.argmax(scores))
         if not bool(scores[position] > floor):
@@ -824,11 +900,7 @@ def sample_candidates(
         return Qwen38CandidateSample(
             token, float(raw[position]) - log_normalizer, _top_logprobs(raw, ids, top_logprobs, log_normalizer), 1, None
         )
-    positions, scaled, probabilities = _filter(scores, parameters)
-    if not bool(scaled[-1] > floor / parameters.temperature):
-        raise Qwen38CandidateFallback(
-            f"kept minimum {float(scaled[-1])} does not exceed the scaled shard floor {float(floor / parameters.temperature)}"
-        )
+    positions, probabilities = _kept_candidates(scores, parameters, floor)
     uniform, _generator = _draw(generator, parameters)
     position = int(positions[_inverse_cdf(probabilities, uniform)])
     return Qwen38CandidateSample(
@@ -838,6 +910,61 @@ def sample_candidates(
         int((probabilities > 0).sum()),
         float(uniform),
     )
+
+
+def _candidate_scores(
+    row: Qwen38CandidateRow, parameters: Qwen38SamplingParameters, history: tuple[int, ...], prompt_tokens: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The read candidates in ascending global id order (the stable sort then breaks ties on the lowest id, as the
+    full row does), their raw and penalized scores and the shard floor; ``top_k`` above the row's k is refused, and
+    ``top_k`` 0 or a boosting penalty over a history is the fallback (before any draw)."""
+
+    if parameters.top_k > CANDIDATE_TOP_K_LIMIT:
+        raise Qwen38SamplingError(f"top_k {parameters.top_k} exceeds the candidate limit {CANDIDATE_TOP_K_LIMIT}")
+    if parameters.top_k == 0:
+        raise Qwen38CandidateFallback("top_k 0: the nucleus may extend past the candidate row")
+    if history and parameters.raises_logits:
+        raise Qwen38CandidateFallback("a penalty raises logits: unread tokens are unbounded")
+    ids, order = torch.sort(row.ids.reshape(-1))
+    raw = row.values.reshape(-1)[order]
+    scores = _penalize(raw.clone(), ids, history, parameters, prompt_tokens=prompt_tokens)
+    return ids, raw, scores, row.shard_floor
+
+
+def _kept_candidates(
+    scores: torch.Tensor, parameters: Qwen38SamplingParameters, floor: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The filters over the penalized candidates, then the guard: the kept minimum must exceed the scaled shard
+    floor, else an unread token could have been kept and the step falls back."""
+
+    positions, scaled, probabilities = _filter(scores, parameters)
+    if not bool(scaled[-1] > floor / parameters.temperature):
+        raise Qwen38CandidateFallback(
+            f"kept minimum {float(scaled[-1])} does not exceed the scaled shard floor {float(floor / parameters.temperature)}"
+        )
+    return positions, probabilities
+
+
+def candidate_distribution(
+    row: Qwen38CandidateRow,
+    parameters: Qwen38SamplingParameters,
+    *,
+    token_history: Sequence[int] = (),
+    prompt_tokens: int = 0,
+) -> Qwen38RowDistribution:
+    """:func:`sample_candidates` stopped before its draw: the row's distribution, exact under the same guard (the
+    same :class:`Qwen38CandidateFallback` where that sampler would fall back)."""
+
+    if not isinstance(row, Qwen38CandidateRow):
+        raise TypeError("row must be a Qwen38CandidateRow")
+    if not isinstance(parameters, Qwen38SamplingParameters):
+        raise TypeError("parameters must be Qwen38SamplingParameters")
+    if parameters.temperature == 0:
+        raise ValueError("a distribution needs temperature > 0 (temperature 0 is the argmax)")
+    history = _normalize_one_history(token_history, label="token history")
+    ids, _raw, scores, floor = _candidate_scores(row, parameters, history, prompt_tokens)
+    positions, probabilities = _kept_candidates(scores, parameters, floor)
+    return Qwen38RowDistribution(ids[positions], probabilities)
 
 
 class Qwen38TTNNHostSampler:
@@ -1120,6 +1247,7 @@ __all__ = [
     "Qwen38CandidateFallback",
     "Qwen38CandidateRow",
     "Qwen38CandidateSample",
+    "Qwen38RowDistribution",
     "Qwen38SampledTokens",
     "Qwen38SamplingCleanupError",
     "Qwen38SamplingError",
@@ -1129,6 +1257,8 @@ __all__ = [
     "Qwen38TTNNHostSampler",
     "UNIFORM_BITS",
     "UniformStream",
+    "candidate_distribution",
+    "full_distribution",
     "sample_candidates",
     "sample_full_vocabulary",
     "sample_host_logits",

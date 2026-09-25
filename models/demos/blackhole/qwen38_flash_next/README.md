@@ -26,7 +26,7 @@ This was implemented with the intention of the n-gram model residing in system m
 |---|---|---|
 | prompt prefill | 300 tok/s (and climbing); 650 tok/s with `--long-chunks`; 1,340 tok/s with `--prefill-slab 2048` | 32-token chunk trace, 3.0-3.5 ms per prompt token, flat from 2k to 261k tokens; 128-token chunks at 1.45-1.56 ms per prompt token (`--long-chunks`); 2,048-row slabs at 0.74-0.90 ms per prompt token (`--prefill-slab 2048`: TTFT 23.6 s for a 31,716-token prompt, 1.91 s for 2,118 tokens; 2026-09-25, tolerance class: see `docs/PREFILL.md`) |
 | decode, one stream | 36.8 tok/s | position-generic traced decode, 27.2 ms per token, flat with depth; BF8 dense weights, the fused GDN step, the compact expert layout and the MoE post program's one-read routing by default; 9 decode chains run as fused programs, the gated-residual read as two programs with its gathers inside them, the router tail's top-k on one core per token group, and the decode linears read each DRAM bank with two cores by default (2026-09-25, bitwise: `docs/NUMERICS.md`) |
-| decode with MTP (`--mtp 4`) | 39 tok/s median over the acceptance prompts, 68 tok/s on structured output | speculative drafting with exact acceptance: the committed stream leaves the CPU reference at the same token as greedy decode on 9 of the 12 acceptance prompts and at a different token on the other 3 (section 6, `docs/NUMERICS.md`) |
+| decode with MTP (`--mtp 4`) | greedy 39 tok/s median over the acceptance prompts, 68 tok/s on structured output; sampled (card profiles, non-thinking / thinking) 40.8 / 40.7 tok/s at 24.5 / 24.6 ms per token against 33.5 / 33.9 plain sampled, 2.64 / 2.68 tokens per pass, 0 fallbacks (2026-09-25, on the 27.7 ms D1 step) | speculative drafting with exact acceptance for greedy and, by default on an `--mtp --sampling` server, sampled requests (`QWEN38_MTP_SAMPLED=0` restores the 1-row sampled loop); the greedy committed stream leaves the CPU reference at the same token as greedy decode on 9 of the 12 acceptance prompts and at a different token on the other 3 (section 6, `docs/NUMERICS.md`) |
 | contexts | 32k, 64k, 128k, 256k | 256k is single-user; MTP fits at 32k, 64k and 128k |
 | correctness | bitwise repeatable; 96/96 greedy token match against the CPU reference on the acceptance prompt | chunked prefill is tolerance-class against the CPU reference on all 48 layers |
 
@@ -204,7 +204,10 @@ contract (hang-ups, stalled readers, deadlines, the stall watchdog, `/health` fi
   passes; the three earlier tokens are near-ties within one bf16 step, not a defect (`docs/NUMERICS.md` has the
   indices and the pinned table).  `--mtp-gdn-anchor layer0` (server flag) re-anchors the layer-0 GDN state from the
   1-row recurrence.  MTP does not fit at 256k (94 MB free per bank against the 128 MiB contiguous it needs); 32k, 64k
-  and 128k fit.
+  and 128k fit.  On an `--mtp` `--sampling` server sampled requests draft by default too, by exact speculative sampling
+  (a draft is accepted with its probability under the request's policy, else the row is sampled with it removed): the
+  stream keeps plain sampling's law on the verify rows' logits and a `seed` reproduces the drafting stream (the
+  fingerprint carries the switch and `k`), not the 1-row loop's; `QWEN38_MTP_SAMPLED=0` restores the plain path (`docs/SERVER.md`).
 
 ## 7. QuietBox 2 (untested)
 

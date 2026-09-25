@@ -107,6 +107,30 @@ read candidate row, not the vocabulary (`logprobs_normalizer` in `/health` and `
 decodes at a time; up to four wait in the queue (`queue_wait_seconds` in `usage`), the fifth gets HTTP 503.  A prompt
 over the context limit gets HTTP 400 `context_length_exceeded`.
 
+Sampled requests and MTP drafting: on an `--mtp` `--sampling` server the pass loop drafts for sampled requests by
+default (`QWEN38_MTP_SAMPLED` unset or `1`; `QWEN38_MTP_SAMPLED=0` in the server's environment restores the plain
+sampled path, the fused verify with sampled requests on the 1-row sampled loop; the launcher passes the variable
+through; a server without `--mtp` or without `--sampling` has no drafting for sampled requests and refuses an
+explicit `1` at start), by exact speculative sampling: the device drafts by argmax as for a greedy request, and the
+host accepts draft `d` at a verify row with probability `p(d)` under the request's own
+sampling policy (its temperature, top-k, top-p, min-p and penalties applied to that row exactly as the 1-row loop
+applies them), else it samples the row's distribution with `d` removed and renormalised; every emitted token therefore
+follows the distribution plain sampling would draw from that row's logits, whatever the draft, and the drafts change
+only how many tokens a pass emits.  The rows are the verify rows' logits: the rows path the greedy pass loop decodes
+on, which differs from the 1-row row by near-ties (`docs/NUMERICS.md`).  `p` comes from a per-row top-32-per-shard
+candidates readback, exact under the same guard as the 1-row row (a row it cannot bound is sampled over the full
+vocabulary, counted in
+`qwen38.sampling.mtp.fallbacks`).  Requests the rows cannot bound every step (`top_k` 0, a penalty that raises logits)
+and `logprobs` requests stay on the 1-row loop; `qwen38.sampling.mtp_drafting` says which loop served the request and
+why, `qwen38.sampling.mtp` carries its passes, accepted drafts, draws and fallbacks, and every field of `qwen38.mtp`
+(passes, accepted drafts, tokens per pass; with the split verify the greedy passes checked against the device lanes
+and the sampled passes with their draws and fallbacks) counts that request alone; `/health.mtp` carries the same
+counters cumulative since the server started, `/health.mtp.sampled` the switch.
+A `seed` reproduces a stream against the same `system_fingerprint`, which carries the switch and `k`: with drafting
+on, the pass loop consumes the request's draws in the pass's order, so the seed reproduces the drafting stream, not
+the 1-row loop's stream (the 1-row stream is the `QWEN38_MTP_SAMPLED=0` server's).  With drafting on a greedy request
+runs the same split pass with the device's own verdict written back and is bitwise the fused pass's stream.
+
 ## The prompt, follow-up turns and the prompt-end snapshot
 
 The prompt is the client's messages, exactly: the server adds no system prompt when the request carries none

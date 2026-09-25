@@ -29,13 +29,21 @@ is one 128-byte readback of the assembled ids and the PLE n-gram lookup + upload
 (:func:`write_verify_ple_rows`).  :func:`forward_commit` is the split form of the catch-up (all commits as one
 body, replayed while the host does the lookup); :class:`Qwen38TTNNMTPChain` is the pass loop over the traces.
 
+The split verify (:func:`forward_verify_head` / :func:`forward_verify_tail`) is the same pass with the decision on the
+host: the head stops after the device accept and reads back ``[a, t', argmax_0 .. argmax_31 | per-row candidates]``
+(the k + 1 rows' top-32-per-shard logits and ids, the epilogue of ``Qwen38TTNNLMHead.sampling_candidates`` on rows);
+the host writes ``(a*, x*)`` and the alignment rows' tokens (:func:`write_verify_decision`: the device's own ``(a, t')``
+and the argmax lanes on the greedy path, bitwise the fused body; a sampled request's point-mass acceptance,
+``ttnn/speculative_sampling.py``, otherwise); the tail runs the alignment on the head's retained roots with those
+tokens, lands the accept scalar and advances ``P``.  The fused :func:`forward_verify` stays the default.
+
 The 1-row production paths are untouched: everything here is a new entry point over the layers' rows paths.
 """
 
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Any
@@ -53,7 +61,12 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     replicate_tensor_2d_mesh_mapper,
     tensor_metadata,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import TOKEN_ROW_SHAPE, ZERO_EMBEDDING_TOKEN
+from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import (
+    SAMPLING_CANDIDATE_ROW_SHAPE,
+    TOKEN_ROW_SHAPE,
+    ZERO_EMBEDDING_TOKEN,
+    Qwen38TTNNSamplingCandidateConstants,
+)
 from models.demos.blackhole.qwen38_flash_next.ttnn.final_mixer import Qwen38TTNNFinalMixer
 from models.demos.blackhole.qwen38_flash_next.ttnn.gdn import Qwen38TTNNGDN, Qwen38TTNNGDNRowsState
 from models.demos.blackhole.qwen38_flash_next.ttnn.layer import (
@@ -86,6 +99,14 @@ READBACK_WIDTH = len(READBACK_FIXED_LANES) + CHUNK_ROWS
 # The pass row (the one host readback per pass, landed by the draft body): the verify readback row, then the next
 # pass's verify tokens ``[t', d_1 .. d_k, ZERO_EMBEDDING_TOKEN ...]`` on CHUNK_ROWS lanes.
 PASS_ROW_WIDTH = READBACK_WIDTH + CHUNK_ROWS
+# The split verify's head readback: the device accept count and next token, the 32 verify argmaxes, then the
+# candidates rows (per verify row the 1-row candidate row: ``[values(32) ids(32)]`` per shard, 256 lanes).
+HEAD_READBACK_FIXED_LANES = ("accepted", "next_token")
+CANDIDATE_LANES_PER_ROW = SAMPLING_CANDIDATE_ROW_SHAPE[3]
+
+
+def head_readback_width(rows: int) -> int:
+    return len(HEAD_READBACK_FIXED_LANES) + CHUNK_ROWS + rows * CANDIDATE_LANES_PER_ROW
 
 
 def _shape(tensor) -> tuple[int, ...]:
@@ -353,6 +374,74 @@ class Qwen38TTNNVerifyAlignment:
 
 
 @dataclass(frozen=True)
+class Qwen38TTNNVerifySplit:
+    """The split verify's buffers beside the verify state.  Host-written per pass (:func:`write_verify_decision`,
+    between the head and the tail): ``accept_tile`` FP32 TILE ``[1,1,1,1]`` and ``accept_index`` UINT32 ROW_MAJOR
+    ``[1,1,1,1]`` = ``a*``, ``next_token`` FP32 ROW_MAJOR ``[1,1,1,1]`` = ``x*``, ``alignment_tokens`` FP32 ROW_MAJOR
+    ``[1,1,1,32]`` = ``[d_1 .. d_a*, x*, ZERO_EMBEDDING_TOKEN ...]``.  Device-written by the head:
+    ``candidates_readback`` FP32 ROW_MAJOR ``[1,1,rows,256]``, the persistent copy of the rows' candidate rows
+    (``candidates_constants`` are the sampling chain's: the shard start scalar the ids are rebased by)."""
+
+    candidates_constants: Qwen38TTNNSamplingCandidateConstants
+    candidates_readback: Any
+    accept_tile: Any
+    accept_index: Any
+    next_token: Any
+    alignment_tokens: Any
+
+    @classmethod
+    def allocate(
+        cls,
+        mesh_device,
+        mesh_contract: Qwen38MeshContract,
+        candidates_constants: Qwen38TTNNSamplingCandidateConstants,
+        *,
+        rows: int,
+    ) -> "Qwen38TTNNVerifySplit":
+        candidates_constants.validate(mesh_contract)
+        uploaded: list[Any] = []
+
+        def upload(host: torch.Tensor, dtype, layout, label: str):
+            tensor = _upload_replicated(mesh_device, mesh_contract, host, dtype, layout, label=label)
+            uploaded.append(tensor)
+            return tensor
+
+        try:
+            return cls(
+                candidates_constants=candidates_constants,
+                candidates_readback=upload(
+                    torch.zeros((1, 1, rows, CANDIDATE_LANES_PER_ROW)),
+                    ttnn.float32,
+                    ttnn.ROW_MAJOR_LAYOUT,
+                    "verify candidates readback",
+                ),
+                accept_tile=upload(torch.zeros((1, 1, 1, 1)), ttnn.float32, ttnn.TILE_LAYOUT, "host accept tile"),
+                accept_index=upload(
+                    torch.zeros((1, 1, 1, 1), dtype=torch.int32),
+                    ttnn.uint32,
+                    ttnn.ROW_MAJOR_LAYOUT,
+                    "host accept index",
+                ),
+                next_token=upload(torch.zeros((1, 1, 1, 1)), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, "host next token"),
+                alignment_tokens=upload(
+                    torch.full(TOKEN_ROW_SHAPE, float(ZERO_EMBEDDING_TOKEN)),
+                    ttnn.float32,
+                    ttnn.ROW_MAJOR_LAYOUT,
+                    "host alignment tokens",
+                ),
+            )
+        except BaseException:
+            _deallocate(*uploaded)
+            raise
+
+    def host_written(self) -> tuple[Any, ...]:
+        return (self.accept_tile, self.accept_index, self.next_token, self.alignment_tokens)
+
+    def deallocate(self) -> None:
+        _deallocate(self.candidates_readback, *self.host_written())
+
+
+@dataclass(frozen=True)
 class Qwen38TTNNVerifyState:
     """Fixed-address buffers of the verify body, allocated beside the generic state before any capture.
 
@@ -362,6 +451,7 @@ class Qwen38TTNNVerifyState:
     ``accepted`` FP32 TILE ``[1,1,1,1]`` (the pass's accept count, read by the next pass's commits).
     ``moe_rows`` is every layer's verify MoE row count (``moe_rows_for(rows)`` unless the allocation was given
     an explicit override); ``gdn_step_anchor_layers`` the GDN layers whose commits run the state re-anchor.
+    ``split`` holds the split verify's buffers when the chain decides its passes on the host, else None.
     """
 
     drafts: int
@@ -378,6 +468,7 @@ class Qwen38TTNNVerifyState:
     alignment: Qwen38TTNNVerifyAlignment | None
     moe_rows: int
     gdn_step_anchor_layers: frozenset[int]
+    split: Qwen38TTNNVerifySplit | None
     _owner: object = field(repr=False, compare=False)
 
 
@@ -568,6 +659,27 @@ def _validate_verify_state(model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyS
             raise RuntimeError(
                 f"alignment residual must be {MTP_RESIDUAL_SHAPE}, got {tensor_metadata(verify.alignment.residual)}"
             )
+    if verify.split is not None:
+        split = verify.split
+        if not isinstance(split, Qwen38TTNNVerifySplit):
+            raise TypeError("verify split must be a Qwen38TTNNVerifySplit")
+        for name, tensor, shape, dtype, layout in (
+            (
+                "candidates readback",
+                split.candidates_readback,
+                (1, 1, verify.rows, CANDIDATE_LANES_PER_ROW),
+                ttnn.float32,
+                ttnn.ROW_MAJOR_LAYOUT,
+            ),
+            ("host accept tile", split.accept_tile, (1, 1, 1, 1), ttnn.float32, ttnn.TILE_LAYOUT),
+            ("host accept index", split.accept_index, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
+            ("host next token", split.next_token, (1, 1, 1, 1), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT),
+            ("host alignment tokens", split.alignment_tokens, TOKEN_ROW_SHAPE, ttnn.float32, ttnn.ROW_MAJOR_LAYOUT),
+        ):
+            if _shape(tensor) != shape or tensor.dtype != dtype or tensor.layout != layout:
+                raise RuntimeError(
+                    f"verify split {name} must be {dtype} {layout} {shape}, got {tensor_metadata(tensor)}"
+                )
 
 
 def _validate_mtp_components(model: Qwen38TTNNTextModel, mtp_components) -> tuple[Any, Any, Any]:
@@ -600,6 +712,7 @@ def allocate_verify_state(
     mtp_components=None,
     moe_rows: int | None = None,
     gdn_step_anchor_layers: Sequence[int] = (),
+    candidates_constants: Qwen38TTNNSamplingCandidateConstants | None = None,
 ) -> Qwen38TTNNVerifyState:
     """Allocate the verify constants and every layer's verify buffers beside ``state`` (before any capture).
 
@@ -607,7 +720,8 @@ def allocate_verify_state(
     alignment rows; without it the pass reports ``first_draft = None`` and skips the MTP layer.  ``moe_rows``
     overrides every layer's verify MoE row count (:func:`resolve_moe_rows`); ``gdn_step_anchor_layers`` names
     the GDN layers whose commits run the committed rows through the 1-row FP32 step recurrence (the state
-    re-anchor) instead of the chunk kernel.
+    re-anchor) instead of the chunk kernel.  ``candidates_constants`` (the sampling chain's) adds the split
+    verify's buffers (:class:`Qwen38TTNNVerifySplit`) for a chain that decides its passes on the host.
     """
 
     if drafts not in SUPPORTED_DRAFTS:
@@ -697,6 +811,10 @@ def allocate_verify_state(
             alignment = Qwen38TTNNVerifyAlignment(
                 mtp_layer, input_mixer, final_mixer, generic_state, mtp_verify, residual
             )
+        split = None
+        if candidates_constants is not None:
+            split = Qwen38TTNNVerifySplit.allocate(mesh_device, mesh_contract, candidates_constants, rows=rows)
+            actions.append(("verify split buffers", split.deallocate))
         verify = Qwen38TTNNVerifyState(
             drafts=drafts,
             rows=rows,
@@ -712,6 +830,7 @@ def allocate_verify_state(
             alignment=alignment,
             moe_rows=moe_rows,
             gdn_step_anchor_layers=anchor_layers,
+            split=split,
             _owner=model._state_owner,
         )
         _validate_verify_state(model, verify)
@@ -724,6 +843,8 @@ def allocate_verify_state(
 def release_verify_state(model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState) -> None:
     _validate_verify_state(model, verify)
     actions: list[tuple[str, Callable[[], Any]]] = []
+    if verify.split is not None:
+        actions.append(("verify split buffers", verify.split.deallocate))
     if verify.alignment is not None:
         alignment = verify.alignment
         actions.append(("MTP alignment residual", lambda: _deallocate(alignment.residual)))
@@ -1017,13 +1138,15 @@ def _embed_rows(model: Qwen38TTNNTextModel, token_row):
     return residual
 
 
-def _resolve_rows(model: Qwen38TTNNTextModel, hidden_rows, *, rows: int, sentinel_tail):
+def _resolve_rows(model: Qwen38TTNNTextModel, hidden_rows, *, rows: int, sentinel_tail, retain: list | None = None):
     """Final-mixer output rows -> the ``rows`` real rows -> LM head -> the FP32 ROW_MAJOR ``[1,1,1,32]`` row of
     per-row global greedy ids (lanes past ``rows`` hold ``ZERO_EMBEDDING_TOKEN`` from ``sentinel_tail``).
 
     The LM head, the local candidates (the argmax over the vocabulary, the head's cost, scales with the rows) and
     the resolve run on the real rows alone: the 32-row forms' first rows, bitwise.  The row slice at row 0 is a
-    copy on this runtime (the PLE layer's form); the padding rows never reach the head.
+    copy on this runtime (the PLE layer's form); the padding rows never reach the head.  ``retain`` (a list)
+    receives the sharded logits instead of their release: the split verify's head keeps them for its candidates
+    epilogue and the host's full-row fallback.
     """
 
     lm_head = model.model_io.lm_head
@@ -1035,7 +1158,10 @@ def _resolve_rows(model: Qwen38TTNNTextModel, hidden_rows, *, rows: int, sentine
         head_rows.update_tensor_topology(hidden_rows.tensor_topology())
     logits = lm_head(head_rows)
     candidates = lm_head.greedy_candidates(logits, values_by_gather=True)
-    _deallocate(logits.tensor)
+    if retain is None:
+        _deallocate(logits.tensor)
+    else:
+        retain.append(logits)
     lanes = lm_head.resolve_greedy_rows_on_device(candidates)
     _deallocate(candidates.local_indices, candidates.local_values)
     if rows != CHUNK_ROWS:
@@ -1245,6 +1371,348 @@ def capture_verify(
             output = forward_verify(model, verify, state, catch_up=catch_up)
         ttnn.end_trace_capture(model.mesh_device, trace_id, cq_id=cq_id)
     return trace_id, output
+
+
+# --------------------------------------------------------------------------- the split verify (the host decides)
+
+
+@dataclass
+class Qwen38TTNNVerifyHeadOutput:
+    """The head's retained tensors, at trace-stable addresses: ``readback`` FP32 ROW_MAJOR
+    ``[1,1,1,head_readback_width(rows)]`` (the host's one read between the head and the tail), ``roots`` the
+    layer-47 residual rows ``[1,4,32,640]`` BF16 (the tail's alignment input), ``logits`` the verify rows' sharded
+    logits (the host's full-row fallback reads them eagerly)."""
+
+    readback: Any
+    roots: Any
+    logits: Any
+    active: bool = True
+
+    def release_tensors(self) -> None:
+        if not self.active:
+            raise RuntimeError("verify head tensors were already released")
+        _deallocate(self.readback, self.roots, self.logits.tensor)
+        self.active = False
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNVerifyHeadReadback:
+    """The parsed head readback: the device's accept count and next token (its greedy verdict), the ``rows``
+    verify argmaxes, and ``candidate_rows`` fp32 ``[rows, 256]`` (row j: the 1-row candidate row of verify row j,
+    ``Qwen38CandidateRow.from_host_row`` parses one)."""
+
+    accepted: int
+    next_token: int
+    argmaxes: tuple[int, ...]
+    candidate_rows: torch.Tensor
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNVerifyDecision:
+    """The host's verdict on one split pass: ``accepted`` drafts ``a*``, the token ``x*`` emitted after them, the
+    alignment rows' tokens (``rows`` lanes: ``[d_1 .. d_a*, x*, ZERO_EMBEDDING_TOKEN ...]``; the argmax lanes on
+    the greedy path), and the statistics the pass record carries."""
+
+    accepted: int
+    next_token: int
+    alignment_tokens: tuple[int, ...]
+    statistics: Mapping[str, Any] = field(default_factory=dict)
+
+
+def _split_prologue(model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState, state, *, catch_up: bool):
+    """The verify body's position inputs (RoPE rows, QSA verify inputs) and, with ``catch_up``, the selectors of the
+    previous pass's accept; the head and the tail each derive them from the position scalar, which the head leaves
+    where it found it."""
+
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    chunk_constants = verify.qsa_chunk_constants
+    selectors = gdn_module.build_rows_selectors(verify.accepted, verify.rows_constants) if catch_up else None
+    index_row = state.position.index_row()
+    index_rows = ttnn.add(index_row, chunk_constants.arange32_lanes, memory_config=dram)
+    block_start_row = state.position.block_start_index_row(index_row)
+    block_start_rows = ttnn.add(block_start_row, chunk_constants.block_start_lanes, memory_config=dram)
+    rope = model.rope_table.rows_chunk(index_rows, block_start_rows)
+    _deallocate(index_row, index_rows, block_start_row, block_start_rows)
+    qsa_verify = qsa_module.derive_qsa_verify_inputs(
+        state.position.scalar, model.qsa_position_constants, verify.qsa_verify_constants
+    )
+    return selectors, rope, qsa_verify
+
+
+def forward_verify_head(
+    model: Qwen38TTNNTextModel,
+    verify: Qwen38TTNNVerifyState,
+    state: Qwen38TTNNTextModelGenericState,
+    *,
+    catch_up: bool,
+    observer: Callable[[str], Any] | None = None,
+) -> Qwen38TTNNVerifyHeadOutput:
+    """The verify body up to and including the device accept, for a pass the host decides: the prologue, the 48
+    layers, the final mixer, the per-row argmaxes, ``accept_rows`` (its ``a`` and ``t'`` are read back as lanes: the
+    greedy path's values, the sampled path's cross-check), the candidates epilogue on the k + 1 rows, and the
+    readback row ``[a, t', argmax_0 .. argmax_31 | candidates rows]``.  No alignment, no position update: the
+    layer-47 residual rows and the sharded logits stay allocated for the tail and the host's fallback.  Same
+    contract as :func:`forward_verify`: fixed op sequence, no host tensor, a failure poisons the model owner.
+    """
+
+    _validate_verify_state(model, verify)
+    if verify.split is None:
+        raise ValueError("the split verify needs the verify state's split buffers (candidates_constants)")
+    if not isinstance(catch_up, bool):
+        raise TypeError(f"catch_up must be a bool, got {catch_up!r}")
+    if model.poisoned:
+        raise RuntimeError("the text model is poisoned")
+    split = verify.split
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    processed_layers = 0
+
+    def stage(name: str) -> None:
+        if observer is not None:
+            observer(f"verify_head:{name}")
+
+    try:
+        selectors, rope, qsa_verify = _split_prologue(model, verify, state, catch_up=catch_up)
+        residual = _embed_rows(model, verify.token_row)
+        stage("prologue")
+        for layer_index in range(BACKBONE_LAYERS):
+            residual = _forward_layer_verify(
+                model.layers[layer_index],
+                residual,
+                state.layers[layer_index],
+                verify.layers[layer_index],
+                prepared_ple_rows=verify.ple_rows if layer_index == PLE_CHECKPOINT_LAYER else None,
+                rope_rows=rope,
+                qsa_verify=qsa_verify,
+                qsa_chunk_constants=verify.qsa_chunk_constants,
+                selectors=selectors,
+            )
+            processed_layers += 1
+            stage(f"layer-{layer_index}")
+        hidden = model.final_mixer.rows(residual, flat_views=True)
+        retained: list[Any] = []
+        argmax_lanes = _resolve_rows(
+            model, hidden, rows=verify.rows, sentinel_tail=verify.accept_constants.sentinel_tail, retain=retained
+        )
+        _deallocate(hidden)
+        (logits,) = retained
+        stage("head")
+        accept = accept_rows(argmax_lanes, verify.draft_lanes, verify.accept_constants)
+        stage("accept")
+        candidates = model.model_io.lm_head.sampling_candidates(
+            logits, split.candidates_constants, into=split.candidates_readback
+        )
+        flat = ttnn.reshape(candidates, (1, 1, 1, verify.rows * CANDIDATE_LANES_PER_ROW))
+        if _tensor_key(flat) != _tensor_key(candidates):
+            _deallocate(candidates)
+        readback = ttnn.concat([accept.accepted_lane, accept.next_token, argmax_lanes, flat], dim=3, memory_config=dram)
+        width = head_readback_width(verify.rows)
+        if _shape(readback) != (1, 1, 1, width) or readback.dtype != ttnn.float32:
+            raise RuntimeError(f"verify head readback must be FP32 [1,1,1,{width}], got {tensor_metadata(readback)}")
+        _deallocate(flat, argmax_lanes)
+        accept.deallocate()
+        qsa_verify.deallocate()
+        rope.deallocate()
+        if selectors is not None:
+            selectors.deallocate()
+        stage("epilogue")
+        return Qwen38TTNNVerifyHeadOutput(readback, residual, logits)
+    except BaseException as error:
+        model._mark_poisoned("forward_verify_head", processed_layers, error)
+
+
+def forward_verify_tail(
+    model: Qwen38TTNNTextModel,
+    verify: Qwen38TTNNVerifyState,
+    state: Qwen38TTNNTextModelGenericState,
+    head: Qwen38TTNNVerifyHeadOutput,
+    *,
+    catch_up: bool,
+    observer: Callable[[str], Any] | None = None,
+) -> Qwen38TTNNVerifyOutput:
+    """The rest of a split pass once the host wrote its decision (:func:`write_verify_decision`): the alignment
+    rows on the head's roots with the host's tokens and accept scalars (``first_draft`` = the alignment argmax at
+    row ``a*``, ``alignment.residual`` <- row ``a*``), the readback row ``[a*, x*, d_1', alignment tokens]`` the
+    draft body reads, the accept scalar for the next commit, then ``P <- P + a* + 1`` as the last op.  The
+    position inputs are derived again from the position scalar the head left unchanged."""
+
+    _validate_verify_state(model, verify)
+    if verify.split is None:
+        raise ValueError("the split verify needs the verify state's split buffers (candidates_constants)")
+    if not isinstance(head, Qwen38TTNNVerifyHeadOutput) or not head.active:
+        raise ValueError("the verify tail needs the live head output whose roots it reads")
+    if _shape(head.roots) != RESIDUAL_ROWS_SHAPE or head.roots.dtype != ttnn.bfloat16:
+        raise RuntimeError(f"verify head roots must be BF16 {RESIDUAL_ROWS_SHAPE}, got {tensor_metadata(head.roots)}")
+    if not isinstance(catch_up, bool):
+        raise TypeError(f"catch_up must be a bool, got {catch_up!r}")
+    if model.poisoned:
+        raise RuntimeError("the text model is poisoned")
+    split = verify.split
+    dram = ttnn.DRAM_MEMORY_CONFIG
+
+    def stage(name: str) -> None:
+        if observer is not None:
+            observer(f"verify_tail:{name}")
+
+    try:
+        selectors, rope, qsa_verify = _split_prologue(model, verify, state, catch_up=catch_up)
+        accepted_lane = ttnn.to_layout(split.accept_tile, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+        accept = Qwen38TTNNAcceptResult(split.accept_tile, accepted_lane, split.accept_index, split.next_token)
+        stage("prologue")
+        if verify.alignment is None:
+            first_draft = verify.accept_constants.sentinel_lane
+        else:
+            first_draft = _forward_alignment(
+                model,
+                verify,
+                head.roots,
+                accept,
+                split.alignment_tokens,
+                rope_rows=rope,
+                qsa_verify=qsa_verify,
+                selectors=selectors,
+            )
+        stage("alignment")
+        readback = ttnn.concat(
+            [accept.accepted_lane, accept.next_token, first_draft, split.alignment_tokens], dim=3, memory_config=dram
+        )
+        if _shape(readback) != (1, 1, 1, READBACK_WIDTH) or readback.dtype != ttnn.float32:
+            raise RuntimeError(
+                f"verify readback must be FP32 [1,1,1,{READBACK_WIDTH}], got {tensor_metadata(readback)}"
+            )
+        if verify.alignment is not None:
+            _deallocate(first_draft)
+        landed = ttnn.copy(accept.accepted_tile, verify.accepted)
+        if landed is not None and _tensor_key(landed) != _tensor_key(verify.accepted):
+            raise RuntimeError("verify accept count did not land in its persistent buffer")
+        # P <- P + a* + 1: exact UINT32 adds into the resident scalar, the body's last op.
+        key = _tensor_key(state.position.scalar)
+        advanced = ttnn.add(state.position.scalar, accept.accepted_index, memory_config=dram)
+        advanced_next = ttnn.add(advanced, 1, memory_config=dram)
+        copied = ttnn.copy(advanced_next, state.position.scalar)
+        if _tensor_key(state.position.scalar) != key or (copied is not None and _tensor_key(copied) != key):
+            raise RuntimeError("verify position advance did not write the resident scalar in place")
+        _deallocate(advanced, advanced_next, accepted_lane)  # the host-written scalars stay
+        qsa_verify.deallocate()
+        rope.deallocate()
+        if selectors is not None:
+            selectors.deallocate()
+        stage("epilogue")
+        return Qwen38TTNNVerifyOutput(readback)
+    except BaseException as error:
+        model._mark_poisoned("forward_verify_tail", 0, error)
+
+
+def capture_verify_head(
+    model: Qwen38TTNNTextModel,
+    verify: Qwen38TTNNVerifyState,
+    state: Qwen38TTNNTextModelGenericState,
+    *,
+    catch_up: bool,
+    guard: Callable[[str], AbstractContextManager[Any]],
+    cq_id: int = 0,
+) -> tuple[int, Qwen38TTNNVerifyHeadOutput]:
+    with ttnn.corruptible_allocation_scope(model.mesh_device):
+        trace_id = ttnn.begin_trace_capture(model.mesh_device, cq_id=cq_id)
+        with guard(f"verify head capture catch_up={catch_up}"):
+            output = forward_verify_head(model, verify, state, catch_up=catch_up)
+        ttnn.end_trace_capture(model.mesh_device, trace_id, cq_id=cq_id)
+    return trace_id, output
+
+
+def capture_verify_tail(
+    model: Qwen38TTNNTextModel,
+    verify: Qwen38TTNNVerifyState,
+    state: Qwen38TTNNTextModelGenericState,
+    head: Qwen38TTNNVerifyHeadOutput,
+    *,
+    catch_up: bool,
+    guard: Callable[[str], AbstractContextManager[Any]],
+    cq_id: int = 0,
+) -> tuple[int, Qwen38TTNNVerifyOutput]:
+    """Capture the tail after the head whose roots it reads; the draft body is captured after this tail's output."""
+
+    with ttnn.corruptible_allocation_scope(model.mesh_device):
+        trace_id = ttnn.begin_trace_capture(model.mesh_device, cq_id=cq_id)
+        with guard(f"verify tail capture catch_up={catch_up}"):
+            output = forward_verify_tail(model, verify, state, head, catch_up=catch_up)
+        ttnn.end_trace_capture(model.mesh_device, trace_id, cq_id=cq_id)
+    return trace_id, output
+
+
+def _verify_head_readback(values: torch.Tensor, *, rows: int) -> Qwen38TTNNVerifyHeadReadback:
+    width = head_readback_width(rows)
+    if values.numel() != width:
+        raise RuntimeError(f"verify head readback has {values.numel()} lanes, expected {width}")
+    fixed = len(HEAD_READBACK_FIXED_LANES)
+    candidates = values[fixed + CHUNK_ROWS :].reshape(rows, CANDIDATE_LANES_PER_ROW)
+    return Qwen38TTNNVerifyHeadReadback(
+        accepted=int(values[0].item()),
+        next_token=int(values[1].item()),
+        argmaxes=tuple(int(value) for value in values[fixed : fixed + rows]),
+        candidate_rows=candidates.clone(),
+    )
+
+
+def read_verify_head(head: Qwen38TTNNVerifyHeadOutput, *, rows: int) -> Qwen38TTNNVerifyHeadReadback:
+    """Host readback (outside any trace, after a head replay) of the head row from coordinate 0: blocking, it
+    completes the head; the host decides on it and writes before the tail is launched."""
+
+    if not head.active:
+        raise RuntimeError("verify head tensors were released")
+    return _verify_head_readback(ttnn.to_torch(ttnn.get_device_tensors(head.readback)[0]).reshape(-1), rows=rows)
+
+
+def decide_greedy(tokens: Sequence[int], head: Qwen38TTNNVerifyHeadReadback) -> Qwen38TTNNVerifyDecision:
+    """The greedy path's decision: the device's ``(a, t')`` written back (bitwise the fused body: the alignment
+    tokens are the argmax lanes), recomputed on the host from the argmaxes and the drafts ``tokens[1:]`` (the longest
+    prefix of drafts equal to their targets, then that row's argmax) and required to agree lane for lane."""
+
+    drafts = [int(token) for token in tokens[1:]]
+    if len(drafts) + 1 != len(head.argmaxes):
+        raise ValueError(f"{len(drafts)} drafts against {len(head.argmaxes)} verify rows")
+    accepted = 0
+    while accepted < len(drafts) and head.argmaxes[accepted] == drafts[accepted]:
+        accepted += 1
+    next_token = head.argmaxes[accepted]
+    if (accepted, next_token) != (head.accepted, head.next_token):
+        raise RuntimeError(
+            f"host greedy accept ({accepted}, {next_token}) vs the device's ({head.accepted}, {head.next_token}) "
+            f"on argmaxes {head.argmaxes} and drafts {drafts}"
+        )
+    return Qwen38TTNNVerifyDecision(accepted, next_token, tuple(head.argmaxes), {"accept_checks": 1})
+
+
+def write_verify_decision(
+    model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState, decision: Qwen38TTNNVerifyDecision
+) -> None:
+    """Host writes of one pass's decision (outside any trace, between the head and the tail): the accept scalars,
+    the next token and the alignment tokens (``rows`` lanes, then ``ZERO_EMBEDDING_TOKEN``)."""
+
+    split = verify.split
+    if split is None:
+        raise ValueError("the verify state has no split buffers")
+    accepted, next_token = decision.accepted, decision.next_token
+    if isinstance(accepted, bool) or type(accepted) is not int or not 0 <= accepted < verify.rows:
+        raise ValueError(f"accept count must be an int in [0,{verify.rows}), got {accepted!r}")
+    if isinstance(next_token, bool) or type(next_token) is not int or next_token < 0:
+        raise ValueError(f"next token must be a non-negative int, got {next_token!r}")
+    tokens = [int(token) for token in decision.alignment_tokens]
+    if len(tokens) != verify.rows or any(token < ZERO_EMBEDDING_TOKEN for token in tokens):
+        raise ValueError(f"alignment tokens must be {verify.rows} ids (or the zero-embedding sentinel), got {tokens}")
+    if tokens[accepted] != next_token:
+        raise ValueError(f"alignment token {tokens[accepted]} at row {accepted} is not the next token {next_token}")
+    lanes = torch.full(TOKEN_ROW_SHAPE, float(ZERO_EMBEDDING_TOKEN))
+    lanes[..., : verify.rows] = torch.tensor(tokens, dtype=torch.float32)
+    replicate = replicate_tensor_2d_mesh_mapper(model.mesh_device)
+    for target, host, layout in (
+        (split.accept_tile, torch.full((1, 1, 1, 1), float(accepted)), ttnn.TILE_LAYOUT),
+        (split.accept_index, torch.full((1, 1, 1, 1), accepted, dtype=torch.int32), ttnn.ROW_MAJOR_LAYOUT),
+        (split.next_token, torch.full((1, 1, 1, 1), float(next_token)), ttnn.ROW_MAJOR_LAYOUT),
+        (split.alignment_tokens, lanes, ttnn.ROW_MAJOR_LAYOUT),
+    ):
+        ttnn.copy_host_to_device_tensor(
+            ttnn.from_torch(host, dtype=target.dtype, layout=layout, mesh_mapper=replicate), target
+        )
 
 
 # --------------------------------------------------------------------------- the commit body (split form)
@@ -1718,17 +2186,47 @@ class Qwen38TTNNMTPTraces:
     (``forward_commit``) is set, never both: the single-trace form runs ``draft -> verify_catch_up``, the split form
     ``draft -> commit -> verify_first`` so the commit replay overlaps the host's PLE lookup.  ``draft_history`` is
     the draft body's history derivation captured on its own (``forward_draft_history``; the draft trace then ran
-    ``derive_history=False``): the two-command-queue form's fence point."""
+    ``derive_history=False``): the two-command-queue form's fence point.  ``verify_head`` / ``verify_tail`` (the
+    split verify, the host deciding between them) replace ``verify_first``; they need the commit form."""
 
-    verify_first: int
+    verify_first: int | None
     draft: int
     verify_catch_up: int | None = None
     commit: int | None = None
     draft_history: int | None = None
+    verify_head: int | None = None
+    verify_tail: int | None = None
 
     def __post_init__(self) -> None:
         if (self.verify_catch_up is None) == (self.commit is None):
             raise ValueError("exactly one of verify_catch_up / commit must be captured")
+        if (self.verify_head is None) != (self.verify_tail is None):
+            raise ValueError("the split verify captures its head and its tail together")
+        if (self.verify_first is None) == (self.verify_head is None):
+            raise ValueError("exactly one verify form: the fused verify_first, or the split verify_head / verify_tail")
+        if self.verify_head is not None and self.commit is None:
+            raise ValueError("the split verify runs the commit form")
+
+    @property
+    def split(self) -> bool:
+        return self.verify_head is not None
+
+    def ids(self) -> list[int]:
+        """Every captured trace id, for release and the pre-replay allocation check."""
+
+        return [
+            trace_id
+            for trace_id in (
+                self.verify_first,
+                self.verify_head,
+                self.verify_tail,
+                self.verify_catch_up,
+                self.commit,
+                self.draft_history,
+                self.draft,
+            )
+            if trace_id is not None
+        ]
 
 
 class Qwen38TTNNCommitQueue:
@@ -1793,6 +2291,7 @@ class Qwen38TTNNMTPPassRecord:
     first_draft: int
     finished: bool
     segments_ns: dict[str, int]
+    decision: Qwen38TTNNVerifyDecision | None = None  # the split verify's host verdict (its statistics)
 
 
 class Qwen38TTNNMTPChain:
@@ -1816,6 +2315,11 @@ class Qwen38TTNNMTPChain:
     With ``commit_queue`` (:class:`Qwen38TTNNCommitQueue`; needs ``traces.commit`` and ``traces.draft_history``)
     the commit runs on its own command queue behind the draft-history fence and the verify waits for it
     (``commit_wait``); the blocking form replays it there.
+
+    With the split verify (``traces.verify_head`` / ``verify_tail``, ``head_output``) the pass is: the head replay,
+    one blocking read of its row (:func:`read_verify_head`), ``decide(tokens, readback)`` on the host (the
+    greedy :func:`decide_greedy` by default; a sampled request's acceptance otherwise), the four decision writes
+    (:func:`write_verify_decision`), the tail replay, then the draft and the pass row as in the fused form.
     """
 
     def __init__(
@@ -1833,6 +2337,8 @@ class Qwen38TTNNMTPChain:
         enqueue: Callable[[int], Any] | None = None,
         observer: Callable[[str], Any] | None = None,
         commit_queue: Qwen38TTNNCommitQueue | None = None,
+        head_output: Qwen38TTNNVerifyHeadOutput | None = None,
+        decide: Callable[[Sequence[int], Qwen38TTNNVerifyHeadReadback], Qwen38TTNNVerifyDecision] = decide_greedy,
     ) -> None:
         _validate_draft_state(model, verify, draft)
         if not isinstance(traces, Qwen38TTNNMTPTraces) or not callable(replay):
@@ -1845,9 +2351,14 @@ class Qwen38TTNNMTPChain:
             not isinstance(commit_queue, Qwen38TTNNCommitQueue) or traces.commit is None or traces.draft_history is None
         ):
             raise ValueError("a commit queue needs the split form with the draft history captured on its own")
+        if traces.split != (head_output is not None) or (traces.split and verify.split is None):
+            raise ValueError("the split verify needs its head output and the verify state's split buffers")
+        if not callable(decide):
+            raise TypeError("decide must be a callable")
         self.model, self.verify, self.draft, self.traces = model, verify, draft, traces
         self.verify_output, self.replay, self.clock_ns = verify_output, replay, clock_ns
         self.enqueue, self.observer, self.commit_queue = enqueue, observer, commit_queue
+        self.head_output, self.decide = head_output, decide
         self.position = position
         self.eos_token_ids = frozenset(int(token) for token in eos_token_ids)
         self.records: list[Qwen38TTNNMTPPassRecord] = []
@@ -1873,11 +2384,22 @@ class Qwen38TTNNMTPChain:
         return result
 
     def _finish_pass(self, tokens: Sequence[int], segments: dict[str, int]) -> Qwen38TTNNMTPPassRecord:
-        verify_trace = (
-            self.traces.verify_catch_up if self.records and self.traces.commit is None else self.traces.verify_first
-        )
         launch, form = (self.replay, "replay") if self.enqueue is None else (self.enqueue, "enqueue")
-        self._timed(segments, f"verify_{form}", lambda: launch(verify_trace))
+        decision = None
+        if not self.traces.split:
+            verify_trace = (
+                self.traces.verify_catch_up if self.records and self.traces.commit is None else self.traces.verify_first
+            )
+            self._timed(segments, f"verify_{form}", lambda: launch(verify_trace))
+        else:
+            # The head, the one blocking read of its row, the host's verdict, its four writes, the tail.
+            self._timed(segments, f"verify_head_{form}", lambda: launch(self.traces.verify_head))
+            head = self._timed(
+                segments, "head_readback", lambda: read_verify_head(self.head_output, rows=self.verify.rows)
+            )
+            decision = self._timed(segments, "decision", lambda: self.decide(tokens, head))
+            self._timed(segments, "decision_write", lambda: write_verify_decision(self.model, self.verify, decision))
+            self._timed(segments, f"verify_tail_{form}", lambda: launch(self.traces.verify_tail))
         if self.traces.draft_history is not None:
             self._timed(segments, f"draft_history_{form}", lambda: launch(self.traces.draft_history))
             if self.commit_queue is not None:
@@ -1886,6 +2408,14 @@ class Qwen38TTNNMTPChain:
         readback, self.next_tokens = self._timed(segments, "readback", lambda: read_pass_row(self.verify, self.draft))
         if readback.first_draft is None:
             raise RuntimeError("the verify readback carries no first draft; the chain needs the alignment rows")
+        if decision is not None and (readback.accepted, readback.next_token) != (
+            decision.accepted,
+            decision.next_token,
+        ):
+            raise RuntimeError(
+                f"pass row ({readback.accepted}, {readback.next_token}) is not the host decision "
+                f"({decision.accepted}, {decision.next_token})"
+            )
         commit_verify_host(self.verify, readback.accepted)
         committed = list(readback.argmaxes[: readback.accepted + 1])
         first_eos = next((i for i, token in enumerate(committed) if token in self.eos_token_ids), None)
@@ -1905,6 +2435,7 @@ class Qwen38TTNNMTPChain:
             first_draft=readback.first_draft,
             finished=self.finished,
             segments_ns=segments,
+            decision=decision,
         )
         self.records.append(record)
         self.position += readback.accepted + 1
@@ -2253,11 +2784,15 @@ __all__ = [
     "accept_rows",
     "allocate_draft_state",
     "allocate_verify_state",
+    "CANDIDATE_LANES_PER_ROW",
     "capture_commit",
     "capture_draft",
     "capture_draft_history",
     "capture_verify",
+    "capture_verify_head",
+    "capture_verify_tail",
     "commit_verify_host",
+    "decide_greedy",
     "DEFAULT_DRAFTS",
     "enter_verify_mode",
     "forward_commit",
@@ -2265,6 +2800,10 @@ __all__ = [
     "forward_draft_history",
     "forward_mtp_step_row",
     "forward_verify",
+    "forward_verify_head",
+    "forward_verify_tail",
+    "head_readback_width",
+    "HEAD_READBACK_FIXED_LANES",
     "leave_verify_mode",
     "moe_rows_for",
     "Qwen38TTNNAcceptConstants",
@@ -2277,12 +2816,17 @@ __all__ = [
     "Qwen38TTNNMTPStepInputs",
     "Qwen38TTNNMTPTraces",
     "Qwen38TTNNVerifyAlignment",
+    "Qwen38TTNNVerifyDecision",
+    "Qwen38TTNNVerifyHeadOutput",
+    "Qwen38TTNNVerifyHeadReadback",
     "Qwen38TTNNVerifyLayerState",
     "Qwen38TTNNVerifyOutput",
     "Qwen38TTNNVerifyReadback",
+    "Qwen38TTNNVerifySplit",
     "Qwen38TTNNVerifyState",
     "PASS_ROW_WIDTH",
     "read_pass_row",
+    "read_verify_head",
     "read_verify_output",
     "READBACK_WIDTH",
     "release_draft_state",
@@ -2293,6 +2837,7 @@ __all__ = [
     "SUPPORTED_DRAFTS",
     "verify_pass_fits",
     "write_verify_accepted",
+    "write_verify_decision",
     "write_verify_inputs",
     "write_verify_ple_rows",
 ]
