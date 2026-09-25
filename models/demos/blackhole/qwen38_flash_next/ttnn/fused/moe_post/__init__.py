@@ -107,6 +107,21 @@ def _check_inputs(pages, scores, indices, owner, shared, sigmoid) -> int:
     return rows
 
 
+def route_contiguous(scores, indices) -> int:
+    """1 when both routing tensors are one L1 shard on one core (moe_compute's drain-core shard: the rows lie at the
+    shard's page pitch and the reader takes each tensor in one read), else 0 (one page read per row)."""
+
+    for tensor in (scores, indices):
+        config = tensor.memory_config()
+        if (
+            not config.is_sharded()
+            or config.buffer_type != ttnn.BufferType.L1
+            or config.shard_spec.grid.num_cores() != 1
+        ):
+            return 0
+    return 1
+
+
 def moe_post_program(pages, scores, indices, owner, shared, sigmoid, out, *, rows: int) -> "ttnn.ProgramDescriptor":
     mesh = pages.device()
     work = fp.split_work(HIDDEN_TILES, mesh)
@@ -117,7 +132,10 @@ def moe_post_program(pages, scores, indices, owner, shared, sigmoid, out, *, row
         ("has_sig", 0 if sigmoid is None else 1),
         ("stage_pages", stage_pages),
         ("owner_bytes", OWNER_BYTES),
+        ("route_contiguous", route_contiguous(scores, indices)),
     ]
+    # study build: per-phase device profiler zones in the three kernels (QWEN38_MOE_POST_ZONES=1); the served build has none
+    defines = [("FMP_ZONES", "1")] if os.environ.get("QWEN38_MOE_POST_ZONES") == "1" else []
     cbs = [
         fp.cb_descriptor(index, dtype, page_bytes, stage_pages if pages_ is None else pages_, cores)
         for _name, index, dtype, page_bytes, pages_ in CBS
@@ -150,6 +168,7 @@ def moe_post_program(pages, scores, indices, owner, shared, sigmoid, out, *, row
             )
             for w in work
         ],
+        defines=defines,
         named=named,
     )
     writer = fp.writer_kernel(
@@ -157,10 +176,11 @@ def moe_post_program(pages, scores, indices, owner, shared, sigmoid, out, *, row
         cores,
         fp.accessor_args(out),
         [(w.core, [out.buffer_address(), w.start]) for w in work],
+        defines=defines,
         named=named,
     )
     compute = fp.compute_kernel(
-        KERNELS["compute"], cores, [], named=named, fidelity=ttnn.MathFidelity.HiFi4, fp32_dest=True
+        KERNELS["compute"], cores, [], defines=defines, named=named, fidelity=ttnn.MathFidelity.HiFi4, fp32_dest=True
     )
     return fp.program_descriptor([reader, writer, compute], cbs=cbs)
 

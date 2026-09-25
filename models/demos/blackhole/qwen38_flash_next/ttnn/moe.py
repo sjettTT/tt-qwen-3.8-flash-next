@@ -32,6 +32,7 @@ import ttnn
 from models.demos.blackhole.qwen38_flash_next.checkpoint import INDEX_SHA256, Qwen38Checkpoint
 from models.demos.blackhole.qwen38_flash_next.config import Qwen38Placement
 from models.demos.blackhole.qwen38_flash_next.tt.moe import Qwen38MoEWeights
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROWS,
     LONG_CHUNK_ROWS,
@@ -39,10 +40,9 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     MESH_SHAPE,
     Qwen38MeshContract,
     TensorPlacement,
+    is_slab_rows,
     replicate_tensor_2d_mesh_mapper,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
-from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dense_dtype_tag,
     dense_math_fidelity_name,
@@ -1107,12 +1107,12 @@ class Qwen38TTNNMoE:
         if packed_w0_w1.dtype != ttnn.bfloat4_b or packed_w2.dtype != ttnn.bfloat4_b:
             raise RuntimeError("routed expert tensors must be BFLOAT4_B")
         phase_observer("before-routed-dispatch")
-        sparse_source = full_hidden
+        # The untilize reads the width-sharded hidden at any row count as it does at one row; several rows then take
+        # the ROW_MAJOR view moe_compute counts (dims 0 x 1) -- no un-sharding of the tiles first (one program per
+        # layer at B > 1 in the 2026-09-25 lane census).
+        sparse_input = ttnn.to_layout(full_hidden, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         if self.rows != 1:
-            sparse_source = ttnn.reshape(
-                ttnn.to_memory_config(full_hidden, ttnn.DRAM_MEMORY_CONFIG), self.row_contract.moe_sparse_input
-            )
-        sparse_input = ttnn.to_layout(sparse_source, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            sparse_input = ttnn.reshape(sparse_input, self.row_contract.moe_sparse_input)
         if _shape(sparse_input) != self.row_contract.moe_sparse_input:
             raise RuntimeError(
                 f"moe_compute sparse input must be {self.row_contract.moe_sparse_input}, got {_shape(sparse_input)}"

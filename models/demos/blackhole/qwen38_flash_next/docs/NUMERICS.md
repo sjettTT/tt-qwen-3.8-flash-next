@@ -33,7 +33,10 @@ per read as 2, the chain's LLK sequences call for call, its reduce scaler and sp
 is data movement, so the fold is bitwise, 2026-09-25); the gated-residual write as one program (SFPU multiply, FPU add, as
 the chain); the tail's greedy epilogue (24 programs as 4 plus one gather); the MoE post program (fill, tilize, the
 score-weighted reduce over the ten expert slots in slot order, the shared expert's x sigmoid and the partial add as one
-program); the prologue's position derivation (40 programs as 1); the sparse-attention block's decode glue as six
+program; its reader takes each routing tensor in one read from moe_compute's drain-core shard and seeds the score
+tiles with the NoC's zeros, so the program is 7.5 -> 5.9 us at one row and flat in the row count, bitwise; at several
+rows the routed dispatch untilizes the sharded hidden directly and takes the rows view of the result, 2026-09-25); the
+prologue's position derivation (40 programs as 1); the sparse-attention block's decode glue as six
 programs (index tail, main tail, post-attention, partial widen, selection row, score merge); the MoE router tail
 (softmax, top-10, sum, div, casts and layouts: 12 programs per layer as one, its top-k on one core per eight-token
 group: the LLK sort's four independent passes, so every token sees the chain's instructions, bitwise, 88 -> 52 us per

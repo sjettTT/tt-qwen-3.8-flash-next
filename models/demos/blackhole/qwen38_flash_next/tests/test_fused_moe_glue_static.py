@@ -54,7 +54,7 @@ def test_post_cb_table_and_named_args():
     assert len(set(indices)) == len(indices) and max(indices) < 32 and mp.CB_INDEX["cb_out"] == 16
     for name in ("cb_act", "cb_scores"):
         assert dict((n, p) for n, _i, _d, _b, p in mp.CBS)[name] == mp.TOP_K
-    extra = {"top_k", "has_sig", "stage_pages", "owner_bytes"}
+    extra = {"top_k", "has_sig", "stage_pages", "owner_bytes", "route_contiguous"}
     for kernel in ("reader", "compute", "writer"):
         names = _named(POST[kernel])
         assert names, kernel
@@ -74,8 +74,8 @@ def test_post_compute_pins_the_replaced_ops_instruction_sequences():
     assert "bcast_init<EltwiseBinaryType::ELWMUL, BroadcastType::COL>(cb_act, cb_scores)" in compute
     assert "llk_math_eltwise_binary_init<EltwiseBinaryType::ELWMUL, BroadcastType::COL, MATH_FIDELITY>" in compute
     assert "1 /*acc_to_dest*/" in compute
-    assert (
-        "for (uint32_t k = 0; k < top_k; ++k) {\n        mul_tiles_bcast_cols(cb_act, cb_scores, k, k, 0);" in compute
+    assert re.search(
+        r"for \(uint32_t k = 0; k < top_k; \+\+k\) \{\s*mul_tiles_bcast_cols\(cb_act, cb_scores, k, k, 0\);", compute
     )
     # binary_ng: the SFPU multiply in the 16-bit-dest rounding (ttnn.multiply defaults fast_and_approximate_mode
     # False); the FPU add_tiles (ttnn.add defaults True) -- never an SFPU add
@@ -95,8 +95,14 @@ def test_post_reader_face_addressing_and_score_tiles():
     reader = POST["reader"]
     # the chain's column-0 score tile: face 0 rows 0..15 at j*16, face 2 rows 16..31 at 512 + (j-16)*16
     assert "(j < 16) ? j * 16 : 512 + (j - 16) * 16" in reader
-    assert "stile[k * 1024 + col0] = value" in reader
-    assert "owner_u16[idx_u16[j * 32 + k]] != 0" in reader and "route_pitch = 64" in reader
+    assert "stile[k * 1024 + col0] = sc_u16[j * route_words + k]" in reader
+    assert "owner_u16[idx_u16[j * route_words + k]] != 0" in reader and "route_pitch = 64" in reader
+    # the score tiles are zero-seeded like the activation pages (only owned scores are written); routing rows that are
+    # one L1 shard on one core come in one read per tensor at the shard's page pitch
+    assert "noc.async_write_zeros(CoreLocalMem<uint32_t>(stile_base), top_k * tile_bytes, {})" in reader
+    assert "route_words = indices.get_aligned_page_size() / 2" in reader
+    assert "noc_async_read(indices.get_noc_addr(0), idx_base, rows * 2 * route_words)" in reader
+    assert "noc_async_read(scores.get_noc_addr(0), sc_base, rows * 2 * route_words)" in reader
     # a token row's 32 columns split into faces (j/16)*2 (columns 0..15) and +1 (columns 16..31), row j%16
     assert "(j >> 4) * 2 * face_bytes + (j & 15) * face_row_bytes" in reader
     assert "dst + face_bytes, face_row_bytes" in reader
@@ -202,7 +208,7 @@ def test_model_switch_sites():
 
 
 @pytest.mark.parametrize("bad", [(9, 1, 2560), (10, 1, 2048)])
-def test_post_rejects_wrong_page_shapes(bad):
+def test_post_rejects_wrong_page_shapes(bad, expect_error):
     class T:
         def __init__(self, shape, dtype, layout):
             self.shape, self.dtype, self.layout = shape, dtype, layout
@@ -210,5 +216,5 @@ def test_post_rejects_wrong_page_shapes(bad):
     scores = T((1, 1, 1, 10), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
     indices = T((1, 1, 1, 10), ttnn.uint16, ttnn.ROW_MAJOR_LAYOUT)
     assert mp.routing_rows_of(scores, indices) == 1
-    with pytest.raises(ValueError):
+    with expect_error(ValueError, "moe_post pages must be"):
         mp._check_inputs(T(bad, ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT), scores, indices, None, None, None)
