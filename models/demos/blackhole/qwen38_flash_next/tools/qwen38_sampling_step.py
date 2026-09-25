@@ -891,7 +891,7 @@ def generate_sampled_on_device(
         if prefilled:
             raise RuntimeError(
                 f"device sampler first token {device_token} vs host reference {expected} on the read row "
-                f"(u={request.uniforms[-1]}, policy={request.device_policy()})"
+                f"(u={request.uniforms[-1]}, policy={session.sampling.device_policy_of(request)})"
             )
         chain.write_token_row(expected)
         session.sampling.rewrite_history([expected])  # the emitted first token, not the device's draw

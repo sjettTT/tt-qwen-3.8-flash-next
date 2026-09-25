@@ -172,6 +172,25 @@ def _log(event: str, **fields: Any) -> None:
 MTP_SAMPLED_VARIABLE = "QWEN38_MTP_SAMPLED"
 
 
+def effective_device_sampler(args: Any) -> bool:
+    """The server's sampler: the on-device sampler is the ``--sampling`` default on a one-stream server; an ``--mtp``
+    server samples on the host (its TAIL resolves the greedy token for the MTP row and the pass loop's point-mass
+    decision is the host's: ``ttnn/speculative_sampling.py``), so ``--device-sampler`` with ``--mtp`` is refused and
+    ``--host-sampler`` is its default.  Without ``--sampling`` there is no sampler at all."""
+
+    requested = args.device_sampler  # None: the default; True / False: --device-sampler / --host-sampler
+    if requested and not args.sampling:
+        raise SystemExit("--device-sampler needs --sampling (the sampler reads the candidate row)")
+    if requested and args.mtp is not None:
+        raise SystemExit(
+            "--device-sampler is not served with --mtp: the MTP chain samples on the host (its tail resolves the greedy "
+            "token for the draft row; the pass loop's point-mass decision is the host's); drop one of the two"
+        )
+    if requested is None:
+        return bool(args.sampling) and args.mtp is None
+    return bool(requested)
+
+
 def mtp_sampled_switch(environment: Mapping[str, str], *, applicable: bool = True) -> bool:
     """The switch's resolution; ``applicable``: the server runs with ``--mtp`` and ``--sampling``."""
 
@@ -1642,10 +1661,7 @@ def main() -> int:
         raise SystemExit(
             f"--stall-seconds must exceed --socket-timeout-seconds {args.socket_timeout_seconds}, got {args.stall_seconds}"
         )
-    if args.device_sampler is None:
-        args.device_sampler = bool(args.sampling)  # the device sampler is the --sampling default
-    if args.device_sampler and not args.sampling:
-        raise SystemExit("--device-sampler needs --sampling (the sampler reads the candidate row)")
+    args.device_sampler = effective_device_sampler(args)
     if args.sampling_discriminator and (not args.sampling or args.acceptance_prompts is None):
         raise SystemExit("--sampling-discriminator needs --sampling and the acceptance prompt records")
     if args.lanes:

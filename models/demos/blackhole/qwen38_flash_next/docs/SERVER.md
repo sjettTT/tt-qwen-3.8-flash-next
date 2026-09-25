@@ -112,7 +112,9 @@ The sampled draw runs on the device by default: for `temperature` up to 4, `top_
 are the device's own history), the same law as the host sampler (`docs/NUMERICS.md`, the law gate).  A request with
 `frequency_penalty`, `repetition_penalty`, a negative `presence_penalty`, `top_k` 0, a temperature above 4 or `logprobs`
 samples on the host over the same candidate row (`qwen38.sampling.sampler` in the response names the path);
-`--host-sampler` keeps every request on the host.  The composite device-sampler path (`--device-sampler` before the
+`--host-sampler` keeps every request on the host, and an `--mtp` server samples on the host by design (its tail resolves
+the greedy token for the draft row and the pass loop's point-mass decision is the host's; `--device-sampler` with `--mtp`
+is refused).  The composite device-sampler path (`--device-sampler` before the
 one-program sampler) never captured inside the chat server before 2026-09-25: its TAIL capture resolved the greedy row
 in a form the warm pass had not compiled; the same change fixes both paths.
 

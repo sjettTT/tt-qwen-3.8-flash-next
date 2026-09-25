@@ -211,6 +211,38 @@ class Qwen38ChatRequestError(ValueError):
     """A request the session refuses (HTTP 400): bad messages, context length, bad token budget."""
 
 
+def mtp_tail_epilogue(model, lm_head, chain_mtp, output, token_row_io, sampling=None):
+    """The MTP chain's TAIL epilogue, one function for the warm pass (eager) and the TAIL capture (recorded), so the
+    capture asks only for programs the warm compiled: the greedy candidates (with a sampling chain, the form its
+    extension uses: the folded candidate row when ``candidate_row`` is on), the device resolve into a fresh row (the
+    MTP row reads it before the copy), the MTP layer's row on the retained residual / RoPE rows / QSA position inputs,
+    the copy into the persistent token row, and with a sampling chain its candidate row from those candidates (the
+    2026-09-25 miss: the row built without them took the chain's form, whose typecasts no warm had compiled).
+    Returns ``(candidates, token_row, row)`` (``row`` None without a sampling chain); the caller checks or releases."""
+
+    if output.logits is None or output.residual is None:
+        raise Qwen38ChatChainError("the MTP tail epilogue needs the step's logits and its retained MTP inputs")
+    if sampling is not None and sampling.candidate_row:
+        candidates = lm_head.greedy_candidates(output.logits, candidate_row=sampling.constants)
+    else:
+        candidates = lm_head.greedy_candidates(output.logits)
+    token_row = lm_head.resolve_greedy_on_device(candidates)
+    mtp_v2.forward_mtp_step_row(
+        model,
+        chain_mtp.alignment,
+        chain_mtp.step_inputs,
+        output.residual,
+        token_row,
+        rope=output.rope,
+        qsa_position=output.qsa_position,
+    )
+    ttnn.copy(token_row, token_row_io)
+    row = None
+    if sampling is not None:
+        row = lm_head.sampling_candidates(output.logits, sampling.constants, candidates=candidates)
+    return candidates, token_row, row
+
+
 class Qwen38ChatChainError(RuntimeError):
     """The device chain disagrees with its host mirror; the model owner cannot be trusted afterwards."""
 
@@ -1935,12 +1967,19 @@ class Qwen38TracedChain:
                 output = model.forward_decode_generic_tail(head, prepared, state, retain_mtp_inputs=True)
             if output.logits is None:
                 raise Qwen38ChatChainError(f"warm position {position} returned no logits")
-            candidates = lm_head.greedy_candidates(output.logits)
-            # The plain greedy body's last op is the copy into the persistent token row, done by the resolve (its
-            # ``into``); an MTP body copies after the MTP row (below).  The warm run compiles the traced programs.
-            resolved_row = lm_head.resolve_greedy_on_device(
-                candidates, into=None if chain_mtp is not None else token_row_io
-            )
+            if chain_mtp is None:
+                candidates = lm_head.greedy_candidates(output.logits)
+                # The plain greedy body's last op is the copy into the persistent token row, done by the resolve (its
+                # ``into``).  The warm run compiles the traced programs.
+                resolved_row = lm_head.resolve_greedy_on_device(candidates, into=token_row_io)
+            else:
+                # The MTP body: the capture's own epilogue (candidates, resolve, the MTP row, the copy), eager here.
+                candidates, resolved_row, warm_row = mtp_tail_epilogue(
+                    model, lm_head, chain_mtp, output, token_row_io, chain.sampling
+                )
+                chain_mtp.step_written = False
+                if warm_row is not None:
+                    ttnn.deallocate(warm_row)  # the warm's copy of the row (the extension's own warm reads its own)
             synchronize()
             actual = state.position.read()
             if actual != position + 1:
@@ -1948,19 +1987,6 @@ class Qwen38TracedChain:
             resolved = resident_decode.require_token_row_resolves(
                 resolved_row, candidates, lm_head, label=f"warm position {position} device greedy resolve"
             )
-            if chain_mtp is not None:
-                mtp_v2.forward_mtp_step_row(
-                    model,
-                    chain_mtp.alignment,
-                    chain_mtp.step_inputs,
-                    output.residual,
-                    resolved_row,
-                    rope=output.rope,
-                    qsa_position=output.qsa_position,
-                )
-                chain_mtp.step_written = False
-                ttnn.copy(resolved_row, token_row_io)  # the MTP body's last op: warm its program
-            synchronize()
             resident_decode.require_token_row_holds(
                 token_row_io, resident_decode.host_token_row(resolved), label=f"warm position {position} row copy"
             )
@@ -2206,28 +2232,15 @@ class Qwen38TracedChain:
             as the fallback token) between the resolve and the row copy, then releases what the TAIL retained."""
 
             if chain_mtp is not None:
-                if trace_output.logits is None or trace_output.residual is None:
-                    raise Qwen38ChatChainError("TAIL capture returned no logits or no retained MTP inputs")
-                candidates = lm_head.greedy_candidates(trace_output.logits)
-                trace_token_row = lm_head.resolve_greedy_on_device(candidates)
-                mtp_v2.forward_mtp_step_row(
-                    model,
-                    chain_mtp.alignment,
-                    chain_mtp.step_inputs,
-                    trace_output.residual,
-                    trace_token_row,
-                    rope=trace_output.rope,
-                    qsa_position=trace_output.qsa_position,
+                candidates, trace_token_row, trace_row = mtp_tail_epilogue(
+                    model, lm_head, chain_mtp, trace_output, token_row_io, chain.sampling
                 )
                 ttnn.deallocate(trace_output.residual)
                 trace_output.rope.deallocate()
                 trace_output.qsa_position.deallocate()
                 trace_output.residual = trace_output.rope = trace_output.qsa_position = None
-                ttnn.copy(trace_token_row, token_row_io)
                 if chain.sampling is not None:
-                    chain.sampling.trace_rows.append(
-                        lm_head.sampling_candidates(trace_output.logits, chain.sampling.constants)
-                    )
+                    chain.sampling.trace_rows.append(trace_row)
                     chain.sampling.trace_logits.append(trace_output.logits)
                 return candidates, trace_token_row
             if chain.sampling is not None:

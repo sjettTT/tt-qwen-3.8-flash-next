@@ -39,6 +39,7 @@ locks and enforcing broker lease.
 from __future__ import annotations
 
 import time
+import warnings
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -2325,6 +2326,25 @@ class Qwen38TTNNTextModel:
         head = self.forward_decode_generic_head(prepared, state)
         return self.forward_decode_generic_tail(head, prepared, state, return_logits=return_logits)
 
+    def _abort_trace_capture(self, trace_id: int, *, cq_id: int, part: str, error: BaseException) -> None:
+        """A failure inside a trace capture: end the capture and release its trace so the failure path can
+        synchronize and close the mesh (the op that failed is not in the trace; the capture's contents are dropped).
+        Each step is best effort: the failure that matters is ``error``, re-raised by the caller."""
+
+        for label, step in (
+            ("end", lambda: ttnn.end_trace_capture(self.mesh_device, trace_id, cq_id=cq_id)),
+            ("release", lambda: ttnn.release_trace(self.mesh_device, trace_id)),
+        ):
+            try:
+                step()
+            except BaseException as cleanup_error:  # noqa: BLE001
+                warnings.warn(
+                    f"generic {part} capture {label} after a failure inside the capture: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error} (the failure: {type(error).__name__})",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
     def capture_decode_generic(
         self,
         prepared: Qwen38TTNNPreparedDecodeInputs,
@@ -2353,7 +2373,9 @@ class Qwen38TTNNTextModel:
         while the host ring-phase bookkeeping advances as if the body ran;
         ``phase_observer`` sees ``before-<part>-capture`` and
         ``after-<part>-capture`` for the caller's phase checks.  A body failure
-        poisons this owner and leaves the capture open; the process must exit.
+        poisons this owner; the open capture is ended and its trace released
+        before the error propagates (a synchronize inside an open capture is a
+        TT_FATAL and the mesh close then hangs), then the process must exit.
         """
 
         if phase_observer is not None and not callable(phase_observer):
@@ -2375,18 +2397,22 @@ class Qwen38TTNNTextModel:
             with ttnn.corruptible_allocation_scope(self.mesh_device):
                 trace_id = ttnn.begin_trace_capture(self.mesh_device, cq_id=cq_id)
                 started_ns = clock_ns()
-                with guard(f"generic {part} capture residue {residue} regime {regime}") as blocked:
-                    if part == "head":
-                        head = self.forward_decode_generic_head(prepared, state)
-                    else:
-                        output = (
-                            self.forward_decode_generic_tail(
-                                head, prepared, state, release_head=False, retain_mtp_inputs=retain_mtp_inputs
+                try:
+                    with guard(f"generic {part} capture residue {residue} regime {regime}") as blocked:
+                        if part == "head":
+                            head = self.forward_decode_generic_head(prepared, state)
+                        else:
+                            output = (
+                                self.forward_decode_generic_tail(
+                                    head, prepared, state, release_head=False, retain_mtp_inputs=retain_mtp_inputs
+                                )
+                                if part == "tail"
+                                else self.forward_decode_generic(prepared, state)
                             )
-                            if part == "tail"
-                            else self.forward_decode_generic(prepared, state)
-                        )
-                        epilogue_result = epilogue(output)
+                            epilogue_result = epilogue(output)
+                except BaseException as error:
+                    self._abort_trace_capture(trace_id, cq_id=cq_id, part=part, error=error)
+                    raise
                 ttnn.end_trace_capture(self.mesh_device, trace_id, cq_id=cq_id)
                 capture_ns[part] = clock_ns() - started_ns
             guard_attempts.extend(blocked or ())

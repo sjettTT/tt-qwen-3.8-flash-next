@@ -193,13 +193,25 @@ def test_token_copy_is_the_resolves_second_write():
         )
     ]
     assert epilogue.count("lm_head.resolve_greedy_on_device(candidates, into=token_row_io)") == 1
-    assert epilogue.count("ttnn.copy(trace_token_row, token_row_io)") == 1  # the MTP body's copy after the MTP row
-    assert epilogue.index("ttnn.copy(trace_token_row, token_row_io)") < epilogue.index("into=token_row_io")
-    start = session.index("            resolved_row = lm_head.resolve_greedy_on_device(")
+    # The MTP body runs the shared epilogue (its resolve into a fresh row, the MTP row, then the copy), warm and capture.
+    assert epilogue.count("candidates, trace_token_row, trace_row = mtp_tail_epilogue(") == 1
+    assert epilogue.index("mtp_tail_epilogue(") < epilogue.index("into=token_row_io")
+    shared = session[
+        session.index("def mtp_tail_epilogue(") : session.index("\n\n\n", session.index("def mtp_tail_epilogue("))
+    ]
+    assert (
+        shared.index("token_row = lm_head.resolve_greedy_on_device(candidates)")
+        < shared.index("mtp_v2.forward_mtp_step_row(")
+        < shared.index("ttnn.copy(token_row, token_row_io)")
+    )
+    start = session.index(
+        "            if chain_mtp is None:\n                candidates = lm_head.greedy_candidates(output.logits)"
+    )
     warm = session[
         start : session.index("            synchronize()\n            actual = state.position.read()", start)
     ]
-    assert "into=None if chain_mtp is not None else token_row_io" in warm  # the warm body compiles the traced program
+    assert "resolved_row = lm_head.resolve_greedy_on_device(candidates, into=token_row_io)" in warm  # the greedy body
+    assert "candidates, resolved_row, warm_row = mtp_tail_epilogue(" in warm
     sampling = (HERE / "tools" / "qwen38_sampling_step.py").read_text()
     assert sampling.count("self.lm_head.resolve_greedy_on_device(candidates, into=token_row_io)") == 1
 
