@@ -33,6 +33,13 @@
 #   --serve-seconds N       stop after N seconds (default: until SIGTERM)
 #   --python PATH           the interpreter that imports ttnn (default: <checkout>/python_env/bin/python)
 #   --validate-only         run the checks and the CPU preparation, do not open the mesh
+#   --prefill-mode M        chunked (default) | teacher_forced (every prompt token through the decode step)
+#   --agreement-reference F --agreement-parts "P Q" --agreement-full-logits DIR
+#                           teacher-force the reference corpus Q38-REF-v1 through the chain before READY and write
+#                           the agreement records, the device column and its score against F (needs the sampled
+#                           server; see tools/qwen38_reference_corpus.py)
+#   QWEN38_DENSE_WEIGHT_DTYPE=bf8|bf16|bf4 (environment; default bf8; bf16 = the previous production format): the resident dense matmul
+#                           weights' dtype (ttnn/decode_matmul.py); the launcher passes it through and prints it
 #
 # The checkout this script lives in must be built (build_metal.sh, create_venv.sh); the server admits only a ttnn
 # imported from it and records the checkout's commit, tree and extension digest as the runtime identity.  No locks, no
@@ -46,12 +53,13 @@ readonly REPO_ROOT="$(cd -- "$MODEL_DIR/../../../.." && pwd -P)"
 readonly SERVER="$HERE/qwen38_chat_server.py"
 
 die() { printf 'run_qwen38_chat_server: %s\n' "$*" >&2; exit 2; }
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,47p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 profile= instance=0 devices= checkpoint= cache_root= allocated_context=32768 mtp= port=8000 host=0.0.0.0 long_chunks=
 prefill_slab=
 acceptance= acceptance_prompts= require_json_96= prepare_only= bf4_stage_limit= bf4_corpus= bf4_corpus_verification=
 serve_seconds= python= validate_only= prefill_mode=chunked sampling=1 stall_seconds=300
+agreement_reference= agreement_parts= agreement_full_logits=
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --profile) profile=${2-}; shift 2 ;;
@@ -78,6 +86,9 @@ while [[ $# -gt 0 ]]; do
         --python) python=${2-}; shift 2 ;;
         --prefill-mode) prefill_mode=${2-}; shift 2 ;;
         --validate-only) validate_only=1; shift ;;
+        --agreement-reference) agreement_reference=${2-}; shift 2 ;;
+        --agreement-parts) agreement_parts=${2-}; shift 2 ;;
+        --agreement-full-logits) agreement_full_logits=${2-}; shift 2 ;;
         -h|--help) usage ;;
         *) die "unknown argument $1 (see --help)" ;;
     esac
@@ -94,7 +105,7 @@ done
 [[ -z "$acceptance" || -z "$acceptance_prompts" ]] || die "--acceptance and --acceptance-prompts are alternatives"
 [[ -z "${TT_METAL_HOME:-}" || "$(cd -- "$TT_METAL_HOME" && pwd -P)" == "$REPO_ROOT" ]] \
     || die "TT_METAL_HOME=$TT_METAL_HOME is not this checkout ($REPO_ROOT); unset it or run that checkout's launcher"
-for name in checkpoint cache_root acceptance_prompts bf4_corpus bf4_corpus_verification python; do
+for name in checkpoint cache_root acceptance_prompts bf4_corpus bf4_corpus_verification python agreement_reference agreement_full_logits; do
     [[ -z "${!name}" || "${!name}" == /* ]] || printf -v "$name" '%s/%s' "$PWD" "${!name}"
 done
 cd "$REPO_ROOT"  # from here on the real ttnn package comes first, not the model's own ttnn/
@@ -179,10 +190,20 @@ fi
 [[ -z "$bf4_stage_limit" ]] || args+=(--bf4-stage-limit "$bf4_stage_limit")
 [[ -z "$bf4_corpus" ]] || args+=(--bf4-corpus "$bf4_corpus" --bf4-corpus-verification "$bf4_corpus_verification")
 [[ -z "$validate_only" ]] || args+=(--validate-only)
+if [[ -n "$agreement_reference" ]]; then
+    [[ -n "$sampling" ]] || die "--agreement-reference needs the sampled server (drop --no-sampling)"
+    [[ -f "$agreement_reference" ]] || die "--agreement-reference $agreement_reference is not a file"
+    args+=(--agreement-reference "$agreement_reference")
+    if [[ -n "$agreement_parts" ]]; then read -r -a agreement_part_list <<<"$agreement_parts"; args+=(--agreement-parts "${agreement_part_list[@]}"); fi
+    [[ -z "$agreement_full_logits" ]] || args+=(--agreement-full-logits "$agreement_full_logits")
+else
+    [[ -z "$agreement_parts$agreement_full_logits" ]] || die "--agreement-parts and --agreement-full-logits need --agreement-reference"
+fi
 
 printf 'run_qwen38_chat_server: checkout %s (%s) head %s%s\n' "$REPO_ROOT" "$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null)" "$head" "$([[ "$dirty" == 0 ]] || printf ' (%s modified files)' "$dirty")" >&2
 printf 'run_qwen38_chat_server: python %s, ttnn extension %s\n' "$python" "$extension" >&2
 printf 'run_qwen38_chat_server: profile %s devices %s context %s run %s\n' "$hardware_profile" "$visible_devices" "$allocated_context" "$run_dir" >&2
+[[ -z "${QWEN38_DENSE_WEIGHT_DTYPE:-}" ]] || printf 'run_qwen38_chat_server: QWEN38_DENSE_WEIGHT_DTYPE=%s (resident dense matmul weights; default bf8, bf16 = the previous production format)\n' "$QWEN38_DENSE_WEIGHT_DTYPE" >&2
 if [[ -n "$serve_seconds" ]]; then
     exec timeout --signal=TERM "$serve_seconds" "$python" "$SERVER" "${args[@]}"
 fi

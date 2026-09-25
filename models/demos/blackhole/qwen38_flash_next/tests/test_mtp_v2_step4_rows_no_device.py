@@ -647,6 +647,7 @@ def _gdn_module(weights) -> gdn_module.Qwen38TTNNGDN:
     module.collective_topology = "linear"
     for name in (
         "compute_config",
+        "projection_compute_config",
         "in_proj_act_memory_config",
         "in_proj_program_config",
         "out_proj_act_memory_config",

@@ -65,7 +65,7 @@ def _mesh_shapes(identity: BF4CacheIdentity) -> dict[str, tuple[int, ...]]:
 
     return {
         name: (*shape[:2], identity.experts_per_device, *shape[3:])
-        for name, shape in bf4_module._canonical_packed_shapes(ring_size=identity.ring_size).items()
+        for name, shape in bf4_module.canonical_packed_shapes(ring_size=identity.ring_size).items()
     }
 
 
@@ -120,7 +120,7 @@ def _write_layer(
     namespace: str = "backbone",
 ) -> tuple[BF4LayerRecord, dict[str, Path]]:
     paths = {name: bf4_module._tensorbin_path(cache._base(namespace, layer_index, name)) for name in ("w0_w1", "w2")}
-    logical_shapes = bf4_module._canonical_packed_shapes(ring_size=cache.identity.ring_size)
+    logical_shapes = bf4_module.canonical_packed_shapes(ring_size=cache.identity.ring_size)
     artifacts = {}
     for name, path in paths.items():
         payload = f"packed:{namespace}:{layer_index}:{name}".encode()
@@ -277,19 +277,29 @@ class TTNNBF4StaticTest(unittest.TestCase):
         self.assertEqual(offenders, [])
 
     def test_exact_packer_storage_not_raw_bf4_storage(self):
-        self.assertEqual(packed_bf4_bytes_per_device(ring_size=7), (346_816_512, 130_056_192))
-        self.assertEqual(packed_bf4_bytes_per_device(ring_size=8), (396_361_728, 148_635_648))
-        self.assertEqual(packed_bf4_model_bytes_per_device(ring_size=7), 23_366_762_496)
-        self.assertEqual(packed_bf4_model_bytes_per_device(ring_size=8), 26_704_871_424)
+        # moe_compute's compact owned-column layout: the 8-bank ring stores the 2560/640 expert without padding
+        # (3,200 gate/up + 1,600 W2 tiles, 20-tile transactions, a half-width last W2 iteration); the 7-bank ring
+        # keeps 14-tile transactions (K padded to 7-tile blocks) and W2's grouped form.
+        self.assertEqual(packed_bf4_bytes_per_device(ring_size=7), (260_112_384, 130_056_192))
+        self.assertEqual(packed_bf4_bytes_per_device(ring_size=8), (235_929_600, 117_964_800))
+        self.assertEqual(packed_bf4_model_bytes_per_device(ring_size=7), 19_118_260_224)
+        self.assertEqual(packed_bf4_model_bytes_per_device(ring_size=8), 17_340_825_600)
         self.assertEqual(
-            bf4_module._canonical_packed_shapes(ring_size=7),
+            bf4_module.canonical_packed_shapes(ring_size=7),
             {
-                "w0_w1": (7, 1, 512, 2, 2688, 128),
+                "w0_w1": (7, 1, 512, 18, 224, 128),
                 "w2": (7, 1, 512, 3, 672, 128),
             },
         )
+        self.assertEqual(
+            bf4_module.canonical_packed_shapes(ring_size=8),
+            {
+                "w0_w1": (8, 1, 512, 10, 320, 128),
+                "w2": (8, 1, 512, 5, 320, 128),
+            },
+        )
         for ring_size in (7, 8):
-            shapes = bf4_module._canonical_packed_shapes(ring_size=ring_size)
+            shapes = bf4_module.canonical_packed_shapes(ring_size=ring_size)
             expected = packed_bf4_bytes_per_device(ring_size=ring_size)
             self.assertEqual(
                 tuple(bf4_module._packed_payload_bytes(shapes[name]) // 4 for name in ("w0_w1", "w2")),
@@ -384,7 +394,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "exact integer|exact integer tuples"):
                     replace(identity, **changes)
 
-        canonical = bf4_module._canonical_packed_shapes(ring_size=7)["w0_w1"]
+        canonical = bf4_module.canonical_packed_shapes(ring_size=7)["w0_w1"]
         aliases = (
             (canonical[0], True, *canonical[2:]),
             (*canonical[:2], 512.0, *canonical[3:]),
@@ -394,6 +404,35 @@ class TTNNBF4StaticTest(unittest.TestCase):
             with self.subTest(shape=shape):
                 with self.assertRaisesRegex(RuntimeError, "shape contains"):
                     bf4_module._native_integer_shape(shape, label="BF4 conversion")
+
+    def test_cache_identity_pins_the_packed_layout_version(self):
+        self.assertEqual(bf4_module.LAYOUT_VERSION, 2)
+        self.assertEqual(asdict(_identity())["layout_version"], 2)
+        for stale in (1, 3, True, 2.0):
+            with self.subTest(layout_version=stale):
+                with self.assertRaisesRegex(ValueError, "encoding identity|exact integers"):
+                    replace(_identity(), layout_version=stale)
+
+    def test_canonical_shapes_are_the_layout_packers_output(self):
+        # The cache derives its slot shapes from the geometry helpers of ttnn.experimental.moe_compute_utils; the
+        # packers themselves (one zero expert, L = E = 1) must lay the bytes out in exactly those shapes.
+        import torch
+
+        for ring_size in (7, 8):
+            with self.subTest(ring_size=ring_size):
+                w01_map, w2_map = bf4_module.ring_shard_maps(2560, 640, ring_size)
+                gate = torch.zeros(1, 1, 2560, 640, dtype=torch.bfloat16)
+                down = torch.zeros(1, 1, 640, 2560, dtype=torch.bfloat16)
+                packed = {
+                    "w0_w1": bf4_module.prepare_w0_w1_tensor_for_moe_compute(gate, gate, 1, 1, 2560, 640, w01_map),
+                    "w2": bf4_module.prepare_w2_tensor_for_moe_compute(down, 1, 1, 640, 2560, w2_map, w01_map),
+                }
+                shapes = bf4_module.canonical_packed_shapes(ring_size=ring_size)
+                for name, tensor in packed.items():
+                    self.assertEqual(tuple(tensor.shape), (*shapes[name][:2], 1, *shapes[name][3:]), name)
+                w01_bytes, w2_bytes = packed_bf4_bytes_per_device(ring_size=ring_size, experts_per_device=1)
+                self.assertEqual(w01_bytes, packed["w0_w1"].numel() // 1024 * 576)
+                self.assertEqual(w2_bytes, packed["w2"].numel() // 1024 * 576)
 
     def test_cache_identity_requires_every_live_bank_once_in_ring_order(self):
         for ring_order in ((0,) * 7, RING7_ORDER[:6], (*RING7_ORDER[:6], 7)):
@@ -833,9 +872,9 @@ class TTNNBF4StaticTest(unittest.TestCase):
         memory_configs = SimpleNamespace(w0_w1=object(), w2=object())
         mesh_shapes = _mesh_shapes(identity)
         aliases = (
-            (7, True, 512, 2, 2688, 128),
-            (7, 1, 512.0, 2, 2688, 128),
-            (7, 1, 512, 2, 2688, "128"),
+            (7, True, 512, 18, 224, 128),
+            (7, 1, 512.0, 18, 224, 128),
+            (7, 1, 512, 18, 224, "128"),
         )
         for invalid_shape in aliases:
             with self.subTest(invalid_shape=invalid_shape), tempfile.TemporaryDirectory() as directory:
@@ -1089,7 +1128,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                 (
                     "canonical slot shape",
                     lambda document: document["layers"][key]["w0_w1"].__setitem__(
-                        "logical_shape", [7, 1, 512, 2, 2688, 160]
+                        "logical_shape", [7, 1, 512, 18, 224, 160]
                     ),
                 ),
                 (
@@ -1150,7 +1189,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
                     cache.verify_layer("mtp", 1)
 
     def test_layer_host_packing_fills_four_canonical_ranges_without_cat(self):
-        shapes = bf4_module._canonical_packed_shapes(ring_size=7)
+        shapes = bf4_module.canonical_packed_shapes(ring_size=7)
         allocations = []
         copies = []
         loaded = []
@@ -1246,7 +1285,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
         contract = _TrackingMeshContract(identity.physical_ids, mesh)
         placement = SimpleNamespace(expert_ranges=EXPERT_RANGES)
         memory_configs = SimpleNamespace(w0_w1=object(), w2=object())
-        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        logical_shapes = bf4_module.canonical_packed_shapes(ring_size=identity.ring_size)
         first_tensor = _FakeBF4Tensor(memory_configs.w0_w1, logical_shapes["w0_w1"])
 
         class HostTensor:
@@ -1304,7 +1343,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
 
         identity = cache.identity
         memory_configs = SimpleNamespace(w0_w1=object(), w2=object())
-        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        logical_shapes = bf4_module.canonical_packed_shapes(ring_size=identity.ring_size)
         uploaded = []
 
         def as_tensor(host, *, dtype, layout, device, memory_config, mesh_mapper, cache_file_name):
@@ -1344,7 +1383,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
     def test_fresh_conversion_records_the_slot_shape_and_accepts_coordinate_local_shards(self):
         identity = _identity()
         mesh = SimpleNamespace(shape=(1, 4))
-        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        logical_shapes = bf4_module.canonical_packed_shapes(ring_size=identity.ring_size)
         mesh_shapes = _mesh_shapes(identity)
         self.assertEqual(mesh_shapes["w0_w1"][2] * 4, logical_shapes["w0_w1"][2])
         with tempfile.TemporaryDirectory() as directory:
@@ -1365,7 +1404,7 @@ class TTNNBF4StaticTest(unittest.TestCase):
     def test_fresh_conversion_refuses_a_global_shaped_upload_and_publishes_nothing(self):
         identity = _identity()
         mesh = SimpleNamespace(shape=(1, 4))
-        logical_shapes = bf4_module._canonical_packed_shapes(ring_size=identity.ring_size)
+        logical_shapes = bf4_module.canonical_packed_shapes(ring_size=identity.ring_size)
         with tempfile.TemporaryDirectory() as directory:
             cache = Qwen38BF4Cache(directory, identity, _TrackingMeshContract(identity.physical_ids, mesh))
             uploaded, deallocate, error = self._fresh_conversion(cache, mesh, uploaded_shapes=logical_shapes)
@@ -1548,6 +1587,12 @@ class TTNNBF4ConverterIdentityTest(unittest.TestCase):
             ]
             decoys["decoy-format-9"] = copy.deepcopy(format2)
             decoys["decoy-format-9"]["format_version"] = 9
+            # A slot converted before the packed layout joined the identity, and one that names the stride layout:
+            # their bytes are the per-core stride layout, never adoptable into a layout-2 slot.
+            decoys["decoy-no-layout-version"] = copy.deepcopy(format2)
+            del decoys["decoy-no-layout-version"]["layout_version"]
+            decoys["decoy-layout-1"] = copy.deepcopy(format2)
+            decoys["decoy-layout-1"]["layout_version"] = 1
             for name, legacy_identity in decoys.items():
                 decoy = copy.deepcopy(document)
                 demote(decoy, legacy_identity)
@@ -1600,11 +1645,11 @@ class TTNNBF4ConverterIdentityTest(unittest.TestCase):
                 self.assertEqual(os.listdir(empty), [])
 
     def test_expert_byte_ranges_walk_the_tiled_shards_one_run_per_ring_bank(self):
-        shapes = bf4_module._canonical_packed_shapes(ring_size=7)
+        shapes = bf4_module.canonical_packed_shapes(ring_size=7)
         physical_ids = (0, 1, 2, 3)
-        for name, groups, rows in (("w0_w1", 2, 2688), ("w2", 3, 672)):
+        for name, blocks, rows in (("w0_w1", 18, 224), ("w2", 3, 672)):
             with self.subTest(name=name):
-                run = groups * (rows // 32) * 4 * 576
+                run = blocks * (rows // 32) * 4 * 576
                 payload = bf4_module._packed_payload_bytes(shapes[name])
                 shard = payload // 4
                 first = bf4_module._expert_byte_ranges(shapes[name], 0, physical_ids)
@@ -1619,7 +1664,7 @@ class TTNNBF4ConverterIdentityTest(unittest.TestCase):
     def test_admission_compares_one_expert_with_a_fresh_packing_and_names_the_differing_bank(self):
         identity = _identity()
         contract = Qwen38MeshContract(identity.physical_ids)
-        shapes = bf4_module._canonical_packed_shapes(ring_size=7)
+        shapes = bf4_module.canonical_packed_shapes(ring_size=7)
         with tempfile.TemporaryDirectory() as directory:
             cache = Qwen38BF4Cache(directory, identity, contract)
             _, paths = _write_layer(cache, 3)

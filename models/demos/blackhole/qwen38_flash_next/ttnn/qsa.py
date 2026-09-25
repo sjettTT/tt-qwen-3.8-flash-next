@@ -58,6 +58,9 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
+    dense_dtype_tag,
+    dense_math_fidelity_name,
+    dense_weight_name,
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
@@ -430,6 +433,8 @@ class Qwen38TTNNQSAWeights:
     index_k: Any
     index_q_norm: Any
     index_k_norm: Any
+    # The six projection weights' dtype (QWEN38_DENSE_WEIGHT_DTYPE); the norms stay BF16.
+    weight_dtype: Any = ttnn.bfloat16
 
     @classmethod
     def from_checkpoint(
@@ -442,9 +447,13 @@ class Qwen38TTNNQSAWeights:
         *,
         layer_index: int,
         tt_metal_sha: str,
+        weight_dtype=None,
         _mtp: bool = False,
     ) -> "Qwen38TTNNQSAWeights":
         mesh_contract.validate_mesh(mesh_device)
+        if weight_dtype is None:
+            weight_dtype = ttnn.bfloat16  # the production path
+        dense_dtype_tag(weight_dtype)
         config = checkpoint.config
         if placement.config.config_sha256 != config.config_sha256:
             raise ValueError("placement and checkpoint configurations differ")
@@ -531,15 +540,16 @@ class Qwen38TTNNQSAWeights:
         input_mapper = ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 2))
         replicate_mapper = replicate_tensor_2d_mesh_mapper(mesh_device)
 
-        def upload(value: torch.Tensor, name: str, mapper, memory_config):
+        def upload(value: torch.Tensor, name: str, mapper, memory_config, dtype=ttnn.bfloat16):
+            # a matmul weight of another dtype packs on the host (bf16 -> bfp8 / bfp4) into a tagged tensorbin
             return ttnn.as_tensor(
                 value.to(torch.bfloat16).contiguous(),
-                dtype=ttnn.bfloat16,
+                dtype=dtype,
                 layout=ttnn.TILE_LAYOUT,
                 device=mesh_device,
                 memory_config=memory_config,
                 mesh_mapper=mapper,
-                cache_file_name=cache / name,
+                cache_file_name=cache / dense_weight_name(name, dtype),
             )
 
         # Projection weights are DRAM width-sharded for the decode matmul
@@ -550,24 +560,28 @@ class Qwen38TTNNQSAWeights:
             "qg_dram_sharded",
             output_mapper,
             dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, 2 * LOCAL_QUERY_WIDTH),
+            dtype=weight_dtype,
         )
         k_tt = upload(
             _expanded_pair_kv(k).transpose(0, 1).reshape(1, 1, HIDDEN_SIZE, TP_SIZE * HEAD_DIM),
             "k_pair_grouped_dram_sharded",
             output_mapper,
             dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, HEAD_DIM),
+            dtype=weight_dtype,
         )
         v_tt = upload(
             _expanded_pair_kv(v).transpose(0, 1).reshape(1, 1, HIDDEN_SIZE, TP_SIZE * HEAD_DIM),
             "v_pair_grouped_dram_sharded",
             output_mapper,
             dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, HEAD_DIM),
+            dtype=weight_dtype,
         )
         out_tt = upload(
             out.transpose(0, 1).reshape(1, 1, QUERY_WIDTH, HIDDEN_SIZE),
             "out_dram_sharded",
             input_mapper,
             dram_sharded_weight_memory_config(mesh_device, LOCAL_QUERY_WIDTH, HIDDEN_SIZE),
+            dtype=weight_dtype,
         )
 
         index_q = index_qk[: INDEX_QUERY_HEADS * INDEX_HEAD_DIM]
@@ -577,12 +591,14 @@ class Qwen38TTNNQSAWeights:
             "index_q_dram_sharded",
             output_mapper,
             dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, INDEX_QUERY_HEADS_PER_DEVICE * INDEX_HEAD_DIM),
+            dtype=weight_dtype,
         )
         index_k_tt = upload(
             index_k.transpose(0, 1).reshape(1, 1, HIDDEN_SIZE, INDEX_HEAD_DIM),
             "index_k_dram_sharded",
             replicate_mapper,
             dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, INDEX_HEAD_DIM),
+            dtype=weight_dtype,
         )
 
         # Qwen4Exp norms are zero-centred: the checkpoint stores delta-gamma.
@@ -615,6 +631,7 @@ class Qwen38TTNNQSAWeights:
             index_k=index_k_tt,
             index_q_norm=index_q_norm_tt,
             index_k_norm=index_k_norm_tt,
+            weight_dtype=weight_dtype,
         )
         result.validate(mesh_contract)
         return result
@@ -630,6 +647,7 @@ class Qwen38TTNNQSAWeights:
         *,
         mtp_layer_index: int = 0,
         tt_metal_sha: str,
+        weight_dtype=None,
     ) -> "Qwen38TTNNQSAWeights":
         """Load the checkpoint's real MTP QSA tensors with the same TP contract."""
 
@@ -641,6 +659,7 @@ class Qwen38TTNNQSAWeights:
             cache_root,
             layer_index=mtp_layer_index,
             tt_metal_sha=tt_metal_sha,
+            weight_dtype=weight_dtype,
             _mtp=True,
         )
 
@@ -657,8 +676,8 @@ class Qwen38TTNNQSAWeights:
         for name, tensor, placement, shard_dim, shape in expected:
             mesh_contract.validate_tensor(tensor, placement=placement, shard_dim=shard_dim)
             _require_shape(tensor, shape, f"QSA {name} weight")
-            if tensor.dtype != ttnn.bfloat16:
-                raise RuntimeError(f"QSA {name} weight must be BF16, got {tensor.dtype}")
+            if tensor.dtype != self.weight_dtype:
+                raise RuntimeError(f"QSA {name} weight must be {self.weight_dtype}, got {tensor.dtype}")
         for name, tensor, width in (
             ("q_norm", self.q_norm, HEAD_DIM),
             ("k_norm", self.k_norm, HEAD_DIM),
@@ -669,8 +688,9 @@ class Qwen38TTNNQSAWeights:
             mesh_contract.validate_tensor(tensor, placement=TensorPlacement.REPLICATED)
             expected_shape = (1, 1, HIDDEN_SIZE, width) if name == "index_k" else (1, 1, 1, width)
             _require_shape(tensor, expected_shape, f"QSA {name} weight")
-            if tensor.dtype != ttnn.bfloat16:
-                raise RuntimeError(f"QSA {name} weight must be BF16, got {tensor.dtype}")
+            expected_dtype = self.weight_dtype if name == "index_k" else ttnn.bfloat16  # index_k is a matmul weight
+            if tensor.dtype != expected_dtype:
+                raise RuntimeError(f"QSA {name} weight must be {expected_dtype}, got {tensor.dtype}")
 
     def deallocate(self) -> None:
         """Release all resident weights owned by this container."""
@@ -1935,6 +1955,15 @@ class Qwen38TTNNQSA:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
+        # The projection linears (qg, k, v, out, index_q, index_k) run the fidelity of their weight format
+        # (decode_matmul: HiFi4 for bf16, HiFi2 for bf8, LoFi for bf4); every other program keeps compute_config.
+        self.projection_compute_config = ttnn.init_device_compute_kernel_config(
+            mesh_device.arch(),
+            math_fidelity=getattr(ttnn.MathFidelity, dense_math_fidelity_name(weights.weight_dtype)),
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
         # The custom indexer LLK explicitly rejects FP32 DEST/full-sync.
         self.indexer_compute_config = ttnn.init_device_compute_kernel_config(
             mesh_device.arch(),
@@ -2627,14 +2656,14 @@ class Qwen38TTNNQSA:
             self.weights.index_q,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.index_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         raw_key_ws = ttnn.linear(
             full_hidden,
             self.weights.index_k,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.index_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         index_q = ttnn.to_memory_config(index_q_ws, ttnn.DRAM_MEMORY_CONFIG)
         raw_key = ttnn.to_memory_config(raw_key_ws, ttnn.DRAM_MEMORY_CONFIG)
@@ -2712,21 +2741,21 @@ class Qwen38TTNNQSA:
             self.weights.qg,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.qg_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         k_ws = ttnn.linear(
             full_hidden,
             self.weights.k_pair_grouped,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.kv_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         v_ws = ttnn.linear(
             full_hidden,
             self.weights.v_pair_grouped,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.kv_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         qg = ttnn.to_memory_config(qg_ws, ttnn.DRAM_MEMORY_CONFIG)
         k = ttnn.to_memory_config(k_ws, ttnn.DRAM_MEMORY_CONFIG)
@@ -3235,7 +3264,7 @@ class Qwen38TTNNQSA:
             self.weights.out,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.out_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         _deallocate(attention_ws)
         local_partial = ttnn.to_memory_config(local_partial_ws, ttnn.DRAM_MEMORY_CONFIG)
@@ -3380,14 +3409,14 @@ class Qwen38TTNNQSA:
             self.weights.index_q,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.index_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         raw_key_ws = ttnn.linear(
             full_hidden,
             self.weights.index_k,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.index_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         rotated = self._index_tail_fused(
             index_q_ws,
@@ -3483,21 +3512,21 @@ class Qwen38TTNNQSA:
             self.weights.qg,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.qg_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         k_ws = ttnn.linear(
             full_hidden,
             self.weights.k_pair_grouped,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.kv_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         v_ws = ttnn.linear(
             full_hidden,
             self.weights.v_pair_grouped,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.kv_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         sparse_query = self._main_tail_fused(
             qg_ws,
@@ -3551,7 +3580,7 @@ class Qwen38TTNNQSA:
             self.weights.out,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.out_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         _deallocate(attention_ws)
         if self._widen_partial_fused is not None:
@@ -3726,7 +3755,7 @@ class Qwen38TTNNQSA:
             self.weights.out,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.out_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         _deallocate(attention_ws)
         local_partial = ttnn.to_memory_config(local_partial_ws, ttnn.DRAM_MEMORY_CONFIG)
@@ -4013,7 +4042,7 @@ class Qwen38TTNNQSA:
                 full_hidden,
                 weight,
                 self._slab_program_config(rows, _shape(weight)[2], _shape(weight)[3]),
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.projection_compute_config,
             )
         if hidden_tiles is None:
             projected_ws = ttnn.linear(
@@ -4021,7 +4050,7 @@ class Qwen38TTNNQSA:
                 weight,
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 program_config=program_config,
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.projection_compute_config,
             )
             projected = ttnn.to_memory_config(projected_ws, ttnn.DRAM_MEMORY_CONFIG)
             _deallocate(projected_ws)
@@ -4033,7 +4062,7 @@ class Qwen38TTNNQSA:
                 weight,
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 program_config=program_config,
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.projection_compute_config,
             )
             projected_tiles.append(ttnn.to_memory_config(projected_ws, ttnn.DRAM_MEMORY_CONFIG))
             _deallocate(projected_ws)
@@ -4513,7 +4542,7 @@ class Qwen38TTNNQSA:
                 self.weights.out,
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 program_config=self.out_program_config,
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.projection_compute_config,
             )
             _deallocate(attention_ws)
             partial_tiles.append(ttnn.to_memory_config(local_partial_ws, ttnn.DRAM_MEMORY_CONFIG))
@@ -4523,7 +4552,7 @@ class Qwen38TTNNQSA:
                 local_attention,
                 self.weights.out,
                 self._slab_program_config(rows, LOCAL_QUERY_WIDTH, HIDDEN_SIZE),
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.projection_compute_config,
             )
         _deallocate(local_attention)
         if slab:

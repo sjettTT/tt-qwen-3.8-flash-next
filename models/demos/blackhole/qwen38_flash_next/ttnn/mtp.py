@@ -28,6 +28,7 @@ from typing import Any, Mapping, NoReturn, Sequence
 import torch
 
 import ttnn
+from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import dense_dtype_tag, dense_math_fidelity_name
 from models.demos.blackhole.qwen38_flash_next.checkpoint import (
     CHECKPOINT_FILE_MANIFEST_SHA256,
     CHECKPOINT_TENSOR_MANIFEST_SHA256,
@@ -305,6 +306,7 @@ class Qwen38TTNNMTPInputWeights:
     fc_hidden: Any | None
     epsilon: float
     cache_directory: Path
+    projection_dtype: Any = ttnn.bfloat16  # fc_embedding / fc_hidden dtype (QWEN38_DENSE_WEIGHT_DTYPE)
     _released: bool = field(default=False, init=False, repr=False)
 
     @classmethod
@@ -318,8 +320,12 @@ class Qwen38TTNNMTPInputWeights:
         *,
         tt_metal_sha: str,
         ttnn_runtime_sha256: str,
+        projection_dtype=None,
     ) -> "Qwen38TTNNMTPInputWeights":
         mesh_contract.validate_mesh(mesh_device)
+        if projection_dtype is None:
+            projection_dtype = ttnn.bfloat16  # the production path
+        projection_tag = dense_dtype_tag(projection_dtype)
         _validate_checkpoint_contract(checkpoint, placement, mesh_contract)
         prepared = _prepare_host_weights({name: checkpoint.tensor(name) for name in MTP_INPUT_TENSOR_SPECS})
         cache = _cache_directory(
@@ -351,10 +357,11 @@ class Qwen38TTNNMTPInputWeights:
                     prepared["embedding_norm_scale"], "embedding-norm-scale.fp32", ttnn.float32
                 ),
                 hidden_norm_scale=upload(prepared["hidden_norm_scale"], "hidden-norm-scale.fp32", ttnn.float32),
-                fc_embedding=upload(prepared["fc_embedding"], "fc-embedding.bf16", ttnn.bfloat16),
-                fc_hidden=upload(prepared["fc_hidden"], "fc-hidden.bf16", ttnn.bfloat16),
+                fc_embedding=upload(prepared["fc_embedding"], f"fc-embedding.{projection_tag}", projection_dtype),
+                fc_hidden=upload(prepared["fc_hidden"], f"fc-hidden.{projection_tag}", projection_dtype),
                 epsilon=RMS_NORM_EPS,
                 cache_directory=cache,
+                projection_dtype=projection_dtype,
             )
             result.validate(mesh_contract)
         except BaseException as error:
@@ -371,8 +378,8 @@ class Qwen38TTNNMTPInputWeights:
         expected = {
             "embedding_norm_scale": (EMBEDDING_LOCAL_SHAPE, ttnn.float32),
             "hidden_norm_scale": (HIDDEN_NORM_SCALE_LOCAL_SHAPE, ttnn.float32),
-            "fc_embedding": (PROJECTION_LOCAL_SHAPE, ttnn.bfloat16),
-            "fc_hidden": (PROJECTION_LOCAL_SHAPE, ttnn.bfloat16),
+            "fc_embedding": (PROJECTION_LOCAL_SHAPE, self.projection_dtype),
+            "fc_hidden": (PROJECTION_LOCAL_SHAPE, self.projection_dtype),
         }
         for name, (shape, dtype) in expected.items():
             tensor = getattr(self, name)
@@ -424,6 +431,15 @@ class Qwen38TTNNMTPInput:
         self.compute_config = ttnn.init_device_compute_kernel_config(
             mesh_device.arch(),
             math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
+        # The fc linears run the fidelity of their weight format (decode_matmul: HiFi4 for bf16, HiFi2 for bf8, LoFi
+        # for bf4); the norms keep compute_config.
+        self.projection_compute_config = ttnn.init_device_compute_kernel_config(
+            mesh_device.arch(),
+            math_fidelity=getattr(ttnn.MathFidelity, dense_math_fidelity_name(weights.projection_dtype)),
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
@@ -605,7 +621,7 @@ class Qwen38TTNNMTPInput:
                 self.weights.fc_embedding,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 dtype=ttnn.bfloat16,
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.projection_compute_config,
             )
             temporaries.append(projected_embedding)
             projected_hidden = ttnn.linear(
@@ -613,7 +629,7 @@ class Qwen38TTNNMTPInput:
                 self.weights.fc_hidden,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 dtype=ttnn.bfloat16,
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.projection_compute_config,
             )
             temporaries.append(projected_hidden)
             self._validate_input(projected_embedding, label="projected embedding", shape=EMBEDDING_LOCAL_SHAPE)
@@ -700,14 +716,14 @@ class Qwen38TTNNMTPInput:
             self.weights.fc_embedding,
             memory_config=dram,
             dtype=ttnn.bfloat16,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         projected_hidden = ttnn.linear(
             full_hidden,
             self.weights.fc_hidden,
             memory_config=dram,
             dtype=ttnn.bfloat16,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         ttnn.deallocate(full_embedding)
         ttnn.deallocate(full_hidden)

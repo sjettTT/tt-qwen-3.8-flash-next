@@ -384,6 +384,7 @@ def _qsa_module(fake) -> qsa_module.Qwen38TTNNQSA:
     module.rms_norm_eps = 1e-6
     module.collective_topology = "linear"
     module.compute_config = "compute_config"
+    module.projection_compute_config = "compute_config"
     module.compressed_row_memory_config = "compressed_row"
     module._next_epoch = 1
     module._live_epochs = set()
@@ -774,6 +775,7 @@ def _final_mixer(fake) -> final_mixer_module.Qwen38TTNNFinalMixer:
     mixer.mesh_contract = FakeContract()
     mixer.collective_topology = "linear"
     mixer.compute_config = "compute_config"
+    mixer.weight_compute_config = "compute_config"
     # The fake reports every tensor in DRAM, so the activation-shard configs the mixer checks are that config.
     mixer.down_act_memory_config, mixer.down_program_config = "DRAM_MEMORY_CONFIG", "down_cfg"
     mixer.up_act_memory_config, mixer.up_program_config = "DRAM_MEMORY_CONFIG", "up_cfg"
@@ -817,6 +819,7 @@ def _mtp_input(fake) -> mtp_module.Qwen38TTNNMTPInput:
     mixer.mesh_contract = FakeContract()
     mixer.collective_topology = "linear"
     mixer.compute_config = "compute_config"
+    mixer.projection_compute_config = "compute_config"
     torch.manual_seed(93)
     mixer.weights = SimpleNamespace(
         released=False,

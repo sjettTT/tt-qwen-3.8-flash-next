@@ -29,6 +29,13 @@
 #include "api/compute/eltwise_unary/sqrt.h"
 #include "api/compute/eltwise_unary/recip.h"
 #include "api/compute/eltwise_unary/binop_with_scalar.h"
+// Per-phase device profiler zones (study build: QWEN38_GDN_STEP_ZONES=1 defines FGS_ZONES); the served build has none.
+#ifdef FGS_ZONES
+#include "tools/profiler/kernel_profiler.hpp"
+#define FGS_ZONE(name) DeviceZoneScopedN(name)
+#else
+#define FGS_ZONE(name)
+#endif
 
 using namespace ckernel;
 
@@ -58,18 +65,23 @@ ALWI void tap(uint32_t idst, uint32_t restore_cb) {
 }
 #endif
 
-// conv[t] = silu(bf16(sum_i slot_i[t] * tap_i[t])) for the 12 q/k/v tiles; taps broadcast row 0.
+// conv[t] = silu(bf16(sum_i slot_i[t] * tap_i[t])) for the 12 q/k/v tiles; taps broadcast row 0.  The reader pushes
+// the inputs per tile (CB_S tile-major: tile t's slots at 3t + i; CB_T: its taps at 4t + i), so tile t starts as soon
+// as its own eight tiles landed.
 ALWI void conv_silu() {
     for (uint32_t t = 0; t < QKV_TILES; ++t) {
+        cb_wait_front(CB_P, t + 1);
+        cb_wait_front(CB_S, 3 * (t + 1));
+        cb_wait_front(CB_T, 4 * (t + 1));
         tile_regs_acquire();
         reconfig_data_format(CB_S, CB_T);
         mul_bcast_rows_init(CB_S, CB_T);
         for (uint32_t tap = 0; tap < 3; ++tap) {
-            mul_tiles_bcast_rows(CB_S, CB_T, tap * QKV_TILES + t, tap * QKV_TILES + t, 0);
+            mul_tiles_bcast_rows(CB_S, CB_T, 3 * t + tap, 4 * t + tap, 0);
         }
         reconfig_data_format(CB_P, CB_T);
         mul_bcast_rows_init(CB_P, CB_T);
-        mul_tiles_bcast_rows(CB_P, CB_T, t, 3 * QKV_TILES + t, 0);
+        mul_tiles_bcast_rows(CB_P, CB_T, t, 4 * t + 3, 0);
         tile_regs_commit();
         tile_regs_wait();
         cb_reserve_back(CB_CONVSUM, 1);
@@ -593,21 +605,39 @@ void kernel_main() {
     cb_wait_front(CB_SCALER, 2);  // reader-built: tile 0 = 1.0 (sums), tile 1 = 1/128 (means)
 
     for (uint32_t item = 0; item < items; ++item) {
-        cb_wait_front(CB_P, QKV_TILES);
-        cb_wait_front(CB_S, 3 * QKV_TILES);
-        cb_wait_front(CB_T, 4 * QKV_TILES);
-        conv_silu();
+        {
+            FGS_ZONE("fgs_wait_inputs");
+            cb_wait_front(CB_P, 1);  // the first tile's group; the conv waits for the rest tile by tile
+            cb_wait_front(CB_S, 3);
+            cb_wait_front(CB_T, 4);
+        }
+        {
+            FGS_ZONE("fgs_conv_silu");
+            conv_silu();
+        }
         cb_pop_front(CB_P, QKV_TILES);
         cb_pop_front(CB_S, 3 * QKV_TILES);
         cb_pop_front(CB_T, 4 * QKV_TILES);
 
         cb_wait_front(CB_QKV, 2 * HT);
-        l2_norm(0, CB_QROW);
-        l2_norm(HT, CB_KROW);
+        {
+            FGS_ZONE("fgs_l2_norms");
+            l2_norm(0, CB_QROW);
+            l2_norm(HT, CB_KROW);
+        }
         cb_pop_front(CB_QKV, 2 * HT);
 
-        gate_scalars();
-        recurrence();
-        gated_norm();
+        {
+            FGS_ZONE("fgs_gates");
+            gate_scalars();
+        }
+        {
+            FGS_ZONE("fgs_recurrence");
+            recurrence();
+        }
+        {
+            FGS_ZONE("fgs_gated_norm");
+            gated_norm();
+        }
     }
 }

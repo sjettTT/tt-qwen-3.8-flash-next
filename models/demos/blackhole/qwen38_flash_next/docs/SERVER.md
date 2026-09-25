@@ -45,12 +45,13 @@ producer identity is what the verification record claims, `--bf4-producer-identi
 ## The BF4 expert cache (the first start)
 
 The first start converts the routed experts of all 49 MoE layers into the BF4 cache
-(`<cache-root>/caches/bf4-experts/`, 107 GB: each layer read from the checkpoint, packed on the host, uploaded to the
+(`<cache-root>/caches/bf4-experts/`, 69 GB in `moe_compute`'s compact expert layout: each layer read from the checkpoint, packed on the host, uploaded to the
 mesh and written back as one tensorbin per weight; a `bf4-stage-backbone-NN` phase per layer in the log), then builds
 the component and model I/O caches of the chosen context (a few minutes), compiles the kernels (the JIT cache fills
 during the warm pass, two to four minutes cold) and captures the decode traces and the prefill chunk trace.  A layer
-takes about 33 s on a 4x p150 host (2.2 GB written; measured 2026-09-05: 25 layers in 812 s; on the QuietBox 2026-09-06:
-49 layers in 1772 s, 35.9-36.9 s each, 100 GB), the 49 under half an hour;
+takes about 27 s on a 4x p150 host (1.4 GB written; measured on the QuietBox 2026-09-25: 26.3-27.4 s each, 49 layers in
+1448 s including three layers slowed by a concurrent build, 69,363,701,982 bytes; the previous per-core stride layout
+took 35.9-36.9 s and 2.2 GB per layer, 107 GB), the 49 under half an hour;
 the payload of every tensorbin is byte for byte the CPU-staged corpus's (`tools/stage_full_bf4_cpu.py`), the manifest records the slot's global shape
 (512 experts) while the mesh tensor presents one device's 128.  A machine that bounds a job's wall time can build the
 expert cache in pieces: `--prepare-only --bf4-stage-limit N` converts at most N missing layers and stops; every layer
@@ -158,13 +159,13 @@ served (no CORS headers); a body needs `Content-Length`.
 |---|---|---|
 | the checkpoint | 360 GB | 131 safetensors shards, the tokenizer, the chat template; 360,023,351,829 bytes in 145 files |
 | the n-gram table inside it | 104 GB | 33 shards of layer 1, read through the page cache at decode; pre-warm it on a host whose RAM holds it (above) |
-| BF4 expert cache (`<cache-root>/caches/bf4-experts/`) | 107 GB | built once on the first start (100 GB written on the QuietBox), shared by every context, kept across runtime rebuilds |
+| BF4 expert cache (`<cache-root>/caches/bf4-experts/`) | 69 GB | built once on the first start (69,363,701,982 bytes written on the QuietBox 2026-09-25, the compact expert layout; 107 GB before it), shared by every context, kept across runtime rebuilds |
 | 32k context caches | about 23 GB | the converted non-expert weights and the model I/O cache |
 | each other allocated context | about 10 GB | the 64k caches measured 9.8 GB on the QuietBox |
 | JIT kernel cache | about 1.3 GB | fills during the warm pass, two to four minutes cold |
 | host memory, first start | about 10 GB in flight | one MoE layer at a time; 64 GB is comfortable |
 | host memory, CPU reference (`tools/run_full_cpu_oracle.py`) | 170-240 GB | not a user step |
-| device DRAM free per bank after the captures, 32k | 474,261,568 bytes | QuietBox 2026-09-06; 375,594,496 with `--mtp 4` (98.7 MB less), 439,384,896 with `--long-chunks` (34.9 MB less) |
-| device DRAM free per bank, 64k | 419,440,704 bytes | QuietBox 2026-09-06 |
-| device DRAM free, 256k | about 750 MB per device | single-user; MTP does not fit (94 MB free per bank against the 128 MiB contiguous it needs) |
+| device DRAM free per bank after the captures, 32k | 1,603,483,392 bytes | QuietBox 2026-09-25 with the compact expert layout (largest contiguous 1,602,833,984); 1,531,678,912 with `--mtp 4` (71.8 MB less), 1,569,890,816 with `--long-chunks` (33.6 MB less); 474,261,568 / 375,594,496 / 439,384,896 before it (2026-09-06) |
+| device DRAM free per bank, 64k | 419,440,704 bytes | QuietBox 2026-09-06, before the compact expert layout (which frees a further 1,146,621,952 bytes per bank at 32k) |
+| device DRAM free, 256k | about 750 MB per device | QuietBox 2026-09-06, before the compact expert layout; single-user; MTP did not fit then (94 MB free per bank against the 128 MiB contiguous it needs) |
 | the prompt-end snapshot | ~53 MB per device | resident; the recurrent part of the device state (above) |

@@ -1,24 +1,24 @@
 {
  "expected": {
-  "chat": "9e70c8679fde143ab0c541e5ac2bd88a837c62903f2e6987552e2dde5cfa618f",
+  "chat": "34686e9146e7ec4ce2b89a22cd86d8649f184bbddbda94690ae5183bdf7cda16",
   "code": "0234032be259edb09c5a14223164516548a972e013dc66d2e6452ee9c14d5c08",
-  "fact": "6b966a3dcc1e5b21228dff51babb6ad1bec9525a476d1c6364c8b491ef142b4d",
+  "fact": "9afd57cc03036e8beac9b7fc53121826c939780b810095f3b88e2c987be9c521",
   "json": "a5b4defa72fae270391869377862fe60b95d893a6c2cfd24ea265bb59de6d16f",
   "list": "5a3a0e334566126f19c51c649e4bda0536aedcc28a0f5be55bddc0a5de06f70a",
   "math": "19f55ccb4bb2174423d32141df95c365aa6306b246a65f26b4e5b255b64a7ea2",
-  "multilingual": "6761ab6faf2b94a425d5c6e568f798d6870063e692b4a7b5bdb54be20957c264",
-  "prose": "966b4e1e0a3aa6b87fd792dfb45711043b14b7314d0eee01823540da3e9ec26a",
-  "refactor": "8a812a8ea01b3d7da9da5788d0d03034082562b5c5e7208ab7efc74ac301ee3d",
+  "multilingual": "c60fa8f457608453dbf2c5c51d3bc64338c7b6f22115867272ed1786f59422b2",
+  "prose": "e1416bf3c3d4a28bd4b42b93aba1451558cb0a7dbfd5c7cf7f3fb66023a37d4e",
+  "refactor": "8fad29b699a43b385a99541cf4aac4a775415f0919ef8c154a5054629d0dbc92",
   "sky": "de86bbc09c482272bf2da4c31c3f13cc593e5590ed85a8dacbd72d6cc80205fc",
-  "story": "b452f1152952592745388bc760335ef77c2e62d4cbc6cd00c5e9c2906de07554",
+  "story": "d1897b72f57de336477b57a6d5f13fcb611f44bcee99a57236ba4022572a7b97",
   "summary": "d9d024681580637c7df49daeb494605434d11459d87314dae53566a7527cbba6"
  },
  "pin": "A3/chunked-32k/device_token_ids_sha256",
  "schema": "qwen38-ci-baseline/v1",
  "source": {
-  "date": "2026-09-06",
-  "evidence": "chat server startup replay, chunked prefill, one lane of a 4x p150 host, 2026-09-06 (the GDN softplus gate and the fused weighted reduce fixed); json, math, sky and summary are the 2026-09-04 streams, the other eight changed",
-  "head": "b98fc47541d192c16d32912111901fc188195e8a",
+  "date": "2026-09-25",
+  "evidence": "chat server startup replay, chunked prefill, one lane of a 4x p150 host, 2026-09-25, on two hosts with identical device tokens record for record (12/12): bf8 dense weights, the fused GDN step and moe_compute's compact expert layout by default; against the 2026-09-06 table chat 43 -> 2 (the device's own row holds 449 one bf16 step above the CPU's 264: a near-tie; the bf8 weights and the fused step each move it one step), the other eleven indices unchanged; six streams differ after their divergence (fact at 60, multilingual at 32, prose at 76, refactor at 83, story at 16)",
+  "head": "79082e430439e60f2e14b5f127ae91f601f232f9",
   "sku": "p150x4"
  },
  "status": "proposal"

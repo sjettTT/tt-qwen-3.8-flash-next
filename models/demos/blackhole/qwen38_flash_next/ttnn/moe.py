@@ -18,6 +18,7 @@ MoE numerics.  Static/source-contract validation is not a numerical claim.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -42,6 +43,9 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
+    dense_dtype_tag,
+    dense_math_fidelity_name,
+    dense_weight_name,
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
@@ -56,6 +60,7 @@ ROUTED_EXPERTS = 512
 EXPERTS_PER_DEVICE = 128
 TOP_K = 10
 LOCAL_COMBINE_AXIS = 0
+MOE_LOCAL_OUTPUT_ENV = "QWEN38_MOE_LOCAL_OUTPUT"
 EP_AXIS = 1
 TARGET_VERIFIER_ROWS = 5
 PREFILL_CHUNK_ROWS = CHUNK_ROWS
@@ -66,6 +71,18 @@ SUPPORTED_ROWS = (1, TARGET_VERIFIER_ROWS, PREFILL_CHUNK_ROWS, LONG_PREFILL_CHUN
 # the largest d <= 4 dividing both the hidden tile count (80) and the live DRAM bank count (the matmul ring).
 MOE_COMPUTE_TOKEN_SIZE = 32
 MOE_COMPUTE_HIDDEN_TILES = HIDDEN_SIZE // 32
+
+
+def moe_local_output_enabled() -> bool:
+    """``QWEN38_MOE_LOCAL_OUTPUT=1``: ``moe_compute`` writes each expert's token rows straight into the ``[10, rows,
+    2560]`` buffer (its LocalOutput path on the degenerate axis: 12 worker cores, no combine kernels, the rows of the
+    experts this device does not hold zero-filled by the op); unset or 0, the fused local combine
+    (``local_combine=True``) the pins were taken with."""
+
+    value = os.environ.get(MOE_LOCAL_OUTPUT_ENV, "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"{MOE_LOCAL_OUTPUT_ENV} must be 0 or 1, got {value!r}")
+    return value == "1"
 
 
 def moe_compute_output_height_shard_dim(rows: int, *, matmul_ring_size: int) -> int:
@@ -300,6 +317,9 @@ class Qwen38TTNNMoEWeights:
     shared_down: Any
     shared_scalar_gate: Any
     shared_gate_up_scalar: Any = None  # [gate | up | scalar | 0] per device, only when the fused shared expert is on
+    shared_dtype: Any = (
+        ttnn.bfloat16
+    )  # the shared expert weights' dtype (QWEN38_DENSE_WEIGHT_DTYPE); the router stays BF16
 
     @classmethod
     def from_checkpoint(
@@ -313,8 +333,12 @@ class Qwen38TTNNMoEWeights:
         layer_index: int,
         namespace: str = "backbone",
         tt_metal_sha: str,
+        shared_dtype=None,
     ) -> "Qwen38TTNNMoEWeights":
         mesh_contract.validate_mesh(mesh_device)
+        if shared_dtype is None:
+            shared_dtype = ttnn.bfloat16  # the production path
+        dense_dtype_tag(shared_dtype)
         if namespace == "backbone":
             source = Qwen38MoEWeights(checkpoint, placement, layer_index=layer_index)
         elif namespace == "mtp":
@@ -334,15 +358,16 @@ class Qwen38TTNNMoEWeights:
         input_mapper = ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 2))
         replicate_mapper = replicate_tensor_2d_mesh_mapper(mesh_device)
 
-        def upload(value: torch.Tensor, name: str, mapper, memory_config):
+        def upload(value: torch.Tensor, name: str, mapper, memory_config, dtype=ttnn.bfloat16):
+            # a matmul weight of another dtype packs on the host (bf16 -> bfp8 / bfp4) into a tagged tensorbin
             return ttnn.as_tensor(
                 value.to(torch.bfloat16).contiguous(),
-                dtype=ttnn.bfloat16,
+                dtype=dtype,
                 layout=ttnn.TILE_LAYOUT,
                 device=mesh_device,
                 memory_config=memory_config,
                 mesh_mapper=mapper,
-                cache_file_name=cache_dir / name,
+                cache_file_name=cache_dir / dense_weight_name(name, dtype),
             )
 
         # TTNN linear consumes [K,N]; checkpoint Linear weights are [N,K].
@@ -362,24 +387,28 @@ class Qwen38TTNNMoEWeights:
             "shared_gate_dram_sharded",
             output_mapper,
             dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, local_intermediate),
+            dtype=shared_dtype,
         )
         shared_up = upload(
             source.shared_up_proj.transpose(0, 1).reshape(1, 1, HIDDEN_SIZE, INTERMEDIATE_SIZE),
             "shared_up_dram_sharded",
             output_mapper,
             dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, local_intermediate),
+            dtype=shared_dtype,
         )
         shared_down = upload(
             source.shared_down_proj.transpose(0, 1).reshape(1, 1, INTERMEDIATE_SIZE, HIDDEN_SIZE),
             "shared_down_dram_sharded",
             input_mapper,
             dram_sharded_weight_memory_config(mesh_device, local_intermediate, HIDDEN_SIZE),
+            dtype=shared_dtype,
         )
         shared_scalar_gate = upload(
             source.shared_scalar_gate.transpose(0, 1).reshape(1, 1, HIDDEN_SIZE, 1),
             "shared_scalar_gate_replicated_dram_sharded",
             replicate_mapper,
             dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, 1),
+            dtype=shared_dtype,
         )
 
         mesh_contract.validate_tensor(router, placement=TensorPlacement.REPLICATED)
@@ -399,11 +428,12 @@ class Qwen38TTNNMoEWeights:
                 "shared_gate_up_scalar_dram_sharded",
                 output_mapper,
                 dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, fused.shared_expert.CAT_WIDTH),
+                dtype=shared_dtype,
             )
             mesh_contract.validate_tensor(
                 shared_gate_up_scalar, placement=TensorPlacement.INTERMEDIATE_SHARDED, shard_dim=3
             )
-        return cls(router, shared_gate, shared_up, shared_down, shared_scalar_gate, shared_gate_up_scalar)
+        return cls(router, shared_gate, shared_up, shared_down, shared_scalar_gate, shared_gate_up_scalar, shared_dtype)
 
 
 @dataclass(frozen=True)
@@ -528,8 +558,18 @@ class Qwen38TTNNMoE:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
+        # The shared-expert linears run the fidelity of their weight format (decode_matmul: HiFi4 for bf16, HiFi2 for
+        # bf8, LoFi for bf4); the router and every other program keep compute_config.
+        self.shared_compute_config = ttnn.init_device_compute_kernel_config(
+            mesh_device.arch(),
+            math_fidelity=getattr(ttnn.MathFidelity, dense_math_fidelity_name(weights.shared_dtype)),
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
         ring_size = effective_matmul_ring_size(mesh_device)
         output_width_shard_dim = auto_output_width_shard_dim(HIDDEN_SIZE, matmul_ring_size=ring_size)
+        self.local_output = moe_local_output_enabled()
         self.output_height_shard_dim = moe_compute_output_height_shard_dim(
             self.routed_tokens, matmul_ring_size=ring_size
         )
@@ -961,7 +1001,7 @@ class Qwen38TTNNMoE:
             optional_cross_device_semaphore=None,
             activation_type=MoEActivationFunction.SILU,
             compute_only=False,
-            local_combine=True,
+            local_combine=not self.local_output,
             num_shared_experts_per_device=0,
         )
         phase_observer("after-moe-compute-launch")
@@ -1099,7 +1139,7 @@ class Qwen38TTNNMoE:
             optional_cross_device_semaphore=None,
             activation_type=MoEActivationFunction.SILU,
             compute_only=False,
-            local_combine=True,
+            local_combine=not self.local_output,
             num_shared_experts_per_device=0,
         )
         phase_observer("after-moe-compute-launch")
@@ -1319,7 +1359,7 @@ class Qwen38TTNNMoE:
                 optional_cross_device_semaphore=None,
                 activation_type=MoEActivationFunction.SILU,
                 compute_only=False,
-                local_combine=True,
+                local_combine=not self.local_output,
                 num_shared_experts_per_device=0,
             )
             phase_observer("after-moe-compute-launch")
@@ -1371,13 +1411,13 @@ class Qwen38TTNNMoE:
             full_hidden,
             self.weights.shared_gate,
             self._slab_program_config(HIDDEN_SIZE, local_intermediate),
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.shared_compute_config,
         )
         up = prefill_linear(
             full_hidden,
             self.weights.shared_up,
             self._slab_program_config(HIDDEN_SIZE, local_intermediate),
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.shared_compute_config,
         )
         self.mesh_contract.validate_tensor(gate, placement=TensorPlacement.INTERMEDIATE_SHARDED, shard_dim=3)
         self.mesh_contract.validate_tensor(up, placement=TensorPlacement.INTERMEDIATE_SHARDED, shard_dim=3)
@@ -1388,7 +1428,7 @@ class Qwen38TTNNMoE:
             intermediate,
             self.weights.shared_down,
             self._slab_program_config(local_intermediate, HIDDEN_SIZE),
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.shared_compute_config,
         )
         _deallocate(intermediate)
         self.mesh_contract.mark_local_partial(
@@ -1398,7 +1438,7 @@ class Qwen38TTNNMoE:
             full_hidden,
             self.weights.shared_scalar_gate,
             self._slab_program_config(HIDDEN_SIZE, 1),
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.shared_compute_config,
         )
         self.mesh_contract.validate_tensor(scalar, placement=TensorPlacement.REPLICATED)
         scalar_gate = ttnn.sigmoid(scalar, memory_config=dram)
@@ -1432,7 +1472,7 @@ class Qwen38TTNNMoE:
                 gate_up_scalar_program_config=self.shared_gate_up_scalar_program_config,
                 down_program_config=self.shared_down_program_config,
                 intermediate_memory_config=self.shared_intermediate_memory_config,
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.shared_compute_config,
             )
             self.mesh_contract.mark_local_partial(
                 partial, replicated_reference=full_hidden, expected_shape=self.row_contract.full_hidden
@@ -1451,14 +1491,14 @@ class Qwen38TTNNMoE:
                 self.weights.shared_gate,
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 program_config=self.shared_gate_up_program_config,
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.shared_compute_config,
             )
             up = ttnn.linear(
                 hidden_tile,
                 self.weights.shared_up,
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 program_config=self.shared_gate_up_program_config,
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.shared_compute_config,
             )
             self.mesh_contract.validate_tensor(gate, placement=TensorPlacement.INTERMEDIATE_SHARDED, shard_dim=3)
             self.mesh_contract.validate_tensor(up, placement=TensorPlacement.INTERMEDIATE_SHARDED, shard_dim=3)
@@ -1470,7 +1510,7 @@ class Qwen38TTNNMoE:
                 self.weights.shared_down,
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 program_config=self.shared_down_program_config,
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.shared_compute_config,
             )
             _deallocate(intermediate)
             self.mesh_contract.mark_local_partial(
@@ -1484,7 +1524,7 @@ class Qwen38TTNNMoE:
                 self.weights.shared_scalar_gate,
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 program_config=self.shared_scalar_program_config,
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.shared_compute_config,
             )
             scalar = ttnn.to_memory_config(scalar_ws, ttnn.DRAM_MEMORY_CONFIG)
             _deallocate(scalar_ws)

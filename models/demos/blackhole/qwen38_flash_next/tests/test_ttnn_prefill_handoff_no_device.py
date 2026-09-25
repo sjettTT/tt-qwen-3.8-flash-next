@@ -205,6 +205,7 @@ def fake_qsa(fake, monkeypatch):
     module.allocated_compressed_blocks = QSA_CONTEXT // qsa_module.COMPRESS_RATIO
     module._live_generic_epochs = {1, 2}
     module.compute_config = "compute_config"
+    module.projection_compute_config = "compute_config"
     return module
 
 

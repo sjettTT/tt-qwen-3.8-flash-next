@@ -13,6 +13,8 @@ work/FUSE-GDN-STEP-20260913.md section 1).  ``reference_step`` is the kernel's a
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -38,8 +40,23 @@ PROJECTION_WIDTH = B_COLUMN + fp.TILE
 STATE_TILES = 16
 # debug taps in program order (one fp32 tile each); the writer stores them per item as [rows*12, DEBUG_TILES, 32, 32]
 DEBUG_TAPS = (
-    "conv_sum0", *(f"conv{t}" for t in range(12)), "q_sum", "q_sum_eps", "q_rsqrt", "q_unit0", "beta", "decay",
-    "sdec0", "vread0", "deltab0", "kcol0", "snew0", "o0", "o1", "o2", "o3",
+    "conv_sum0",
+    *(f"conv{t}" for t in range(12)),
+    "q_sum",
+    "q_sum_eps",
+    "q_rsqrt",
+    "q_unit0",
+    "beta",
+    "decay",
+    "sdec0",
+    "vread0",
+    "deltab0",
+    "kcol0",
+    "snew0",
+    "o0",
+    "o1",
+    "o2",
+    "o3",
 )
 DEBUG_TILES = len(DEBUG_TAPS)
 EPS = 1.0e-6
@@ -47,10 +64,32 @@ EPS = 1.0e-6
 BF16, FP32 = ttnn.bfloat16, ttnn.float32
 # (index, dtype, pages); indices must match the three kernels
 CBS = (
-    (0, BF16, 12), (1, BF16, 36), (2, BF16, 48), (3, BF16, 4), (4, BF16, 2), (5, FP32, 2), (6, BF16, 4), (7, FP32, 16),
-    (8, BF16, 1), (9, FP32, 2), (10, BF16, 4), (11, BF16, 12), (12, BF16, 4), (13, BF16, 2), (14, BF16, 4),
-    (15, FP32, 4), (16, FP32, 4), (17, FP32, 4), (18, FP32, 1), (19, FP32, 1), (20, FP32, 16), (21, FP32, 16),
-    (22, FP32, 4), (23, FP32, 4), (26, BF16, 4), (27, FP32, 1),
+    (0, BF16, 12),
+    (1, BF16, 36),
+    (2, BF16, 48),
+    (3, BF16, 4),
+    (4, BF16, 2),
+    (5, FP32, 2),
+    (6, BF16, 4),
+    (7, FP32, 16),
+    (8, BF16, 1),
+    (9, FP32, 2),
+    (10, BF16, 4),
+    (11, BF16, 12),
+    (12, BF16, 4),
+    (13, BF16, 2),
+    (14, BF16, 4),
+    (15, FP32, 4),
+    (16, FP32, 4),
+    (17, FP32, 4),
+    (18, FP32, 1),
+    (19, FP32, 1),
+    (20, FP32, 16),
+    (21, FP32, 16),
+    (22, FP32, 4),
+    (23, FP32, 4),
+    (26, BF16, 4),
+    (27, FP32, 1),
 )
 CB_SNEW, CB_OUTS, CB_DEBUG = 24, 25, 28
 # fp32 CBs consumed only by copy_tile (exact unpack to DST); matmul, reduce and broadcast operands stay Default
@@ -68,7 +107,12 @@ def constant_tiles(mesh, dt_bias, neg_exp_A):
 
     host = torch.stack(
         [
-            torch.cat([dt.view(HEADS, 1, 1).expand(HEADS, fp.TILE, fp.TILE), na.view(HEADS, 1, 1).expand(HEADS, fp.TILE, fp.TILE)])
+            torch.cat(
+                [
+                    dt.view(HEADS, 1, 1).expand(HEADS, fp.TILE, fp.TILE),
+                    na.view(HEADS, 1, 1).expand(HEADS, fp.TILE, fp.TILE),
+                ]
+            )
             for dt, na in zip(per_device(dt_bias), per_device(neg_exp_A))
         ]
     ).contiguous()
@@ -93,7 +137,9 @@ def run(projected, older, newest, taps, constants, norm, recurrent, out, *, debu
     if fp.tile_width_of(projected) != PROJECTION_WIDTH:
         raise ValueError(f"gdn_step projection width must be {PROJECTION_WIDTH}, got {projected.shape[-1]}")
     if tuple(recurrent.shape) != (rows, HEADS, HEAD_DIM, HEAD_DIM) or recurrent.dtype != FP32:
-        raise ValueError(f"gdn_step state must be [{rows}, {HEADS}, {HEAD_DIM}, {HEAD_DIM}] fp32, got {recurrent.shape} {recurrent.dtype}")
+        raise ValueError(
+            f"gdn_step state must be [{rows}, {HEADS}, {HEAD_DIM}, {HEAD_DIM}] fp32, got {recurrent.shape} {recurrent.dtype}"
+        )
     if len(older) != 3 or len(taps) != 4:
         raise ValueError("gdn_step takes three older ring slots and four taps")
     mesh = projected.device()
@@ -119,6 +165,8 @@ def run(projected, older, newest, taps, constants, norm, recurrent, out, *, debu
     writer_cta = [rows, *fp.accessor_args(recurrent), *fp.accessor_args(out)]
     writer_addrs = [recurrent.buffer_address(), out.buffer_address()]
     defines = [("INP_FLOAT32", "1")]
+    if os.environ.get("QWEN38_GDN_STEP_ZONES") == "1":  # study: per-phase device profiler zones in the compute kernel
+        defines.append(("FGS_ZONES", "1"))
     cbs = [fp.cb_descriptor(index, dtype, fp.TILE_BYTES[dtype], pages, cores) for index, dtype, pages in CBS]
     # the new state is read back by the compute (CB_SNEW) and drained by the writer (CB_OUTS): one allocation
     cbs.append(
@@ -172,10 +220,35 @@ def gdn_step(gdn, projected, window, state):
     out-projection's activation layout and updates ``state.recurrent`` and the newest slot in place."""
 
     rows = fp.rows_of(projected)
-    out = fp.allocate((1, 1, rows, VALUE_WIDTH), BF16, ttnn.TILE_LAYOUT, gdn.mesh_device, gdn.out_proj_act_memory_config)
-    run(projected, window[:3], window[3], gdn.weights.conv_taps, _constants(gdn), gdn.weights.norm, state.recurrent, out)
+    out = fp.allocate(
+        (1, 1, rows, VALUE_WIDTH), BF16, ttnn.TILE_LAYOUT, gdn.mesh_device, gdn.out_proj_act_memory_config
+    )
+    run(
+        projected, window[:3], window[3], gdn.weights.conv_taps, _constants(gdn), gdn.weights.norm, state.recurrent, out
+    )
     ttnn.deallocate(projected)
     return out
+
+
+def admits(gdn, projected, window, state) -> bool:
+    """The fused step's input contract for one call, as ``run`` asserts it before building the program: ``projected``
+    one row tile of the projection width, the ring window's four slots, the state's fp32 recurrent tensor with one
+    lane per row.  The served decode tensors satisfy it; host fakes whose padded shape is their logical shape do not
+    and take the composed chain (``registry.resolve_admitted``)."""
+
+    if not (fp.is_row_tile(projected) and fp.is_tile_width(projected, PROJECTION_WIDTH)):
+        return False
+    try:
+        slots = len(window)
+    except TypeError:
+        return False
+    recurrent = getattr(state, "recurrent", None)
+    return (
+        slots == 4
+        and recurrent is not None
+        and tuple(recurrent.shape) == (projected.shape[-2], HEADS, HEAD_DIM, HEAD_DIM)
+        and recurrent.dtype == FP32
+    )
 
 
 def gdn_step_composed(gdn, projected, window, state):
@@ -200,7 +273,11 @@ def reference_step(projected, older, taps, dt_bias, neg_exp_A, norm, state):
     conv = sum(w.float() * t.float() for w, t in zip(window, taps)).to(torch.bfloat16)
     conv = F.silu(conv)
     q = conv[:, :QK_WIDTH].reshape(rows, 1, QK_HEADS, HEAD_DIM).repeat_interleave(HEADS // QK_HEADS, dim=2)
-    k = conv[:, QK_WIDTH : 2 * QK_WIDTH].reshape(rows, 1, QK_HEADS, HEAD_DIM).repeat_interleave(HEADS // QK_HEADS, dim=2)
+    k = (
+        conv[:, QK_WIDTH : 2 * QK_WIDTH]
+        .reshape(rows, 1, QK_HEADS, HEAD_DIM)
+        .repeat_interleave(HEADS // QK_HEADS, dim=2)
+    )
     v = conv[:, 2 * QK_WIDTH :].reshape(rows, 1, HEADS, HEAD_DIM)
     z = projected[:, QKV_WIDTH:A_COLUMN].reshape(rows, 1, HEADS, HEAD_DIM)
     a = projected[:, A_COLUMN : A_COLUMN + HEADS].reshape(rows, 1, HEADS)
@@ -211,7 +288,14 @@ def reference_step(projected, older, taps, dt_bias, neg_exp_A, norm, state):
     normalized = output.float() * torch.rsqrt(output.float().square().mean(dim=-1, keepdim=True) + EPS)
     normalized = norm * normalized.to(output.dtype)
     gated = (normalized * torch.sigmoid(z.float())).to(output.dtype)
-    return new_state, gated.reshape(rows, VALUE_WIDTH), conv, output.reshape(rows, HEADS, HEAD_DIM), beta[:, 0], log_decay[:, 0].exp()
+    return (
+        new_state,
+        gated.reshape(rows, VALUE_WIDTH),
+        conv,
+        output.reshape(rows, HEADS, HEAD_DIM),
+        beta[:, 0],
+        log_decay[:, 0].exp(),
+    )
 
 
 register(
@@ -222,6 +306,9 @@ register(
         tolerance=COMPONENT,
         fused=gdn_step,
         composed=gdn_step_composed,
+        admits=admits,
+        component_proof="the fused GDN step probe against the CPU oracle, four p150, 2026-09-25: state error 0.0048 and "
+        "gated output 0.0098 for the fused step, 0.0081 and 0.0234 for the composed chain",
         # The audit capture holds no GDN recurrent state; the component gate is the real-input probe of the dev tools
         # (fused_gdn_step_probe: layer-0 inputs, the oracle state, 64 consecutive steps, per-component taps).
         gate=None,

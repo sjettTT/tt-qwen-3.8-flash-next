@@ -39,9 +39,14 @@ from typing import Any, Literal
 import torch
 import ttnn.experimental.moe_compute_utils as moe_compute_utils
 from ttnn.experimental.moe_compute_utils import (
-    BLOCK_TILES_H,
     W2_TILES_PER_A2A_ITER_W,
+    _block_tiles_h,
     _shard_tiles,
+    _tiles_per_txn,
+    _w0_w1_compact_layout,
+    _w2_core_blocks_per_expert,
+    _w2_last_a2a_iter_half,
+    _w2_num_a2a_iters,
     _w2_shard_tiles,
     prepare_w0_w1_tensor_for_moe_compute,
     prepare_w2_tensor_for_moe_compute,
@@ -71,6 +76,11 @@ LEGACY_FORMAT_VERSIONS = (1, 2)
 PACKER = "ttnn.experimental.moe_compute_utils"
 DTYPE = "BFLOAT4_B"
 LAYOUT = "TILE"
+# The packed expert layout the cache holds, part of the identity: 1 = the per-core stride layout (every ring core
+# stored the uniform even column stride, K padded to 7-tile blocks); 2 = moe_compute's compact owned-column layout
+# with the per-shape DRAM transaction size (20-tile transactions and a half-width last W2 iteration on the 8-bank
+# ring, 14-tile transactions on the 7-bank ring).
+LAYOUT_VERSION = 2
 BF4_TILE_BYTES = 576
 BACKBONE_LAYERS = 48
 MTP_LAYERS = 1
@@ -607,6 +617,7 @@ class BF4CacheIdentity:
     dtype: str = DTYPE
     packer: str = PACKER
     format_version: int = FORMAT_VERSION
+    layout_version: int = LAYOUT_VERSION
 
     def __post_init__(self) -> None:
         string_fields = (
@@ -626,6 +637,7 @@ class BF4CacheIdentity:
             "routed_experts",
             "experts_per_device",
             "format_version",
+            "layout_version",
         )
         if any(type(getattr(self, name)) is not int for name in integer_fields):
             raise ValueError("BF4 cache identity scalar fields must be exact integers")
@@ -684,7 +696,12 @@ class BF4CacheIdentity:
             128,
         ):
             raise ValueError("BF4 cache identity does not match the pinned Qwen3.8-Flash-Next routed shape")
-        if (self.dtype, self.packer, self.format_version) != (DTYPE, PACKER, FORMAT_VERSION):
+        if (self.dtype, self.packer, self.format_version, self.layout_version) != (
+            DTYPE,
+            PACKER,
+            FORMAT_VERSION,
+            LAYOUT_VERSION,
+        ):
             raise ValueError("BF4 cache encoding identity differs from the released packer contract")
 
     @property
@@ -712,45 +729,50 @@ def ring_shard_maps(hidden_size: int, intermediate_size: int, ring_size: int):
     return w0_w1, w2
 
 
+def _packed_block_dims(*, ring_size: int) -> dict[str, tuple[int, int]]:
+    """Dimensions 3 and 4 -- ``(blocks, rows per block)`` -- of each packed tensor of the pinned 2560/640 expert, from
+    the layout helpers of ``ttnn.experimental.moe_compute_utils`` (the python mirror of the op's
+    ``moe_ring_common.h``).  W0/W1: each ring core stores only its own gate/up columns and the (layer, expert) stream
+    is cut into ``ring_size`` equal bank pieces of whole blocks.  W2: one slice per ring core; with a half-width last
+    all-to-all iteration (the 8-bank ring's 20-tile transactions) it is stored as blocks, otherwise the packer keeps
+    its grouped ``(iterations, K padded to whole blocks)`` form.  ``tests/test_ttnn_bf4_static.py`` pins both against
+    the packers' output."""
+
+    if ring_size not in BLACKHOLE_RING_SIZES:
+        raise ValueError(f"unsupported Blackhole ring size {ring_size}")
+    hidden_tiles, intermediate_tiles = 2560 // ttnn.TILE_SIZE, 640 // ttnn.TILE_SIZE
+    tiles_per_txn = _tiles_per_txn(hidden_tiles, intermediate_tiles, False, ring_size)
+    block_tiles_h = _block_tiles_h(tiles_per_txn)
+    block_rows = block_tiles_h * ttnn.TILE_SIZE
+    w0_w1 = _w0_w1_compact_layout(hidden_tiles, intermediate_tiles, ring_size, ring_size, tiles_per_txn)
+    if w0_w1["uniform"]:
+        w0_w1_dims = (w0_w1["stored_cols"][0] // 2, w0_w1["blocks_per_col"] * block_rows)
+    else:
+        w0_w1_dims = (w0_w1["bank_blocks_per_expert"], block_rows)
+    if _w2_last_a2a_iter_half(hidden_tiles, ring_size, tiles_per_txn):
+        w2_dims = (_w2_core_blocks_per_expert(hidden_tiles, intermediate_tiles, ring_size, tiles_per_txn), block_rows)
+    else:
+        w2_dims = (_w2_num_a2a_iters(hidden_tiles, ring_size), -(-intermediate_tiles // block_tiles_h) * block_rows)
+    return {"w0_w1": w0_w1_dims, "w2": w2_dims}
+
+
+def canonical_packed_shapes(*, ring_size: int) -> dict[str, tuple[int, ...]]:
+    """Exact global tensor shapes serialized for one four-device cache slot: ``(ring, 1, 512 experts, blocks, rows,
+    4 tiles)`` per tensor (``_packed_block_dims``)."""
+
+    dims = _packed_block_dims(ring_size=ring_size)
+    return {name: (ring_size, 1, 512, *dims[name], 4 * ttnn.TILE_SIZE) for name in ("w0_w1", "w2")}
+
+
 def packed_bf4_bytes_per_device(*, ring_size: int, experts_per_device: int = 128) -> tuple[int, int]:
-    """Return exact packed W0/W1 and W2 BF4 payload bytes for one device.
+    """Exact packed W0/W1 and W2 BF4 payload bytes for one device (``experts_per_device`` experts of the canonical
+    slot shape; a BF4 tile is 576 bytes): the pre-allocation memory gate before any checkpoint tensor is read."""
 
-    BF4 tiles occupy 576 bytes.  This formula mirrors the host packers and is
-    used as a pre-allocation memory gate before any checkpoint tensor is read.
-    """
-
-    h, n, tile = 2560, 640, ttnn.TILE_SIZE
-    w01_map, w2_map = ring_shard_maps(h, n, ring_size)
-    max_w01 = max(w01_map)
-    even_w01 = max(max_w01 + (max_w01 % 2), W2_TILES_PER_A2A_ITER_W)
-    w01_groups = even_w01 // 2
-    kp = ((h // tile + BLOCK_TILES_H - 1) // BLOCK_TILES_H) * BLOCK_TILES_H * tile
-    w01_elements = ring_size * experts_per_device * w01_groups * kp * 4 * tile
-
-    max_w2_tiles = (h // tile + ring_size - 1) // ring_size
-    w2_groups = (max_w2_tiles + W2_TILES_PER_A2A_ITER_W - 1) // W2_TILES_PER_A2A_ITER_W
-    np = ((n // tile + BLOCK_TILES_H - 1) // BLOCK_TILES_H) * BLOCK_TILES_H * tile
-    w2_elements = ring_size * experts_per_device * w2_groups * np * 4 * tile
-    tile_elements = tile * tile
-    if w01_elements % tile_elements or w2_elements % tile_elements:
-        raise AssertionError("packed BF4 payload is not a whole number of tiles")
-    return w01_elements // tile_elements * BF4_TILE_BYTES, w2_elements // tile_elements * BF4_TILE_BYTES
-
-
-def _canonical_packed_shapes(*, ring_size: int) -> dict[str, tuple[int, ...]]:
-    """Exact global tensor shapes serialized for one four-device cache slot."""
-
-    w01_map, _ = ring_shard_maps(2560, 640, ring_size)
-    max_w01 = max(w01_map)
-    w01_groups = max(max_w01 + (max_w01 % 2), W2_TILES_PER_A2A_ITER_W) // 2
-    k_padded = ((2560 // ttnn.TILE_SIZE + BLOCK_TILES_H - 1) // BLOCK_TILES_H) * (BLOCK_TILES_H * ttnn.TILE_SIZE)
-    max_w2_tiles = (2560 // ttnn.TILE_SIZE + ring_size - 1) // ring_size
-    w2_groups = (max_w2_tiles + W2_TILES_PER_A2A_ITER_W - 1) // W2_TILES_PER_A2A_ITER_W
-    n_padded = ((640 // ttnn.TILE_SIZE + BLOCK_TILES_H - 1) // BLOCK_TILES_H) * (BLOCK_TILES_H * ttnn.TILE_SIZE)
-    return {
-        "w0_w1": (ring_size, 1, 512, w01_groups, k_padded, 4 * ttnn.TILE_SIZE),
-        "w2": (ring_size, 1, 512, w2_groups, n_padded, 4 * ttnn.TILE_SIZE),
-    }
+    shapes = canonical_packed_shapes(ring_size=ring_size)
+    w0_w1, w2 = (
+        _packed_payload_bytes((*shapes[name][:2], experts_per_device, *shapes[name][3:])) for name in ("w0_w1", "w2")
+    )
+    return w0_w1, w2
 
 
 def _packed_payload_bytes(logical_shape: tuple[int, ...]) -> int:
@@ -798,7 +820,7 @@ def _prepare_routed_layer_host_tensors(
             f"got {tuple(weights.expert_ranges)}"
         )
 
-    canonical_shapes = _canonical_packed_shapes(ring_size=ring_size)
+    canonical_shapes = canonical_packed_shapes(ring_size=ring_size)
     w01_map, w2_map = ring_shard_maps(2560, 640, ring_size)
     torch_w01 = torch.empty(canonical_shapes["w0_w1"], dtype=torch.bfloat16)
     torch_w2 = torch.empty(canonical_shapes["w2"], dtype=torch.bfloat16)
@@ -854,13 +876,14 @@ def _expert_byte_ranges(
 ) -> tuple[tuple[int, int], ...]:
     """``(offset, size)`` of one expert's tiles in the tensorbin payload, one contiguous run per ring bank.
 
-    The payload is the mesh shards in coordinate order, each a tiled ``(ring, 1, experts_per_device, groups, rows,
-    cols)`` tensor: tiles run over the leading dims in row-major order, so an expert's groups are one run per ring bank.
+    The payload is the mesh shards in coordinate order, each a tiled ``(ring, 1, experts_per_device, blocks, rows,
+    cols)`` tensor: tiles run over the leading dims in row-major order, so an expert's blocks (W0/W1: the bank piece
+    stored there; W2: the ring core's slice) are one run per ring bank.
     """
 
-    ring_size, _, experts, groups, rows, cols = logical_shape
+    ring_size, _, experts, blocks, rows, cols = logical_shape
     experts_per_device = experts // len(physical_ids)
-    run = groups * (rows // ttnn.TILE_SIZE) * (cols // ttnn.TILE_SIZE) * BF4_TILE_BYTES
+    run = blocks * (rows // ttnn.TILE_SIZE) * (cols // ttnn.TILE_SIZE) * BF4_TILE_BYTES
     shard = experts_per_device * ring_size * run
     device_index, local = divmod(expert, experts_per_device)
     return tuple(
@@ -1045,7 +1068,7 @@ class Qwen38BF4Cache:
                 f"BF4 layer ring size {record.ring_size!r} differs from cache identity {self.identity.ring_size}"
             )
 
-        canonical_shapes = _canonical_packed_shapes(ring_size=self.identity.ring_size)
+        canonical_shapes = canonical_packed_shapes(ring_size=self.identity.ring_size)
         packed_per_device = dict(
             zip(
                 ("w0_w1", "w2"),
@@ -1100,7 +1123,7 @@ class Qwen38BF4Cache:
         """A mesh tensor's shape is the coordinate-local shard: the slot's experts (dim 2) split over the mesh
         columns, 128 per device; the rest of the canonical slot shape is per device already."""
 
-        canonical_shapes = _canonical_packed_shapes(ring_size=self.identity.ring_size)
+        canonical_shapes = canonical_packed_shapes(ring_size=self.identity.ring_size)
         for name, tensor in (("w0_w1", tt_w01), ("w2", tt_w2)):
             slot_shape = canonical_shapes[name]
             expected = (*slot_shape[:2], self.identity.experts_per_device, *slot_shape[3:])
@@ -1397,7 +1420,7 @@ class Qwen38BF4Cache:
                     # mesh tensor presents one coordinate's shard.  Both are checked while the files are still
                     # temporary, so a refused record publishes nothing.
                     self._validate_mesh_shapes(tt_w01, tt_w2, label="BF4 conversion")
-                    canonical_shapes = _canonical_packed_shapes(ring_size=self.identity.ring_size)
+                    canonical_shapes = canonical_packed_shapes(ring_size=self.identity.ring_size)
                     record = BF4LayerRecord(
                         namespace=namespace,
                         layer_index=layer_index,

@@ -438,10 +438,10 @@
    "better": "lower",
    "idle_only": true,
    "loaded_tolerance": 0.15,
-   "note": "the timing runner's 32-token median after warm-up; 35.82 ms median over 200 traced steps on 4x p150 on 2026-09-25 (dsp-timing-a-tree-7c6f7c9f-20260925T003535Z; 36.91 before it in the same hold, -003133Z) with the gated-residual read as two programs with its gathers inside them (gr_fold) on by default; was 36.92 ms on 2026-09-18 with the router tail's top-k on one core per token group (its lane form) on by default; was 38.67 ms on 2026-09-16 with the fused decode kernels (gr_read, gr_write, greedy_tail, moe_post, ple, position_derive, qsa_block, router_tail, shared_expert) and two DRAM readers per bank for the GDN/QSA/LM-head decode linears on by default; was 42.14 ms on 2026-09-15 and 50.00 / 50.01 ms on both lanes on 2026-09-04 (a proposal: seed it)",
+   "note": "the timing runner's 32-token median after warm-up; 27.77 ms median over 200 traced steps on 4x p150 on 2026-09-25 (dsp-timing-a-tree-f2933ef2-20260925T070237Z; 35.90 on the base 30cc1a5e5d in the same hold, dsp-timing-a-tree-30cc1a5e-20260925T065824Z) with bf8 dense weights, the fused GDN step and moe_compute's compact expert layout on by default; was 35.82 ms median over 200 traced steps on 4x p150 on 2026-09-25 (dsp-timing-a-tree-7c6f7c9f-20260925T003535Z; 36.91 before it in the same hold, -003133Z) with the gated-residual read as two programs with its gathers inside them (gr_fold) on by default; was 36.92 ms on 2026-09-18 with the router tail's top-k on one core per token group (its lane form) on by default; was 38.67 ms on 2026-09-16 with the fused decode kernels (gr_read, gr_write, greedy_tail, moe_post, ple, position_derive, qsa_block, router_tail, shared_expert) and two DRAM readers per bank for the GDN/QSA/LM-head decode linears on by default; was 42.14 ms on 2026-09-15 and 50.00 / 50.01 ms on both lanes on 2026-09-04 (a proposal: seed it)",
    "rule": "band",
    "status": "todo",
-   "target": 35.8,
+   "target": 27.8,
    "tolerance": 0.02,
    "unit": "ms"
   },
@@ -449,9 +449,10 @@
    "better": "higher",
    "idle_only": true,
    "loaded_tolerance": 0.15,
-   "note": "the ledger's median tokens/s over requests of 32+ tokens",
+   "note": "the ledger's median tokens/s over requests of 32+ tokens; 36.01 = 1000 / 27.77 ms from the traced-step pair of 2026-09-25 (27.86 on the base 30cc1a5e5d; the sampled client measured 33.2 tokens/s per stream on a shared-broker host)",
    "rule": "band",
    "status": "todo",
+   "target": 36.0,
    "tolerance": 0.05
   },
   "D1/chunked-32k/free_bytes_per_bank": {
@@ -535,10 +536,10 @@
    "better": "lower",
    "idle_only": true,
    "loaded_tolerance": 0.15,
-   "note": "the timing runner's 32-token median after warm-up; 35.82 ms median over 200 traced steps on 4x p150 on 2026-09-25 (dsp-timing-a-tree-7c6f7c9f-20260925T003535Z; 36.91 before it in the same hold, -003133Z) with the gated-residual read as two programs with its gathers inside them (gr_fold) on by default; was 36.92 ms on 2026-09-18 with the router tail's top-k on one core per token group (its lane form) on by default; was 38.67 ms on 2026-09-16 with the fused decode kernels (gr_read, gr_write, greedy_tail, moe_post, ple, position_derive, qsa_block, router_tail, shared_expert) and two DRAM readers per bank for the GDN/QSA/LM-head decode linears on by default; was 42.14 ms on 2026-09-15 and 50.00 / 50.01 ms on both lanes on 2026-09-04 (a proposal: seed it)",
+   "note": "the timing runner's 32-token median after warm-up; 27.77 ms median over 200 traced steps on 4x p150 on 2026-09-25 (dsp-timing-a-tree-f2933ef2-20260925T070237Z; 35.90 on the base 30cc1a5e5d in the same hold, dsp-timing-a-tree-30cc1a5e-20260925T065824Z) with bf8 dense weights, the fused GDN step and moe_compute's compact expert layout on by default; was 35.82 ms median over 200 traced steps on 4x p150 on 2026-09-25 (dsp-timing-a-tree-7c6f7c9f-20260925T003535Z; 36.91 before it in the same hold, -003133Z) with the gated-residual read as two programs with its gathers inside them (gr_fold) on by default; was 36.92 ms on 2026-09-18 with the router tail's top-k on one core per token group (its lane form) on by default; was 38.67 ms on 2026-09-16 with the fused decode kernels (gr_read, gr_write, greedy_tail, moe_post, ple, position_derive, qsa_block, router_tail, shared_expert) and two DRAM readers per bank for the GDN/QSA/LM-head decode linears on by default; was 42.14 ms on 2026-09-15 and 50.00 / 50.01 ms on both lanes on 2026-09-04 (a proposal: seed it)",
    "rule": "band",
    "status": "todo",
-   "target": 35.8,
+   "target": 27.8,
    "tolerance": 0.02,
    "unit": "ms"
   },
@@ -546,9 +547,10 @@
    "better": "higher",
    "idle_only": true,
    "loaded_tolerance": 0.15,
-   "note": "the ledger's median tokens/s over requests of 32+ tokens",
+   "note": "the ledger's median tokens/s over requests of 32+ tokens; 36.01 = 1000 / 27.77 ms from the traced-step pair of 2026-09-25 (27.86 on the base 30cc1a5e5d; the sampled client measured 33.2 tokens/s per stream on a shared-broker host)",
    "rule": "band",
    "status": "todo",
+   "target": 36.0,
    "tolerance": 0.05
   },
   "D1/forced-32k/free_bytes_per_bank": {

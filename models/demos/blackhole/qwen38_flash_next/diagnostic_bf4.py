@@ -31,7 +31,6 @@ EXPECTED_MESH_SHAPE = (1, 4)
 EXPECTED_MESH_COORDINATES = ((0, 0), (0, 1), (0, 2), (0, 3))
 EXPECTED_EXPERT_RANGES = ((0, 128), (128, 256), (256, 384), (384, 512))
 EXPECTED_RING_SIZE = 8
-EXPECTED_TOTAL_BYTES = 106_819_608_000
 PRODUCER_IDENTITY_KEYS = ("source_head", "runtime", "checkpoint")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
@@ -48,18 +47,20 @@ ARTIFACT_SPECS = MappingProxyType(
     {
         "w0_w1": _ArtifactSpec(
             filename="w0_w1_dtype_BFLOAT4_B_layout_TILE.tensorbin",
-            bytes=1_585_448_160,
-            local_shape=(8, 1, 128, 2, 2688, 128),
-            global_shape=(8, 1, 512, 2, 2688, 128),
+            bytes=943_719_648,
+            local_shape=(8, 1, 128, 10, 320, 128),
+            global_shape=(8, 1, 512, 10, 320, 128),
         ),
         "w2": _ArtifactSpec(
             filename="w2_dtype_BFLOAT4_B_layout_TILE.tensorbin",
-            bytes=594_543_840,
-            local_shape=(8, 1, 128, 3, 672, 128),
-            global_shape=(8, 1, 512, 3, 672, 128),
+            bytes=471_860_448,
+            local_shape=(8, 1, 128, 5, 320, 128),
+            global_shape=(8, 1, 512, 5, 320, 128),
         ),
     }
 )
+# The corpus total follows the per-artifact pins: 49 slots x (w0_w1 + w2) = 69,363,424,704 bytes in the compact layout.
+EXPECTED_TOTAL_BYTES = len(EXPECTED_SLOTS) * sum(spec.bytes for spec in ARTIFACT_SPECS.values())
 
 
 class DiagnosticBF4BindingError(RuntimeError):

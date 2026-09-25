@@ -352,10 +352,15 @@ MoEComputeMeshWorkloadFactory::create_at(
     const uint32_t tilize_num_cores = tilize_core_range_set.num_cores();
     const uint32_t matmul_num_cores = matmul_core_range_set.num_cores();
 
-    // a2a_cb_pages = IN2_TILES_PER_STEP = ceil(intermediate_tiles / matmul_num_cores), even-rounded
-    // and at least the W2 A2A matmul width.
-    // (formula-driven, replaces the pre-#43932 per-config table). The ring size is the live
-    // DRAM-bank count, so each ring core maps 1:1 to a DRAM bank and no cross-bank walk is needed.
+    // Which output stage this program carries. FullCcl/FullLocal build the fused combine kernels on
+    // the combine cores; LocalOutput builds none and dm1 writes the final output itself;
+    // ComputeOnly builds none and stops at the matmul output.
+    const bool combine_built = args.path == MoEComputePath::FullCcl || args.path == MoEComputePath::FullLocal;
+    const bool local_output = args.path == MoEComputePath::LocalOutput;
+
+    // a2a_cb_pages = IN2_TILES_PER_STEP = moe_ring::a2a_exchange_tiles: the largest per-core gate/up column count
+    // (at least 2) for a compact shape, else the uniform even stride (at least the W2 A2A matmul width).
+    // The ring size is the live DRAM-bank count, so each ring core maps 1:1 to a DRAM bank.
     const uint32_t expected_matmul_n =
         mesh_device->get_optimal_dram_bank_to_logical_worker_assignment(tt::tt_metal::NOC::RISCV_0_default).size();
     TT_FATAL(
@@ -363,8 +368,13 @@ MoEComputeMeshWorkloadFactory::create_at(
         "moe_compute: expected matmul_num_cores={}, got {}",
         expected_matmul_n,
         matmul_num_cores);
-    const uint32_t a2a_cb_pages_raw = (intermediate_tiles + matmul_num_cores - 1) / matmul_num_cores;
-    const uint32_t a2a_cb_pages = moe_ring::even_stride_at_least_a2a_width(a2a_cb_pages_raw);
+    const uint32_t a2a_cb_pages = moe_ring::a2a_exchange_tiles(intermediate_tiles, matmul_num_cores);
+
+    // Per-shape DRAM transaction size of both weight streams (moe_ring::tiles_per_txn_for_shape: 14 tiles, or 20
+    // for the 2560/640 expert on the 8-bank ring), passed to the kernels as the "tiles_per_txn" compile arg.
+    const uint32_t weight_tiles_per_txn =
+        moe_ring::tiles_per_txn_for_shape(hidden_tiles, intermediate_tiles, args.has_bias, matmul_num_cores);
+    const uint32_t weight_tiles_per_block = moe_ring::W0_W1_TXNS_PER_BLOCK * weight_tiles_per_txn;
 
     const uint32_t tilize_bounding_box_num_cores = tilize_bounding_box.size();
     const uint32_t matmul_bounding_box_num_cores = matmul_bounding_box.size();
@@ -476,24 +486,19 @@ MoEComputeMeshWorkloadFactory::create_at(
     // Allocate on the combine bounding box (not just selected cores) because the combine
     // reader kernel multicasts to the full rectangle — cores inside the bbox but outside
     // the selected set must also have a valid semaphore address to avoid L1 corruption.
-    // In ComputeOnly mode, the kernel-side increment is gated off via the compute_only CT arg, so
-    // the semaphore is unused by anyone -- but tilize_reader still calls get_semaphore() on it
-    // (a local L1 address lookup), so we still need it to be allocated on at least the matmul
-    // core range set.
+    // Without combine kernels (ComputeOnly, LocalOutput) the kernel-side increment is gated off via
+    // the compute_only / local_output CT args, so the semaphore is unused by anyone -- but
+    // tilize_reader still calls get_semaphore() on it (a local L1 address lookup), so we still need
+    // it to be allocated on at least the matmul core range set.
     const auto tilize_combine_sync_semaphore_id = tt::tt_metal::CreateSemaphore(
-        program,
-        args.path == MoEComputePath::ComputeOnly ? matmul_core_range_set
-                                                 : CoreRangeSet(combine_core_range_set.bounding_box()),
-        INVALID);
+        program, combine_built ? CoreRangeSet(combine_core_range_set.bounding_box()) : matmul_core_range_set, INVALID);
 
     // Matmul dm1 signals combine cores when data is written; combine writer waits on this semaphore.
     // For double buffering, combine cores will also use this semaphore to signal matmul when buffer segments are free.
-    // In ComputeOnly mode, dm1 still calls get_semaphore() to look up the local L1 address, but the
-    // wait/increment/set are all gated off via the compute_only CT arg.
+    // Without combine kernels dm1 still calls get_semaphore() to look up the local L1 address, but the
+    // wait/increment/set are all gated off via the compute_only / local_output CT args.
     const auto matmul_combine_sync_semaphore_id = tt::tt_metal::CreateSemaphore(
-        program,
-        args.path == MoEComputePath::ComputeOnly ? matmul_core_range_set : combine_matmul_core_range_set,
-        INVALID);
+        program, combine_built ? combine_matmul_core_range_set : matmul_core_range_set, INVALID);
 
     //-------------------------------------------------------------------------
     // Tilize work split
@@ -756,7 +761,8 @@ MoEComputeMeshWorkloadFactory::create_at(
         | Name           | CB Index     | Dtype     | Tile? | Tiles/CB  | DS  | GPT | Remarks                    |
         ----------------------------------------------------------------------------------------------------------
         | cb_s2c_in      | CBIndex::c_0 | Float16_b | true  | (shared)  | 448 | 180 | Shared output buf          |
-        | cb_r2c_w0      | CBIndex::c_3 | Bfp4_b    | true  | 14*6      |  84 |  84 | 3 triple-bufs W0/W1        |
+        | cb_r2c_w0      | CBIndex::c_3 | Bfp4_b    | true  | slots*2*t |  84 |  84 | 3 blocks W0/W1 + W2 (txn=  |
+        |                |              |           |       |           |     |     | 14 tiles; 20 -> 3 x 40)    |
         | cb_c2w_rdy     | CBIndex::c_4 | Float32   | false | 1         |   — |   — | Compute->writer ready      |
         | cb_w2c_rdy     | CBIndex::c_5 | Float32   | false | 1         |   — |   — | Writer->compute ready      |
         | cb_s2c_in2     | CBIndex::c_6 | Float16_b | true  | a2a*cores |  72 |  96 | Ring A2A activation        |
@@ -769,7 +775,13 @@ MoEComputeMeshWorkloadFactory::create_at(
     // Define the CB configuration as a tuple: name, CBIndex, DataFormat, tiles_per_cb
     // Note: cb_s2c_in and cb_c2s_out are handled separately as it is allocated on Tilize, Matmul, and Combine cores
     std::vector<std::tuple<std::string, tt::CBIndex, tt::DataFormat, bool, uint32_t>> matmul_cb_specs0 = {
-        {"cb_r2c_w0", tt::CBIndex::c_3, tt::DataFormat::Bfp4_b, true, 14 * 6},
+        // dm0's slots of one block each (moe_ring::weight_cb_slots: 3 for 14- and 20-tile transactions);
+        // whole blocks so the ring buffer wraps on a block boundary.
+        {"cb_r2c_w0",
+         tt::CBIndex::c_3,
+         tt::DataFormat::Bfp4_b,
+         true,
+         moe_ring::weight_cb_slots(weight_tiles_per_txn) * weight_tiles_per_block},
         {"cb_c2w_rdy", tt::CBIndex::c_4, tt::DataFormat::Float32, false, 1},
         {"cb_w2c_rdy", tt::CBIndex::c_5, tt::DataFormat::Float32, false, 1},
         {"cb_s2c_in2", tt::CBIndex::c_6, tt::DataFormat::Float16_b, true, a2a_cb_pages * matmul_num_cores},
@@ -788,6 +800,48 @@ MoEComputeMeshWorkloadFactory::create_at(
                                    .set_page_size(index, bytes_per_tile);
 
         tt::tt_metal::CreateCircularBuffer(program, matmul_core_range_set, cb_config);
+    }
+
+    // LOCAL_OUTPUT: dm1's per-chunk copy of the current expert's e_t entries (one 16-B entry per
+    // token: word 0 token id, word 1 k slot), read from the e_t output tensor. c_9 is free on the
+    // matmul cores (c_8 is the bias ones tile).
+    constexpr uint32_t local_output_map_cb_id = tt::CBIndex::c_9;
+    if (local_output) {
+        const uint32_t map_bytes = tokens_per_chunk * l1_alignment;
+        tt::tt_metal::CreateCircularBuffer(
+            program,
+            matmul_core_range_set,
+            tt::tt_metal::CircularBufferConfig(map_bytes, {{local_output_map_cb_id, tt::DataFormat::UInt32}})
+                .set_page_size(local_output_map_cb_id, map_bytes));
+    }
+
+    // LOCAL_OUTPUT: the output contract is "every row of [k, T, H] is what this op wrote": the rows
+    // of experts this device holds carry their W2 results and every other row is zero, so the
+    // per-device partials of a 1xN mesh sum directly, also into a reused caller tensor. Before its
+    // first row write dm1 writes its W2 column slice of all k x T rows from this pre-zeroed L1
+    // region (one row slice: the widest W2 column slice of the ring), overlapped with the tilize
+    // phase. c_10 is free on the matmul cores (c_10..c_14 are tilize-core CBs).
+    constexpr uint32_t local_output_zero_cb_id = tt::CBIndex::c_10;
+    uint32_t local_output_num_rows = 0;
+    if (local_output) {
+        uint32_t max_w2_slice_tiles = 0;
+        for (uint32_t core = 0; core < matmul_num_cores; ++core) {
+            max_w2_slice_tiles = std::max(
+                max_w2_slice_tiles, moe_ring::w2_shard_tiles(hidden_tiles, core, intermediate_tiles, matmul_num_cores));
+        }
+        const uint32_t zero_bytes =
+            max_w2_slice_tiles * tt::constants::TILE_WIDTH * tt::datum_size(tilize_output_dataformat);
+        tt::tt_metal::CreateCircularBuffer(
+            program,
+            matmul_core_range_set,
+            tt::tt_metal::CircularBufferConfig(zero_bytes, {{local_output_zero_cb_id, tilize_output_dataformat}})
+                .set_page_size(local_output_zero_cb_id, zero_bytes));
+        TT_FATAL(
+            tensor_return_value.size() == 6,
+            "path=LocalOutput expects 6 output tensors, got {}",
+            tensor_return_value.size());
+        const auto& local_output_shape = tensor_return_value[5].logical_shape();
+        local_output_num_rows = local_output_shape[0] * local_output_shape[1];  // k x T
     }
 
     //-------------------------------------------------------------------------
@@ -944,7 +998,10 @@ MoEComputeMeshWorkloadFactory::create_at(
         {"combine_sync_noc_y", (uint32_t)mesh_device->worker_core_from_logical_core(combine_cores[0]).y},
 
         // Bypass selective_reduce_combine path entirely (1=skip combine semaphore inc/wait/set).
-        {"compute_only", args.path == MoEComputePath::ComputeOnly ? 1u : 0u}};
+        {"compute_only", args.path == MoEComputePath::ComputeOnly ? 1u : 0u},
+        // LocalOutput: no combine kernels either; the drain publishes the e_t tensor (token id + k
+        // slot per entry) before releasing the matmul cores, since dm1 reads it for its output rows.
+        {"local_output", local_output ? 1u : 0u}};
 
     std::vector<uint32_t> tilize_compile_time_args = {};
     tt::tt_metal::TensorAccessorArgs(tilize_input_tensor.buffer()).append_to(tilize_compile_time_args);
@@ -1154,6 +1211,22 @@ MoEComputeMeshWorkloadFactory::create_at(
     for (const auto& tensor : matmul_tensors) {
         tt::tt_metal::TensorAccessorArgs(*tensor->buffer()).append_to(matmul_compile_time_args);
     }
+    if (local_output) {
+        // LOCAL_OUTPUT: dm1 reads the e_t pages and writes the final output through TensorAccessors
+        // whose args follow the three matmul tensors (dm0 and compute stop after those). The output
+        // accessor is built from the actual slot-5 buffer (the caller's optional_output_tensor when
+        // given, else the tensor allocated from combine_params.output_memory_config): interleaved or
+        // height-sharded, DRAM or L1, its bank / shard-core coordinates become compile-time args. A
+        // program-cache hit reuses them: the hash covers the optional tensor's spec and
+        // combine_params, so the distribution is the same and only the address changes
+        // (override_runtime_arguments below).
+        TT_FATAL(
+            tensor_return_value.size() == 6,
+            "path=LocalOutput expects 6 output tensors, got {}",
+            tensor_return_value.size());
+        tt::tt_metal::TensorAccessorArgs(*tilize_e_t_output_tensor.buffer()).append_to(matmul_compile_time_args);
+        tt::tt_metal::TensorAccessorArgs(*tensor_return_value[5].buffer()).append_to(matmul_compile_time_args);
+    }
 
     // parameters for writing to output shards
     const uint32_t tile_width = tilize_input_tensor.tensor_spec().tile().get_width();
@@ -1164,8 +1237,15 @@ MoEComputeMeshWorkloadFactory::create_at(
         output_shard_width_tiles * tile_width * tilize_output_tensor.element_size();
     constexpr uint32_t num_source_buffers = 2;
     const auto& source_shard_shape = tilize_output_tensor.memory_config().shard_spec()->shape;
+    // token_expert_row_offset is in token-segment rows (hidden_size / combine_data_parallel_cores
+    // wide): dm1 turns it into the byte offset of ring entry 1 inside each combine core's shard
+    // (rows * combine_shard_width_tiles * tile_width_size_bytes). The shard itself is
+    // [2 x 32, hidden_size], so the offset is 32 * combine_data_parallel_cores segment rows, not 32.
+    // Same helper and arguments as selective_reduce_combine's consumer side.
     const auto fused_source_layout = ttnn::experimental::prim::detail::compute_fused_source_buffer_layout(
         source_shard_shape[0],
+        source_shard_shape[1],
+        hidden_size / combine_data_parallel_cores,
         tilize_output_tensor.buffer()->aligned_size_per_bank(),
         token_segment_size_bytes,
         num_source_buffers);
@@ -1181,18 +1261,59 @@ MoEComputeMeshWorkloadFactory::create_at(
     // Ring size equals the live bank count: 12 on WH (no DRAM-bank harvesting), 7/8 on BH.
     // Ring cores and banks are 1:1, so no cross-bank walk is needed.
     const uint32_t num_dram_banks = mesh_device->allocator()->get_num_banks(tt::tt_metal::BufferType::DRAM);
-    // pages_per_ring_core_total / w2_pages_per_ring_core_total: number of tile-pages each
-    // ring core "owns" in the FLAT layout of the HEIGHT_SHARDED weight tensor. The flat
-    // layout is core-major (ring_core_0's tiles for all (layer, expert), then ring_core_1's,
-    // etc.), so this value equals total_pages / num_cores. The kernel uses it to derive the
-    // global page offset for each (ring_core, layer, expert).
+    // w2_pages_per_ring_core_total: number of tile-pages each ring core "owns" in the FLAT
+    // layout of the HEIGHT_SHARDED W2 tensor. The flat layout is core-major (ring_core_0's
+    // tiles for all (layer, expert), then ring_core_1's, etc.), so this value equals
+    // total_pages / num_cores. The kernel uses it to derive the global page offset for each
+    // (ring_core, layer, expert).
+    //
+    // W0/W1 uses the compact per-expert bank-balanced layout (moe_ring_common.h): every bank
+    // holds w0_w1_bank_blocks_per_expert whole blocks per (layer, expert). dm0 derives the
+    // geometry from the shape compile args; check here that the tensor was packed that way
+    // (a tensor packed with the old per-core stride has a different page count).
     const uint32_t w0_w1_total_pages_buf = static_cast<uint32_t>(matmul_w0_w1_tensor.buffer()->num_pages());
     const uint32_t w2_total_pages_buf = static_cast<uint32_t>(matmul_w2_tensor.buffer()->num_pages());
-    TT_FATAL(
-        w0_w1_total_pages_buf % matmul_num_cores == 0,
-        "moe_compute: w0_w1 total pages ({}) not divisible by num_cores ({})",
-        w0_w1_total_pages_buf,
-        matmul_num_cores);
+    {
+        const uint32_t w0_w1_layers = matmul_w0_w1_tensor.logical_shape()[1];
+        const uint32_t w0_w1_bank_blocks = moe_ring::w0_w1_bank_blocks_per_expert(
+            args.has_bias ? hidden_tiles + 1 : hidden_tiles,
+            intermediate_tiles,
+            matmul_num_cores,
+            num_dram_banks,
+            weight_tiles_per_txn);
+        const uint32_t w0_w1_expected_pages =
+            num_dram_banks * w0_w1_layers * experts_per_device * w0_w1_bank_blocks * weight_tiles_per_block;
+        TT_FATAL(
+            w0_w1_total_pages_buf == w0_w1_expected_pages,
+            "moe_compute: w0_w1 tensor has {} tile pages, the compact layout for {} layers x {} experts over {} banks "
+            "needs {} ({} blocks of {} tiles per bank per expert); pack it with prepare_w0_w1_tensor_for_moe_compute",
+            w0_w1_total_pages_buf,
+            w0_w1_layers,
+            experts_per_device,
+            num_dram_banks,
+            w0_w1_expected_pages,
+            w0_w1_bank_blocks,
+            weight_tiles_per_block);
+        const uint32_t w2_layers = matmul_w2_tensor.logical_shape()[1];
+        const uint32_t w2_core_blocks = moe_ring::w2_core_blocks_per_expert(
+            hidden_tiles,
+            args.has_bias ? intermediate_tiles + 1 : intermediate_tiles,
+            matmul_num_cores,
+            weight_tiles_per_txn);
+        const uint32_t w2_expected_pages =
+            matmul_num_cores * w2_layers * experts_per_device * w2_core_blocks * weight_tiles_per_block;
+        TT_FATAL(
+            w2_total_pages_buf == w2_expected_pages,
+            "moe_compute: w2 tensor has {} tile pages, the layout for {} layers x {} experts over {} ring cores needs "
+            "{} ({} blocks of {} tiles per core per expert); pack it with prepare_w2_tensor_for_moe_compute",
+            w2_total_pages_buf,
+            w2_layers,
+            experts_per_device,
+            matmul_num_cores,
+            w2_expected_pages,
+            w2_core_blocks,
+            weight_tiles_per_block);
+    }
     TT_FATAL(
         w2_total_pages_buf % matmul_num_cores == 0,
         "moe_compute: w2 total pages ({}) not divisible by num_cores ({})",
@@ -1208,7 +1329,6 @@ MoEComputeMeshWorkloadFactory::create_at(
         const auto& mesh_shape = mesh_device->get_view().shape();
         shared_expert_tp_factor = mesh_shape[1 - args.cluster_axis().value()];
     }
-    const uint32_t w0_w1_pages_per_ring_core_total = w0_w1_total_pages_buf / matmul_num_cores;
     const uint32_t w2_pages_per_ring_core_total = w2_total_pages_buf / matmul_num_cores;
     std::unordered_map<std::string, uint32_t> matmul_named_compile_time_args = {
         {"num_experts", experts_per_device},
@@ -1218,7 +1338,6 @@ MoEComputeMeshWorkloadFactory::create_at(
         {"has_bias", args.has_bias ? 1u : 0u},
         {"num_cores", static_cast<uint32_t>(matmul_num_cores)},
         {"num_banks", num_dram_banks},
-        {"w0_w1_pages_per_ring_core_total", w0_w1_pages_per_ring_core_total},
         {"w2_pages_per_ring_core_total", w2_pages_per_ring_core_total},
         {"activation_function", static_cast<uint32_t>(activation_type)},
         {"metadata_ready_semaphore_id", metadata_ready_semaphore_id},
@@ -1237,12 +1356,22 @@ MoEComputeMeshWorkloadFactory::create_at(
         {"height_shard_dim", output_height_shard_dim},
         {"width_shard_dim", combine_data_parallel_cores},
         {"hidden_tiles", hidden_tiles},
+        {"tiles_per_txn", weight_tiles_per_txn},
         {"intermediate_tiles", intermediate_tiles},
         {"noc_max_burst_bytes", noc_max_burst_bytes},
         // Matmul -> combine: dm1 increments this on combine cores when data is written
         {"matmul_combine_sync_semaphore_id", matmul_combine_sync_semaphore_id},
         // Bypass combine signaling/wait when no combine kernels are built.
         {"compute_only", args.path == MoEComputePath::ComputeOnly ? 1u : 0u},
+        // LOCAL_OUTPUT (dm1): write each token row slice straight into the final [k, T, H] output,
+        // page k * total_tokens + t from the expert's e_t entries.
+        {"local_output", local_output ? 1u : 0u},
+        {"total_tokens", tokens},
+        {"e_t_entry_size", l1_alignment},
+        {"local_output_map_cb_id", local_output_map_cb_id},
+        // Zero fill of the rows this device does not own: the pre-zeroed row-slice CB and k x T.
+        {"local_output_zero_cb_id", local_output_zero_cb_id},
+        {"local_output_num_rows", local_output_num_rows},
     };
 
     // Create kernels for the program
@@ -1350,6 +1479,12 @@ MoEComputeMeshWorkloadFactory::create_at(
             matmul_runtime_args.push_back(static_cast<uint32_t>(c.x));
         }
     }
+    if (local_output) {
+        // LOCAL_OUTPUT: final output and e_t addresses trail dm0's bank table (dm0 reads that table
+        // by position); override_runtime_arguments refreshes these last two entries.
+        matmul_runtime_args.push_back(tensor_return_value[5].buffer()->address());
+        matmul_runtime_args.push_back(tilize_e_t_output_tensor.buffer()->address());
+    }
 
     // shard_to_bank translation table: maps shard index → physical chip DRAM bank id.
     //
@@ -1383,11 +1518,6 @@ MoEComputeMeshWorkloadFactory::create_at(
             "moe_compute: w2 total pages ({}) must be divisible by num_banks ({})",
             w2_total_pages,
             num_dram_banks);
-        TT_FATAL(
-            w0_w1_total_pages % matmul_num_cores == 0,
-            "moe_compute: w0_w1 total pages ({}) must be divisible by num_cores ({})",
-            w0_w1_total_pages,
-            matmul_num_cores);
         TT_FATAL(
             w2_total_pages % matmul_num_cores == 0,
             "moe_compute: w2 total pages ({}) must be divisible by num_cores ({})",
@@ -1448,7 +1578,7 @@ MoEComputeMeshWorkloadFactory::create_at(
     std::vector<GlobalSemaphore> combine_global_semaphores;
     std::vector<CoreCoord> combine_cores_for_shared = combine_cores;
 
-    if (args.path != MoEComputePath::ComputeOnly) {
+    if (combine_built) {
         // combine_params validity, num_links, and axis range are all checked in
         // validate_on_program_cache_miss. Barrier semaphores are an internal contract
         // between create_mesh_workload (caller) and create_at (callee), so checked here.
@@ -1509,8 +1639,8 @@ MoEComputeMeshWorkloadFactory::create_at(
             combine_global_semaphores = {*init_barrier_semaphore, *final_barrier_semaphore};
         }
     } else {
-        // ComputeOnly: no combine kernels are built. The matmul/tilize kernels' increments to
-        // combine semaphores are gated off via the compute_only CT arg.
+        // ComputeOnly / LocalOutput: no combine kernels are built. The matmul/tilize kernels'
+        // increments to combine semaphores are gated off via the compute_only / local_output CT args.
         combine_cores_for_shared.clear();
     }
 
@@ -1621,6 +1751,18 @@ void MoEComputeMeshWorkloadFactory::override_runtime_arguments(
                 matmul_runtime_args[2] = tensor_args.matmul_w0_w1_tensor.buffer()->address();
                 matmul_runtime_args[3] = tensor_args.matmul_w2_tensor.buffer()->address();
                 matmul_runtime_args[4] = tilize_output_tensor.buffer()->address();
+                if (shared_variables.path == MoEComputePath::LocalOutput) {
+                    // The final output and e_t addresses are the two trailing entries (see create_at).
+                    // tensor_return_value[5] is the caller's optional_output_tensor when one was given
+                    // (create_output_tensors returns it), so its address is what dm1 writes to.
+                    TT_FATAL(
+                        tensor_return_value.size() == 6 && matmul_runtime_args.size() >= 11,
+                        "path=LocalOutput expects 6 output tensors and >= 11 matmul runtime args, got {} and {}",
+                        tensor_return_value.size(),
+                        matmul_runtime_args.size());
+                    matmul_runtime_args[matmul_runtime_args.size() - 2] = tensor_return_value[5].buffer()->address();
+                    matmul_runtime_args[matmul_runtime_args.size() - 1] = tilize_e_t_output_tensor.buffer()->address();
+                }
             }
         }
 
@@ -1628,7 +1770,7 @@ void MoEComputeMeshWorkloadFactory::override_runtime_arguments(
         // Combine
         //-------------------------------------------------------------------------
 
-        if (shared_variables.path != MoEComputePath::ComputeOnly) {
+        if (shared_variables.path == MoEComputePath::FullCcl || shared_variables.path == MoEComputePath::FullLocal) {
             // combine_params validity is checked in validate_on_program_cache_miss.
             TT_FATAL(
                 shared_variables.combine_kernel_handles.size() == 2,

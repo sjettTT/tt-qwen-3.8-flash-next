@@ -25,8 +25,8 @@ This was implemented with the intention of the n-gram model residing in system m
 | path | measured | notes |
 |---|---|---|
 | prompt prefill | 300 tok/s (and climbing); 650 tok/s with `--long-chunks`; 1,150 tok/s with `--prefill-slab 2048` | 32-token chunk trace, 3.0-3.5 ms per prompt token, flat from 2k to 261k tokens; 128-token chunks at 1.45-1.56 ms per prompt token (`--long-chunks`); 2,048-row slabs at 0.87-1.08 ms per prompt token (`--prefill-slab 2048`, 2026-09-09, tolerance class: see `docs/PREFILL.md`) |
-| decode, one stream | 27.9 tok/s | position-generic traced decode, 35.8 ms per token, flat with depth; 9 decode chains run as fused programs, the gated-residual read as two programs with its gathers inside them, the router tail's top-k on one core per token group, and the decode linears read each DRAM bank with two cores by default (2026-09-25, bitwise: `docs/NUMERICS.md`) |
-| decode with MTP (`--mtp 4`) | 39 tok/s median over the acceptance prompts, 68 tok/s on structured output | speculative drafting with exact acceptance: the committed stream leaves the CPU reference at the same token as greedy decode on 8 of the 12 acceptance prompts and at a different token on the other 4 (section 6, `docs/NUMERICS.md`) |
+| decode, one stream | 36.0 tok/s | position-generic traced decode, 27.8 ms per token, flat with depth; BF8 dense weights, the fused GDN step and the compact expert layout by default; 9 decode chains run as fused programs, the gated-residual read as two programs with its gathers inside them, the router tail's top-k on one core per token group, and the decode linears read each DRAM bank with two cores by default (2026-09-25, bitwise: `docs/NUMERICS.md`) |
+| decode with MTP (`--mtp 4`) | 39 tok/s median over the acceptance prompts, 68 tok/s on structured output | speculative drafting with exact acceptance: the committed stream leaves the CPU reference at the same token as greedy decode on 9 of the 12 acceptance prompts and at a different token on the other 3 (section 6, `docs/NUMERICS.md`) |
 | contexts | 32k, 64k, 128k, 256k | 256k is single-user; MTP fits at 32k, 64k and 128k |
 | correctness | bitwise repeatable; 96/96 greedy token match against the CPU reference on the acceptance prompt | chunked prefill is tolerance-class against the CPU reference on all 48 layers |
 
@@ -52,7 +52,7 @@ This was implemented with the intention of the n-gram model residing in system m
   The server admits only a `ttnn` imported from this checkout's own build and records the checkout's commit, tree
   and extension digest with every run (`tools/runtime_admission.py`; `docs/SERVER.md`).
 - The checkpoint: 360 GB (131 safetensors shards, the tokenizer, the chat template; section 3).
-- Disk under `--cache-root`: 107 GB for the BF4 expert cache (built once, shared by every context, kept across
+- Disk under `--cache-root`: 69 GB for the BF4 expert cache (built once, shared by every context, kept across
   runtime rebuilds), about 23 GB for the 32k context and 10 GB for each other allocated context (the converted
   non-expert weights and the model I/O cache), and the JIT kernel cache (about 1.3 GB).
 - Host memory: the first start reads the checkpoint once and converts one MoE layer at a time (about 10 GB of host
@@ -117,10 +117,10 @@ Then the server:
 modified or not), the interpreter and the `ttnn` extension, the profile, the device set, the context and the run directory.
 
 **The first start** converts the routed experts of all 49 MoE layers into the BF4 cache
-(`<cache-root>/caches/bf4-experts/`, 107 GB; a `bf4-stage-backbone-NN` phase per layer in the log), then builds the
-component and model I/O caches of the chosen context (a few minutes), compiles the kernels (two to four minutes
-cold) and captures the decode traces and the prefill chunk trace.  A layer takes about 33 s on a 4x p150 host (on the
-QuietBox 2026-09-06: 49 layers in 1772 s), the 49 under half an hour.  A machine that bounds a job's wall time can
+(`<cache-root>/caches/bf4-experts/`, 69 GB in the compact expert layout; a `bf4-stage-backbone-NN` phase per layer in the
+log), then builds the component and model I/O caches of the chosen context (a few minutes), compiles the kernels (two to
+four minutes cold) and captures the decode traces and the prefill chunk trace.  A layer takes about 27 s on a 4x p150
+host (on the QuietBox 2026-09-25: 49 layers in 1448 s), the 49 under half an hour.  A machine that bounds a job's wall time can
 build the expert cache in pieces: `--prepare-only --bf4-stage-limit N` converts at most N missing layers and stops,
 and the next run continues.  The cache is keyed by the checkpoint and the converter's sources, not by the tt-metal
 revision: a rebuilt runtime keeps it, and every start checks one re-packed expert against it (`docs/SERVER.md`).

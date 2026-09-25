@@ -76,6 +76,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.live_decode_diagnostic impor
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
+from models.demos.blackhole.qwen38_flash_next.ttnn.moe import moe_local_output_enabled
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     DEFAULT_PREFILL_MODE,
     MAX_TOKENS_BOUND,
@@ -1837,6 +1838,8 @@ def main() -> int:
             "prefill_mode": session.prefill_mode,
             "sampling": chain.sampling is not None,
             "dram_workers_per_bank": chain.construction.builder.decode_dram_workers_per_bank,
+            "dram_workers_fallback": chain.construction.builder.decode_dram_workers_fallback,
+            "dense_weight_dtype": chain.construction.builder.dense_weight_plan.describe(),
             "mtp": (
                 None
                 if chain.mtp is None
@@ -1932,6 +1935,9 @@ def main() -> int:
                 "mtp": report["chain"]["mtp"],
                 "fused_kernels": sorted(fused.enabled_names()),
                 "dram_workers_per_bank": report["chain"]["dram_workers_per_bank"],
+                "moe_local_output": moe_local_output_enabled(),
+                "dram_workers_fallback": report["chain"]["dram_workers_fallback"],
+                "dense_weight_dtype": report["chain"]["dense_weight_dtype"],
                 "route": list(hardware_profile.route),
                 "route_derivation": route_derivation["route_derivation"],
             }

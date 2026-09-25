@@ -56,7 +56,12 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import (
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE, Qwen38MeshContract
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
+    DenseWeightPlan,
+    TWO_READER_QUALIFIED_DTYPES,
     default_decode_dram_workers,
+    default_dense_weight_plan,
+    dense_dtype_tag,
+    qualify_decode_dram_workers,
     validate_decode_dram_workers,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import (
@@ -740,6 +745,7 @@ class Qwen38TTNNBuilder:
         expert_residency: Literal["streamed", "resident"] = "streamed",
         qsa_cache_capacity: int = MAX_CONTEXT,
         decode_dram_workers_per_bank: int | None = None,
+        dense_weight_plan: DenseWeightPlan | None = None,
     ) -> None:
         # The decode linears' DRAM readers per bank (decode_matmul): the serving default or QWEN38_DRAM_WORKERS
         # unless the caller names the count; the GDN weights, the QSA and the LM head (backbone and MTP) run it.
@@ -748,6 +754,11 @@ class Qwen38TTNNBuilder:
             if decode_dram_workers_per_bank is None
             else validate_decode_dram_workers(decode_dram_workers_per_bank)
         )
+        # The resident dense matmul weights' dtype per module (decode_matmul: QWEN38_DENSE_WEIGHT_DTYPE, bf16 unless set).
+        if dense_weight_plan is None:
+            dense_weight_plan = default_dense_weight_plan()
+        if not isinstance(dense_weight_plan, DenseWeightPlan):
+            raise TypeError("dense_weight_plan must be a DenseWeightPlan")
         validate_checkpoint_and_placement(checkpoint, placement)
         if not isinstance(mesh_contract, Qwen38MeshContract):
             raise TypeError("mesh_contract must be Qwen38MeshContract")
@@ -775,6 +786,26 @@ class Qwen38TTNNBuilder:
         if mesh_device.arch() != ttnn.Arch.BLACKHOLE:
             raise ValueError("Qwen3.8 four-P150 construction requires a Blackhole mesh")
         ring_order = qualify_live_bf4_ring(mesh_device)
+        # Two readers per bank need one bank -> worker assignment on every device (decode_matmul): a mesh of
+        # differently harvested dies runs one reader, and the one-reader caches keep their identity.
+        decode_dram_workers_per_bank, decode_dram_workers_fallback = qualify_decode_dram_workers(
+            mesh_device, decode_dram_workers_per_bank
+        )
+        if decode_dram_workers_per_bank != 1:
+            # Two readers per bank serve the GDN, QSA and LM-head projections: their weight dtype must be one the
+            # two-reader form was checked bitwise against one reader with (decode_matmul.TWO_READER_QUALIFIED_DTYPES).
+            unqualified = [
+                module
+                for module in ("gdn", "qsa", "lm_head")
+                if dense_weight_plan.dtype(module) not in TWO_READER_QUALIFIED_DTYPES
+            ]
+            if unqualified:
+                decode_dram_workers_per_bank = 1
+                decode_dram_workers_fallback = (
+                    "one reader per DRAM bank: two readers are qualified for "
+                    f"{sorted(dense_dtype_tag(d) for d in TWO_READER_QUALIFIED_DTYPES)} dense weights, not "
+                    + ", ".join(f"{module}={dense_weight_plan.tag(module)}" for module in unqualified)
+                )
         live_identity = Qwen38LiveBuildIdentity(
             provenance=provenance,
             mesh_shape=tuple(mesh_contract.mesh_shape),
@@ -829,6 +860,8 @@ class Qwen38TTNNBuilder:
         self.expert_residency = expert_residency
         self.qsa_cache_capacity = qsa_cache_capacity
         self.decode_dram_workers_per_bank = decode_dram_workers_per_bank
+        self.decode_dram_workers_fallback = decode_dram_workers_fallback  # None, or why the mesh runs one reader
+        self.dense_weight_plan = dense_weight_plan
         self.identity = live_identity
         self.component_cache_root = component_cache_root
         self.bf4_cache = bf4_cache
@@ -1034,6 +1067,7 @@ class Qwen38TTNNBuilder:
             namespace=namespace,
             layer_index=layer_index,
             tt_metal_sha=self.provenance.tt_metal_sha,
+            shared_dtype=self.dense_weight_plan.dtype("shared_expert"),
         )
         return Qwen38TTNNMoE(
             self.mesh_device,
@@ -1057,6 +1091,7 @@ class Qwen38TTNNBuilder:
                 self.component_cache_root,
                 layer_index=spec.layer_index,
                 tt_metal_sha=self.provenance.tt_metal_sha,
+                projection_dtype=self.dense_weight_plan.dtype("gdn"),
                 decode_dram_workers_per_bank=self.decode_dram_workers_per_bank,
             )
             if weights.layer_index != spec.layer_index:
@@ -1075,6 +1110,7 @@ class Qwen38TTNNBuilder:
             self.component_cache_root,
             layer_index=spec.layer_index,
             tt_metal_sha=self.provenance.tt_metal_sha,
+            weight_dtype=self.dense_weight_plan.dtype("qsa"),
         )
         if (weights.source_kind, weights.layer_index) != ("backbone", spec.layer_index):
             raise RuntimeError("constructed QSA weights belong to another checkpoint slot")
@@ -1148,6 +1184,7 @@ class Qwen38TTNNBuilder:
             self.mesh_device,
             self.mesh_contract,
             self.io_cache,
+            lm_head_dtype=self.dense_weight_plan.dtype("lm_head"),
         )
         return Qwen38TTNNModelIO(
             self.mesh_device,
@@ -1172,6 +1209,7 @@ class Qwen38TTNNBuilder:
             self.component_cache_root,
             namespace=namespace,
             tt_metal_sha=self.provenance.tt_metal_sha,
+            weight_dtype=self.dense_weight_plan.dtype("final_mixer"),
         )
         if weights.namespace != namespace:
             raise RuntimeError(f"constructed final mixer belongs to {weights.namespace}, expected {namespace}")
@@ -1289,6 +1327,7 @@ class Qwen38TTNNBuilder:
                 self.component_cache_root,
                 tt_metal_sha=self.provenance.tt_metal_sha,
                 ttnn_runtime_sha256=self.provenance.ttnn_runtime_sha256,
+                projection_dtype=self.dense_weight_plan.dtype("mtp"),
             )
             input_mixer = Qwen38TTNNMTPInput(
                 self.mesh_device,
@@ -1304,6 +1343,7 @@ class Qwen38TTNNBuilder:
                 self.component_cache_root,
                 mtp_layer_index=0,
                 tt_metal_sha=self.provenance.tt_metal_sha,
+                weight_dtype=self.dense_weight_plan.dtype("qsa"),
             )
             if (attention_weights.source_kind, attention_weights.layer_index) != ("mtp", 0):
                 raise RuntimeError("constructed MTP QSA weights do not belong to released layer 0")

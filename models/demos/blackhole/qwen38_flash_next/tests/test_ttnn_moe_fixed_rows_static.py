@@ -18,6 +18,8 @@ import torch
 import models.demos.blackhole.qwen38_flash_next.ttnn.builder as builder_module
 import models.demos.blackhole.qwen38_flash_next.ttnn.moe as moe_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import TensorPlacement
+import ttnn
+from models.demos.blackhole.qwen38_flash_next.ttnn import decode_matmul as decode_matmul_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.moe import (
     BLACKHOLE_MOE_NUMERIC_ISSUE,
     EXPERTS_PER_DEVICE,
@@ -75,6 +77,7 @@ def _bare_moe(rows: int) -> Qwen38TTNNMoE:
         layout=moe_module.ttnn.ROW_MAJOR_LAYOUT,
         memory=moe_module.ttnn.DRAM_MEMORY_CONFIG,
     )
+    instance.local_output = False  # the production path: FullLocal (QWEN38_MOE_LOCAL_OUTPUT unset)
     instance._owned_buffers_released = False
     instance._owns_local_combine_output = True
     instance.output_height_shard_dim = 1
@@ -215,6 +218,7 @@ def test_builder_selects_async_only_for_proven_resident_expert_ownership(
     builder.tt_ccl = object()
     builder.collective_topology = object()
     builder.expert_residency = expert_residency
+    builder.dense_weight_plan = decode_matmul_module.default_dense_weight_plan({})  # bf16: the production path
     weights = object()
     constructed = object()
     from_checkpoint = mock.Mock(return_value=weights)
@@ -249,7 +253,7 @@ def test_five_row_clone_borrows_resident_weights_and_allocates_only_private_buff
     mesh_device.dram_grid_size.return_value = ttnn.CoreCoord(8, 1)  # decode matmul configs read the bank grid
     mesh_contract = mock.Mock()
     # the fused shared expert (on by default) checks the concatenated weight is loaded; the clone borrows it as is
-    borrowed_weights = mock.Mock(shared_gate_up_scalar=object())
+    borrowed_weights = mock.Mock(shared_gate_up_scalar=object(), shared_dtype=ttnn.bfloat16)
     mapping_tensor = _FakeTensor((4, ROUTED_EXPERTS), dtype=ttnn.uint16)
     local_tensor = _FakeTensor(
         (TOP_K, TARGET_VERIFIER_ROWS, HIDDEN_SIZE),
@@ -711,7 +715,10 @@ def test_pinned_ttnn_source_contracts_match_the_five_row_choreography() -> None:
     ).read_text()
     assert "const uint32_t total_tokens = input_shape[0] * input_shape[1];" in moe_source
     assert ".seq_size = total_tokens" in moe_source
-    assert "path=FullLocal requires a fully replicated logical-token input topology" in moe_source
+    assert "path=FullLocal requires combine_params->local_combine to be true" in moe_source
+    # the replicated-input contract holds on a multi-device mesh; a 1x1 mesh has nothing to replicate
+    assert "if (mesh_device->num_devices() > 1) {" in moe_source
+    assert "path=FullLocal on a multi-device mesh requires a fully replicated logical-token input " in moe_source
 
     reduce_source = (
         REPO_ROOT / "ttnn/cpp/ttnn/operations/experimental/reduction/deepseek_moe_fast_reduce_nc_fused/device/"

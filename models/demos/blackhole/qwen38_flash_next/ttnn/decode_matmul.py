@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Mapping
+from dataclasses import dataclass
+from typing import Any, Mapping
 
 import ttnn
 
@@ -75,6 +76,168 @@ def default_decode_dram_workers(environ: Mapping[str, str] | None = None) -> int
     if raw not in {str(value) for value in WORKERS_PER_DRAM_BANK}:
         raise ValueError(f"{WORKERS_ENV} must be one of {WORKERS_PER_DRAM_BANK}, got {raw!r}")
     return int(raw)
+
+
+# -- dense weight dtype (QWEN38_DENSE_WEIGHT_DTYPE) -------------------------------------------------------------------
+# ``bf8`` (the default: HiFi2 matmuls, about 1 GB less per die and 3 % off the decode step at a KL of 0.007 against
+# the CPU oracle on the 2026-09-24 A/B) | ``bf16`` (the previous production format, byte for byte) | ``bf4``: the dtype of the resident dense
+# matmul weights the decode linears stream from DRAM -- the GDN projections (qkvzab, out), the QSA projections (qg,
+# k, v, out, index_q, index_k), the shared expert (gate, up, down, the scalar gate and the fused [gate|up|scalar]
+# row), the LM-head chunks, the final mixer (down, up) and the MTP input fc linears.  ``QWEN38_DENSE_WEIGHT_DTYPE_<M>``
+# (M in GDN, QSA, SHARED_EXPERT, LM_HEAD, FINAL_MIXER, MTP) overrides one module.  The matmuls whose weights changed
+# run the compute fidelity tech_reports/LLMs/llms.md gives for the weight format (HiFi4 for BF16, HiFi2 for BFP8,
+# LoFi for BFP4; fp32 accumulation, no approximation, no packer L1 accumulation, as before); every other program keeps
+# its config.  Kept BF16 regardless: the embedding table, the router (mlp.gate), every norm, the GDN conv taps /
+# dt_bias / A_log (the GDN gating projections in_proj_a / in_proj_b are packed into qkvzab and follow its dtype), the
+# PLE tables, and the hyper-connection (GR) mixers, whose default-on fused read program (ttnn/fused/gr_read) streams
+# BF16 tiles through BF16 circular buffers.  A converted tensorbin carries the dtype tag in its name (``.bf8b`` /
+# ``.bf4b``; the GDN's ``.bf16`` / ``.bf8b`` scheme), so the bf16 caches are never read or written by another dtype.
+DENSE_DTYPE_ENV = "QWEN38_DENSE_WEIGHT_DTYPE"
+DEFAULT_DENSE_DTYPE_NAME = "bf8"
+DENSE_MODULES = ("gdn", "qsa", "shared_expert", "lm_head", "final_mixer", "mtp")
+DENSE_DTYPE_NAMES: dict[str, Any] = {"bf16": ttnn.bfloat16, "bf8": ttnn.bfloat8_b, "bf4": ttnn.bfloat4_b}
+DENSE_DTYPE_TAGS: dict[Any, str] = {ttnn.bfloat16: "bf16", ttnn.bfloat8_b: "bf8b", ttnn.bfloat4_b: "bf4b"}
+DENSE_MATH_FIDELITY_NAMES: dict[Any, str] = {ttnn.bfloat16: "HiFi4", ttnn.bfloat8_b: "HiFi2", ttnn.bfloat4_b: "LoFi"}
+# One 32x32 tile: 1024 bf16 values; 1024 one-byte mantissas + 64 shared exponents; 512 bytes of 4-bit mantissas + 64.
+DENSE_TILE_BYTES: dict[Any, int] = {ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
+# The two-reader bank layouts are whole tiles per reader (bank_tiles), so they do not depend on the tile's bytes; a
+# dtype enters this set once one reader and two readers were checked bitwise equal on the device for every shape of
+# TWO_WORKER_PROJECTIONS (tools/qualify_dense_two_readers.py).  A dtype outside it runs one reader everywhere (the
+# builder records the reason in decode_dram_workers_fallback).  Qualified 2026-09-24 on a QuietBox p150b (eight
+# banks): bf16, bf8b (HiFi2) and bf4b (LoFi) bitwise equal one vs two readers on all five shapes at 32 rows.
+TWO_READER_QUALIFIED_DTYPES: frozenset = frozenset({ttnn.bfloat16, ttnn.bfloat8_b, ttnn.bfloat4_b})
+
+
+def parse_dense_weight_dtype(raw: str, *, source: str = DENSE_DTYPE_ENV):
+    key = raw.strip().lower()
+    if key not in DENSE_DTYPE_NAMES:
+        raise ValueError(f"{source} must be one of {tuple(DENSE_DTYPE_NAMES)}, got {raw!r}")
+    return DENSE_DTYPE_NAMES[key]
+
+
+def dense_dtype_tag(dtype) -> str:
+    """``bf16`` / ``bf8b`` / ``bf4b``; any other dtype is refused."""
+
+    if dtype not in DENSE_DTYPE_TAGS:
+        raise ValueError(f"dense weight dtype must be one of {tuple(DENSE_DTYPE_TAGS)}, got {dtype!r}")
+    return DENSE_DTYPE_TAGS[dtype]
+
+
+def dense_math_fidelity_name(dtype) -> str:
+    """The ``ttnn.MathFidelity`` member a matmul on ``dtype`` weights runs with (HiFi4 / HiFi2 / LoFi)."""
+
+    dense_dtype_tag(dtype)
+    return DENSE_MATH_FIDELITY_NAMES[dtype]
+
+
+def dense_weight_name(name: str, dtype) -> str:
+    """The cache file name of a converted matmul weight: ``name`` itself for BF16 (the production tensorbins), else
+    ``name`` plus the dtype tag, so a bf8 / bf4 tensorbin never shadows or overwrites a bf16 one."""
+
+    tag = dense_dtype_tag(dtype)
+    return name if dtype == ttnn.bfloat16 else f"{name}.{tag}"
+
+
+@dataclass(frozen=True)
+class DenseWeightPlan:
+    """Per module (DENSE_MODULES) the resident dense matmul weights' dtype."""
+
+    dtypes: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if tuple(self.dtypes) != DENSE_MODULES:
+            raise ValueError(f"dense weight plan must name {DENSE_MODULES} in order, got {tuple(self.dtypes)}")
+        for dtype in self.dtypes.values():
+            dense_dtype_tag(dtype)
+
+    def dtype(self, module: str):
+        return self.dtypes[module]
+
+    def tag(self, module: str) -> str:
+        return dense_dtype_tag(self.dtypes[module])
+
+    @property
+    def name(self) -> str:
+        """``bf16`` / ``bf8`` / ``bf4`` when every module agrees, else ``mixed``."""
+
+        names = {next(n for n, d in DENSE_DTYPE_NAMES.items() if d == dtype) for dtype in self.dtypes.values()}
+        return names.pop() if len(names) == 1 else "mixed"
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "modules": {
+                module: {"dtype": self.tag(module), "math_fidelity": dense_math_fidelity_name(dtype)}
+                for module, dtype in self.dtypes.items()
+            },
+            "kept_bf16": [
+                "embedding table",
+                "router mlp.gate",
+                "norms",
+                "gdn conv taps / dt_bias / A_log",
+                "ple",
+                "gr mixers (the fused gr_read program streams BF16 tiles)",
+            ],
+        }
+
+
+def default_dense_weight_plan(environ: Mapping[str, str] | None = None) -> DenseWeightPlan:
+    """``QWEN38_DENSE_WEIGHT_DTYPE`` (bf8 when unset) for every module, ``QWEN38_DENSE_WEIGHT_DTYPE_<MODULE>`` over it."""
+
+    env = os.environ if environ is None else environ
+    base = parse_dense_weight_dtype(env.get(DENSE_DTYPE_ENV, "").strip() or DEFAULT_DENSE_DTYPE_NAME)
+    dtypes = {}
+    for module in DENSE_MODULES:
+        key = f"{DENSE_DTYPE_ENV}_{module.upper()}"
+        raw = env.get(key, "").strip()
+        dtypes[module] = parse_dense_weight_dtype(raw, source=key) if raw else base
+    return DenseWeightPlan(dtypes)
+
+
+def mesh_dram_bank_worker_signatures(mesh_device) -> dict[tuple[int, int], tuple[tuple[int, int], ...]]:
+    """Per mesh coordinate, the DRAM bank -> worker core order the DRAM-sharded matmul reads in1 with (NOC 0)."""
+
+    rows, columns = (int(extent) for extent in mesh_device.shape)
+    signatures: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
+    for row in range(rows):
+        for column in range(columns):
+            assignment = ttnn.device.get_optimal_dram_bank_to_logical_worker_assignment_at_mesh_coordinate(
+                mesh_device, ttnn.NOC.RISCV_0_default, ttnn.MeshCoordinate(row, column)
+            )
+            signatures[(row, column)] = tuple((int(core.x), int(core.y)) for core in assignment)
+    return signatures
+
+
+def qualify_decode_dram_workers(mesh_device, requested: int) -> tuple[int, str | None]:
+    """The readers per DRAM bank this mesh admits: ``requested``, or 1 with the reason.
+
+    One DRAM-sharded matmul program is placed on every device of the mesh, so more than one reader per bank requires
+    every device to report the same bank -> worker assignment (tt-metal ``get_dram_bank_reader_assignments``: "identical
+    local device geometry and primary readers", a TT_FATAL after the weights are on the device).  Dies harvested in
+    different columns (a QuietBox 2, 2026-09-18) serve their banks from different worker columns, so they run one
+    reader per bank; the caller records the reason.  The two-reader table (``TWO_WORKER_PROJECTIONS``) was qualified on
+    eight banks, so a board with another bank count (a seven-bank Blackhole DRAM ring) runs one reader too.
+    """
+
+    validate_decode_dram_workers(requested)
+    if requested == 1:
+        return 1, None
+    banks = _dram_bank_count(mesh_device)
+    if banks != 8:
+        return 1, (
+            f"one reader per DRAM bank: the two-reader projections were qualified on 8 DRAM banks, this mesh has {banks}"
+        )
+    signatures = mesh_dram_bank_worker_signatures(mesh_device)
+    if len(set(signatures.values())) == 1:
+        return requested, None
+    reference_coordinate = min(signatures)
+    differing = sorted(
+        coordinate for coordinate, signature in signatures.items() if signature != signatures[reference_coordinate]
+    )
+    return 1, (
+        f"one reader per DRAM bank: {requested} readers need every device to share one bank -> worker assignment, "
+        f"and the devices at mesh coordinates {differing} differ from {reference_coordinate} (differently harvested dies)"
+    )
 
 
 def bank_tiles(mesh_device, k: int, n: int, num_workers_per_dram_bank: int = 1) -> int:

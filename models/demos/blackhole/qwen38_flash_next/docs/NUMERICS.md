@@ -40,8 +40,13 @@ group: the LLK sort's four independent passes, so every token sees the chain's i
 layer at one row, 2026-09-18); the shared expert as three programs (one
 DRAM-sharded linear over the concatenated [gate | up | scalar] weight, one silu / product / sigmoid program, the down
 linear); the layer-1 PLE (stats, group norm, gate, conv with the state shift and the layer's permute + add: 56 programs
-as 9, the SFPU `mac_tile` of `ttnn.mac`, the accurate fp32 reduce of the gate's sum).  Opt-in through
-`QWEN38_FUSED=<name>`: `final_mixer`, `gdn_step`, `position_advance`.  The kernels cover rows 1..32 (decode, the MTP
+as 9, the SFPU `mac_tile` of `ttnn.mac`, the accurate fp32 reduce of the gate's sum); and, since 2026-09-25, `gdn_step`,
+the GDN decode step from the projection to the gated output as one program (the conv, the head split, the gates, the
+l2 norms, the fp32 delta-rule update, the read-out, the gated RMSNorm and the sigmoid gate: 49 programs per layer as 1),
+a COMPONENT-class kernel that serves by default on its component-gate proof against the CPU oracle (layer-0 probe, four
+p150: state error 0.0048 and gated output 0.0098 for the fused step, 0.0081 and 0.0234 for the composed chain) and
+runs only where its input contract holds (the one-row step; the MTP draft body and verify rows keep the chain).  Opt-in
+through `QWEN38_FUSED=<name>`: `final_mixer`, `position_advance`.  The kernels cover rows 1..32 (decode, the MTP
 verify rows); the 128-row prefill chunk and the slab keep their chains.  `QWEN38_FUSED_OFF=<name>[,...]` (or `all`) in
 the server's environment falls back to the composed chains; an unknown name in either variable refuses to start;
 `QWEN38_FUSED_OFF=gr_fold` runs the GR read's merged three-program form with the stock collectives (5 programs per read);
@@ -73,17 +78,24 @@ in `acceptance.json` in the run directory).  The records were rendered by the CP
 `You are a helpful assistant.`; that system turn is inside their recorded prompt ids, which the replay feeds to the
 device as they are.  The server itself adds no system prompt to a client's request (`SERVER.md`).
 
-## The pinned table: chunked prefill, 32k, 2026-09-06
+## The pinned table: chunked prefill, 32k, 2026-09-25
 
-The pinned table (`tools/ci/baselines/A3-chunked-32k-divergence_index.json`), measured 2026-09-06 on 4x p150 with
-the chunked prefill, is the first index where each record leaves the CPU greedy stream; a start whose replay leaves
-earlier is a regression:
+The pinned table (`tools/ci/baselines/A3-chunked-32k-divergence_index.json`), measured 2026-09-25 on two 4x p150 hosts
+with identical device tokens record for record, with the chunked prefill, is the first index where each record leaves
+the CPU greedy stream; a start whose replay leaves earlier is a regression:
 
 | json | chat | code | fact | list | math | multilingual | prose | refactor | sky | story | summary |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| none (96/96) | 43 | 32 | 15 | 56 | 61 | 9 | 13 | 24 | 19 | 6 | 75 |
+| none (96/96) | 2 | 32 | 15 | 56 | 61 | 9 | 13 | 24 | 19 | 6 | 75 |
 
-Before 2026-09-06 the table read chat 8, code 24, list 46, refactor 22 (the other eight as above).  The change is the
+The 2026-09-25 change is the BF8 dense weights, the fused GDN step and the compact expert layout by default: `chat`
+leaves at 2 where the 2026-09-06 table had 43 (at index 2 the device's own candidate row holds its pick, 449, one bf16
+step above the CPU's 264; the BF8 weights and the fused step each move that margin one step, alone either keeps 264),
+the other eleven indices are unchanged, and six streams differ from the previous table after their divergence
+(`fact` at 60, `multilingual` at 32, `prose` at 76, `refactor` at 83, `story` at 16).  Against the HF reference over the
+36-item corpus the device column stays at top-1 0.9502 (the 2026-09-06 record, weighted the same way, 0.9518) and
+against the bf16 CPU oracle at top-1 0.9539, truncated KL 0.0511.  The 2026-09-06 table read chat 43 with the rest as
+above.  Before 2026-09-06 the table read chat 8, code 24, list 46, refactor 22 (the other eight as above).  The change is the
 GDN decay gate: the fused `add + softplus` activation the gate used returned exactly 0 wherever its input was below
 -5.02 (and was 1.5e-3 off elsewhere); the gate now runs `ttnn.add` then `ttnn.softplus`, which follows the reference
 everywhere (4e-5 absolute).  Against the CPU oracle the device's GDN state error on a decode step fell from 0.29 to
@@ -98,13 +110,15 @@ The 128-row chunk path gives the same tokens as 32-row chunks alone, bitwise on 
 (2026-09-06, before the gate fix) the acceptance replay with `--long-chunks` was identical to the plain start (`json`
 96/96, the same eleven divergence indices, 19.4-19.6 tokens/s).
 
-## MTP (`--mtp 4`), 32k, 2026-09-06
+## MTP (`--mtp 4`), 32k, 2026-09-25
 
-The MTP path is not bitwise with plain decode on 4 of the 12 acceptance prompts (measured 2026-09-06 with the GDN gate
-fix above; the verify rows and the 1-row loop round differently): the committed stream leaves the CPU reference on
-`chat` at token 56 where plain decode leaves at 43, on `list` at 46 against 56, on `math` at 56 against 61 and on
-`summary` at 1 against 75 (`In 1947,` becomes `Invented at Bell Labs in`); the other eight records leave the reference
-at the plain-decode token (`json` 96/96, `code` and `refactor` bitwise the plain streams), and every gate passes.  At
+The MTP path is not bitwise with plain decode on 3 of the 12 acceptance prompts (measured 2026-09-25 with the fused GDN
+step serving the one-row step while the draft body and the verify rows run the composed chain, and the verify rows and
+the 1-row loop rounding differently): the committed stream leaves the CPU reference on `chat` at token 43 where plain
+decode leaves at 2, on `math` at 63 against 61 and on `summary` at 1 against 75 (`In 1947,` becomes `Invented at Bell
+Labs in`); the other nine records leave the reference at the plain-decode token (`json` 96/96), and every gate passes.
+The 2026-09-06 table (below, the GDN gate fix of that day) had four such prompts: `chat` 56 against 43, `list` 46
+against 56, `math` 56 against 61, `summary` 1 against 75; `list` now agrees at 56.  At
 each of the three earlier tokens the device's own 1-row logits hold the CPU's token and the MTP token within one bf16
 step (an exact tie on `summary` and `list`, which the 1-row loop breaks toward the lower id), the verify row lands one
 step the other way, and the CPU oracle rates the two 0.4-1.0 logits apart: near-ties, not a defect (the rows-path gate
@@ -116,8 +130,10 @@ pass, 70.7 ms per pass); `--mtp 3` 38.0 median, 55.6 on `json`.
 
 | | json | chat | code | fact | list | math | multilingual | prose | refactor | sky | story | summary |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| plain decode | none (96/96) | 43 | 32 | 15 | 56 | 61 | 9 | 13 | 24 | 19 | 6 | 75 |
-| `--mtp 4` | none (96/96) | 56 | 32 | 15 | 46 | 56 | 9 | 13 | 24 | 19 | 6 | 1 |
+| plain decode, 2026-09-25 | none (96/96) | 2 | 32 | 15 | 56 | 61 | 9 | 13 | 24 | 19 | 6 | 75 |
+| `--mtp 4`, 2026-09-25 | none (96/96) | 43 | 32 | 15 | 56 | 63 | 9 | 13 | 24 | 19 | 6 | 1 |
+| plain decode, 2026-09-06 | none (96/96) | 43 | 32 | 15 | 56 | 61 | 9 | 13 | 24 | 19 | 6 | 75 |
+| `--mtp 4`, 2026-09-06 | none (96/96) | 56 | 32 | 15 | 46 | 56 | 9 | 13 | 24 | 19 | 6 | 1 |
 
 ## The teacher-forced table
 

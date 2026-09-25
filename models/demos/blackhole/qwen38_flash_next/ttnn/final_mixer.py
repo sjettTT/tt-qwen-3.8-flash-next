@@ -23,6 +23,8 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     replicate_tensor_2d_mesh_mapper,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
+    dense_dtype_tag,
+    dense_math_fidelity_name,
     dram_sharded_matmul_configs,
     dram_sharded_weight_memory_config,
 )
@@ -146,6 +148,7 @@ class Qwen38TTNNFinalMixerWeights:
     up: Any
     replicated_anchor: Any
     namespace: Literal["backbone", "mtp"]
+    weight_dtype: Any = ttnn.bfloat16  # the down / up matmul weights' dtype (QWEN38_DENSE_WEIGHT_DTYPE)
 
     @classmethod
     def from_checkpoint(
@@ -158,8 +161,12 @@ class Qwen38TTNNFinalMixerWeights:
         *,
         namespace: Literal["backbone", "mtp"] = "backbone",
         tt_metal_sha: str,
+        weight_dtype=None,
     ) -> "Qwen38TTNNFinalMixerWeights":
         mesh_contract.validate_mesh(mesh_device)
+        if weight_dtype is None:
+            weight_dtype = ttnn.bfloat16  # the production path
+        weight_tag = dense_dtype_tag(weight_dtype)
         source = (
             Qwen38FinalMixerWeights.from_checkpoint(checkpoint, placement)
             if namespace == "backbone"
@@ -196,15 +203,15 @@ class Qwen38TTNNFinalMixerWeights:
             # interleaved caches.
             down=upload(
                 prepared["down"],
-                "down-dram-sharded.bf16",
-                ttnn.bfloat16,
+                "down-dram-sharded.bf16" if weight_dtype == ttnn.bfloat16 else f"down-dram-sharded.{weight_tag}",
+                weight_dtype,
                 hidden_input_mapper,
                 dram_sharded_weight_memory_config(mesh_device, FLAT_LOCAL_WIDTH, RESIDUAL_RANK),
             ),
             up=upload(
                 prepared["up"],
-                "up-dram-sharded.bf16",
-                ttnn.bfloat16,
+                "up-dram-sharded.bf16" if weight_dtype == ttnn.bfloat16 else f"up-dram-sharded.{weight_tag}",
+                weight_dtype,
                 hidden_output_mapper,
                 dram_sharded_weight_memory_config(mesh_device, RESIDUAL_RANK, FLAT_LOCAL_WIDTH),
             ),
@@ -217,6 +224,7 @@ class Qwen38TTNNFinalMixerWeights:
                 mesh_mapper=replicate_tensor_2d_mesh_mapper(mesh_device),
             ),
             namespace=namespace,
+            weight_dtype=weight_dtype,
         )
         result.validate(mesh_contract)
         return result
@@ -224,6 +232,8 @@ class Qwen38TTNNFinalMixerWeights:
     def validate(self, mesh_contract: Qwen38MeshContract) -> None:
         for name, (shape, dtype, shard_dim) in DEVICE_WEIGHTS.items():
             tensor = getattr(self, name)
+            if name in MATMUL_WEIGHTS:
+                dtype = self.weight_dtype
             if _shape(tensor) != shape or tensor.dtype != dtype or tensor.layout != ttnn.TILE_LAYOUT:
                 raise RuntimeError(
                     f"final mixer {name} must be TILE {dtype} {shape}, got {tensor.layout} {tensor.dtype} {_shape(tensor)}"
@@ -265,6 +275,15 @@ class Qwen38TTNNFinalMixer:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
+        # The down / up linears run the fidelity of their weight format (decode_matmul: HiFi4 for bf16, HiFi2 for
+        # bf8, LoFi for bf4); the norms keep compute_config.
+        self.weight_compute_config = ttnn.init_device_compute_kernel_config(
+            mesh_device.arch(),
+            math_fidelity=getattr(ttnn.MathFidelity, dense_math_fidelity_name(weights.weight_dtype)),
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
         # Decode matmul configs, the GR read pattern: K=2560 over five cores
         # (eight-tile K blocks), K=320 over two cores (five-tile K blocks).
         self.down_act_memory_config, self.down_program_config = dram_sharded_matmul_configs(
@@ -280,6 +299,11 @@ class Qwen38TTNNFinalMixer:
         # sum) bind at construction; the pinned chain below stays the class body.
         from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_kernels
 
+        if fused_kernels.enabled("final_mixer") and weights.weight_dtype != ttnn.bfloat16:
+            raise ValueError(
+                "QWEN38_FUSED=final_mixer streams BF16 mixer weights through BF16 circular buffers; "
+                f"these final mixer weights are {weights.weight_dtype}"
+            )
         if fused_kernels.enabled("final_mixer"):
             self._fused_forward = functools.partial(fused_kernels.kernel("final_mixer").fused, self)
 
@@ -348,7 +372,7 @@ class Qwen38TTNNFinalMixer:
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.down_program_config,
             dtype=ttnn.float32,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.weight_compute_config,
         )
         partial = ttnn.to_memory_config(partial_ws, ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(partial_ws)
@@ -382,7 +406,7 @@ class Qwen38TTNNFinalMixer:
             self.weights.up,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.up_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.weight_compute_config,
         )
         _deallocate(low_rank_ws)
         up_flat = ttnn.to_memory_config(up_ws, ttnn.DRAM_MEMORY_CONFIG)
@@ -475,7 +499,7 @@ class Qwen38TTNNFinalMixer:
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.down_program_config,
             dtype=ttnn.float32,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.weight_compute_config,
         )
         partial = ttnn.to_memory_config(partial_ws, dram)
         _deallocate(partial_ws)
@@ -499,7 +523,7 @@ class Qwen38TTNNFinalMixer:
             self.weights.up,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.up_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.weight_compute_config,
         )
         _deallocate(low_rank_ws)
         up_flat = ttnn.to_memory_config(up_ws, dram)

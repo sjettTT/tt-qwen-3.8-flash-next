@@ -41,6 +41,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
+    DENSE_DTYPE_TAGS,
+    TWO_READER_QUALIFIED_DTYPES,
+    dense_dtype_tag,
+    dense_math_fidelity_name,
     dram_sharded_matmul_configs,
     dram_sharded_row_tiles,
     dram_sharded_weight_memory_config,
@@ -404,13 +408,13 @@ class Qwen38TTNNGDNWeights:
             # weights in BF16.  BF8_B is an explicit later experiment, never
             # an implicit substitute during ordinary-decode bring-up.
             projection_dtype = ttnn.bfloat16
-        if projection_dtype not in (ttnn.bfloat8_b, ttnn.bfloat16):
-            raise ValueError("GDN projection weights must use BFLOAT8_B or BFLOAT16")
+        if projection_dtype not in DENSE_DTYPE_TAGS:
+            raise ValueError("GDN projection weights must use BFLOAT16, BFLOAT8_B or BFLOAT4_B")
 
         source = Qwen38GDNWeights.from_checkpoint(checkpoint, layer_index)
         shards = tuple(source.device_shard(device_index) for device_index in range(TP_SIZE))
         cache_dir = _cache_directory(cache_root, checkpoint, mesh_contract, layer_index, tt_metal_sha)
-        dtype_tag = "bf8b" if projection_dtype == ttnn.bfloat8_b else "bf16"
+        dtype_tag = dense_dtype_tag(projection_dtype)
 
         # Each device-local TTNN linear weight is [K,N].  Concatenating the
         # transposed local blocks along N makes Shard(dim=3) select one whole
@@ -422,8 +426,12 @@ class Qwen38TTNNGDNWeights:
         # Projection weights are DRAM width-sharded for the decode matmul
         # program; the renamed tensorbins deliberately orphan interleaved
         # caches and the unpadded 4120-column packing.
-        if decode_dram_workers_per_bank != 1 and projection_dtype != ttnn.bfloat16:
-            raise ValueError("two DRAM readers per bank were qualified with bf16 GDN projection weights only")
+        if decode_dram_workers_per_bank != 1 and projection_dtype not in TWO_READER_QUALIFIED_DTYPES:
+            raise ValueError(
+                "two DRAM readers per bank are qualified for "
+                f"{sorted(dense_dtype_tag(d) for d in TWO_READER_QUALIFIED_DTYPES)} GDN projection weights, "
+                f"not {dtype_tag}"
+            )
         # Two readers per bank pad this weight's bank shard to 18 tiles (576 columns; 17 with one reader): the file
         # name carries the wider layout (weight_layout_tag), the loaded members are checked against it below.
         layout_suffix = weight_layout_tag(
@@ -1167,6 +1175,15 @@ class Qwen38TTNNGDN:
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
         )
+        # The projection linears (qkvzab, out) run the fidelity of their weight format (decode_matmul: HiFi4 for bf16,
+        # HiFi2 for bf8, LoFi for bf4); every other program keeps compute_config.
+        self.projection_compute_config = ttnn.init_device_compute_kernel_config(
+            mesh_device.arch(),
+            math_fidelity=getattr(ttnn.MathFidelity, dense_math_fidelity_name(weights.projection_dtype)),
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
         self.in_proj_act_memory_config, self.in_proj_program_config = dram_sharded_matmul_configs(
             mesh_device, HIDDEN_SIZE, PROJECTION_WIDTH_PER_DEVICE, num_cores=8, num_workers_per_dram_bank=workers
         )
@@ -1209,12 +1226,13 @@ class Qwen38TTNNGDN:
         )
 
     def _gdn_step(self):
-        """The projection -> gated-output step: the composed chain, or the fused kernel when QWEN38_FUSED names
-        gdn_step; resolved once (fakes that skip ``__init__`` resolve here)."""
+        """The projection -> gated-output step: the fused kernel when it serves (``gdn_step`` is a default;
+        QWEN38_FUSED_OFF=gdn_step restores the chain) and the call's tensors meet its input contract, the composed
+        chain otherwise; resolved once (fakes that skip ``__init__`` resolve here)."""
 
         step = self.__dict__.get("_step")
         if step is None:
-            step = self._step = fused.resolve("gdn_step")
+            step = self._step = fused.resolve_admitted("gdn_step")
         return step
 
     def _validate_state(self, state: Qwen38TTNNGDNState) -> None:
@@ -1247,7 +1265,7 @@ class Qwen38TTNNGDN:
             self.weights.qkvzab,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.in_proj_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         projected = ttnn.to_memory_config(projected_ws, ttnn.L1_MEMORY_CONFIG)
         _deallocate(projected_ws)
@@ -1493,7 +1511,7 @@ class Qwen38TTNNGDN:
             self.weights.out,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.out_proj_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         _deallocate(gated)
         # The line reduce-scatter reads the sixteen-core partial in place.
@@ -1690,7 +1708,7 @@ class Qwen38TTNNGDN:
                 self.weights.qkvzab,
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 program_config=self.in_proj_program_config,
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.projection_compute_config,
             )
             projected = ttnn.to_memory_config(projected_ws, ttnn.L1_MEMORY_CONFIG)
             _deallocate(projected_ws)
@@ -1700,7 +1718,7 @@ class Qwen38TTNNGDN:
                 full_hidden,
                 self.weights.qkvzab,
                 self._slab_program_config(tile_rows, HIDDEN_SIZE, PROJECTION_WIDTH_PER_DEVICE),
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.projection_compute_config,
             )
         else:
             projected_tiles = []
@@ -1710,7 +1728,7 @@ class Qwen38TTNNGDN:
                     self.weights.qkvzab,
                     memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                     program_config=self.in_proj_program_config,
-                    compute_kernel_config=self.compute_config,
+                    compute_kernel_config=self.projection_compute_config,
                 )
                 projected_tiles.append(ttnn.to_memory_config(projected_ws, ttnn.DRAM_MEMORY_CONFIG))
                 _deallocate(tile, projected_ws)
@@ -1815,9 +1833,7 @@ class Qwen38TTNNGDN:
         else:
             window = self._conv_window_rows(rows_state)
             pieces = [
-                self._select_rows(
-                    select, window, memory_config=ttnn.L1_MEMORY_CONFIG, label=f"GDN rows FIR tap {tap}"
-                )
+                self._select_rows(select, window, memory_config=ttnn.L1_MEMORY_CONFIG, label=f"GDN rows FIR tap {tap}")
                 for tap, select in enumerate(rows_state.constants.conv_taps)
             ]
             _deallocate(window)
@@ -2024,9 +2040,7 @@ class Qwen38TTNNGDN:
             # concatenated on the width (no padded token-major intermediate), gated interleaved, one 2D-multicast
             # out-proj over every row, one reduce-scatter, the rows copied into the persistent output.
             heads = [
-                ttnn.slice(
-                    normalized_heads, (0, head, 0, 0), (1, head + 1, tile_rows, HEAD_DIM), memory_config=l1
-                )
+                ttnn.slice(normalized_heads, (0, head, 0, 0), (1, head + 1, tile_rows, HEAD_DIM), memory_config=l1)
                 for head in range(VALUE_HEADS_PER_DEVICE)
             ]
             _deallocate(normalized_heads)
@@ -2040,7 +2054,7 @@ class Qwen38TTNNGDN:
                 gated,
                 self.weights.out,
                 self._slab_program_config(tile_rows, VALUE_WIDTH_PER_DEVICE, HIDDEN_SIZE),
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.projection_compute_config,
             )
             _deallocate(gated)
             self.mesh_contract.mark_local_partial(
@@ -2121,7 +2135,7 @@ class Qwen38TTNNGDN:
             self.weights.out,
             memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
             program_config=self.out_proj_program_config,
-            compute_kernel_config=self.compute_config,
+            compute_kernel_config=self.projection_compute_config,
         )
         _deallocate(gated_tile)
         self.mesh_contract.mark_local_partial(
@@ -2362,7 +2376,10 @@ class Qwen38TTNNGDN:
             dram = ttnn.DRAM_MEMORY_CONFIG
             tile_rows = rows_state.constants.tile_rows
             last_tile = ttnn.slice(
-                rows_state.qkv, (0, 0, tile_rows - CHUNK_SIZE, 0), (1, 1, tile_rows, QKV_WIDTH_PER_DEVICE), memory_config=dram
+                rows_state.qkv,
+                (0, 0, tile_rows - CHUNK_SIZE, 0),
+                (1, 1, tile_rows, QKV_WIDTH_PER_DEVICE),
+                memory_config=dram,
             )
             last_rm = ttnn.to_layout(last_tile, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
             _deallocate(last_tile)
@@ -2373,7 +2390,9 @@ class Qwen38TTNNGDN:
                 memory_config=dram,
             )
             _deallocate(last_rm)
-            padded = ttnn.pad(tail, [(0, 0), (0, 0), (0, CHUNK_SIZE - CONV_HISTORY_ROWS), (0, 0)], 0.0, memory_config=dram)
+            padded = ttnn.pad(
+                tail, [(0, 0), (0, 0), (0, CHUNK_SIZE - CONV_HISTORY_ROWS), (0, 0)], 0.0, memory_config=dram
+            )
             history = ttnn.to_layout(padded, ttnn.TILE_LAYOUT, memory_config=dram)
             _require_shape(history, (1, 1, CHUNK_SIZE, QKV_WIDTH_PER_DEVICE), label="GDN slab history tile")
             _copy_inplace(history, rows_state.history, label="GDN slab history")

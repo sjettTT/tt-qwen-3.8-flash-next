@@ -6,7 +6,7 @@
 This diagnostic, non-promoting consumer checks every recorded artifact path,
 regular-file identity, byte count, shape, dtype, and layer evidence record.  It
 hashes four deterministic boundary samples rather than rereading the complete
-106 GB corpus.  It never imports Torch or TTNN and never writes beneath the
+69 GB corpus (49 slots in moe_compute's compact expert layout).  It never imports Torch or TTNN and never writes beneath the
 artifact root.
 """
 
@@ -29,15 +29,15 @@ EXPECTED_SLOTS = tuple(("backbone", index) for index in range(48)) + (("mtp", 0)
 ARTIFACT_SPECS = {
     "w0_w1": {
         "filename": "w0_w1_dtype_BFLOAT4_B_layout_TILE.tensorbin",
-        "bytes": 1_585_448_160,
-        "local_shape": [8, 1, 128, 2, 2688, 128],
-        "global_shape": [8, 1, 512, 2, 2688, 128],
+        "bytes": 943_719_648,
+        "local_shape": [8, 1, 128, 10, 320, 128],
+        "global_shape": [8, 1, 512, 10, 320, 128],
     },
     "w2": {
         "filename": "w2_dtype_BFLOAT4_B_layout_TILE.tensorbin",
-        "bytes": 594_543_840,
-        "local_shape": [8, 1, 128, 3, 672, 128],
-        "global_shape": [8, 1, 512, 3, 672, 128],
+        "bytes": 471_860_448,
+        "local_shape": [8, 1, 128, 5, 320, 128],
+        "global_shape": [8, 1, 512, 5, 320, 128],
     },
 }
 HASH_SAMPLE = (
@@ -211,10 +211,10 @@ def verify_corpus(
         raise RuntimeError(f"staging corpus paths differ: missing={missing} extra={extra}")
 
     expected_total = len(EXPECTED_SLOTS) * sum(spec["bytes"] for spec in ARTIFACT_SPECS.values())
-    if len(records) != 98 or total_bytes != expected_total or total_bytes != 106_819_608_000:
+    expected_files = len(EXPECTED_SLOTS) * len(ARTIFACT_SPECS)
+    if len(records) != expected_files or total_bytes != expected_total:
         raise RuntimeError(
-            f"staging corpus aggregate differs: files={len(records)}/98 "
-            f"bytes={total_bytes}/{expected_total}/106819608000"
+            f"staging corpus aggregate differs: files={len(records)}/{expected_files} bytes={total_bytes}/{expected_total}"
         )
 
     selective_hashes = []

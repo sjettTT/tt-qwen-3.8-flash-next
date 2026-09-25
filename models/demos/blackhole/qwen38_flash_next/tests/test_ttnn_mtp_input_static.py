@@ -220,6 +220,7 @@ def test_mixer_operation_graph_is_distributed_norm_then_column_parallel_projecti
     mixer.weights = weights
     mixer.collective_topology = object()
     mixer.compute_config = object()
+    mixer.projection_compute_config = mixer.compute_config  # bf16: the same HiFi4 config
 
     hidden = TensorPlacement.HIDDEN_SHARDED
     replicated = TensorPlacement.REPLICATED

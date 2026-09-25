@@ -72,6 +72,8 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     replicate_tensor_2d_mesh_mapper,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
+    dense_dtype_tag,
+    dense_math_fidelity_name,
     dram_sharded_matmul_configs,
     dram_sharded_weight_memory_config,
     validate_decode_dram_workers,
@@ -1040,6 +1042,8 @@ class Qwen38TTNNModelIOWeights:
     vocab_start: Any
     vocab_ranges: tuple[tuple[int, int], ...]
     token_row: Qwen38TTNNTokenRowConstants
+    # The LM-head chunks' dtype (QWEN38_DENSE_WEIGHT_DTYPE); the embedding gather table stays BF16.
+    lm_head_dtype: Any = ttnn.bfloat16
 
     @classmethod
     def from_checkpoint(
@@ -1049,8 +1053,12 @@ class Qwen38TTNNModelIOWeights:
         mesh_device,
         mesh_contract: Qwen38MeshContract,
         cache: Qwen38IOCache,
+        lm_head_dtype=None,
     ) -> "Qwen38TTNNModelIOWeights":
         mesh_contract.validate_mesh(mesh_device)
+        if lm_head_dtype is None:
+            lm_head_dtype = ttnn.bfloat16  # the production path
+        lm_head_tag = dense_dtype_tag(lm_head_dtype)
         _validate_exact_config(checkpoint, placement)
         validate_terminal_architecture(checkpoint)
         if tuple(placement.physical_ids) != mesh_contract.physical_ids:
@@ -1112,11 +1120,14 @@ class Qwen38TTNNModelIOWeights:
             # range in the name orphans every chunk of a different plan.
             mapper = ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3))
             tensor = cache.load_or_create(
-                name=f"lm-head-chunk-dram-sharded-{chunk_index:02d}-cols-{chunk_offset}-{chunk_offset + chunk_size}",
+                # a converted chunk carries the dtype tag in its artifact name; the BF16 artifacts keep theirs
+                name=f"lm-head-chunk-dram-sharded-{chunk_index:02d}-cols-{chunk_offset}-{chunk_offset + chunk_size}"
+                if lm_head_dtype == ttnn.bfloat16
+                else f"lm-head-chunk-dram-sharded-{lm_head_tag}-{chunk_index:02d}-cols-{chunk_offset}-{chunk_offset + chunk_size}",
                 mesh_device=mesh_device,
                 host_factory=build_chunk,
                 mapper=mapper,
-                dtype=ttnn.bfloat16,
+                dtype=lm_head_dtype,
                 layout=ttnn.TILE_LAYOUT,
                 memory_config=dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, chunk_size),
                 global_shape=(1, 1, HIDDEN_SIZE, TP_SIZE * chunk_size),
@@ -1159,6 +1170,7 @@ class Qwen38TTNNModelIOWeights:
             vocab_start=vocab_start,
             vocab_ranges=tuple(tuple(pair) for pair in placement.vocab_ranges),
             token_row=Qwen38TTNNTokenRowConstants.build(mesh_device, mesh_contract),
+            lm_head_dtype=lm_head_dtype,
         )
 
 
@@ -1700,15 +1712,24 @@ class Qwen38TTNNLMHead:
         for tensor, width in zip(weights.lm_head_chunks, weights.lm_head_chunk_sizes):
             if (
                 _shape(tensor) != (1, 1, HIDDEN_SIZE, width)
-                or tensor.dtype != ttnn.bfloat16
+                or tensor.dtype != weights.lm_head_dtype
                 or tensor.layout != ttnn.TILE_LAYOUT
             ):
-                raise ValueError(f"LM-head chunk is not exact BF16 [1,1,{HIDDEN_SIZE},{width}]")
+                raise ValueError(f"LM-head chunk is not exact {weights.lm_head_dtype} [1,1,{HIDDEN_SIZE},{width}]")
             mesh_contract.validate_tensor(tensor, placement=TensorPlacement.VOCAB_SHARDED, shard_dim=3)
         mesh_contract.validate_tensor(weights.replicated_anchor, placement=TensorPlacement.REPLICATED)
         self.compute_config = ttnn.init_device_compute_kernel_config(
             mesh_device.arch(),
             math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
+        # The chunk linears run the fidelity of their weight format (decode_matmul: HiFi4 for bf16, HiFi2 for bf8,
+        # LoFi for bf4); every other program keeps compute_config.
+        self.weight_compute_config = ttnn.init_device_compute_kernel_config(
+            mesh_device.arch(),
+            math_fidelity=getattr(ttnn.MathFidelity, dense_math_fidelity_name(weights.lm_head_dtype)),
             math_approx_mode=False,
             fp32_dest_acc_en=True,
             packer_l1_acc=False,
@@ -1783,7 +1804,7 @@ class Qwen38TTNNLMHead:
                 dtype=ttnn.bfloat16,
                 memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
                 program_config=program_config,
-                compute_kernel_config=self.compute_config,
+                compute_kernel_config=self.weight_compute_config,
             )
             outputs.append(ttnn.to_memory_config(chunk_ws, ttnn.DRAM_MEMORY_CONFIG))
             _deallocate(chunk_ws)

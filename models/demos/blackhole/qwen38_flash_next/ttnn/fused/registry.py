@@ -4,11 +4,14 @@
 """The fused decode kernels by name and the ``QWEN38_FUSED`` / ``QWEN38_FUSED_OFF`` switches.
 
 Every fused kernel stands in for one named chain of existing ttnn ops.  The kernels in ``DEFAULT_ON`` (the one list
-below: proven bitwise against their chains and at the model level, and faster than the record in their own timing
+below: proven bitwise against their chains and at the model level -- or, for a COMPONENT-class kernel such as
+``gdn_step``, against the tt/ oracle at the component gate -- and faster than the record in their own timing
 slot) serve by default; ``QWEN38_FUSED_OFF`` (comma-separated names, or ``all``) falls back to the composed chains,
 ``QWEN38_FUSED`` switches an opt-in kernel on.  A name that is not registered raises in either variable and in
 ``DEFAULT_ON``, so a typo cannot silently change what runs.  Callers resolve once at construction and keep the choice
-through trace capture: ``run = resolve("router_tail")``.
+through trace capture: ``run = resolve("router_tail")``.  A kernel that declares its input contract (``admits``)
+is resolved with ``resolve_admitted``: the fused program serves the calls that satisfy the contract and the composed
+chain the others, so a production default never raises on inputs its program was not written for.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ _NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 # traced wall under the record in their own slot (the FUSION-DEFAULTS notes).  Flipping a kernel is this one list.
 DEFAULT_ON: frozenset[str] = frozenset(
     {
+        "gdn_step",
         "gr_fold",
         "gr_read",
         "gr_write",
@@ -76,6 +80,13 @@ class FusedKernel:
     fused: Callable[..., Any]
     composed: Callable[..., Any]
     gate: GateSpec | None = None
+    # A COMPONENT-class kernel may serve by default only with this recorded component-gate proof (the numbers of the
+    # probe against the tt/ oracle); BITWISE defaults need none.
+    component_proof: str | None = None
+    # The kernel's input contract as a predicate over the call's arguments (what its program asserts before it
+    # builds): a production default runs the fused program only when it holds and the composed chain otherwise
+    # (``resolve_admitted``).  None: the fused callable serves every call.
+    admits: Callable[..., bool] | None = None
 
     @property
     def default_on(self) -> bool:
@@ -122,11 +133,19 @@ def _names(environ: Mapping[str, str], variable: str) -> frozenset[str]:
 
 
 def default_names() -> frozenset[str]:
-    """``DEFAULT_ON``, every name of which must be registered."""
+    """``DEFAULT_ON``, every name of which must be registered and BITWISE, or COMPONENT with its component-gate proof."""
 
     unknown = sorted(DEFAULT_ON - set(_REGISTRY))
     if unknown:
         raise ValueError(f"DEFAULT_ON names unregistered fused kernels {unknown}; registered: {sorted(_REGISTRY)}")
+    unproven = sorted(
+        name
+        for name in DEFAULT_ON
+        if _REGISTRY[name].tolerance != BITWISE
+        and not (_REGISTRY[name].tolerance == COMPONENT and _REGISTRY[name].component_proof)
+    )
+    if unproven:
+        raise ValueError(f"DEFAULT_ON kernels {unproven} are neither BITWISE nor COMPONENT with a component-gate proof")
     return DEFAULT_ON
 
 
@@ -147,3 +166,35 @@ def resolve(name: str, environ: Mapping[str, str] = os.environ) -> Callable[...,
 
     entry = kernel(name)
     return entry.fused if name in enabled_names(environ) else entry.composed
+
+
+class AdmittedStep:
+    """A kernel that runs, dispatched per call: the fused program when ``kernel.admits`` holds for the call's
+    arguments, the composed chain otherwise.  The test is a few shape reads, and a traced capture keeps whichever branch
+    its real tensors took (the served tensors satisfy the contract; host fakes outside it take the chain)."""
+
+    def __init__(self, entry: FusedKernel) -> None:
+        if entry.admits is None:
+            raise ValueError(f"fused kernel {entry.name!r} has no admission predicate")
+        self.kernel = entry
+        self.fused = entry.fused
+        self.composed = entry.composed
+        self.admits = entry.admits
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self.admits(*args, **kwargs):
+            return self.fused(*args, **kwargs)
+        return self.composed(*args, **kwargs)
+
+
+def resolve_admitted(name: str, environ: Mapping[str, str] = os.environ) -> Callable[..., Any]:
+    """``resolve`` with the kernel's admission: the composed chain when the kernel is off; the fused callable when it
+    runs and declares no ``admits``; an ``AdmittedStep`` (fused within the input contract, composed outside it) when it
+    does.  The production default's site resolves here."""
+
+    entry = kernel(name)
+    if name not in enabled_names(environ):
+        return entry.composed
+    if entry.admits is None:
+        return entry.fused
+    return AdmittedStep(entry)

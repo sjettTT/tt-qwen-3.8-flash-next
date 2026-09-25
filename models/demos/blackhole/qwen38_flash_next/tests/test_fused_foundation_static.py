@@ -35,7 +35,9 @@ def test_registry_serves_the_proven_kernels_by_default():
     assert fused.default_names() == DEFAULT_ON
     assert fused.enabled_names({}) == DEFAULT_ON
     for name in DEFAULT_ON:
-        assert fused.kernel(name).default_on and fused.kernel(name).tolerance == fused.BITWISE
+        entry = fused.kernel(name)
+        assert entry.default_on
+        assert entry.tolerance == fused.BITWISE or (entry.tolerance == fused.COMPONENT and entry.component_proof)
         assert fused.resolve(name, {}) is fused.kernel(name).fused
         assert fused.resolve(name, {fused.OFF_ENV: name}) is fused.kernel(name).composed
     for name in set(fused.kernels()) - DEFAULT_ON:

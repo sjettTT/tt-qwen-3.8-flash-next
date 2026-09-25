@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Per (lane, head) item: the projection's q/k/v/z/a/b tiles, the three older conv ring slots' q/k/v tiles, the four
-// taps' q/k/v tiles, the head's dt_bias / neg_exp_A tiles, the lane's state tiles, and the lane's row mask; writes
+// taps' q/k/v tiles (tile-major: CB_S holds tile t's three slots at 3t.., CB_T its four taps at 4t.., pushed per
+// tile), the head's dt_bias / neg_exp_A tiles, the lane's state tiles, and the lane's row mask; writes
 // the projection's q/k/v tiles into the newest ring slot.  Tile ids: q 4(h/3)+c, k 16+4(h/3)+c, v 32+4h+c,
 // z 80+4h+c, a 128, b 129 (one tile row of the [1,1,rows,4160] projection); state ((lane*12+h)*16 + t).
 // Compile-time args: 0 rows; then TensorAccessorArgs of projected, slot0, slot1, slot2, tap0..tap3, dtna, norm,
@@ -113,25 +114,36 @@ void kernel_main() {
             ids[2 * HT + c] = V_TILE0 + head * HT + c;
         }
         noc_async_write_barrier();  // the previous item's newest-slot writes have left the CB_P slot
-        const uint32_t p_l1 = read_tiles(CB_P, p, ids, QKV_TILES, BF16_TILE);
-        cb_reserve_back(CB_S, 3 * QKV_TILES);  // slot i's 12 tiles at i*12
+        // The conv inputs go out per output tile t (P[t], the three slots' tile t at CB_S 3t.., the four taps' tile t
+        // at CB_T 4t..) with one group of reads in flight ahead of each barrier, so the conv starts after the first
+        // group instead of after all 96 tiles (the same tiles, the same per-element operands: bitwise).
+        cb_reserve_back(CB_P, QKV_TILES);
+        cb_reserve_back(CB_S, 3 * QKV_TILES);
+        cb_reserve_back(CB_T, 4 * QKV_TILES);
+        const uint32_t p_l1 = get_write_ptr(CB_P);
         const uint32_t s_l1 = get_write_ptr(CB_S);
-        read_tiles_at(s_l1, s0, ids, QKV_TILES, BF16_TILE);
-        read_tiles_at(s_l1 + QKV_TILES * BF16_TILE, s1, ids, QKV_TILES, BF16_TILE);
-        read_tiles_at(s_l1 + 2 * QKV_TILES * BF16_TILE, s2, ids, QKV_TILES, BF16_TILE);
-        cb_reserve_back(CB_T, 4 * QKV_TILES);  // tap i's 12 tiles at i*12
         const uint32_t t_l1 = get_write_ptr(CB_T);
-        read_tiles_at(t_l1, t0, ids, QKV_TILES, BF16_TILE);
-        read_tiles_at(t_l1 + QKV_TILES * BF16_TILE, t1, ids, QKV_TILES, BF16_TILE);
-        read_tiles_at(t_l1 + 2 * QKV_TILES * BF16_TILE, t2, ids, QKV_TILES, BF16_TILE);
-        read_tiles_at(t_l1 + 3 * QKV_TILES * BF16_TILE, t3, ids, QKV_TILES, BF16_TILE);
-        noc_async_read_barrier();
+        auto issue_group = [&](uint32_t t) {
+            noc_async_read_page(ids[t], p, p_l1 + t * BF16_TILE);
+            noc_async_read_page(ids[t], s0, s_l1 + (3 * t + 0) * BF16_TILE);
+            noc_async_read_page(ids[t], s1, s_l1 + (3 * t + 1) * BF16_TILE);
+            noc_async_read_page(ids[t], s2, s_l1 + (3 * t + 2) * BF16_TILE);
+            noc_async_read_page(ids[t], t0, t_l1 + (4 * t + 0) * BF16_TILE);
+            noc_async_read_page(ids[t], t1, t_l1 + (4 * t + 1) * BF16_TILE);
+            noc_async_read_page(ids[t], t2, t_l1 + (4 * t + 2) * BF16_TILE);
+            noc_async_read_page(ids[t], t3, t_l1 + (4 * t + 3) * BF16_TILE);
+        };
+        issue_group(0);
         for (uint32_t t = 0; t < QKV_TILES; ++t) {
+            if (t + 1 < QKV_TILES) {
+                issue_group(t + 1);
+            }
+            noc_async_read_barrier();  // groups <= t + 1 landed; group t goes to the compute, P[t] to the newest slot
             noc_async_write_page(ids[t], newest, p_l1 + t * BF16_TILE);
+            cb_push_back(CB_P, 1);
+            cb_push_back(CB_S, 3);
+            cb_push_back(CB_T, 4);
         }
-        cb_push_back(CB_P, QKV_TILES);
-        cb_push_back(CB_S, 3 * QKV_TILES);
-        cb_push_back(CB_T, 4 * QKV_TILES);
 
         uint32_t z_ids[HT];
         for (uint32_t c = 0; c < HT; ++c) {

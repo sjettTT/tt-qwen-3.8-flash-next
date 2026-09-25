@@ -49,16 +49,18 @@ from models.demos.blackhole.qwen38_flash_next.checkpoint import (
 )
 from models.demos.blackhole.qwen38_flash_next.config import CONFIG_SHA256, Qwen38Placement
 from models.demos.blackhole.qwen38_flash_next.tt.moe import Qwen38MoEWeights
+from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import canonical_packed_shapes
 
 MODE = "diagnostic_non_promoting_cpu_bf4_staging"
 PHYSICAL_IDS = (1, 0, 2, 3)
 MESH_COORDS = ((0, 0), (0, 1), (0, 2), (0, 3))
 RING_SIZE = 8
 EXPERT_RANGES = ((0, 128), (128, 256), (256, 384), (384, 512))
-W01_LOCAL_SHAPE = (8, 1, 128, 2, 2688, 128)
-W2_LOCAL_SHAPE = (8, 1, 128, 3, 672, 128)
-W01_GLOBAL_SHAPE = (8, 1, 512, 2, 2688, 128)
-W2_GLOBAL_SHAPE = (8, 1, 512, 3, 672, 128)
+# The op's packed layout for the 8-bank ring (moe_compute's compact owned-column layout, 20-tile transactions), as
+# the production cache derives it from the layout packer's geometry.
+W01_GLOBAL_SHAPE, W2_GLOBAL_SHAPE = (canonical_packed_shapes(ring_size=RING_SIZE)[name] for name in ("w0_w1", "w2"))
+W01_LOCAL_SHAPE = (*W01_GLOBAL_SHAPE[:2], 128, *W01_GLOBAL_SHAPE[3:])
+W2_LOCAL_SHAPE = (*W2_GLOBAL_SHAPE[:2], 128, *W2_GLOBAL_SHAPE[3:])
 BF4_TILE_BYTES = 576
 TILE_ELEMENTS = 32 * 32
 TENSORBIN_SUFFIX = "_dtype_BFLOAT4_B_layout_TILE.tensorbin"

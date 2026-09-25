@@ -67,25 +67,43 @@ def kernel_source(name: str, file: str) -> str:
     return relative
 
 
+def _padded_shape(tensor) -> tuple[int, ...]:
+    return tuple(getattr(tensor, "padded_shape", tensor.shape))
+
+
+def is_row_tile(tensor) -> bool:
+    """Whether ``tensor`` is one row tile ``[1, 1, rows, W]`` with ``1 <= rows <= ROWS_MAX`` padded to ``TILE`` rows:
+    the fused programs' input contract as a predicate, so a dispatcher can take the composed chain instead of raising
+    (a host fake whose padded shape is its logical shape is outside it)."""
+
+    shape, padded = tuple(tensor.shape), _padded_shape(tensor)
+    return len(shape) == 4 and shape[:2] == (1, 1) and 1 <= shape[-2] <= ROWS_MAX and padded[-2] == TILE
+
+
+def is_tile_width(tensor, width: int | None = None) -> bool:
+    """Whether the last dimension is whole tiles, unpadded, and (when given) exactly ``width``."""
+
+    actual, padded = tensor.shape[-1], _padded_shape(tensor)[-1]
+    return actual % TILE == 0 and padded == actual and (width is None or actual == width)
+
+
 def rows_of(tensor) -> int:
     """The valid rows of one row tile ``[1, 1, rows, W]`` (padded to 32 rows); rejects any other shape."""
 
-    shape, padded = tuple(tensor.shape), tuple(tensor.padded_shape)
-    rows = shape[-2]
-    if len(shape) != 4 or shape[:2] != (1, 1) or not 1 <= rows <= ROWS_MAX or padded[-2] != TILE:
+    if not is_row_tile(tensor):
         raise ValueError(
-            f"expected one row tile [1, 1, 1..{ROWS_MAX}, W] padded to {TILE} rows, got {shape} padded {padded}"
+            f"expected one row tile [1, 1, 1..{ROWS_MAX}, W] padded to {TILE} rows, got {tuple(tensor.shape)} padded "
+            f"{_padded_shape(tensor)}"
         )
-    return rows
+    return tensor.shape[-2]
 
 
 def tile_width_of(tensor) -> int:
     """The width of a tensor whose last dimension is whole tiles."""
 
-    width, padded = tensor.shape[-1], tensor.padded_shape[-1]
-    if width % TILE or padded != width:
-        raise ValueError(f"expected a width of whole tiles, got {width} padded {padded}")
-    return width
+    if not is_tile_width(tensor):
+        raise ValueError(f"expected a width of whole tiles, got {tensor.shape[-1]} padded {_padded_shape(tensor)[-1]}")
+    return tensor.shape[-1]
 
 
 @dataclass(frozen=True)
@@ -237,8 +255,13 @@ def stamp_topology(tensor, reference, shard_dim: int | None = None):
     or a mesh contract check downstream reads it.  Returns ``tensor``."""
 
     topology = reference.tensor_topology()
-    placements = [ttnn.PlacementReplicate(), ttnn.PlacementReplicate() if shard_dim is None else ttnn.PlacementShard(shard_dim)]
-    tensor.update_tensor_topology(ttnn.TensorTopology(topology.distribution_shape(), placements, topology.mesh_coords()))
+    placements = [
+        ttnn.PlacementReplicate(),
+        ttnn.PlacementReplicate() if shard_dim is None else ttnn.PlacementShard(shard_dim),
+    ]
+    tensor.update_tensor_topology(
+        ttnn.TensorTopology(topology.distribution_shape(), placements, topology.mesh_coords())
+    )
     return tensor
 
 
