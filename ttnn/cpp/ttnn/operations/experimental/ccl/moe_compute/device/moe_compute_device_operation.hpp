@@ -61,10 +61,12 @@ std::vector<Tensor> moe_compute(
     bool compute_only = false,
     bool local_combine = false,
     const std::optional<uint32_t>& bh_ring_size = std::nullopt,
-    const std::optional<uint32_t>& num_shared_experts_per_device = std::nullopt);
+    const std::optional<uint32_t>& num_shared_experts_per_device = std::nullopt,
+    bool zero_fill_non_owned_rows = true,
+    const std::optional<uint32_t>& prefill_rings = std::nullopt);
 
 using ttnn::experimental::prim::get_moe_combine_cores;
-using ttnn::experimental::prim::get_moe_worker_mcast_bounding_box;
 using ttnn::experimental::prim::get_moe_tilize_drain_core;
+using ttnn::experimental::prim::get_moe_worker_mcast_bounding_box;
 
 }  // namespace ttnn::prim

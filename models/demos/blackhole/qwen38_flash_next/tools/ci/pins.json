@@ -55,6 +55,16 @@
   "oracle-bf4": {
    "description": "the tt/ CPU oracle with BF4-rounded experts (the device's expert precision) as the column under test"
   },
+  "slab2048-32k": {
+   "description": "the served default with the 2048-row prefill slab (--prefill-slab 2048; the slab's routed experts in one moe_compute call per layer, QWEN38_MOE_SLAB_ONE_CALL and QWEN38_MOE_SLAB_RINGS unset): chunked prefill through the chunk trace for the remainder, sampling on, MTP off, 32768 context",
+   "server": {
+    "allocated_context": 32768,
+    "mtp": null,
+    "prefill_mode": "chunked",
+    "prefill_slab": 2048,
+    "sampling": true
+   }
+  },
   "thinking-medium": {
    "description": "eval rows at the shipped request defaults (thinking on, reasoning_effort=medium), greedy, max_tokens 1536",
    "request": {
@@ -391,6 +401,42 @@
    "status": "active",
    "target": 0
   },
+  "A3/slab2048-32k/device_token_ids_sha256": {
+   "baseline": true,
+   "note": "a differing stream without an earlier index is a numerics-class change: A1 full before merge",
+   "rule": "exact",
+   "severity": "info",
+   "status": "todo"
+  },
+  "A3/slab2048-32k/divergence_index": {
+   "baseline": true,
+   "note": "per record the first index where the device leaves the CPU greedy stream; null is the largest; never earlier than the baseline",
+   "rule": "not_earlier",
+   "status": "todo"
+  },
+  "A3/slab2048-32k/echo_verbatim": {
+   "note": "the coherence guard: the sentence echoed verbatim at temperature 0",
+   "rule": "exact",
+   "status": "active",
+   "target": true
+  },
+  "A3/slab2048-32k/gate_compared_tokens": {
+   "rule": "exact",
+   "status": "active",
+   "target": 96
+  },
+  "A3/slab2048-32k/gate_pass": {
+   "note": "the json record replays 96/96 CPU greedy tokens (--require-json-96)",
+   "rule": "exact",
+   "status": "active",
+   "target": true
+  },
+  "A3/slab2048-32k/requests_incomplete": {
+   "note": "every probe request finishes with stop or length",
+   "rule": "exact",
+   "status": "active",
+   "target": 0
+  },
   "C1/thinking-medium/item_pass": {
    "baseline": true,
    "max_flips": 3,
@@ -614,6 +660,103 @@
    "unit": "s"
   },
   "D1/forced-32k/ttft_seconds/4096": {
+   "better": "lower",
+   "idle_only": true,
+   "loaded_tolerance": 0.25,
+   "note": "one-token reply to a 4096-token prompt, thinking off, host-timed by the runner",
+   "rule": "band",
+   "status": "todo",
+   "tolerance": 0.1,
+   "unit": "s"
+  },
+  "D1/slab2048-32k/capture_ms": {
+   "better": "lower",
+   "rule": "band",
+   "status": "todo",
+   "tolerance": 0.15,
+   "unit": "ms"
+  },
+  "D1/slab2048-32k/decode_ms_per_token": {
+   "better": "lower",
+   "idle_only": true,
+   "loaded_tolerance": 0.15,
+   "note": "the timing runner's 32-token median after warm-up under --prefill-slab 2048 (decode is the same trace as chunked-32k's); seed from three idle runs",
+   "rule": "band",
+   "status": "todo",
+   "target": 35.8,
+   "tolerance": 0.02,
+   "unit": "ms"
+  },
+  "D1/slab2048-32k/decode_tokens_per_second": {
+   "better": "higher",
+   "idle_only": true,
+   "loaded_tolerance": 0.15,
+   "note": "the ledger's median tokens/s over requests of 32+ tokens",
+   "rule": "band",
+   "status": "todo",
+   "tolerance": 0.05
+  },
+  "D1/slab2048-32k/free_bytes_per_bank": {
+   "note": "DRAM headroom per bank after the captures",
+   "rule": "floor",
+   "slack_relative": 0.01,
+   "status": "todo"
+  },
+  "D1/slab2048-32k/prefill_ms_per_prompt_token": {
+   "better": "lower",
+   "idle_only": true,
+   "loaded_tolerance": 0.2,
+   "note": "the ledger's median over fresh requests of 64+ prompt tokens",
+   "rule": "band",
+   "status": "todo",
+   "tolerance": 0.1,
+   "unit": "ms"
+  },
+  "D1/slab2048-32k/program_cache_after_capture": {
+   "note": "the timing runner's program cache entries after the captures",
+   "rule": "exact",
+   "status": "todo"
+  },
+  "D1/slab2048-32k/program_cache_delta": {
+   "note": "no program-cache miss over the replays",
+   "rule": "exact",
+   "status": "active",
+   "target": 0
+  },
+  "D1/slab2048-32k/program_cache_entries_at_ready": {
+   "note": "/health at READY, before any request",
+   "rule": "exact",
+   "status": "todo"
+  },
+  "D1/slab2048-32k/startup_seconds": {
+   "better": "lower",
+   "note": "READY's startup_seconds with warm JIT caches",
+   "rule": "band",
+   "status": "todo",
+   "tolerance": 0.2,
+   "unit": "s"
+  },
+  "D1/slab2048-32k/ttft_seconds/1024": {
+   "better": "lower",
+   "idle_only": true,
+   "loaded_tolerance": 0.25,
+   "note": "one-token reply to a 1024-token prompt, thinking off, host-timed by the runner",
+   "rule": "band",
+   "status": "todo",
+   "tolerance": 0.1,
+   "unit": "s"
+  },
+  "D1/slab2048-32k/ttft_seconds/128": {
+   "better": "lower",
+   "idle_only": true,
+   "loaded_tolerance": 0.25,
+   "note": "one-token reply to a 128-token prompt, thinking off, host-timed by the runner",
+   "rule": "band",
+   "status": "todo",
+   "tolerance": 0.1,
+   "unit": "s"
+  },
+  "D1/slab2048-32k/ttft_seconds/4096": {
    "better": "lower",
    "idle_only": true,
    "loaded_tolerance": 0.25,

@@ -62,11 +62,29 @@ EXPERTS_PER_DEVICE = 128
 TOP_K = 10
 LOCAL_COMBINE_AXIS = 0
 MOE_LOCAL_OUTPUT_ENV = "QWEN38_MOE_LOCAL_OUTPUT"
+MOE_SLAB_ONE_CALL_ENV = "QWEN38_MOE_SLAB_ONE_CALL"
+MOE_SLAB_RINGS_ENV = "QWEN38_MOE_SLAB_RINGS"
+# The one-call slab's weight stream: 2 = two rings of cores splitting the chunks, each reading the slices of the
+# experts it owns (the default since 2026-09-25: bitwise on the 4-chip line three times, the last with the ring
+# exchange's credit in place; 6 percent less time per prompt token than one ring at 32k); 0 = the op's one-ring
+# three-slot stream (opt-in: `QWEN38_MOE_SLAB_RINGS=0`); 1 = the replay ring (one ring, each expert's slice read once
+# per slab; bitwise on one die, opt-in). Three rings are refused at this switch: the op implements them, but on the
+# 4-chip line their output was nondeterministic (2026-09-25) before the exchange's credit; a line arm is owed.
+MOE_SLAB_RINGS_DEFAULT = 2
+MOE_SLAB_RINGS_ADMITTED = (0, 1, 2)
+MOE_SLAB_RINGS_REFUSED = {3: "nondeterministic on the 4-chip line (2026-09-25); under investigation"}
+# The one-call slab's weighted reduce runs in blocks of this many rows: the fused reduce keeps one score table per
+# row tile in L1 (512 rows admitted bitwise the 128-row form, 1024 refused) and the whole [10, rows, 2560] page set
+# tilized at once would not fit L1.
+SLAB_REDUCE_BLOCK_ROWS = 512
 EP_AXIS = 1
 TARGET_VERIFIER_ROWS = 5
 PREFILL_CHUNK_ROWS = CHUNK_ROWS
 LONG_PREFILL_CHUNK_ROWS = LONG_CHUNK_ROWS
-SUPPORTED_ROWS = (*range(1, MAX_LANES + 1), LONG_PREFILL_CHUNK_ROWS)  # 1 = decode, 5 = MTP verify, 32 = chunk or B lanes, 128
+SUPPORTED_ROWS = (
+    *range(1, MAX_LANES + 1),
+    LONG_PREFILL_CHUNK_ROWS,
+)  # 1 = decode, 5 = MTP verify, 32 = chunk or B lanes, 128
 # moe_compute processes the tokens of one expert in 32-token chunks and admits at most
 # TOKEN_SIZE x num_data_parallel_cores x output_height_shard_dim tokens per call; num_data_parallel_cores is
 # the largest d <= 4 dividing both the hidden tile count (80) and the live DRAM bank count (the matmul ring).
@@ -86,10 +104,57 @@ def moe_local_output_enabled() -> bool:
     return value == "1"
 
 
+def moe_slab_one_call_enabled() -> bool:
+    """``QWEN38_MOE_SLAB_ONE_CALL`` (unset = 1): a slab instance routes all of its rows through ONE ``moe_compute``
+    call on the op's local output path (each expert's tokens packed into 32-row chunks once per slab instead of once
+    per 128-row block: 223 chunks per layer per device against 745 on the captured natural-text routing; the rows
+    nobody owns are not zero-filled, the buffer being zero at allocation and every slot it ever holds a finite expert
+    output the weighted reduce multiplies by an exact 0) and reduces the ``[10, rows, 2560]`` pages in
+    ``SLAB_REDUCE_BLOCK_ROWS``-row blocks. ``0`` restores the 16 x 128-row blocks the pins were taken with; the one
+    call is bitwise those blocks on the 4-chip line (the acceptance records, the agreement rows and the long-prompt
+    completions identical at three heads). Scoped to slab rows: decode and the 32-/128-row chunks keep their forms."""
+
+    value = os.environ.get(MOE_SLAB_ONE_CALL_ENV, "1")
+    if value not in ("0", "1"):
+        raise ValueError(f"{MOE_SLAB_ONE_CALL_ENV} must be 0 or 1, got {value!r}")
+    return value == "1"
+
+
+def moe_slab_prefill_rings() -> int:
+    """``QWEN38_MOE_SLAB_RINGS``: the one-call slab's ``prefill_rings`` (2 = two rings of cores splitting the chunks,
+    each ring reading the slices of the experts it owns -- the default when unset; 0 = the op's one-ring 3-slot
+    weight stream; 1 = the replay ring, one ring with each expert's weight slice read from DRAM once per slab;
+    ``MOE_SLAB_RINGS_ADMITTED``). A count in ``MOE_SLAB_RINGS_REFUSED`` (three rings) is refused with its reason even
+    though the op implements it. Only the one-call slab reads the switch; the chunk forms and decode never do."""
+
+    value = os.environ.get(MOE_SLAB_RINGS_ENV, str(MOE_SLAB_RINGS_DEFAULT))
+    for refused, reason in MOE_SLAB_RINGS_REFUSED.items():
+        if value == str(refused):
+            raise ValueError(f"{MOE_SLAB_RINGS_ENV}={value} is refused: {reason}")
+    if value not in tuple(str(v) for v in MOE_SLAB_RINGS_ADMITTED):
+        raise ValueError(f"{MOE_SLAB_RINGS_ENV} must be one of {MOE_SLAB_RINGS_ADMITTED}, got {value!r}")
+    return int(value)
+
+
+def admit_slab_moe_switches() -> tuple[bool, int]:
+    """Read both slab MoE switches once, before any device is touched: the server calls this when ``--prefill-slab``
+    is given (a refused ``QWEN38_MOE_SLAB_RINGS``, three rings today, ends the process at its start instead of at the
+    first slab forward 79 s into the warm pass), and every slab MoE instance calls it at construction. Returns
+    ``(one_call, rings)``."""
+
+    one_call = moe_slab_one_call_enabled()
+    rings = moe_slab_prefill_rings() if one_call else 0
+    return one_call, rings
+
+
 def moe_compute_output_height_shard_dim(rows: int, *, matmul_ring_size: int) -> int:
     """The smallest ``output_height_shard_dim`` under which ``moe_compute`` admits ``rows`` tokens (1 for every
-    form up to 32 rows; the 128-row form needs 1 on an 8-bank part and 4 on a 7-bank part)."""
+    form up to 32 rows; the 128-row form needs 1 on an 8-bank part and 4 on a 7-bank part). A slab's rows only ever
+    go through one call on the local output path, which stages nothing in the combine cores' L1 and admits any
+    token count at 1."""
 
+    if is_slab_rows(rows):
+        return 1
     data_parallel_cores = max(d for d in range(1, 5) if MOE_COMPUTE_HIDDEN_TILES % d == 0 and matmul_ring_size % d == 0)
     return -(-rows // (MOE_COMPUTE_TOKEN_SIZE * data_parallel_cores))
 
@@ -115,8 +180,11 @@ LONG_CHUNK_ROUTED_TOKENS_PER_CALL = LONG_PREFILL_CHUNK_ROWS
 
 def routed_tokens_per_call_for(rows: int) -> int:
     """The token count of one ``moe_compute`` call of a ``rows``-row instance by default: the rows themselves up to
-    32 and for the 128-row chunk (``LONG_CHUNK_ROUTED_TOKENS_PER_CALL``)."""
+    32, for the 128-row chunk (``LONG_CHUNK_ROUTED_TOKENS_PER_CALL``), the whole slab for a slab (the one-call
+    default) or 128-row blocks of it under ``QWEN38_MOE_SLAB_ONE_CALL=0``."""
 
+    if is_slab_rows(rows) and moe_slab_one_call_enabled():
+        return rows
     if rows == LONG_PREFILL_CHUNK_ROWS or is_slab_rows(rows):
         return LONG_CHUNK_ROUTED_TOKENS_PER_CALL
     return min(rows, CHUNK_ROWS)
@@ -260,10 +328,13 @@ class Qwen38TTNNMoERowContract:
 
 def allocate_local_combine_output(mesh_device, mesh_contract: Qwen38MeshContract, rows: int):
     """The ``[10, rows, 2560]`` ROW_MAJOR BF16 local-combine buffer ``moe_compute`` writes (replicated: every
-    device combines its own experts); one per row instance, or one shared by the 48 long-chunk instances."""
+    device combines its own experts); one per row instance, one shared by the 48 long-chunk instances, or the
+    one-call slab's whole page (``rows`` = the slab rows under ``QWEN38_MOE_SLAB_ONE_CALL=1``: admitted here the way
+    the slab's layer instances admit them)."""
 
+    contract = Qwen38TTNNMoERowContract(rows, admitted_rows=SUPPORTED_ROWS + ((rows,) if is_slab_rows(rows) else ()))
     tensor = ttnn.from_torch(
-        torch.zeros(Qwen38TTNNMoERowContract(rows).local_combine, dtype=torch.bfloat16),
+        torch.zeros(contract.local_combine, dtype=torch.bfloat16),
         device=mesh_device,
         layout=ttnn.ROW_MAJOR_LAYOUT,
         dtype=ttnn.bfloat16,
@@ -536,6 +607,12 @@ class Qwen38TTNNMoE:
                 f"for a slab, got {routed_tokens_per_call!r}"
             )
         self.routed_calls = self.rows // self.routed_tokens
+        if self.slab_one_call:
+            admit_slab_moe_switches()  # a refused ring count ends the construction, not the first slab forward
+        if self.slab_one_call and self.rows % SLAB_REDUCE_BLOCK_ROWS:
+            raise ValueError(
+                f"the one-call slab reduces in {SLAB_REDUCE_BLOCK_ROWS}-row blocks; {self.rows} rows is not a multiple"
+            )
         # The one-tile router tail (rows <= 32): the fused program (ttnn/fused/router_tail) by default, the composed
         # chain under QWEN38_FUSED_OFF=router_tail; the long chunk and the slab keep their inline chain until the
         # four-tile form is proven in the model.
@@ -579,7 +656,7 @@ class Qwen38TTNNMoE:
         )
         ring_size = effective_matmul_ring_size(mesh_device)
         output_width_shard_dim = auto_output_width_shard_dim(HIDDEN_SIZE, matmul_ring_size=ring_size)
-        self.local_output = moe_local_output_enabled()
+        self.local_output = moe_local_output_enabled() or self.slab_one_call
         self.output_height_shard_dim = moe_compute_output_height_shard_dim(
             self.routed_tokens, matmul_ring_size=ring_size
         )
@@ -658,7 +735,7 @@ class Qwen38TTNNMoE:
                     mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 0)),
                 )
                 mesh_contract.validate_tensor(self.expert_owner, placement=TensorPlacement.EXPERT_SHARDED, shard_dim=0)
-            if self.slab:
+            if self.slab and not self.slab_one_call:
                 if self.routed_tokens != LONG_PREFILL_CHUNK_ROWS:
                     raise ValueError(f"a slab MoE instance routes {LONG_PREFILL_CHUNK_ROWS} tokens per call")
                 self.block_instance = Qwen38TTNNMoE(
@@ -931,7 +1008,7 @@ class Qwen38TTNNMoE:
         if packed_w0_w1.dtype != ttnn.bfloat4_b or packed_w2.dtype != ttnn.bfloat4_b:
             raise RuntimeError("routed expert tensors must be BFLOAT4_B")
 
-        if self.slab:
+        if self.slab and not self.slab_one_call:
             return self._routed_partial_blocks(full_hidden, routing, packed_w0_w1, packed_w2, phase_observer)
         if self.routed_calls != 1:
             return self._routed_partial_tiles(full_hidden, routing, packed_w0_w1, packed_w2, phase_observer)
@@ -985,8 +1062,9 @@ class Qwen38TTNNMoE:
         # Local combine writes only owned k slots.  Clear every invocation so a
         # masked 0*uninitialized-NaN cannot poison fast-reduce.  The long chunk's shared buffer is zero at
         # allocation and every slot it ever holds is a finite expert output (the weighted reduce multiplies
-        # the slots this device does not own by an exact 0), so its 48 layers skip the 6.5 MB fill.
-        if self.rows != LONG_PREFILL_CHUNK_ROWS:
+        # the slots this device does not own by an exact 0), so its 48 layers skip the 6.5 MB fill; the one-call slab's
+        # 105 MB buffer likewise (and the op does not zero the unowned rows either: zero_fill_non_owned_rows below).
+        if self.rows != LONG_PREFILL_CHUNK_ROWS and not self.slab_one_call:
             zeroed = ttnn.fill(self.local_combine_output, 0.0, output_tensor=self.local_combine_output)
             if zeroed.tensor_id != self.local_combine_output.tensor_id:
                 raise RuntimeError("ttnn.fill did not update the persistent local-combine buffer in place")
@@ -1014,6 +1092,8 @@ class Qwen38TTNNMoE:
             compute_only=False,
             local_combine=not self.local_output,
             num_shared_experts_per_device=0,
+            zero_fill_non_owned_rows=self.zero_fill_non_owned_rows,
+            prefill_rings=self.prefill_rings,
         )
         phase_observer("after-moe-compute-launch")
         if len(outputs) != 6 or outputs[5].tensor_id != self.local_combine_output.tensor_id:
@@ -1026,6 +1106,8 @@ class Qwen38TTNNMoE:
 
         # Slots 3/4 alias one L1 backing buffer; freeing slot 4 releases it.
         _deallocate(outputs[0], outputs[1], outputs[2], outputs[4], sparse_input, indices_l1, scores_l1)
+        if self.slab_one_call:
+            return self._weighted_reduce_slab_blocks(outputs[5], full_hidden, routing, phase_observer)
         phase_observer("before-selective-reduce")
         local_stack = ttnn.unsqueeze(outputs[5], dim=1)
         if _shape(local_stack) != self.row_contract.fast_reduce_input:
@@ -1079,6 +1161,77 @@ class Qwen38TTNNMoE:
         self.mesh_contract.validate_tensor(fast_outputs[0], placement=TensorPlacement.LOCAL_PARTIAL)
         phase_observer("after-selective-reduce")
         return fast_outputs[0]
+
+    def _weighted_reduce_slab_blocks(self, combine, full_hidden, routing: Qwen38TTNNRouting, phase_observer):
+        """The one-call slab's weighted reduce, ``SLAB_REDUCE_BLOCK_ROWS`` rows at a time: each block's pages (a
+        k-strided ROW_MAJOR slice of the ``[10, rows, 2560]`` buffer) tilized and viewed as the reduce's
+        ``[10, 1, block, 2560]``, with the block's scores and indices; the partials concatenated."""
+
+        phase_observer("before-selective-reduce")
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        block = SLAB_REDUCE_BLOCK_ROWS
+        # A slab of exactly one block (512 rows) has no sub-range to slice: ``ttnn.slice`` over a tensor's full extent
+        # returns its INPUT (an alias), and ``ttnn.concat`` of one tensor likewise, so the block's pages are the
+        # combine buffer itself and the block's scores / indices are the routing's own tensors -- never freed here
+        # (freeing "pages" would free the persistent combine page under the next layer). Only what this method
+        # created is released.
+        one_block = self.rows == block
+        partials = []
+        for start in range(0, self.rows, block):
+            pages = (
+                combine
+                if one_block
+                else ttnn.slice(combine, (0, start, 0), (TOP_K, start + block, HIDDEN_SIZE), memory_config=dram)
+            )
+            stack = ttnn.experimental.view(
+                ttnn.to_layout(
+                    ttnn.reshape(pages, (TOP_K * block, HIDDEN_SIZE)),
+                    ttnn.TILE_LAYOUT,
+                    memory_config=dram,
+                    pad_value=0.0,
+                ),
+                (TOP_K, 1, block, HIDDEN_SIZE),
+            )
+            scores = (
+                routing.scores
+                if one_block
+                else ttnn.slice(routing.scores, (0, 0, start, 0), (1, 1, start + block, TOP_K), memory_config=dram)
+            )
+            indices = (
+                routing.indices
+                if one_block
+                else ttnn.slice(routing.indices, (0, 0, start, 0), (1, 1, start + block, TOP_K), memory_config=dram)
+            )
+            fast_outputs = ttnn.experimental.deepseek_moe_fast_reduce_nc_fused(
+                stack,
+                indices,
+                self.expert_mapping,
+                reduce_dim=0,
+                split_size=HIDDEN_SIZE,
+                cluster_axis=LOCAL_COMBINE_AXIS,
+                output_memory_config=dram,
+                scores_tensor=ttnn.reshape(scores, (block, 1, 1, TOP_K)),
+                num_shared_experts=0,
+                shared_expert_scale=1.0,
+                compute_kernel_config=self.compute_config,
+            )
+            _deallocate(stack, *(() if one_block else (pages, scores, indices)))
+            if len(fast_outputs) != 1 or _shape(fast_outputs[0]) != (1, 1, block, HIDDEN_SIZE):
+                raise RuntimeError(
+                    f"weighted routed reduce of a {block}-row block must return one (1, 1, {block}, {HIDDEN_SIZE}) "
+                    f"partial, got {tuple(_shape(item) for item in fast_outputs)}"
+                )
+            partials.append(fast_outputs[0])
+        if one_block:
+            partial = partials[0]  # ttnn.concat of one tensor would return it (an alias): the partial IS the result
+        else:
+            partial = ttnn.concat(partials, dim=2, memory_config=dram)
+            _deallocate(*partials)
+        self.mesh_contract.mark_local_partial(
+            partial, replicated_reference=full_hidden, expected_shape=self.row_contract.full_hidden
+        )
+        phase_observer("after-selective-reduce")
+        return partial
 
     def _routed_local_sum(
         self, full_hidden, routing: Qwen38TTNNRouting, packed_w0_w1, packed_w2, shared, *, phase_observer
@@ -1248,6 +1401,27 @@ class Qwen38TTNNMoE:
         self.mesh_contract.validate_tensor(scores_rm, placement=TensorPlacement.REPLICATED)
         self.mesh_contract.validate_tensor(indices_rm, placement=TensorPlacement.REPLICATED)
         return Qwen38TTNNRouting(scores_rm, indices_rm)
+
+    @property
+    def slab_one_call(self) -> bool:
+        """The one-call slab: the op's local output path, no zero fill of the rows this device's experts do not own
+        (the buffer is zero at allocation and only ever holds finite expert outputs that the weighted reduce
+        multiplies by an exact 0 where unowned), the reduce in 512-row blocks. Derived from the row contract (a slab
+        instance whose one call covers its rows); ``QWEN38_MOE_SLAB_ONE_CALL`` (unset = 1) only sets that default."""
+
+        return self.slab and self.routed_calls == 1
+
+    @property
+    def zero_fill_non_owned_rows(self) -> bool:
+        return not self.slab_one_call
+
+    @property
+    def prefill_rings(self) -> int | None:
+        """The one-call slab's ring mode (``QWEN38_MOE_SLAB_RINGS``); ``None`` = the op's default for every other
+        instance (the kwarg is not passed as a value, so the chunk forms' program hashes are untouched)."""
+
+        rings = moe_slab_prefill_rings() if self.slab_one_call else 0
+        return rings if rings else None
 
     @property
     def slab(self) -> bool:

@@ -17,8 +17,10 @@ Inside a slab every layer runs its ROWS rows in one pass:
   inside the slab body, 0.04-0.15 ms each);
 - the GDN kernel (`chunk_gated_delta_rule`) takes the whole slab in one call (ROWS / 32 sub-chunks, the recurrent
   state carried inside the kernel in fp32) and commits its final state; the FIR taps are row shifts;
-- the routed experts run in `moe_compute` calls of 128 tokens (the largest call the kernel admits), one per 128-row
-  block, through the 128-row instance's own call, tilize and weighted reduce;
+- the routed experts run in one `moe_compute` call over the whole slab on the op's local output path (each expert's
+  tokens packed into 32-row chunks once per slab, its outputs written straight into the slab's `[10, ROWS, 2560]`
+  page), and that page is reduced in 512-row blocks; `QWEN38_MOE_SLAB_ONE_CALL=0` restores the 16 calls of 128 tokens
+  through the 128-row instance's own call, tilize and weighted reduce (*The routed experts in one call* below);
 - the QSA layer writes one ROWS-row KV slab and ROWS / 128 compressed tiles through one page table, scores and selects
   its blocks in 512-row blocks (the indexer, the score all-reduce, a broadcast causal block mask, `topk_large_indices`),
   and runs `sparse_sdpa` over all ROWS query rows in one call.
@@ -43,9 +45,11 @@ acceptance prompts are shorter than one slab, so the slab body itself is exercis
 Per device, per 2048-row slab (measured on 4x p150, 2026-09-09): a dense linear at 2048 rows runs 10-12x faster than
 its 64 per-tile calls (GDN in-proj 6.03 -> 0.49 ms + 0.15 ms for the weight copy; QSA query-gate 4.28 -> 0.48); the GDN
 kernel 1.34 ms in one call against 2.47 ms chained; `sparse_sdpa` at S = 2048 10.99 ms against 13.31 for 16 x 128; the
-KV slab write 0.056 ms against 0.206.  What does not change with the row count is the MoE expert stream (16 calls of
-128 tokens per layer per slab: `moe_compute` refuses more tokens per call on this runtime) and its per-call combine
-tilize and weighted reduce, together about 0.4 ms per prompt token: the slab's floor.
+KV slab write 0.056 ms against 0.206.  What did not change with the row count in these measurements is the MoE
+expert stream (16 calls of 128 tokens per layer per slab, the most the kernel then admitted per call) and its per-call
+combine tilize and weighted reduce, together about 0.4 ms per prompt token: the slab's floor at the time.  The
+tables of this section and the next were measured in that form; *The routed experts in one call* below is the
+default since 2026-09-25 and lowers the floor.
 
 Measured end to end on 4x p150 (2026-09-09, 32k context; the 6942-token prompt is 3 slabs, 6 long chunks, 2 short
 chunks and a 30-row tail, so its rate blends the slab's with the remainder's):
@@ -102,6 +106,57 @@ bank at any context.
 Memory: the slab state adds about 200 MB per device at 32k (one set of GDN pass buffers shared by the 35 GDN layers,
 the PLE rows, the QSA slab constants and kept rows, the slab trace); the transients inside a layer peak around
 150 MB (about 350 MB at 256k, where the score all-reduce per 512-row block is the largest).
+
+## The routed experts in one call (`QWEN38_MOE_SLAB_ONE_CALL`, `QWEN38_MOE_SLAB_RINGS`)
+
+Since 2026-09-25 the slab routes all of its rows through one `moe_compute` call per layer (`QWEN38_MOE_SLAB_ONE_CALL`
+unset or `1`) on the op's local output path: each expert's tokens are packed into 32-row chunks once per slab (223
+chunks per layer per device on natural text against 745 in 128-row blocks), the op writes each token's expert output
+straight into the slab's `[10, 2048, 2560]` page, and the weighted reduce runs over that page in 512-row blocks.  The
+rows of the experts a device does not hold are not zero-filled: the page is zero at allocation and only ever holds
+finite expert outputs, which the reduce multiplies by an exact 0 where unowned.  The one call is bitwise the 16 x
+128-row blocks: on 4x p150 the twelve acceptance records, the 3232 agreement rows and the four long-prompt completions
+are identical at three heads.  `QWEN38_MOE_SLAB_ONE_CALL=0` restores the blocks.
+
+Per device, per layer, per 2048-row slab on one p150 with a captured natural-text routing, the expert stream takes
+3.25 ms in one call against 13.45 ms in the 16 calls.  Under the device profiler on the 4-chip line (P = 0, a 2048-row
+slab of a 32k record, one chip) the slab's kernel time falls from 1425.3 ms (`moe_compute` 510.1 ms over 768 calls,
+19,161 programs) to 1044.9 ms with the one call (`moe_compute` 158.7 ms over 48 calls, 13,401 programs; -26.7 percent,
+1,426 -> 1,945 prompt tokens per second of kernel time) and to 971.4 ms with two rings (`moe_compute` 98.3 ms; -31.8
+percent, 2,092 tokens per second).  Beside `moe_compute` the one call saves the per-block combine tilize (-25.6 ms,
+988 -> 412 calls) and the combine reduce-scatter (-21.9 ms; -35.5 with two rings) and adds 21.3 ms of `slice` (the
+reduce's fewer, larger k-strided slices of the one-call page); the page costs 12.2 MB more DRAM per bank.  Served
+(4x p150, 2026-09-25, 32k context, natural-text prompts, `max_tokens` 64, TTFT the request's time to its first token
+and the rate the server's prefill ms per prompt token):
+
+| prompt tokens | 16 x 128-row blocks | one call, one ring (`QWEN38_MOE_SLAB_RINGS=0`) | one call, two rings (the default) |
+|---|---|---|---|
+| 2,118 | | 1.59 s / 0.736 | 1.54 s / 0.712 |
+| 2,764 | | 2.40 s / 0.855 | 2.31 s / 0.826 |
+| 25,546 | | 14.75 s / 0.576 | 13.90 s / 0.543 |
+| 31,716 | 24.73 s / 0.779 | 18.09 s / 0.569 | 17.06 s / 0.537 |
+
+At 32k the one call on one ring takes 27 percent less time per prompt token than the blocks and the two rings 31
+percent less (the blocks were measured at the longest prompt only in this pass).  The line gate of 2026-09-25 with the
+ring exchange's backpressure credit in place (the served kernels of this landing) measured, per 2048-row slab under
+the profiler, 1041.7 ms of kernel time on one ring (1,951 prompt tokens per second) and 971.6 ms on two rings
+(2,090); served, 31,716 tokens reached their first token in 18.03 s (one ring) and 17.04 s (two rings), 2,118 tokens in
+1.58 and 1.53 s; the acceptance records, the agreement rows and the completions were identical across the blocks, the
+one ring and the two rings, and the decode after the prefill identical to the lineage's own run.
+
+`QWEN38_MOE_SLAB_RINGS` selects how the one call streams the expert weights; only the one-call slab reads it, the
+32- and 128-row chunks and decode never do.  Two rings are the default since 2026-09-25 (the ring exchange's
+backpressure credit landed the same day); `QWEN38_MOE_SLAB_RINGS=0` restores one ring:
+
+- `2` (unset): the chunks are split over two rings of cores, each reading the slices of the experts it owns.
+  Bitwise on the 4-chip line at 32k in three runs (the acceptance records, agreement rows and completions identical
+  to the one-ring form's); 73.5 ms less kernel time per slab under the profiler (971.4 against 1044.9 ms);
+- `0`: the op's one-ring, three-slot weight stream (the form the one call was first gated with);
+- `1`: one ring with each expert's weight slice read from DRAM once per slab (a replay ring); bitwise the one-ring
+  stream on one die, not measured on the 4-chip line;
+- `3`: refused by the switch.  The op implements three rings, but on the 4-chip line their output was
+  nondeterministic (2026-09-25: two runs of the same prompts differed from each other and from the default in
+  different places while every other form was identical); the cause is under investigation.
 
 ## Glue forms (`QWEN38_PREFILL_GLUE`)
 
@@ -162,7 +217,9 @@ models/demos/blackhole/qwen38_flash_next/tools/run_qwen38_chat_server.sh --profi
 ```
 
 The first start compiles the slab body's programs in the warm pass (an eager slab from the reset state) and captures
-its trace after the 128-row chunk trace; `/health` reports `prefill_slab_rows`.
+its trace after the 128-row chunk trace; `/health` reports `prefill_slab_rows`.  `QWEN38_MOE_SLAB_ONE_CALL=0` in the
+server's environment restores the 16 x 128-row expert calls, `QWEN38_MOE_SLAB_RINGS=0` restores one ring for the
+one call; both are read when the slab's layer instances are built, so they take effect at the next start.
 
 ### The dense-linear switches
 

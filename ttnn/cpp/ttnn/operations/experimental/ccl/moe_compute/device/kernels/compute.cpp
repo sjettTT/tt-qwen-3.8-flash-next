@@ -183,6 +183,12 @@ void kernel_main() {
 
     // For synchronization with tilize cores
     constexpr uint32_t tokens_per_chunk = get_named_compile_time_arg_val("tokens_per_chunk");
+    // Chunk g arrives in half g % chunk_halves of cb_s2c_in (2 halves today, R + 1 with R prefill rings)
+    constexpr uint32_t chunk_halves = get_named_compile_time_arg_val("chunk_halves");
+    // Chunk ownership over the prefill rings: every role derives the same table from the per-expert counts
+    // (moe_ring::rings::ChunkOwners); one ring today, so every chunk is this core's.
+    constexpr uint32_t prefill_rings = get_named_compile_time_arg_val("prefill_rings");
+    constexpr uint32_t num_rings = prefill_rings < 2 ? 1u : prefill_rings;
 
     // Run-time arguments
     uint32_t argidx = 0;
@@ -195,6 +201,9 @@ void kernel_main() {
     const auto ring_core_id = get_arg_val<uint32_t>(argidx++);
     [[maybe_unused]] const auto ring_neighbor_physical_x = get_arg_val<uint32_t>(argidx++);
     [[maybe_unused]] const auto ring_neighbor_physical_y = get_arg_val<uint32_t>(argidx++);
+    const auto ring_index = get_arg_val<uint32_t>(argidx++);
+    [[maybe_unused]] const auto ring_predecessor_physical_x = get_arg_val<uint32_t>(argidx++);
+    [[maybe_unused]] const auto ring_predecessor_physical_y = get_arg_val<uint32_t>(argidx++);
 
     // CB ids
     constexpr auto cb_s2c_in_id = tt::CBIndex::c_0;     // tilize_output_cb_id
@@ -318,8 +327,7 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* num_tokens_per_expert_ptr =
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cb_w2c_md_read_ptr[0]);
 
-    // Value we wait on that indicates the next chunk of tiles have arrived from the tilize cores
-    uint32_t matmul_chunk_ready_semaphore_wait_value = 1;
+    // The tilize cores' chunk-ready count is the number of chunks delivered: chunk g has arrived at g + 1
     uint32_t matmul_chunk_ready_semaphore_addr = cb_w2c_md_read_ptr[1];
 
     // Zero out dest registers
@@ -329,12 +337,25 @@ void kernel_main() {
     // Expert loop
     //-------------------------------------------------------------------------
 
-    // This decides which half of the buffer will have the valid data sent by tilize cores
-    bool use_second_half_buffer = false;
+    // Chunks are numbered in feed order over all experts; chunk g sits in half g % chunk_halves of the buffer.
+    uint32_t chunk_index = 0;
+    moe_ring::rings::ChunkOwners<num_rings> owners;
     for (uint32_t expert_id = 0; expert_id < num_experts; ++expert_id) {
         const uint32_t num_tokens = num_tokens_per_expert_ptr[expert_id];
         const uint32_t num_expert_chunks = (num_tokens + tokens_per_chunk - 1) / tokens_per_chunk;
+        owners.begin_expert(num_expert_chunks);
         for (uint32_t chunk = 0; chunk < num_expert_chunks; ++chunk) {
+            const uint32_t chunk_g = chunk_index++;
+            if (owners.owner(chunk) != ring_index) {
+                // Another ring's chunk: it lands in this core's buffer too, but nothing here reads it. The W2 output
+                // staging (cb_c2s_out) is the same L1 as the input halves, so its pointer must stay in step with the
+                // input half g % chunk_halves: an empty push here, matched by dm1's empty pop, keeps every chunk's
+                // output over its own (consumed) input and never over a later chunk's pending input.
+                cb_c2s_out.reserve_back(num_w0_w1_tiles_h);
+                cb_c2s_out.push_back(num_w0_w1_tiles_h);
+                continue;
+            }
+            const uint32_t chunk_half = chunk_g % chunk_halves;
             // GELU re-inits its SFPU LUT inside pack_compute_activation on every iteration (the
             // trailing MUL there clobbers it), so it's its own initializer — skip the per-chunk
             // init for GELU to avoid a redundant gelu_init. SILU/SWIGLU init once here.
@@ -349,9 +370,15 @@ void kernel_main() {
             // Wait for next chunk of tiles to arrive from the tilize cores
             // Min to allow tilize cores to send increment for second expert
             // while first expert still being processed
-            ::detail::noc_semaphore_wait_min(
-                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(matmul_chunk_ready_semaphore_addr),
-                matmul_chunk_ready_semaphore_wait_value++);
+            // Study zones (MOE_ZONES): this chunk's wait for the feed and its compute body
+            const bool zone_on = moe_ring::zones::in_window(chunk_g);
+            {
+                MOE_ZONE_IF(zone_on, "mz_m_wait_chunk");
+                ::detail::noc_semaphore_wait_min(
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(matmul_chunk_ready_semaphore_addr), chunk_g + 1);
+            }
+            MOE_ZONE_IF(zone_on, "mz_m_body");
+            MOE_STUDY_DELAY(M_BEFORE_W0W1);
 
             //---------------------------------------------------------------------
             // Compute in @ {W0,W1}
@@ -366,7 +393,7 @@ void kernel_main() {
             const uint32_t prod_tiles_per_step = Cfg::w0_w1_prod_cols(ring_core_id, is_shared_expert);
             const uint32_t prod_pair_tiles = prod_tiles_per_step & ~1u;
             for (uint32_t tile_id = 0; tile_id < prod_pair_tiles; tile_id += 2) {
-                uint32_t in0_index = use_second_half_buffer ? num_w0_w1_tiles_h : 0;
+                uint32_t in0_index = chunk_half * num_w0_w1_tiles_h;
 
                 tile_regs_acquire();
                 [[maybe_unused]] uint32_t k_tracker = 0;
@@ -449,7 +476,7 @@ void kernel_main() {
                     /*ct_dim=*/moe_ring::W0_W1_HALF_BLOCK_TILES_W,
                     /*rt_dim=*/1,
                     /*kt_dim=*/1);
-                uint32_t in0_index = use_second_half_buffer ? num_w0_w1_tiles_h : 0;
+                uint32_t in0_index = chunk_half * num_w0_w1_tiles_h;
 
                 tile_regs_acquire();
                 [[maybe_unused]] uint32_t k_tracker = 0;
@@ -555,6 +582,7 @@ void kernel_main() {
                 /*full_ct_dim=*/Cfg::w2_tiles_per_expert_w>(cb_c2s_out_id);
 
             for (uint32_t iter = 0; iter < Cfg::num_a2a_iters; ++iter) {
+                MOE_ZONE_IF(zone_on, "mz_m_a2a_iter");
                 // Half-width last iteration (non-default transaction size): 2 output tiles, blocks of 2 wide x
                 // half_block_tiles_h K rows. The pack below stays 4 wide: DEST tiles 2 and 3 are zero
                 // (cleared at the previous release of this DEST half) and dm1 copies only the valid tiles.
@@ -643,8 +671,6 @@ void kernel_main() {
 
             cb_c2s_out.push_back(num_w0_w1_tiles_h);
 
-            // Toggle the buffer to use
-            use_second_half_buffer = !use_second_half_buffer;
             // Restore packer data format for next chunk's activation pipeline (mirrors moe_gpt:342).
             pack_reconfig_data_format(cb_s2c_in2_id);
 

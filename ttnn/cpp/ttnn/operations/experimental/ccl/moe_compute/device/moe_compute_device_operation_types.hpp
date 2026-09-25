@@ -67,6 +67,19 @@ struct MoEComputeParams {
     ttnn::experimental::prim::detail::MoEActivationFunction activation_type =
         ttnn::experimental::prim::detail::MoEActivationFunction::SILU;  // Default to SILU
 
+    // LocalOutput only: dm1 writes the rows of the experts this coordinate does not own as zero before its own
+    // rows (the "every row is what this op wrote" contract). Off, those rows keep the output buffer's previous
+    // contents; a caller whose buffer is zero at allocation and only ever holds finite expert outputs, and whose
+    // reduce multiplies unowned slots by an exact 0, skips k x T row writes per call.
+    bool zero_fill_non_owned_rows = true;
+
+    // LocalOutput only. 0: today's ring (the weight CB holds 3 blocks, dm0 re-streams an expert's slice from DRAM
+    // for every 32-token chunk). 1: the replay ring: the weight CB holds one whole expert slice, dm0 reads it once
+    // per expert and re-presents it to compute for every further chunk without moving a byte. The compute kernel
+    // and its arithmetic are the same, so the pages are the same. (Values above 1 are the R replicated rings of the
+    // prefill mode, not implemented yet.)
+    uint32_t prefill_rings = 0;
+
     // Same value as combine_params->axis (single source of truth when combine_params is set).
     // ComputeOnly path returns nullopt; Full-path call-sites must unwrap with .value().
     std::optional<uint32_t> cluster_axis() const {
@@ -76,7 +89,7 @@ struct MoEComputeParams {
     auto attributes() const {
         using ttsl::reflection::Attribute;
         std::vector<std::tuple<std::string, Attribute>> attrs;
-        attrs.reserve(11);
+        attrs.reserve(13);
         attrs.emplace_back("layer_id", layer_id);
         attrs.emplace_back("output_height_shard_dim", output_height_shard_dim);
         attrs.emplace_back("intermediate_size", intermediate_size);
@@ -88,6 +101,8 @@ struct MoEComputeParams {
         attrs.emplace_back("bh_ring_size", bh_ring_size);
         attrs.emplace_back("combine_params", combine_params);
         attrs.emplace_back("activation_type", static_cast<uint32_t>(activation_type));
+        attrs.emplace_back("zero_fill_non_owned_rows", zero_fill_non_owned_rows);
+        attrs.emplace_back("prefill_rings", prefill_rings);
         return attrs;
     }
 };

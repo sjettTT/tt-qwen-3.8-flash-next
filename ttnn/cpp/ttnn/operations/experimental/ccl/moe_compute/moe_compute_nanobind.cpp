@@ -194,7 +194,16 @@ void bind_moe_compute(nb::module_& mod) {
           rows per shard, DRAM or L1; WIDTH_SHARDED, BLOCK_SHARDED and ND sharding are rejected
           (a row would span several pages). Nothing is staged in the combine cores' L1, so the
           matmul-output tensor (slot 4) is not written on this path. That form does not support
-          shared experts.
+          shared experts. It keeps the routing as packed (token, k slot) lists instead of the fused
+          paths' per-token L1 metadata, so one call admits a whole prefill slab (the token count is
+          bounded by the 24-bit token id of an entry, not by the combine staging): slot 1 is a one-page
+          placeholder and slot 2 the packed page (segment start per local expert, then 4-byte
+          ``(k_slot << 24) | token_id`` entries). ``zero_fill_non_owned_rows=False`` (this path only)
+          skips the zero write of the rows this coordinate's experts do not own: for a caller whose
+          buffer is zero at allocation, only ever holds finite expert outputs, and whose reduce
+          multiplies unowned slots by an exact 0. ``prefill_rings=1`` (this path only) keeps each
+          expert's weight slice resident in the ring cores' L1 for all of the expert's chunks (read
+          from DRAM once per expert instead of once per 32-token chunk); the pages are the same.
 
         With ``compute_only=True``, ``cluster_axis``, ``topology``, ``num_links``,
         ``mux_core_range_set``, ``optional_output_tensor``, and
@@ -279,7 +288,9 @@ void bind_moe_compute(nb::module_& mod) {
         nb::arg("activation_type") = nb::none(),
         nb::arg("compute_only") = false,
         nb::arg("local_combine") = false,
-        nb::arg("num_shared_experts_per_device") = nb::none());
+        nb::arg("num_shared_experts_per_device") = nb::none(),
+        nb::arg("zero_fill_non_owned_rows") = true,
+        nb::arg("prefill_rings") = nb::none());
 }
 
 void bind_get_moe_combine_cores(nb::module_& mod) {

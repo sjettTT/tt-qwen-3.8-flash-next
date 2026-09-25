@@ -56,6 +56,22 @@ void kernel_main() {
     constexpr uint32_t metadata_ready_semaphore_id = get_named_compile_time_arg_val("metadata_ready_semaphore_id");
     constexpr uint32_t per_expert_total_tokens_cb_id = get_named_compile_time_arg_val("per_expert_total_tokens_cb_id");
     constexpr uint32_t tokens_per_chunk = get_named_compile_time_arg_val("tokens_per_chunk");
+    // The replay ring: the weight CB holds one whole expert slice (its capacity equals the slice exactly), read
+    // from DRAM at an expert's first chunk into slot = block-within-slice and re-presented to compute for every
+    // further chunk by a reserve of the whole slice (compute has popped it all) and a push of the whole slice
+    // (the pointers wrap to the base): no byte moves, the consume order is the DRAM order either way.
+    constexpr bool replay_slice = get_named_compile_time_arg_val("replay_slice") == 1;
+    // Chunk ownership over the prefill rings: every role derives the same table from the per-expert counts
+    // (moe_ring::rings::ChunkOwners); one ring today, so every chunk is this core's. With several rings each ring
+    // core reads the slices of the experts it owns chunks of from DRAM itself, as the one-ring replay does: one
+    // exposed read per owned expert on the reading ring (overlapping the other rings' compute), a split expert's
+    // slice read by every ring owning one of its chunks, the cores beside the bank-aligned ring reading at their
+    // bank's second-reader rate. (Ring 0 reading once and forwarding the blocks to the other rings was measured
+    // slower: a credit lockstep at every expert boundary and forward-only reads serialized both rings on one dm0.)
+    constexpr uint32_t prefill_rings = get_named_compile_time_arg_val("prefill_rings");
+    constexpr uint32_t num_rings = prefill_rings < 2 ? 1u : prefill_rings;
+    static_assert(
+        num_rings == 1 || replay_slice, "several rings need the replay ring: one slice read per owned expert");
 
     constexpr auto w0_w1_args = TensorAccessorArgs<0>();
     constexpr auto w2_args = TensorAccessorArgs<w0_w1_args.next_compile_time_args_offset()>();
@@ -76,6 +92,13 @@ void kernel_main() {
     const auto ring_core_id = get_arg_val<uint32_t>(argidx++);
     [[maybe_unused]] const auto ring_neighbor_physical_x = get_arg_val<uint32_t>(argidx++);
     [[maybe_unused]] const auto ring_neighbor_physical_y = get_arg_val<uint32_t>(argidx++);
+    const auto ring_index = get_arg_val<uint32_t>(argidx++);
+    [[maybe_unused]] const auto ring_predecessor_physical_x = get_arg_val<uint32_t>(argidx++);
+    [[maybe_unused]] const auto ring_predecessor_physical_y = get_arg_val<uint32_t>(argidx++);
+    {
+        // Study zones (MOE_ZONES): a tag on the cores of the rings beside ring 0, so the phase table tells them apart
+        MOE_ZONE_IF(ring_index != 0, "mz_d_replica_tag");
+    }
 
     // shard_to_bank translation table: maps shard index -> physical chip DRAM bank id.
     // The host appends `num_banks` entries here. The bank-run loops below derive a
@@ -191,7 +214,7 @@ void kernel_main() {
     const uint32_t w_cb_base_addr = cb_r2c_w0_w1.get_write_ptr();
 
     // Precompute slot addresses (avoid multiply in hot loop)
-    // Each slot holds 2 transactions (one block)
+    // Each slot holds 2 transactions (one block); the replay ring addresses slots by block-within-slice instead.
     uint32_t slot_addr[NUM_SLOTS];
     for (uint32_t slot = 0; slot < NUM_SLOTS; ++slot) {
         slot_addr[slot] = w_cb_base_addr + slot * w0_w1_bytes_per_block;
@@ -205,6 +228,33 @@ void kernel_main() {
     constexpr uint32_t blocks_in_flight = NUM_SLOTS - 1;
     uint32_t trid_to_issue = 1, trid_to_wait = 1, slot_to_issue = 0;
     uint32_t blocks_pending = 0;
+
+    // Where the next block lands: the 3-slot ring today, the block's place in the expert's slice under replay.
+    [[maybe_unused]] uint32_t block_in_slice = 0;
+    auto issue_addr = [&]() -> uint32_t {
+        if constexpr (replay_slice) {
+            return w_cb_base_addr + block_in_slice * w0_w1_bytes_per_block;
+        } else {
+            return slot_addr[slot_to_issue];
+        }
+    };
+    auto advance_issue_slot = [&]() {
+        if constexpr (replay_slice) {
+            ++block_in_slice;
+        } else {
+            ADVANCE_SLOT(slot_to_issue);
+        }
+    };
+    static_assert(w2_tiles_per_block == w0_w1_tiles_per_block, "one block size for both weight streams");
+
+    // A block's DRAM read has completed (its trid barrier): hand it to compute. Issue order is trid order, so the
+    // block that completes is the one issued blocks_pending blocks ago.
+    auto land_block = [&]() {
+        noc_async_read_barrier_with_trid(trid_to_wait);
+        cb_r2c_w0_w1.push_back(w0_w1_tiles_per_block);
+        ADVANCE_TRID(trid_to_wait);
+        --blocks_pending;
+    };
 
     //-------------------------------------------------------------------------
     // Init synchronization with tilize cores
@@ -230,7 +280,9 @@ void kernel_main() {
     //-------------------------------------------------------------------------
 
     // We reserve the blocks issued before the first wait to kick start the pipeline, and then it is steady state
-    cb_r2c_w0_w1.reserve_back(w0_w1_tiles_per_block * (blocks_in_flight - 1));
+    if constexpr (!replay_slice) {
+        cb_r2c_w0_w1.reserve_back(w0_w1_tiles_per_block * (blocks_in_flight - 1));
+    }
 
     // Pre-set state for this ring core's first bank (WH fast path: when
     // pages_per_ring_core_total <= pages_per_bank_total). The bank-run loop below will
@@ -266,8 +318,19 @@ void kernel_main() {
     const uint32_t w2_ring_core_first_global_page =
         ring_core_id * w2_pages_per_ring_core_total + w2_layer_offset_in_ring_core;
 
+    moe_ring::rings::ChunkOwners<num_rings> owners;
+    [[maybe_unused]] uint32_t chunk_g_counter = 0;  // chunks in feed order over all experts (the study zones' window)
     for (uint32_t expert_id = 0; expert_id < num_experts; ++expert_id) {
         uint32_t num_expert_chunks = NUM_CHUNKS_PER_EXPERT[expert_id];
+        owners.begin_expert(num_expert_chunks);
+        uint32_t owned_chunks = 0;
+        for (uint32_t chunk = 0; chunk < num_expert_chunks; ++chunk) {
+            owned_chunks += owners.owner(chunk) == ring_index;
+        }
+        if (owned_chunks == 0) {
+            chunk_g_counter += num_expert_chunks;  // the other rings' chunks keep the feed count in step
+            continue;  // no chunk of this expert on this ring: its weights are not read here
+        }
 
         // Shared experts are TP-split on the intermediate dim and front-packed (real TpNt slice at
         // the front of each core's full-Nt shard, zeros after -- add_shared_expert_weights). Read
@@ -286,7 +349,16 @@ void kernel_main() {
         const uint32_t w2_slice_first_global_page =
             w2_ring_core_first_global_page + expert_id * w2_pages_per_logical_shard;
 
-        for (uint32_t chunk = 0; chunk < num_expert_chunks; ++chunk) {
+        [[maybe_unused]] const uint32_t slice_tiles =
+            (w0_w1_blocks_this_expert + Cfg::w2_blocks_per_expert) * w0_w1_tiles_per_block;
+        if constexpr (replay_slice) {
+            // The host sized this CB from the same block arithmetic: a slice that is not exactly the capacity would
+            // leave the pointers mid-buffer after the wrap (watcher builds trap here, others rely on the host fatal).
+            ASSERT(get_local_cb_interface(cb_r2c_w0_w1_id).fifo_num_pages == slice_tiles);
+        }
+        // Read this core's slice of the expert once: W0/W1 blocks then W2 blocks, two DRAM transactions per block,
+        // blocks_in_flight reads outstanding; every completed block goes through land_block (the push to compute).
+        auto issue_slice = [&]() {
             //-------------------------------------------------------------------------
             // Pipelined reading of W0/W1 -- bank-run loop
             //-------------------------------------------------------------------------
@@ -320,10 +392,7 @@ void kernel_main() {
                     noc_async_read_one_packet_with_state_with_trid<
                         /*skip_ptr_update=*/false,
                         /*skip_cmdbuf_chk=*/false>(
-                        get_noc_addr_from_bank_id<true>(bank_id, 0),
-                        in_bank_byte_offset,
-                        slot_addr[slot_to_issue],
-                        trid_to_issue);
+                        get_noc_addr_from_bank_id<true>(bank_id, 0), in_bank_byte_offset, issue_addr(), trid_to_issue);
                     w0_w1_piece_page += w0_w1_tiles_per_txn;
                     if (w0_w1_piece_page == w0_w1_bank_pages_per_expert) {
                         ++w0_w1_shard_idx;
@@ -346,7 +415,7 @@ void kernel_main() {
                         /*skip_cmdbuf_chk=*/false>(
                         get_noc_addr_from_bank_id<true>(bank_id, 0),
                         in_bank_byte_offset,
-                        slot_addr[slot_to_issue] + w0_w1_bytes_per_txn,
+                        issue_addr() + w0_w1_bytes_per_txn,
                         trid_to_issue);
                     w0_w1_piece_page += w0_w1_tiles_per_txn;
                     if (w0_w1_piece_page == w0_w1_bank_pages_per_expert) {
@@ -355,19 +424,16 @@ void kernel_main() {
                     }
                 }
 
-                ADVANCE_SLOT(slot_to_issue);
+                advance_issue_slot();
                 ADVANCE_TRID(trid_to_issue);
 
                 // While the pipeline fills (the first blocks_in_flight - 1 blocks) nothing is waited on
                 if (++blocks_pending == blocks_in_flight) {
-                    noc_async_read_barrier_with_trid(trid_to_wait);
-                    cb_r2c_w0_w1.push_back(w0_w1_tiles_per_block);
-
-                    ADVANCE_TRID(trid_to_wait);
-                    --blocks_pending;
-
+                    land_block();
                     // Reserve for next block (the blocks in flight and the next one)
-                    cb_r2c_w0_w1.reserve_back(w0_w1_tiles_per_block * blocks_in_flight);
+                    if constexpr (!replay_slice) {
+                        cb_r2c_w0_w1.reserve_back(w0_w1_tiles_per_block * blocks_in_flight);
+                    }
                 }
             }
 
@@ -396,10 +462,7 @@ void kernel_main() {
                     noc_async_read_one_packet_with_state_with_trid<
                         /*skip_ptr_update=*/false,
                         /*skip_cmdbuf_chk=*/false>(
-                        get_noc_addr_from_bank_id<true>(bank_id, 0),
-                        in_bank_byte_offset,
-                        slot_addr[slot_to_issue],
-                        trid_to_issue);
+                        get_noc_addr_from_bank_id<true>(bank_id, 0), in_bank_byte_offset, issue_addr(), trid_to_issue);
                     w2_global_page += w2_tiles_per_txn;
                 }
                 // Second transaction (may cross a bank boundary):
@@ -418,37 +481,71 @@ void kernel_main() {
                         /*skip_cmdbuf_chk=*/false>(
                         get_noc_addr_from_bank_id<true>(bank_id, 0),
                         in_bank_byte_offset,
-                        slot_addr[slot_to_issue] + w2_bytes_per_txn,
+                        issue_addr() + w2_bytes_per_txn,
                         trid_to_issue);
                     w2_global_page += w2_tiles_per_txn;
                 }
 
-                ADVANCE_SLOT(slot_to_issue);
+                advance_issue_slot();
                 ADVANCE_TRID(trid_to_issue);
 
                 if (++blocks_pending == blocks_in_flight) {
-                    noc_async_read_barrier_with_trid(trid_to_wait);
-                    cb_r2c_w2.push_back(w2_tiles_per_block);
-
-                    ADVANCE_TRID(trid_to_wait);
-                    --blocks_pending;
-
+                    land_block();
                     // Reserve for next block (the blocks in flight and the next one)
-                    cb_r2c_w2.reserve_back(w2_tiles_per_block * blocks_in_flight);
+                    if constexpr (!replay_slice) {
+                        cb_r2c_w2.reserve_back(w2_tiles_per_block * blocks_in_flight);
+                    }
                 }
             }
+
+            if constexpr (replay_slice) {
+                // The whole slice is resident before it can be replayed: land the blocks still in flight.
+                while (blocks_pending > 0) {
+                    land_block();
+                }
+            }
+        };
+
+        uint32_t owned_seen = 0;
+        for (uint32_t chunk = 0; chunk < num_expert_chunks; ++chunk) {
+            [[maybe_unused]] const uint32_t chunk_g = chunk_g_counter++;
+            if (owners.owner(chunk) != ring_index) {
+                continue;  // another ring's chunk
+            }
+            const bool first_owned_chunk = owned_seen++ == 0;
+            const bool zone_on = moe_ring::zones::in_window(chunk_g);
+            if constexpr (replay_slice) {
+                // Compute has popped the whole slice of the previous chunk (or the previous expert): the CB is empty.
+                // At an expert boundary this also holds the next expert's first DRAM read until compute has popped the
+                // previous slice (the 3-slot stream prefetches across it): about one DRAM latency per active expert,
+                // bounded; a second slice buffer would remove it (R >= 2 work, not here).
+                {
+                    MOE_ZONE_IF(zone_on, "mz_d_slice_reserve");
+                    cb_r2c_w0_w1.reserve_back(slice_tiles);
+                }
+                if (!first_owned_chunk) {
+                    // Re-present the resident slice: the pointers wrap to the base, the consume order is unchanged.
+                    cb_r2c_w0_w1.push_back(slice_tiles);
+                    continue;
+                }
+                block_in_slice = 0;
+            }
+            MOE_ZONE_IF(zone_on, "mz_d_issue_slice");
+            MOE_STUDY_DELAY(D_BEFORE_SLICE);
+            issue_slice();
         }
     }
 
-    // Drain the pipeline - the blocks still in flight
-    for (; blocks_pending > 0; --blocks_pending) {
-        noc_async_read_barrier_with_trid(trid_to_wait);
-        cb_r2c_w2.push_back(w2_tiles_per_block);
-        ADVANCE_TRID(trid_to_wait);
+    // Drain the pipeline - the blocks still in flight (none on the replay ring: every slice was drained)
+    while (blocks_pending > 0) {
+        land_block();
     }
 
     // We have one extra slot reserved, which we won't use.
-    // For CB hygiene, we can push it back.
+    // For CB hygiene, we can push it back (compute pops one block at its end).
+    if constexpr (replay_slice) {
+        cb_r2c_w2.reserve_back(w2_tiles_per_block);
+    }
     cb_r2c_w2.push_back(w2_tiles_per_block);
 }
 

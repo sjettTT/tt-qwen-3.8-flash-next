@@ -25,7 +25,14 @@ namespace ttnn::experimental::prim {
 namespace detail {
 
 constexpr auto TOKEN_SIZE = 32;  // This does not mean we only support 32 tokens, just hardcoding the shared buffer size
-constexpr auto DOUBLE_BUFFER_SIZE = 2;
+// prefill_rings admitted today: the replay ring (1), two or three rings (2, 3; each ring core reads the slices of the
+// experts it owns chunks of). The output specs are computed before the validation runs, so they must not size buffers
+// for a ring count the validation refuses.
+constexpr uint32_t ADMITTED_PREFILL_RINGS = 3;
+constexpr uint32_t admitted_prefill_rings(uint32_t prefill_rings) {
+    // a refused count sizes nothing: today's two halves, and the validation says why it is refused
+    return prefill_rings <= ADMITTED_PREFILL_RINGS ? prefill_rings : 0;
+}
 
 // LocalOutput: dm1 addresses the [k, T, H] output through a TensorAccessor built from the actual
 // buffer, one page per token row (2 x H bytes) plus the column offset of its slice. A row-major
@@ -164,10 +171,45 @@ void MoEComputeDeviceOperation::validate_on_program_cache_miss(
     const auto combine_token_parallel_cores = args.num_token_parallel_cores;
     const auto combine_data_parallel_cores = args.num_data_parallel_cores;
 
-    // make sure the shared L1 buffer is sufficiently large enough to contain all output tokens
-    const auto max_tokens = detail::TOKEN_SIZE * combine_data_parallel_cores * combine_token_parallel_cores;
     TT_FATAL(
-        max_tokens >= total_tokens, "Too many tokens in input, got: {} but expected max: {}", total_tokens, max_tokens);
+        args.zero_fill_non_owned_rows || args.path == MoEComputePath::LocalOutput,
+        "zero_fill_non_owned_rows=False applies to the local output path only (a cluster_axis of extent 1)");
+    TT_FATAL(
+        args.prefill_rings == 0 || args.path == MoEComputePath::LocalOutput,
+        "prefill_rings applies to the local output path only (a cluster_axis of extent 1)");
+    TT_FATAL(
+        args.prefill_rings <= detail::ADMITTED_PREFILL_RINGS,
+        "prefill_rings={}: one replay ring (1), two or three rings (2, 3) are implemented",
+        args.prefill_rings);
+    TT_FATAL(
+        args.prefill_rings < 2 || !args.zero_fill_non_owned_rows,
+        "prefill_rings={}: the zero fill of the unowned rows is one ring's job and would race the other rings' "
+        "row writes; pass zero_fill_non_owned_rows=False",
+        args.prefill_rings);
+    if (args.path == MoEComputePath::LocalOutput) {
+        // Nothing is staged in the combine cores' L1 on this path and the tilize cores keep the routing as packed
+        // (token, k slot) lists (moe_ring::token_list), so the token count is bounded by the entry format, not by
+        // the shared buffer.
+        const auto select_experts_k = tensor_args.tilize_expert_indices_tensor.logical_shape()[-1];
+        TT_FATAL(
+            total_tokens <= moe_ring::token_list::TOKEN_MASK + 1,
+            "moe_compute over a mesh axis of extent 1 packs the token id into {} bits; got {} tokens",
+            moe_ring::token_list::TOKEN_BITS,
+            total_tokens);
+        TT_FATAL(
+            select_experts_k <= moe_ring::token_list::MAX_K_SLOTS,
+            "moe_compute over a mesh axis of extent 1 packs the k slot into {} bits; got k = {}",
+            32 - moe_ring::token_list::TOKEN_BITS,
+            select_experts_k);
+    } else {
+        // make sure the shared L1 buffer is sufficiently large enough to contain all output tokens
+        const auto max_tokens = detail::TOKEN_SIZE * combine_data_parallel_cores * combine_token_parallel_cores;
+        TT_FATAL(
+            max_tokens >= total_tokens,
+            "Too many tokens in input, got: {} but expected max: {}",
+            total_tokens,
+            max_tokens);
+    }
 
     // Mode-specific validation of combine_params and optional_output_tensor.
     // - ComputeOnly: no combine_params, no optional_output_tensor (5 outputs).
@@ -373,7 +415,8 @@ void MoEComputeDeviceOperation::validate_on_program_cache_miss(
         combine_data_parallel_cores,
         hidden_size,
         validate_mux_cores,
-        args.bh_ring_size);
+        args.bh_ring_size,
+        args.prefill_rings);
 }
 
 MoEComputeDeviceOperation::spec_return_value_t MoEComputeDeviceOperation::compute_output_specs(
@@ -461,12 +504,16 @@ MoEComputeDeviceOperation::spec_return_value_t MoEComputeDeviceOperation::comput
         tt::tt_metal::BufferType::L1,
         tt::tt_metal::ShardSpec(
             shard_cores,
-            {detail::DOUBLE_BUFFER_SIZE * detail::TOKEN_SIZE, hidden_size},
+            {moe_ring::rings::chunk_halves(detail::admitted_prefill_rings(args.prefill_rings)) * detail::TOKEN_SIZE,
+             hidden_size},
             tt::tt_metal::ShardOrientation::ROW_MAJOR),
     };
 
-    auto tilize_output_shape =
-        ttnn::Shape({shard_cores.num_cores(), detail::DOUBLE_BUFFER_SIZE, detail::TOKEN_SIZE, hidden_size});
+    auto tilize_output_shape = ttnn::Shape(
+        {shard_cores.num_cores(),
+         moe_ring::rings::chunk_halves(detail::admitted_prefill_rings(args.prefill_rings)),
+         detail::TOKEN_SIZE,
+         hidden_size});
     auto tilize_output_spec = tt::tt_metal::TensorSpec(
         Shape(tilize_output_shape),
         tt::tt_metal::TensorLayout(
@@ -506,6 +553,20 @@ MoEComputeDeviceOperation::spec_return_value_t MoEComputeDeviceOperation::comput
     TT_FATAL(args.combine_params.has_value(), "combine_params required when path is not ComputeOnly");
 
     if (args.path == MoEComputePath::LocalOutput) {
+        // No combine reads the routing on this path: output 1 is a one-page placeholder and output 2 the packed
+        // token-list page (moe_ring::token_list) dm1 fetches one chunk at a time; neither scales L1 with the tokens.
+        const auto placeholder_row_words = l1_alignment / sizeof(uint32_t);
+        const auto tilize_expert_activation_placeholder_spec = TensorSpec(
+            ttnn::Shape({1, placeholder_row_words}),
+            TensorLayout(DataType::UINT32, PageConfig(Layout::ROW_MAJOR), ttnn::DRAM_MEMORY_CONFIG));
+        const auto select_experts_k = tensor_args.tilize_expert_indices_tensor.logical_shape()[-1];
+        const auto packed_token_list_spec = TensorSpec(
+            ttnn::Shape(
+                {1,
+                 moe_ring::token_list::page_words(
+                     total_tokens, select_experts_k, experts_per_device, moe_ring::TOKENS_PER_CHUNK)}),
+            TensorLayout(DataType::UINT32, PageConfig(Layout::ROW_MAJOR), ttnn::DRAM_MEMORY_CONFIG));
+
         // Output 5: the final [k, T, H] row-major tensor that dm1 writes directly (T is the whole
         // replicated token set: the axis has extent 1). Same shape the combine returns on that axis.
         const auto& combine_params = *args.combine_params;
@@ -516,8 +577,8 @@ MoEComputeDeviceOperation::spec_return_value_t MoEComputeDeviceOperation::comput
                 tilize_input_tensor.dtype(), PageConfig(Layout::ROW_MAJOR), combine_params.output_memory_config));
         return {
             tilize_per_expert_total_tokens_spec,
-            tilize_expert_activation_spec,
-            tilize_e_t_spec,
+            tilize_expert_activation_placeholder_spec,
+            packed_token_list_spec,
             tilize_output_spec,
             matmul_output_spec,
             local_output_spec};
@@ -620,7 +681,9 @@ std::vector<ttnn::Tensor> moe_compute(
     const bool compute_only,
     const bool local_combine,
     const std::optional<uint32_t>& bh_ring_size,
-    const std::optional<uint32_t>& num_shared_experts_per_device) {
+    const std::optional<uint32_t>& num_shared_experts_per_device,
+    const bool zero_fill_non_owned_rows,
+    const std::optional<uint32_t>& prefill_rings) {
     using OperationType = ttnn::experimental::prim::MoEComputeDeviceOperation;
 
     const auto& input_shape = tilize_input_tensor.tensor_spec().logical_shape();
@@ -841,7 +904,9 @@ std::vector<ttnn::Tensor> moe_compute(
                                    : experimental::prim::MoEComputePath::FullCcl,
             .bh_ring_size = ring_n,
             .combine_params = combine_params,
-            .activation_type = activation_type.value_or(experimental::prim::detail::MoEActivationFunction::SILU)},
+            .activation_type = activation_type.value_or(experimental::prim::detail::MoEActivationFunction::SILU),
+            .zero_fill_non_owned_rows = zero_fill_non_owned_rows,
+            .prefill_rings = prefill_rings.value_or(0)},
         OperationType::tensor_args_t{
             .tilize_input_tensor = tilize_input_tensor,
             .tilize_expert_indices_tensor = tilize_expert_indices_tensor,

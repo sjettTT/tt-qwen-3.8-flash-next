@@ -95,7 +95,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
     Qwen38ResidentContext,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
-from models.demos.blackhole.qwen38_flash_next.ttnn.moe import moe_local_output_enabled
+from models.demos.blackhole.qwen38_flash_next.ttnn.moe import admit_slab_moe_switches, moe_local_output_enabled
 
 MODEL_ID = "Qwen/Qwen3.8-Flash-Next"
 ACCEPTANCE_CONTINUATION = 96
@@ -1638,6 +1638,13 @@ def main() -> int:
         raise SystemExit(f"--prefill-slab takes a multiple of 128 in 256..4096, got {args.prefill_slab}")
     if args.prefill_slab is not None and args.mtp is not None:
         raise SystemExit("--prefill-slab and --mtp are alternatives (the MTP chain prefills in 32-row chunks)")
+    if args.prefill_slab is not None:
+        # the slab MoE switches (QWEN38_MOE_SLAB_ONE_CALL / QWEN38_MOE_SLAB_RINGS) are admitted here, before any
+        # device is opened: a refused ring count is a start-up error, not a poisoned model 79 s into the warm pass
+        try:
+            admit_slab_moe_switches()
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
     try:
         hardware_profile = hardware_profiles.resolve_hardware_profile(args.hardware_profile)
     except hardware_profiles.HardwareProfileError as error:

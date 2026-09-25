@@ -568,7 +568,9 @@ def test_long_chunk_source_pins() -> None:
     )
     assert not hasattr(gdn_module.Qwen38TTNNGDN, "_fold_head_rows_long")
     routed = inspect.getsource(moe_module.Qwen38TTNNMoE._routed_partial)
-    assert "if self.rows != LONG_PREFILL_CHUNK_ROWS:\n            zeroed = ttnn.fill(" in routed
+    assert (
+        "if self.rows != LONG_PREFILL_CHUNK_ROWS and not self.slab_one_call:\n            zeroed = ttnn.fill(" in routed
+    )
     # The long chunk's combine is tilized as one [1280, 2560] tile grid and viewed back as the reduce's rank-4 input.
     assert "ttnn.reshape(outputs[5], (TOP_K * self.rows, HIDDEN_SIZE))" in routed
     assert "ttnn.experimental.view(combine_flat, self.row_contract.fast_reduce_input)" in routed

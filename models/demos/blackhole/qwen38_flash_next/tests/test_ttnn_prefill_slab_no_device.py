@@ -21,6 +21,8 @@ from models.demos.blackhole.qwen38_flash_next.ttnn import contracts as contracts
 from models.demos.blackhole.qwen38_flash_next.ttnn import decode_matmul as decode_matmul_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import gr as gr_module
+from models.demos.blackhole.qwen38_flash_next.ttnn import layer as layer_module
+from models.demos.blackhole.qwen38_flash_next.ttnn import model as model_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import moe as moe_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import qsa as qsa_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
@@ -40,7 +42,10 @@ BLOCKS = 8192  # the 32k context's compressed blocks
 # --------------------------------------------------------------------------- contracts
 
 
-def test_slab_row_contract() -> None:
+def test_slab_row_contract(monkeypatch) -> None:
+    monkeypatch.setenv(
+        moe_module.MOE_SLAB_ONE_CALL_ENV, "0"
+    )  # the 128-row blocks' contract; the default is tested below
     assert (MIN_SLAB_ROWS, MAX_SLAB_ROWS, DEFAULT_SLAB_ROWS) == (256, 4096, 2048)
     assert CHUNK_ROW_COUNTS == (32, 128)  # the chunk forms are untouched
     for rows in (256, 512, 1024, 2048, 4096):
@@ -62,7 +67,231 @@ def test_slab_row_contract() -> None:
         moe_module.Qwen38TTNNMoERowContract(SLAB)
 
 
+def test_slab_one_call_switch(monkeypatch) -> None:
+    """QWEN38_MOE_SLAB_ONE_CALL (unset = 1) makes a slab instance route its rows in one moe_compute call on the local
+    output path (height shard 1: nothing is staged) with the fill of unowned rows off, and reduce in 512-row blocks;
+    0 restores the 16 x 128-row blocks; the chunk forms are untouched either way."""
+    monkeypatch.delenv(moe_module.MOE_SLAB_ONE_CALL_ENV, raising=False)
+    assert moe_module.moe_slab_one_call_enabled()
+    assert moe_module.routed_tokens_per_call_for(SLAB) == SLAB and moe_module.routed_tokens_per_call_for(4096) == 4096
+    assert moe_module.routed_tokens_per_call_for(128) == 128 and moe_module.routed_tokens_per_call_for(32) == 32
+    for ring in (7, 8):
+        assert moe_module.moe_compute_output_height_shard_dim(SLAB, matmul_ring_size=ring) == 1
+    monkeypatch.setenv(moe_module.MOE_SLAB_ONE_CALL_ENV, "1")
+    assert moe_module.moe_slab_one_call_enabled() and moe_module.routed_tokens_per_call_for(SLAB) == SLAB
+    monkeypatch.setenv(moe_module.MOE_SLAB_ONE_CALL_ENV, "2")
+    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
+        moe_module.moe_slab_one_call_enabled()
+    monkeypatch.setenv(moe_module.MOE_SLAB_ONE_CALL_ENV, "0")
+    assert not moe_module.moe_slab_one_call_enabled() and moe_module.routed_tokens_per_call_for(SLAB) == 128
+    assert moe_module.routed_tokens_per_call_for(128) == 128 and moe_module.routed_tokens_per_call_for(32) == 32
+    monkeypatch.delenv(moe_module.MOE_SLAB_ONE_CALL_ENV)
+    # the one-call slab's ring mode: unset = 2 (two rings, the default since 2026-09-25), 0 and 1 admitted (one
+    # ring), 3 refused with the line's reason (the op implements it), anything else refused as unknown
+    monkeypatch.delenv(moe_module.MOE_SLAB_RINGS_ENV, raising=False)
+    assert moe_module.moe_slab_prefill_rings() == 2 == moe_module.MOE_SLAB_RINGS_DEFAULT
+    assert moe_module.MOE_SLAB_RINGS_ADMITTED == (0, 1, 2)
+    for value in ("0", "1", "2"):
+        monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, value)
+        assert moe_module.moe_slab_prefill_rings() == int(value)
+    monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "3")
+    with pytest.raises(ValueError, match="nondeterministic on the 4-chip line"):  # allow-pytest.raises: contract
+        moe_module.moe_slab_prefill_rings()
+    assert moe_module.MOE_SLAB_RINGS_REFUSED == {
+        3: "nondeterministic on the 4-chip line (2026-09-25); under investigation"
+    }
+    monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "4")
+    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
+        moe_module.moe_slab_prefill_rings()
+    monkeypatch.delenv(moe_module.MOE_SLAB_RINGS_ENV)
+    # the kwarg reaches the op only from the one-call slab; every other instance passes None (the op's default)
+    partial = inspect.getsource(moe_module.Qwen38TTNNMoE._routed_partial)
+    assert "prefill_rings=self.prefill_rings," in partial
+    prop = inspect.getsource(moe_module.Qwen38TTNNMoE.prefill_rings.fget)
+    assert "moe_slab_prefill_rings() if self.slab_one_call else 0" in prop and "return rings if rings else None" in prop
+    assert moe_module.SLAB_REDUCE_BLOCK_ROWS == 512 and SLAB % moe_module.SLAB_REDUCE_BLOCK_ROWS == 0
+    # a slab whose rows the 512-row blocks do not divide is refused at construction, not at its first slice
+    init = inspect.getsource(moe_module.Qwen38TTNNMoE.__init__)
+    assert "if self.slab_one_call and self.rows % SLAB_REDUCE_BLOCK_ROWS:" in init
+    assert [rows for rows in range(256, 4097, 128) if rows % moe_module.SLAB_REDUCE_BLOCK_ROWS] == [
+        256,
+        384,
+        640,
+        768,
+        896,
+        1152,
+        1280,
+        1408,
+        1664,
+        1792,
+        1920,
+        2176,
+        2304,
+        2432,
+        2688,
+        2816,
+        2944,
+        3200,
+        3328,
+        3456,
+        3712,
+        3840,
+        3968,
+    ]
+    routed = inspect.getsource(moe_module.Qwen38TTNNMoE._routed_partial)
+    assert "zero_fill_non_owned_rows=self.zero_fill_non_owned_rows" in routed
+    assert "if self.slab and not self.slab_one_call:" in routed and "if self.slab_one_call:" in routed
+    blocks = inspect.getsource(moe_module.Qwen38TTNNMoE._weighted_reduce_slab_blocks)
+    assert blocks.count("deepseek_moe_fast_reduce_nc_fused(") == 1 and "range(0, self.rows, block)" in blocks
+    assert "scores_tensor=ttnn.reshape(scores, (block, 1, 1, TOP_K))" in blocks
+    assert (
+        "one_block = self.rows == block" in blocks
+        and "_deallocate(stack, *(() if one_block else (pages, scores, indices)))" in blocks
+    )
+
+
+class _AliasingTensor:
+    """A stand-in device tensor: ttnn.slice over the full extent and ttnn.concat of one tensor return their input."""
+
+    def __init__(self, shape, name):
+        self.shape, self.name = tuple(shape), name
+
+
+def _slab_reduce_fakes(monkeypatch, rows: int):
+    """_weighted_reduce_slab_blocks on a fake ttnn whose slice/concat alias like the real ones (a full-extent slice and
+    a one-tensor concat return their input); returns the deallocated names and the reduce's call count."""
+    freed, reduced = [], []
+    K, H = moe_module.TOP_K, moe_module.HIDDEN_SIZE
+
+    def slice_(tensor, start, end, memory_config):
+        if start == (0,) * len(start) and tuple(end) == tensor.shape:
+            return tensor  # the alias the real op returns for a full-extent slice
+        return _AliasingTensor(
+            tuple(e - s for s, e in zip(start, end)), f"{tensor.name}[{start[-2] if len(start) > 2 else start[1]}]"
+        )
+
+    def concat(tensors, dim, memory_config):
+        if len(tensors) == 1:
+            return tensors[0]  # the alias the real op returns for one tensor
+        shape = list(tensors[0].shape)
+        shape[dim] = sum(t.shape[dim] for t in tensors)
+        return _AliasingTensor(shape, "concat")
+
+    def reduce_(stack, indices, mapping, **kwargs):
+        reduced.append((stack.name, indices.name, kwargs["scores_tensor"].name))
+        return [_AliasingTensor((1, 1, stack.shape[2], H), f"partial{len(reduced)}")]
+
+    fake_ttnn = SimpleNamespace(
+        DRAM_MEMORY_CONFIG="dram",
+        TILE_LAYOUT="tile",
+        slice=slice_,
+        concat=concat,
+        reshape=lambda tensor, shape: _AliasingTensor(shape, f"reshape({tensor.name})"),
+        to_layout=lambda tensor, layout, memory_config, pad_value: _AliasingTensor(
+            tensor.shape, f"tilized({tensor.name})"
+        ),
+        deallocate=lambda tensor: freed.append(tensor.name),
+        experimental=SimpleNamespace(
+            view=lambda tensor, shape: _AliasingTensor(shape, f"view({tensor.name})"),
+            deepseek_moe_fast_reduce_nc_fused=reduce_,
+        ),
+    )
+    monkeypatch.setattr(moe_module, "ttnn", fake_ttnn)
+    combine = _AliasingTensor((K, rows, H), "combine")
+    routing = SimpleNamespace(
+        scores=_AliasingTensor((1, 1, rows, K), "scores"), indices=_AliasingTensor((1, 1, rows, K), "indices")
+    )
+    marked = []
+    owner = SimpleNamespace(
+        rows=rows,
+        expert_mapping="mapping",
+        compute_config="compute",
+        mesh_contract=SimpleNamespace(mark_local_partial=lambda tensor, **kwargs: marked.append((tensor.name, kwargs))),
+        row_contract=SimpleNamespace(full_hidden=(1, 1, rows, H)),
+    )
+    partial = moe_module.Qwen38TTNNMoE._weighted_reduce_slab_blocks(
+        owner, combine, "full_hidden", routing, lambda phase: None
+    )
+    return SimpleNamespace(partial=partial, freed=freed, reduced=reduced, marked=marked)
+
+
+@pytest.mark.parametrize("rows", [512, 1024, 2048])
+def test_slab_reduce_never_frees_what_it_did_not_create(monkeypatch, rows: int) -> None:
+    """A 512-row slab is one 512-row block: ttnn.slice over the whole [10, 512, 2560] page returns the page itself
+    and ttnn.concat of one partial returns that partial, so the reduce must not free the combine page, the routing's
+    scores / indices or the partial it returns (it did before this fix: the persistent combine buffer was released
+    under the next layer). Larger slabs slice proper sub-ranges and free every block's slices and partials."""
+    result = _slab_reduce_fakes(monkeypatch, rows)
+    blocks = rows // moe_module.SLAB_REDUCE_BLOCK_ROWS
+    assert len(result.reduced) == blocks
+    assert result.partial.shape == (1, 1, rows, moe_module.HIDDEN_SIZE)
+    assert result.marked and result.marked[0][0] == result.partial.name
+    for name in ("combine", "scores", "indices", result.partial.name):
+        assert name not in result.freed, (name, result.freed)
+    if blocks == 1:
+        assert result.freed == ["view(tilized(reshape(combine)))"]  # only the tilized stack the method created
+        assert result.partial.name == "partial1"
+    else:
+        assert result.freed.count("combine[0]") == 1 and f"combine[{rows - 512}]" in result.freed
+        assert all(f"partial{i}" in result.freed for i in range(1, blocks + 1)) and result.partial.name == "concat"
+        assert all(f"scores[{s}]" in result.freed and f"indices[{s}]" in result.freed for s in range(0, rows, 512))
+
+
 # --------------------------------------------------------------------------- the 2D-multicast matmul config
+
+
+def test_slab_moe_defaults_when_nothing_is_set(monkeypatch) -> None:
+    """The shipping frame: with neither switch set, a slab instance runs the one-call MoE (no zero fill of the rows
+    it does not own) on two rings -- prefill_rings 2 on the instance -- and the 128-/32-row chunks keep their forms
+    (prefill_rings None: the kwarg is not passed); QWEN38_MOE_SLAB_RINGS=0 restores one ring (None = the op's
+    default stream)."""
+    monkeypatch.delenv(moe_module.MOE_SLAB_ONE_CALL_ENV, raising=False)
+    monkeypatch.delenv(moe_module.MOE_SLAB_RINGS_ENV, raising=False)
+    assert moe_module.moe_slab_one_call_enabled() and moe_module.moe_slab_prefill_rings() == 2
+    assert moe_module.routed_tokens_per_call_for(SLAB) == SLAB
+    assert moe_module.routed_tokens_per_call_for(LONG_CHUNK_ROWS) == LONG_CHUNK_ROWS
+    assert moe_module.routed_tokens_per_call_for(CHUNK_ROWS) == CHUNK_ROWS
+    one_call = SimpleNamespace(slab_one_call=True)
+    blocks = SimpleNamespace(slab_one_call=False)
+    assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(one_call) == 2
+    assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(blocks) is None  # only the one-call slab reads the switch
+    assert moe_module.Qwen38TTNNMoE.zero_fill_non_owned_rows.fget(one_call) is False
+    assert moe_module.Qwen38TTNNMoE.zero_fill_non_owned_rows.fget(blocks) is True
+    monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "0")
+    assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(one_call) is None  # one ring = the op's default stream
+    assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(blocks) is None
+    monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "1")
+    assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(one_call) == 1
+    monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "3")
+    with pytest.raises(ValueError, match="under investigation"):  # allow-pytest.raises: pure contract test
+        moe_module.Qwen38TTNNMoE.prefill_rings.fget(one_call)
+    assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(blocks) is None
+
+
+def test_slab_moe_switches_are_admitted_before_the_device(monkeypatch) -> None:
+    """A refused QWEN38_MOE_SLAB_RINGS ends the process at its start: the server admits both slab MoE switches right
+    after its --prefill-slab argument checks and before the runtime admission opens a device, and every slab MoE
+    instance re-admits them at construction (not at its first forward, 79 s into the warm pass)."""
+    from models.demos.blackhole.qwen38_flash_next.tools import qwen38_chat_server as server_module
+
+    monkeypatch.delenv(moe_module.MOE_SLAB_ONE_CALL_ENV, raising=False)
+    monkeypatch.delenv(moe_module.MOE_SLAB_RINGS_ENV, raising=False)
+    assert moe_module.admit_slab_moe_switches() == (True, moe_module.MOE_SLAB_RINGS_DEFAULT)
+    monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "0")
+    assert moe_module.admit_slab_moe_switches() == (True, 0)
+    monkeypatch.setenv(moe_module.MOE_SLAB_ONE_CALL_ENV, "0")
+    monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "3")  # the blocks never read the ring switch
+    assert moe_module.admit_slab_moe_switches() == (False, 0)
+    monkeypatch.setenv(moe_module.MOE_SLAB_ONE_CALL_ENV, "1")
+    with pytest.raises(ValueError, match="under investigation"):  # allow-pytest.raises: pure contract test
+        moe_module.admit_slab_moe_switches()
+    main = inspect.getsource(server_module.main)
+    admit = main.index("admit_slab_moe_switches()")
+    assert "if args.prefill_slab is not None:" in main[:admit]
+    assert admit < main.index("runtime_admission.admit_runtime(args)")
+    assert "raise SystemExit(str(error)) from error" in main[admit : admit + 200]
+    init = inspect.getsource(moe_module.Qwen38TTNNMoE.__init__)
+    assert "if self.slab_one_call:\n            admit_slab_moe_switches()" in init
 
 
 def test_prefill_matmul_config_covers_the_rows_and_columns_with_whole_subblocks() -> None:
@@ -390,3 +619,121 @@ def test_slab_source_pins() -> None:
     # The 32-row and 128-row bodies keep their forms (their own pins hold): the per-tile loops are still there.
     assert "dram_sharded_row_tiles(full_hidden, self.in_proj_act_memory_config)" in inspect.getsource(gdn_module)
     assert "def _routed_partial_tiles" in inspect.getsource(moe_module)
+
+
+# --------------------------------------------------------------------------- the shared MoE combine buffer of a slab state
+
+
+class _FakeBuffer:
+    def __init__(self, shape):
+        self.shape = tuple(int(item) for item in shape)
+
+
+def _moe_buffer_fakes(monkeypatch):
+    """moe.allocate_local_combine_output on a fake ttnn: the buffer keeps the requested shape, the mesh contract
+    records what it validated."""
+
+    validated = []
+    fake_ttnn = SimpleNamespace(
+        from_torch=lambda tensor, **kwargs: _FakeBuffer(tensor.shape),
+        deallocate=lambda tensor: None,
+        ROW_MAJOR_LAYOUT="row-major",
+        bfloat16="bf16",
+        DRAM_MEMORY_CONFIG="dram",
+    )
+    monkeypatch.setattr(moe_module, "ttnn", fake_ttnn)
+    monkeypatch.setattr(moe_module, "replicate_tensor_2d_mesh_mapper", lambda device: "replicate", raising=False)
+    contract = SimpleNamespace(validate_tensor=lambda tensor, placement: validated.append((tensor.shape, placement)))
+    return SimpleNamespace(ttnn=fake_ttnn, contract=contract, validated=validated)
+
+
+def test_slab_combine_buffer_admits_the_slab_rows(monkeypatch) -> None:
+    """The one-call slab writes its whole [10, rows, 2560] page: allocate_local_combine_output must admit the slab
+    rows the way the slab's layer instances do; the chunk forms keep their rows and every other count stays refused."""
+    fakes = _moe_buffer_fakes(monkeypatch)
+    for rows in (CHUNK_ROWS, LONG_CHUNK_ROWS, SLAB, MAX_SLAB_ROWS):
+        buffer = moe_module.allocate_local_combine_output("mesh", fakes.contract, rows)
+        assert buffer.shape == (moe_module.TOP_K, rows, moe_module.HIDDEN_SIZE)
+    assert [shape[1] for shape, _ in fakes.validated] == [CHUNK_ROWS, LONG_CHUNK_ROWS, SLAB, MAX_SLAB_ROWS]
+    # counts no form admits: not a lane count (the lanes lineage admits 1..MAX_LANES), not a chunk, not a slab
+    for rows in (100, LONG_CHUNK_ROWS + 1, 2050):
+        with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
+            moe_module.allocate_local_combine_output("mesh", fakes.contract, rows)
+
+
+def _fake_text_model_for_chunk_state(monkeypatch, fakes):
+    """A stand-in for Qwen38TTNNTextModel with the collaborators allocate_chunk_state touches (two layers: a GDN and
+    a QSA, the PLE checkpoint layer at index 1), so the REAL Qwen38TTNNTextModel.allocate_chunk_state runs its own
+    body, including the shared combine buffer allocation through moe.allocate_local_combine_output."""
+
+    releasable = lambda: SimpleNamespace(deallocate=lambda: None, release=lambda: None, active=True)
+    monkeypatch.setattr(
+        qsa_module.Qwen38TTNNQSAChunkConstants,
+        "build",
+        classmethod(lambda cls, mesh, contract, blocks, *, rows: releasable()),
+    )
+    monkeypatch.setattr(model_module, "ttnn", fakes.ttnn)
+    monkeypatch.setattr(model_module, "replicate_tensor_2d_mesh_mapper", lambda device: "replicate", raising=False)
+
+    def make_layer(layer_type):
+        attention = SimpleNamespace(
+            allocate_rows_constants=lambda rows: releasable(), allocated_compressed_blocks=BLOCKS
+        )
+        ple = SimpleNamespace(prepare_rows_input=lambda tokens, rows_state, *, rows: releasable())
+        layer = SimpleNamespace(layer_type=layer_type, attention=attention, ple=ple)
+        layer.allocate_chunk_state = lambda rows_constants, *, base, local_combine_output, gdn_body: SimpleNamespace(
+            attention=SimpleNamespace(), ple=SimpleNamespace(), local_combine_output=local_combine_output
+        )
+        layer.release_chunk_state = lambda state: None
+        return layer
+
+    owner = object()
+    layers = [make_layer(layer_module.Qwen38TTNNLayerType.GDN), make_layer(layer_module.Qwen38TTNNLayerType.QSA)]
+    assert layer_module.PLE_CHECKPOINT_LAYER == 1
+    model = SimpleNamespace(
+        layers=layers,
+        mesh_device="mesh",
+        mesh_contract=fakes.contract,
+        rope_table=object(),
+        qsa_position_constants=object(),
+        model_io=SimpleNamespace(embedding=SimpleNamespace(upload_token_rows=lambda rows: _FakeBuffer((1, rows)))),
+        _state_owner=owner,
+        _validate_generic_state=lambda state: None,
+        _validate_chunk_state=lambda state: None,
+    )
+    base = SimpleNamespace(rows=CHUNK_ROWS, layers=(SimpleNamespace(), SimpleNamespace()))
+    return model, base
+
+
+@pytest.mark.parametrize("one_call", [False, True], ids=["blocks", "one-call"])
+def test_slab_chunk_state_allocates_the_combine_buffer_the_slab_writes(monkeypatch, one_call: bool) -> None:
+    """The chain opens a slab state through Qwen38TTNNTextModel.allocate_chunk_state(state, rows=slab, base=chunk):
+    the shared MoE combine buffer it allocates is sized by routed_tokens_per_call_for(rows) -- the whole slab by
+    default (the one call's page), 128 rows under QWEN38_MOE_SLAB_ONE_CALL=0 (the 128-row blocks) -- and must be
+    admitted by the row contract either way (the line gate of 2026-09-25 hit 'MoE rows must be exactly one of
+    (1, 5, 32, 128), got 2048' here)."""
+    if one_call:
+        monkeypatch.delenv(moe_module.MOE_SLAB_ONE_CALL_ENV, raising=False)  # the default
+    else:
+        monkeypatch.setenv(moe_module.MOE_SLAB_ONE_CALL_ENV, "0")
+    fakes = _moe_buffer_fakes(monkeypatch)
+    model, base = _fake_text_model_for_chunk_state(monkeypatch, fakes)
+    state = model_module.Qwen38TTNNTextModel.allocate_chunk_state(model, "generic-state", rows=SLAB, base=base)
+    expected_rows = SLAB if one_call else LONG_CHUNK_ROWS
+    assert moe_module.routed_tokens_per_call_for(SLAB) == expected_rows
+    assert state.rows == SLAB and state.local_combine_output.shape == (
+        moe_module.TOP_K,
+        expected_rows,
+        moe_module.HIDDEN_SIZE,
+    )
+    assert all(layer_state.local_combine_output is state.local_combine_output for layer_state in state.layers)
+    assert [shape[1] for shape, _ in fakes.validated] == [expected_rows]
+    # the model allocates that buffer with exactly this expression (the chain's path), and moe admits slab rows there
+    allocate = inspect.getsource(model_module.Qwen38TTNNTextModel.allocate_chunk_state)
+    assert (
+        "moe_module.allocate_local_combine_output(\n"
+        "                    self.mesh_device, self.mesh_contract, moe_module.routed_tokens_per_call_for(rows)\n"
+        "                )" in allocate
+    )
+    combine = inspect.getsource(moe_module.allocate_local_combine_output)
+    assert "admitted_rows=SUPPORTED_ROWS + ((rows,) if is_slab_rows(rows) else ())" in combine
