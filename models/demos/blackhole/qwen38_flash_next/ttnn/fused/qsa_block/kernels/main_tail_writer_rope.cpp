@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // main_tail, rope core writer: a query head (ROLE 0) writes, per lane, the rotated tiles' row into bytes 512..639 of
-// the head's sparse-query row; the key (ROLE 1) hands its rotated tiles to the staging core (pack tiles 8, 9).
+// the head's sparse-query row; the key (ROLE 1) hands its rotated tiles to every staging core (pack tiles 8, 9; one
+// staging core per lane).
 // Compile-time args: 0 ROLE, then TensorAccessorArgs query.
-// Runtime args: 0 query address, 1 rows, 2 head, 3 staging core x, 4 staging core y.
+// Runtime args: 0 query address, 1 rows, 2 head, 3 staging core count, then the staging cores' (x, y) pairs.
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -18,8 +19,7 @@ void kernel_main() {
     const uint32_t query_addr = get_arg_val<uint32_t>(0);
     const uint32_t rows = get_arg_val<uint32_t>(1);
     const uint32_t head = get_arg_val<uint32_t>(2);
-    const uint32_t st_x = get_arg_val<uint32_t>(3);
-    const uint32_t st_y = get_arg_val<uint32_t>(4);
+    const uint32_t staging_cores = get_arg_val<uint32_t>(3);
     constexpr uint32_t ROLE = get_compile_time_arg_val(0);
     constexpr auto query_args = TensorAccessorArgs<1>();
     const auto query = TensorAccessor(query_args, query_addr);
@@ -42,10 +42,15 @@ void kernel_main() {
         }
         noc_async_write_barrier();
     } else {
-        noc_async_write(
-            l1, get_noc_addr(st_x, st_y, get_write_ptr(CB_PACK) + HEAD_TILES * TILE_BYTES), ROPE_TILES * TILE_BYTES);
+        for (uint32_t s = 0; s < staging_cores; ++s) {
+            const uint32_t st_x = get_arg_val<uint32_t>(4 + 2 * s), st_y = get_arg_val<uint32_t>(5 + 2 * s);
+            noc_async_write(
+                l1, get_noc_addr(st_x, st_y, get_write_ptr(CB_PACK) + HEAD_TILES * TILE_BYTES), ROPE_TILES * TILE_BYTES);
+        }
         noc_async_write_barrier();
-        sem_krot.up(noc, st_x, st_y, 1);
+        for (uint32_t s = 0; s < staging_cores; ++s) {
+            sem_krot.up(noc, get_arg_val<uint32_t>(4 + 2 * s), get_arg_val<uint32_t>(5 + 2 * s), 1);
+        }
     }
     cb_pop_front(CB_OUT, ROPE_TILES);
     noc_async_atomic_barrier();

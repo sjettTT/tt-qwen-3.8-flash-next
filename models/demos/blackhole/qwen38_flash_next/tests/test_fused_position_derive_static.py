@@ -34,6 +34,7 @@ def _qsa():
 
 
 SOURCE = (fp.REPO_ROOT / pd.KERNEL).read_text()
+LANES_SOURCE = (fp.REPO_ROOT / pd.LANES_KERNEL).read_text()
 MODEL_SOURCE = Path(__file__).resolve().parents[1] / "ttnn" / "model.py"
 
 
@@ -241,3 +242,49 @@ def test_templates_are_the_chains_constants():
         pd.ONE_BF16 == 0x3F80
         and torch.tensor(qsa.INDEXER_MASK_VALUE).to(torch.bfloat16).view(torch.int16).item() == -129
     )  # 0xFF7F
+
+
+def test_lane_form_runtime_and_compile_time_arg_contract():
+    """derive_lanes.cpp: 18 tensors then the lane and the lane count; the same named constants as derive.cpp; one
+    core per lane row; the lane offsets ride the fill's tail ids; the model's lane body binds it only with the six QSA
+    programs (its outputs are the fused QSA lane body's inputs)."""
+
+    assert len(pd.LANES_RUNTIME_ARGS) == 18 and pd.LANES_QSA_OUTPUTS == pd.LANES_RUNTIME_ARGS[7:12]
+    used = sorted({int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d+)\)", LANES_SOURCE)})
+    assert used == list(range(20))
+    assert "TensorAccessorArgs<0>()" in LANES_SOURCE and LANES_SOURCE.count("next_compile_time_args_offset()") == 17
+    named = set(re.findall(r'get_named_compile_time_arg_val\("([a-z_0-9]+)"\)', LANES_SOURCE))
+    assert named == set(re.findall(r'get_named_compile_time_arg_val\("([a-z_0-9]+)"\)', SOURCE))
+    python_named = set(
+        re.findall(r'"([a-z_0-9]+)": ', inspect.getsource(pd.position_derive_lanes).split("named = {")[1].split("}")[0])
+    )
+    assert named == python_named, named ^ python_named
+    assert "words[STAGE_U32 / 4 + k] = k + offset + tail_shift;" in LANES_SOURCE  # lane u's KV region offset
+    assert "if (lane < lane_count) {" in LANES_SOURCE and "if (lane == 0) {" in LANES_SOURCE
+    source = re.sub(r"\s+", "", inspect.getsource(pd.position_derive_lanes))
+    assert "cores=[ttnn.CoreCoord(u%LANE_COLUMNS,u//LANE_COLUMNS)foruinrange(TILE)]" in source
+    assert "[(core,[t.buffer_address()fortintensors]+[u,lanes])foru,coreinenumerate(cores)]" in source
+    fused_lanes = inspect.getsource(pd.derive_lanes_fused)
+    assert "state.qsa_lane_constants.kv_offsets_row" in fused_lanes and "Qwen38TTNNQSAFusedLaneInputs(" in fused_lanes
+    composed = inspect.getsource(pd.derive_lanes_composed)
+    for call in (
+        "state.position.index_row()",
+        "state.position.block_start_index_row(index_row)",
+        "model.rope_table.rows_chunk(index_row, block_start_row)",
+        "derive_qsa_lane_inputs(",
+    ):
+        assert call in composed, call
+    model = MODEL_SOURCE.read_text(encoding="utf-8")
+    init = model[model.index('if fused_kernels.enabled("position_derive"):') :]
+    init = init[: init.index("self._state_owner = object()")]
+    assert "if all(fused_kernels.enabled(name) for name in QSA_LANE_FUSED_KERNELS):" in init
+    assert "self._position_derive_lanes = fused_kernels.position_derive.derive_lanes_fused" in init
+    body = model[model.index("    def forward_decode_lanes(") : model.index("    def resolve_lane_tokens(")]
+    assert "rope, qsa_lanes = self._position_derive_lanes(self, state)" in body
+    assert "qsa_lanes = qsa_module.derive_qsa_lane_inputs(" in body  # the chain stays the fallback
+    stage_u32 = 8192 * 2
+    stage_tile = stage_u32 + ((2080 * 4 + 63) & ~63)
+    stage_rows = stage_tile + 2048 + 4 * 128
+    assert stage_rows + 5 * 128 <= pd.LANES_STAGE_PAGES * pd.STAGE_PAGE_BYTES
+    manifest = json.loads((Path(__file__).resolve().parents[1] / "tools" / "release" / "manifest.json").read_text())
+    assert "ttnn/fused/position_derive/kernels/derive_lanes.cpp" in manifest["public"]

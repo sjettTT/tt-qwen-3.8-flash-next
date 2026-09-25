@@ -1565,6 +1565,17 @@ def _parser() -> argparse.ArgumentParser:
         default="off",
         help="MTP: the GDN state re-anchor (layer0 = layer 0's commits run the 1-row fp32 step recurrence)",
     )
+    parser.add_argument(
+        "--lanes",
+        type=int,
+        default=0,
+        help="serve B batched lanes through the lane body; refused on this head (the lane service binds sessions "
+        "by the prompt splice, removed with the committed-prefix rule): 0, the single-lane chain",
+    )
+    parser.add_argument("--lane-slots", type=int, default=None, help="host slots for parked lane images (--lanes)")
+    parser.add_argument("--lane-verify-policy", default="2/0", help="N/M tracker passes after lane lifecycle events (--lanes)")
+    parser.add_argument("--lane-prefill-chunk-budget", type=int, default=2, help="chunk replays per device tick (--lanes)")
+    parser.add_argument("--lane-prefill-import-check", action="store_true", help="re-read prefilled lane images (--lanes)")
     return parser
 
 
@@ -1601,6 +1612,12 @@ def main() -> int:
         raise SystemExit("--device-sampler needs --sampling (the composite reads the candidate row)")
     if args.sampling_discriminator and (not args.sampling or args.acceptance_prompts is None):
         raise SystemExit("--sampling-discriminator needs --sampling and the acceptance prompt records")
+    if args.lanes:
+        raise SystemExit(
+            "--lanes: the lane serving path is not on this head; it bound sessions by the prompt splice "
+            "(protocol.splice_prompt, Qwen38ServedTurn), removed with the committed-prefix rule the single-lane "
+            "server follows; the lane service serves again once it binds sessions by that rule"
+        )
     if args.agreement_reference is not None and not args.sampling:
         raise SystemExit("--agreement-reference needs --sampling (the records read the candidate row)")
     if args.agreement_reference is not None and not args.agreement_reference.is_file():

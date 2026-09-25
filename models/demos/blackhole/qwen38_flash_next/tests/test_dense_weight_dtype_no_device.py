@@ -126,7 +126,8 @@ def _check_module(
 
 
 def test_gdn_projection_linears_run_the_weight_fidelity() -> None:
-    source = _check_module(gdn_module, ("self.weights.qkvzab", "self.weights.out"), "projection_compute_config", 7)
+    # the one-row forms, the MTP rows forms and the lanes forms (_project_lanes, _gate_and_project_lanes)
+    source = _check_module(gdn_module, ("self.weights.qkvzab", "self.weights.out"), "projection_compute_config", 9)
     init = inspect.getsource(gdn_module.Qwen38TTNNGDN.__init__)
     assert "dense_math_fidelity_name(weights.projection_dtype)" in init
     assert (

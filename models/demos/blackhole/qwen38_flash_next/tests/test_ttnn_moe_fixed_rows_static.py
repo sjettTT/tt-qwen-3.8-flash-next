@@ -56,6 +56,9 @@ class _FakeTensor:
     def memory_config(self):
         return self._memory
 
+    def device(self):
+        return "mesh"
+
 
 def _bare_moe(rows: int) -> Qwen38TTNNMoE:
     instance = object.__new__(Qwen38TTNNMoE)
@@ -126,7 +129,12 @@ def test_builder_owns_one_lazy_ccl_manager(monkeypatch) -> None:
 
 
 def test_fixed_row_contract_is_exact_and_fail_closed() -> None:
-    assert SUPPORTED_ROWS == (1, 5, 32, 128) and PREFILL_CHUNK_ROWS == 32 and moe_module.LONG_PREFILL_CHUNK_ROWS == 128
+    # 1..32 rows (1 = decode, 5 = the MTP verifier, 32 = the prefill chunk, B = the batched lanes) and the 128-row chunk.
+    assert (
+        SUPPORTED_ROWS == (*range(1, 33), 128)
+        and PREFILL_CHUNK_ROWS == 32
+        and moe_module.LONG_PREFILL_CHUNK_ROWS == 128
+    )
     ordinary = Qwen38TTNNMoERowContract(1)
     assert ordinary.hidden_sharded == (1, 1, 1, 640)
     assert ordinary.full_hidden == (1, 1, 1, HIDDEN_SIZE)
@@ -163,8 +171,12 @@ def test_fixed_row_contract_is_exact_and_fail_closed() -> None:
     assert chunk.fast_reduce_scores == (32, 1, 1, TOP_K)
     assert chunk.output_sharded == (1, 1, 32, 640)
 
-    for rows in (False, True, 0, 2, 4, 6, 31, 33, 64, 1.0, "5", "32"):
-        with pytest.raises(ValueError, match="rows must be exactly"):  # allow-pytest.raises: pure contract test
+    # Every lane count 1..32 is a row count (the batched decode); anything else is refused with the range.
+    for rows in (2, 4, 6, 31):
+        lanes = Qwen38TTNNMoERowContract(rows)
+        assert lanes.moe_sparse_input == (1, rows, HIDDEN_SIZE) and lanes.fast_reduce_scores == (rows, 1, 1, TOP_K)
+    for rows in (False, True, 0, 33, 64, 1.0, "5", "32"):
+        with pytest.raises(ValueError, match=r"MoE rows must be exactly one of"):  # allow-pytest.raises: contract
             Qwen38TTNNMoERowContract(rows)
 
 
@@ -176,8 +188,8 @@ def test_row_contract_admits_an_explicit_override_for_one_instance_only() -> Non
     assert six.rows == 6 and six.hidden_sharded == (1, 1, 6, 640) and six.moe_sparse_input == (1, 6, HIDDEN_SIZE)
     assert six.moe_routing == (1, 6, TOP_K) and six.fast_reduce_scores == (6, 1, 1, TOP_K)
     assert Qwen38TTNNMoERowContract(5, (5, 6)).rows == 5
-    assert Qwen38TTNNMoERowContract(1).admitted_rows == SUPPORTED_ROWS == (1, 5, 32, 128)
-    for rows, admitted in ((6, SUPPORTED_ROWS), (7, (6,)), (0, (0,)), (129, (129,)), (6, (True, 6)), (6, [6])):
+    assert Qwen38TTNNMoERowContract(1).admitted_rows == SUPPORTED_ROWS == (*range(1, 33), 128)
+    for rows, admitted in ((33, SUPPORTED_ROWS), (7, (6,)), (0, (0,)), (129, (129,)), (6, (True, 6)), (6, [6])):
         with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
             Qwen38TTNNMoERowContract(rows, admitted)
     with pytest.raises(ValueError):  # allow-pytest.raises: an empty admission admits nothing
@@ -499,10 +511,13 @@ def test_routed_partial_uses_the_exact_row_shapes_and_weight_ownership(rows: int
     if rows == 1:
         assert fast_reduce_call["kwargs"]["scores_tensor"] is routing.scores
     else:
-        # The verifier rows move the shard to DRAM before the tiled reshape.
-        assert [(tensor.memory_config(), shape) for tensor, shape in reshape_calls if shape[-1] == HIDDEN_SIZE] == [
-            (ttnn.DRAM_MEMORY_CONFIG, contract.moe_sparse_input)
-        ]
+        # The rows are untilized first (the one-row op) and reshaped ROW_MAJOR: no un-shard or relayout kernel.
+        assert [
+            (tensor.memory_config(), tensor.layout, shape)
+            for tensor, shape in reshape_calls
+            if shape[-1] == HIDDEN_SIZE
+        ] == [(ttnn.DRAM_MEMORY_CONFIG, ttnn.ROW_MAJOR_LAYOUT, contract.moe_sparse_input)]
+        assert "to_memory_config(full_hidden" not in inspect.getsource(Qwen38TTNNMoE._routed_partial)
         assert fast_reduce_call["kwargs"]["scores_tensor"] is not routing.scores
 
     expected_weight_validation = [

@@ -11,7 +11,8 @@
 // gated, conv[1], conv[2], conv[4], conv[5], conv[7], conv[8], and the branch-major residual [1,4,1,640] (sixteen,
 // chained; the six state rows only for the shift, the residual only with INJECT: its four block tiles b * 20 + first
 // go to CB 19).  Compile-time args 0 T, 1 SHIFT, 2 INJECT.  Runtime args: the sixteen buffer addresses in that order,
-// 16 the first tile of this core's column block.
+// 16 the first tile of this core's column block, 17 the first tap tile of the block (the column within the lane's
+// 20-tile row-block: the taps are one [1,1,4,640] per tap for every lane; the 1-row form passes the same as 16).
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -72,6 +73,7 @@ void kernel_main() {
     constexpr auto a14 = TensorAccessorArgs<a13.next_compile_time_args_offset()>();
     constexpr auto a15 = TensorAccessorArgs<a14.next_compile_time_args_offset()>();
     const uint32_t first = get_arg_val<uint32_t>(16);
+    const uint32_t tap_first = get_arg_val<uint32_t>(17);
     Noc noc;
     const auto c0 = TensorAccessor(a0, get_arg_val<uint32_t>(0));
     const auto c3 = TensorAccessor(a1, get_arg_val<uint32_t>(1));
@@ -81,10 +83,10 @@ void kernel_main() {
     stream(noc, c3, 1, first);
     stream(noc, c6, 2, first);
     stream(noc, n, 3, first);
-    stream(noc, TensorAccessor(a4, get_arg_val<uint32_t>(4)), 4, first);
-    stream(noc, TensorAccessor(a5, get_arg_val<uint32_t>(5)), 5, first);
-    stream(noc, TensorAccessor(a6, get_arg_val<uint32_t>(6)), 6, first);
-    stream(noc, TensorAccessor(a7, get_arg_val<uint32_t>(7)), 7, first);
+    stream(noc, TensorAccessor(a4, get_arg_val<uint32_t>(4)), 4, tap_first);
+    stream(noc, TensorAccessor(a5, get_arg_val<uint32_t>(5)), 5, tap_first);
+    stream(noc, TensorAccessor(a6, get_arg_val<uint32_t>(6)), 6, tap_first);
+    stream(noc, TensorAccessor(a7, get_arg_val<uint32_t>(7)), 7, tap_first);
     stream(noc, TensorAccessor(a8, get_arg_val<uint32_t>(8)), 8, first);
     if constexpr (INJECT) {
         const auto residual = TensorAccessor(a15, get_arg_val<uint32_t>(15));

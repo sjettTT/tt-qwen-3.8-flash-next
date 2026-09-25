@@ -67,7 +67,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.layer import (
     Qwen38TTNNLayerType,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.model import Qwen38TTNNTextModel, Qwen38TTNNTextModelGenericState
-from models.demos.blackhole.qwen38_flash_next.ttnn.moe import SUPPORTED_ROWS, Qwen38TTNNMoE
+from models.demos.blackhole.qwen38_flash_next.ttnn.moe import SUPPORTED_ROWS, TARGET_VERIFIER_ROWS, Qwen38TTNNMoE
 from models.demos.blackhole.qwen38_flash_next.ttnn.mtp import Qwen38TTNNMTPInput
 from models.demos.blackhole.qwen38_flash_next.ttnn.ple import (
     Qwen38TTNNPLE,
@@ -404,13 +404,15 @@ class Qwen38TTNNVerifyReadback:
 
 
 def moe_rows_for(rows: int) -> int:
-    """The smallest admitted MoE row count that holds ``rows`` (5 for k = 3 and 4; 32 for k = 5 until rows 6 is
-    admitted in ``moe.SUPPORTED_ROWS``); a verify pass is one 32-row tile, so the 128-row prefill form is not a
-    candidate."""
+    """The smallest admitted MoE row count that holds ``rows`` (5 for k = 3 and 4; 32 for k = 5: the two verify
+    forms proven on silicon); a verify pass is one 32-row tile, so the 128-row prefill form is not a candidate."""
 
-    admitted = [count for count in SUPPORTED_ROWS if rows <= count <= CHUNK_ROWS]
+    # The verify forms proven on silicon: 5 and 32 rows.  SUPPORTED_ROWS also admits the batched lanes' 1..32, which
+    # are not verify candidates (the choice is pinned by the MTP tables).
+    candidates = tuple(count for count in (TARGET_VERIFIER_ROWS, CHUNK_ROWS) if count in SUPPORTED_ROWS)
+    admitted = [count for count in candidates if rows <= count <= CHUNK_ROWS]
     if not admitted:
-        raise ValueError(f"no admitted MoE row count holds {rows} rows (SUPPORTED_ROWS = {SUPPORTED_ROWS})")
+        raise ValueError(f"no admitted MoE row count holds {rows} rows (candidates {candidates})")
     return min(admitted)
 
 
@@ -1112,6 +1114,7 @@ def forward_verify(
     *,
     catch_up: bool,
     observer: Callable[[str], Any] | None = None,
+    hidden_observer: Callable[[Any], Any] | None = None,
 ) -> Qwen38TTNNVerifyOutput:
     """One verify pass at the device position: fixed op sequence, fixed shapes, no host ints, no host I/O.
 
@@ -1119,7 +1122,8 @@ def forward_verify(
     pass after :func:`seed_verify_state_inplace` runs with ``catch_up=False``.  ``P <- P + a + 1`` is the last
     op.  Any failure poisons the model owner: the in-place state cannot be rolled back.  ``observer`` (eager
     diagnostics only, never inside a capture) is called with a stage label after the prologue, after every layer,
-    after the head, the accept, the alignment and the position update.
+    after the head, the accept, the alignment and the position update; ``hidden_observer`` (eager only) with the
+    final mixer's ``[1,1,32,640]`` rows before the head.
     """
 
     _validate_verify_state(model, verify)
@@ -1163,6 +1167,8 @@ def forward_verify(
             processed_layers += 1
             stage(f"layer-{layer_index}")
         hidden = model.final_mixer.rows(residual, flat_views=True)
+        if hidden_observer is not None:
+            hidden_observer(hidden)
         argmax_lanes = _resolve_rows(
             model, hidden, rows=verify.rows, sentinel_tail=verify.accept_constants.sentinel_tail
         )

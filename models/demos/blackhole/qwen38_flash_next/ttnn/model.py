@@ -57,10 +57,12 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     MESH_SHAPE,
     Qwen38MeshContract,
     Qwen38TTNNDevicePosition,
+    Qwen38TTNNDevicePositionRow,
     TensorPlacement,
     chunk_row_tiles,
     is_slab_rows,
     replicate_tensor_2d_mesh_mapper,
+    require_lane_count,
     tensor_metadata,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import (
@@ -70,6 +72,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import (
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.final_mixer import Qwen38TTNNFinalMixer
 from models.demos.blackhole.qwen38_flash_next.ttnn.gr import block_rows_shape, residual_rows_shape
+from models.demos.blackhole.qwen38_flash_next.ttnn.lanes import Qwen38LaneLayout
 from models.demos.blackhole.qwen38_flash_next.ttnn.layer import (
     BACKBONE_LAYERS,
     BLOCK_LOCAL_SHAPE,
@@ -79,13 +82,18 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.layer import (
     Qwen38TTNNDecoderLayerAux,
     Qwen38TTNNDecoderLayerChunkState,
     Qwen38TTNNDecoderLayerGenericState,
+    Qwen38TTNNDecoderLayerLaneState,
     Qwen38TTNNDecoderLayerSnapshot,
     Qwen38TTNNDecoderLayerState,
     Qwen38TTNNLayerCleanupError,
     Qwen38TTNNLayerNamespace,
     Qwen38TTNNLayerType,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.ple import Qwen38TTNNPLEPreparedInput, Qwen38TTNNPLERowsPreparedInput
+from models.demos.blackhole.qwen38_flash_next.ttnn.ple import (
+    Qwen38TTNNPLELanesPreparedInput,
+    Qwen38TTNNPLEPreparedInput,
+    Qwen38TTNNPLERowsPreparedInput,
+)
 
 TP_SIZE = 4
 HIDDEN_SIZE = 2560
@@ -685,6 +693,29 @@ class Qwen38TTNNTextModelGenericSnapshot:
     captured: bool = False
 
 
+@dataclass(frozen=True)
+class Qwen38TTNNTextModelLaneState:
+    """Fixed-address 48-layer state of B batched decode lanes, the per-lane position row and the lane body's
+    host-written inputs, all allocated before any capture (the lane traces bake every address in).
+
+    ``token_row`` (replicated FP32 TILE ``[1,1,1,32]``, lane u = the token lane u consumes this step, lanes B..31
+    zero) and ``ple_rows`` (the persistent ROW_MAJOR ``[1,1,B,640]`` upload of lane u's n-gram row) are the
+    host-written inputs; ``embedding_rows`` the persistent ``[1,1,B,640]`` the 32-lane embedding is sliced into
+    (None at B = 32); ``qsa_chunk_constants`` / ``qsa_lane_constants`` the lane count's constants of the QSA lane
+    derive and body.  All resident lanes share ``P_u mod 4`` with every GDN ring phase (the residue rule).
+    """
+
+    lanes: int
+    position: Qwen38TTNNDevicePositionRow
+    layers: tuple[Qwen38TTNNDecoderLayerLaneState, ...]
+    token_row: Any
+    ple_rows: Qwen38TTNNPLELanesPreparedInput
+    embedding_rows: Any | None
+    qsa_chunk_constants: qsa_module.Qwen38TTNNQSAChunkConstants
+    qsa_lane_constants: qsa_module.Qwen38TTNNQSALaneConstants
+    _owner: object = field(repr=False, compare=False)
+
+
 @dataclass
 class Qwen38TTNNGenericDecodeOutput:
     """Logits of one position-generic step; every other tensor is in-place state or released.
@@ -934,6 +965,16 @@ LayerObserver = Callable[
 DecodePhaseObserver = Callable[[str], None]
 
 
+QSA_LANE_FUSED_KERNELS = (  # the six programs the fused QSA lane body needs together (ttnn/qsa.py binds it on all six)
+    "qsa_index_tail",
+    "qsa_main_tail",
+    "qsa_post_attention",
+    "qsa_widen_partial",
+    "qsa_selection_row",
+    "qsa_score_merge",
+)
+
+
 class Qwen38TTNNTextModel:
     """Exact 48-layer ordinary-decode owner on one physical 1x4 mesh."""
 
@@ -941,6 +982,7 @@ class Qwen38TTNNTextModel:
     semantic_max_context = MAX_CONTEXT
 
     _position_derive = None  # the fused tail derive when QWEN38_FUSED names position_derive (see __init__)
+    _position_derive_lanes = None  # its lane form, when the six QSA programs also serve the lane body (see __init__)
 
     def __init__(
         self,
@@ -1039,6 +1081,9 @@ class Qwen38TTNNTextModel:
 
         if fused_kernels.enabled("position_derive"):
             self._position_derive = fused_kernels.kernel("position_derive").fused
+            # the lane form derives only the fused QSA lane body's inputs: it serves when that body serves
+            if all(fused_kernels.enabled(name) for name in QSA_LANE_FUSED_KERNELS):
+                self._position_derive_lanes = fused_kernels.position_derive.derive_lanes_fused
         self._state_owner = object()
         self._poisoned_error: Qwen38TTNNModelPoisonedError | None = None
         self._poisoned_device_owners: list[Any] = []
@@ -2785,6 +2830,430 @@ class Qwen38TTNNTextModel:
         except BaseException as error:
             self._mark_poisoned("finish_prefill", 0, error)
 
+    # ------------------------------------------------------------------ lanes (batched decode, B = 1..32)
+    # forward_decode_lanes is forward_decode_generic over B lanes: the per-lane RoPE rows and QSA lane inputs from
+    # the position row, the token row's B lanes embedded, 48 layers on [1,4,B,640] rows in place, the final mixer
+    # and LM head at B rows, the position row advanced as the last op.  One trace per GDN ring residue serves the
+    # step; every resident lane's position is congruent to the ring phase (the residue rule), so a lane is admitted
+    # at a step of its position's residue class.  The 1-row bodies above are untouched.
+
+    def _validate_lane_state(self, state: Qwen38TTNNTextModelLaneState) -> int:
+        self._require_healthy()
+        if not isinstance(state, Qwen38TTNNTextModelLaneState) or state._owner is not self._state_owner:
+            raise ValueError("text-model lane state was not allocated by this model owner")
+        lanes = require_lane_count(state.lanes, label="text-model lanes")
+        if not isinstance(state.position, Qwen38TTNNDevicePositionRow) or state.position.lanes != lanes:
+            raise TypeError(f"text-model lane state requires a {lanes}-lane Qwen38TTNNDevicePositionRow")
+        if len(state.layers) != BACKBONE_LAYERS:
+            raise ValueError(f"text-model lane state must contain {BACKBONE_LAYERS} target layers")
+        for layer_index, (layer, layer_state) in enumerate(zip(self.layers, state.layers)):
+            if layer_state.namespace is not Qwen38TTNNLayerNamespace.BACKBONE or layer_state.layer_index != layer_index:
+                raise ValueError(f"lane target state {layer_index} identity does not match its layer")
+            if layer_state.lanes != lanes:
+                raise ValueError(f"lane target state {layer_index} holds {layer_state.lanes} lanes, expected {lanes}")
+        if (state.embedding_rows is None) != (lanes == CHUNK_ROWS):
+            raise ValueError("the lane state carries an embedding rows buffer exactly below 32 lanes")
+        if (
+            state.qsa_lane_constants.lanes != lanes
+            or state.qsa_lane_constants.allocated_context != self.allocated_context
+        ):
+            raise ValueError(
+                f"QSA lane constants were built for {state.qsa_lane_constants.lanes} lanes at "
+                f"{state.qsa_lane_constants.allocated_context}, the state has {lanes} at {self.allocated_context}"
+            )
+        if not state.ple_rows.active or tuple(state.ple_rows.source_contexts) != (None,) * lanes:
+            raise ValueError("the lane PLE rows must be live and prepared without host n-gram contexts")
+        return lanes
+
+    def allocate_lane_state(self, lanes: int, *, indexer_form: str = "wide") -> Qwen38TTNNTextModelLaneState:
+        """Allocate the position row, every layer's lane state, the lane constants and the host-written inputs of
+        B lanes (before any capture).  The first call also builds the model-lifetime generic constants."""
+
+        self._require_healthy()
+        lanes = require_lane_count(lanes, label="text-model lanes")
+        if self.rope_table is None:
+            self.rope_table = Qwen38TTNNRoPETable.build(
+                self.mesh_device, self.mesh_contract, self.config, self.allocated_context
+            )
+        qsa = next(layer.attention for layer in self.layers if layer.layer_type is Qwen38TTNNLayerType.QSA)
+        if self.qsa_position_constants is None:
+            self.qsa_position_constants = qsa_module.Qwen38TTNNQSAPositionConstants.build(
+                self.mesh_device, self.mesh_contract, qsa.allocated_compressed_blocks
+            )
+        position = Qwen38TTNNDevicePositionRow.allocate(self.mesh_device, self.mesh_contract, [0] * lanes, lanes=lanes)
+        allocated: list[Qwen38TTNNDecoderLayerLaneState] = []
+        chunk_constants = None
+        lane_constants = None
+        token_row = None
+        embedding_rows = None
+        ple_rows = None
+        try:
+            chunk_constants = qsa_module.Qwen38TTNNQSAChunkConstants.build(
+                self.mesh_device, self.mesh_contract, qsa.allocated_compressed_blocks
+            )
+            lane_constants = qsa_module.Qwen38TTNNQSALaneConstants.build(
+                self.mesh_device,
+                self.mesh_contract,
+                lanes=lanes,
+                allocated_context=self.allocated_context,
+                indexer_form=indexer_form,
+            )
+            for layer in self.layers:
+                allocated.append(layer.allocate_lane_state(lanes))
+            token_row = self.model_io.embedding.upload_token_row(0)
+            if lanes < CHUNK_ROWS:
+                embedding_rows = ttnn.from_torch(
+                    torch.zeros((1, 1, lanes, HIDDEN_SIZE), dtype=torch.bfloat16),
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.mesh_device,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3)),
+                )
+            ple_layer, ple_lanes_state = self.layers[PLE_CHECKPOINT_LAYER], allocated[PLE_CHECKPOINT_LAYER].ple
+            if ple_layer.ple is None or ple_lanes_state is None:
+                raise RuntimeError("checkpoint layer 1 PLE owner/lanes state is unavailable")
+            ple_rows = ple_layer.ple.prepare_lanes_input([0] * lanes, ple_lanes_state)
+            ple_lanes_state.token_contexts = (None,) * lanes
+            result = Qwen38TTNNTextModelLaneState(
+                lanes=lanes,
+                position=position,
+                layers=tuple(allocated),
+                token_row=token_row,
+                ple_rows=ple_rows,
+                embedding_rows=embedding_rows,
+                qsa_chunk_constants=chunk_constants,
+                qsa_lane_constants=lane_constants,
+                _owner=self._state_owner,
+            )
+            self._validate_lane_state(result)
+            return result
+        except BaseException as error:
+            actions = [
+                (
+                    f"target layer {index} lane state",
+                    lambda layer=layer, layer_state=layer_state: layer.release_lane_state(layer_state),
+                )
+                for index, (layer, layer_state) in reversed(tuple(enumerate(zip(self.layers, allocated))))
+            ]
+            if ple_rows is not None:
+                actions.append(("lane PLE rows", ple_rows.release))
+            for label, tensor in (("lane embedding rows", embedding_rows), ("lane token row", token_row)):
+                if tensor is not None:
+                    actions.append((label, lambda tensor=tensor: ttnn.deallocate(tensor)))
+            for label, constants in (("QSA lane constants", lane_constants), ("QSA chunk constants", chunk_constants)):
+                if constants is not None:
+                    actions.append((label, constants.deallocate))
+            actions.append(("device position row", position.deallocate))
+            cause = _cleanup_failure_cause("lane text-model state allocation", actions, error)
+            if cause is not error:
+                self._mark_poisoned("allocate_lane_state cleanup", 0, cause)
+            raise
+
+    def release_lane_state(self, state: Qwen38TTNNTextModelLaneState) -> None:
+        self._validate_lane_state(state)
+        actions = [
+            (
+                f"target layer {index} lane state",
+                lambda layer=layer, layer_state=layer_state: layer.release_lane_state(layer_state),
+            )
+            for index, (layer, layer_state) in reversed(tuple(enumerate(zip(self.layers, state.layers))))
+        ]
+        actions.append(("lane PLE rows", state.ple_rows.release))
+        if state.embedding_rows is not None:
+            actions.append(("lane embedding rows", lambda: ttnn.deallocate(state.embedding_rows)))
+        actions.append(("lane token row", lambda: ttnn.deallocate(state.token_row)))
+        actions.append(("QSA lane constants", state.qsa_lane_constants.deallocate))
+        actions.append(("QSA chunk constants", state.qsa_chunk_constants.deallocate))
+        actions.append(("device position row", state.position.deallocate))
+        try:
+            _run_cleanup_actions("lane text-model state", actions)
+        except BaseException as error:
+            self._mark_poisoned("release_lane_state", 0, error)
+
+    def reset_lane_state_inplace(self, state: Qwen38TTNNTextModelLaneState, positions) -> None:
+        """A new batch: every lane's buffers back to their position-zero contents at every captured address, the
+        position row rewritten to ``positions`` (one residue class), the token row zeroed."""
+
+        self._validate_lane_state(state)
+        try:
+            state.position.reset(positions)
+            for layer, layer_state in zip(self.layers, state.layers):
+                layer.reset_lane_state_inplace(layer_state)
+            self.write_lane_tokens(state, [0] * state.lanes)
+        except BaseException as error:
+            self._mark_poisoned("reset_lane_state_inplace", 0, error)
+
+    def admit_lane(self, state: Qwen38TTNNTextModelLaneState, lane: int, position: int) -> None:
+        """Admit one lane at ``position``: refused (nothing written) unless ``position mod 4`` is the resident
+        residue at this step (``admission_wait_steps`` names the wait); then the lane's buffers in every layer are
+        zeroed with keep-mask writes (the other lanes hold their state) and the position row takes the lane."""
+
+        self._validate_lane_state(state)
+        state.position.admit(lane, position)  # the residue rule: a ValueError before any device write
+        try:
+            for layer, layer_state in zip(self.layers, state.layers):
+                layer.reset_lane_inplace(layer_state, lane)
+        except BaseException as error:
+            self._mark_poisoned("admit_lane", 0, error)
+
+    def lane_layout(self, state: Qwen38TTNNTextModelLaneState) -> Qwen38LaneLayout:
+        """The lane state's per-lane device tensors by family for the lane pager (``lanes.Qwen38TTNNLanePager``:
+        eviction to the host pool and re-admission): the 12 QSA caches, staging tiles and rings, the 36 GDN
+        recurrent states and 144 ring slots, the 9 PLE slots.  The position row and the host-written inputs stay
+        with the model (re-admission goes through ``state.position.admit`` first)."""
+
+        lanes = self._validate_lane_state(state)
+        gdn_states = [s.attention for s in state.layers if isinstance(s.attention, gdn_module.Qwen38TTNNGDNState)]
+        qsa_states = [s.attention for s in state.layers if isinstance(s.attention, qsa_module.Qwen38TTNNQSALaneState)]
+        ple_state = state.layers[PLE_CHECKPOINT_LAYER].ple
+        if ple_state is None:
+            raise RuntimeError("checkpoint layer 1 PLE lanes state is unavailable")
+        layout = Qwen38LaneLayout(
+            lanes=lanes,
+            allocated_context=self.allocated_context,
+            kv=tuple(s.packed_kv_cache for s in qsa_states),
+            compressed=tuple(s.compressed_index_cache for s in qsa_states),
+            staging=tuple(s.kv_staging for s in qsa_states),
+            ring=tuple(s.raw_key_ring for s in qsa_states),
+            recurrent=tuple(s.recurrent for s in gdn_states),
+            conv=tuple(slot for s in gdn_states for slot in s.conv),
+            ple=tuple(ple_state.conv),
+        )
+        layout.validate(self.mesh_contract)
+        return layout
+
+    def generic_lane_layout(self, state: Qwen38TTNNTextModelGenericState) -> Qwen38LaneLayout:
+        """The generic (single-lane) state's tensors as a 1-lane layout for the lane pager: the state the chunk
+        trace prefills is packed into a host slot and re-admitted into a lane (the lane server's prefill import).
+        The device position scalar and the GDN ring phases stay with the model (the importer resets them)."""
+
+        self._validate_generic_state(state)
+        gdn_states = [s.attention for s in state.layers if isinstance(s.attention, gdn_module.Qwen38TTNNGDNState)]
+        qsa_states = [
+            s.attention for s in state.layers if isinstance(s.attention, qsa_module.Qwen38TTNNQSAGenericState)
+        ]
+        ple_state = state.layers[PLE_CHECKPOINT_LAYER].ple
+        if ple_state is None:
+            raise RuntimeError("checkpoint layer 1 PLE state is unavailable")
+        layout = Qwen38LaneLayout(
+            lanes=1,
+            allocated_context=self.allocated_context,
+            kv=tuple(s.packed_kv_cache for s in qsa_states),
+            compressed=tuple(s.compressed_index_cache for s in qsa_states),
+            staging=tuple(s.kv_staging for s in qsa_states),
+            ring=tuple(s.raw_key_ring for s in qsa_states),
+            recurrent=tuple(s.recurrent for s in gdn_states),
+            conv=tuple(slot for s in gdn_states for slot in s.conv),
+            ple=tuple(ple_state.conv),
+        )
+        layout.validate(self.mesh_contract)
+        return layout
+
+    def write_lane_tokens(self, state: Qwen38TTNNTextModelLaneState, tokens: Sequence[int]) -> None:
+        """Host write of the token row (outside any trace): lane u = ``tokens[u]``, the idle lanes 0."""
+
+        lanes = self._validate_lane_state(state)
+        tokens = [int(token) for token in tokens]
+        if len(tokens) != lanes:
+            raise ValueError(f"lane tokens need one token per lane: got {len(tokens)}, expected {lanes}")
+        ttnn.copy_host_to_device_tensor(
+            ttnn.from_torch(
+                self.model_io.embedding.host_token_rows(tokens + [0] * (CHUNK_ROWS - lanes)),
+                dtype=ttnn.float32,
+                layout=ttnn.TILE_LAYOUT,
+                mesh_mapper=replicate_tensor_2d_mesh_mapper(self.mesh_device),
+            ),
+            state.token_row,
+        )
+
+    def write_lane_ple_rows(
+        self, state: Qwen38TTNNTextModelLaneState, tokens: Sequence[int], contexts
+    ) -> tuple[tuple[int, int], ...]:
+        """Host write of the PLE rows (outside any trace): lane u's ``tokens[u]`` looked up under ``contexts[u]``
+        in one batched read into the persistent rows.  Returns the next context per lane; the caller keeps them
+        (the body's PLE state is pinned context-free)."""
+
+        lanes = self._validate_lane_state(state)
+        ple = self.layers[PLE_CHECKPOINT_LAYER].ple
+        if ple is None:
+            raise RuntimeError("checkpoint layer 1 PLE owner is unavailable")
+        tokens = [int(token) for token in tokens]
+        if len(tokens) != lanes:
+            raise ValueError(f"lane PLE rows need one token per lane: got {len(tokens)}, expected {lanes}")
+        rows, next_contexts = ple.host_lanes(tokens, contexts)
+        ttnn.copy_host_to_device_tensor(
+            ttnn.from_torch(
+                rows.contiguous(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3)),
+            ),
+            state.ple_rows.embedding_rows,
+        )
+        return next_contexts
+
+    def _embed_residual_lanes_from_device_token(self, state: Qwen38TTNNTextModelLaneState):
+        """Trace-capturable branch-major ``[1,4,B,640]`` residual rows of the token row's B lanes: the 32-lane
+        embedding, its lane rows sliced into the persistent embedding rows below 32 lanes."""
+
+        owned: list[Any | None] = [self.model_io.embedding.embed_device_token_rows(state.token_row), None]
+        try:
+            hidden = owned[0]
+            if state.embedding_rows is not None:
+                landed = ttnn.slice(
+                    hidden, (0, 0, 0, 0), (1, 1, state.lanes, LOCAL_HIDDEN_SIZE), output_tensor=state.embedding_rows
+                )
+                if landed is not None and _tensor_key(landed) != _tensor_key(state.embedding_rows):
+                    raise RuntimeError("lane embedding slice did not land in the persistent embedding rows")
+                hidden = state.embedding_rows
+            expected = (1, 1, state.lanes, LOCAL_HIDDEN_SIZE)
+            if _shape(hidden) != expected or hidden.dtype != ttnn.bfloat16 or hidden.layout != ttnn.TILE_LAYOUT:
+                raise RuntimeError(
+                    f"lane embedding rows must be BF16 TILE {list(expected)}, got {tensor_metadata(hidden)}"
+                )
+            self.mesh_contract.validate_tensor(hidden, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+            owned[1] = ttnn.repeat_interleave(
+                hidden, repeats=RESIDUAL_BRANCHES, dim=1, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+            residual = owned[1]
+            expected = (1, RESIDUAL_BRANCHES, state.lanes, LOCAL_HIDDEN_SIZE)
+            if _shape(residual) != expected or residual.dtype != ttnn.bfloat16 or residual.layout != ttnn.TILE_LAYOUT:
+                raise RuntimeError(
+                    f"lane residual rows must be BF16 TILE {list(expected)}, got {tensor_metadata(residual)}"
+                )
+            self.mesh_contract.validate_tensor(residual, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        except BaseException as error:
+            self._poisoned_device_owners.extend(tensor for tensor in owned if tensor is not None)
+            self._mark_poisoned("lane residual rows", 0, error)
+        _release_tensor_slot_indices(owned, (0,), label="lane embedding rows transient")
+        return owned[1]
+
+    def forward_decode_lanes(
+        self, state: Qwen38TTNNTextModelLaneState, *, return_logits: bool = True
+    ) -> Qwen38TTNNGenericDecodeOutput:
+        """One batched step: fixed op sequence for every position row, no host ints, no host I/O.
+
+        Per-lane RoPE rows and QSA lane inputs from the position row, the token row's lanes embedded, the 48 layers
+        on ``[1,4,B,640]`` rows in place (the PLE layer consumes the persistent PLE rows), the final mixer and LM
+        head at B rows (row u = lane u), then the position row advanced as the last op.  Any failure poisons this
+        owner: the in-place state cannot be rolled back.
+        """
+
+        lanes = self._validate_lane_state(state)
+        processed_layers = 0
+        try:
+            if self._position_derive_lanes is not None:
+                rope, qsa_lanes = self._position_derive_lanes(self, state)
+            else:
+                index_row = state.position.index_row()
+                block_start_row = state.position.block_start_index_row(index_row)
+                rope = self.rope_table.rows_chunk(index_row, block_start_row)
+                _deallocate_unique(index_row, block_start_row)
+                qsa_lanes = qsa_module.derive_qsa_lane_inputs(
+                    state.position.row, self.qsa_position_constants, state.qsa_chunk_constants, state.qsa_lane_constants
+                )
+            residual = self._embed_residual_lanes_from_device_token(state)
+            for layer_index in range(BACKBONE_LAYERS):
+                residual = self.layers[layer_index].forward_decode_lanes(
+                    residual,
+                    state.layers[layer_index],
+                    prepared_ple=state.ple_rows if layer_index == PLE_CHECKPOINT_LAYER else None,
+                    rope=rope,
+                    qsa_lanes=qsa_lanes,
+                    qsa_constants=state.qsa_chunk_constants,
+                    qsa_lane_constants=state.qsa_lane_constants,
+                )
+                processed_layers += 1
+            qsa_lanes.deallocate()
+            rope.deallocate()
+            hidden = self.final_mixer.rows(residual, flat_views=True)
+            _deallocate_unique(residual)
+            expected = (1, 1, lanes, LOCAL_HIDDEN_SIZE)
+            if _shape(hidden) != expected or hidden.dtype != ttnn.bfloat16:
+                raise RuntimeError(
+                    f"lane terminal mixer output must be BF16 {list(expected)}, got {tensor_metadata(hidden)}"
+                )
+            logits = self.model_io.lm_head(hidden) if return_logits else None
+            _deallocate_unique(hidden)
+            state.position.advance()
+            return Qwen38TTNNGenericDecodeOutput(logits)
+        except BaseException as error:
+            self._mark_poisoned("forward_decode_lanes", processed_layers, error)
+
+    def resolve_lane_tokens(self, output: Qwen38TTNNGenericDecodeOutput, state: Qwen38TTNNTextModelLaneState):
+        """The lane epilogue (trace-capturable): the per-row greedy candidates, the device resolve to the
+        ``[1,1,1,32]`` token row (lane u = row u's id) and its copy into the state's token row for the next step.
+        Returns ``(candidates, token_row)``; the caller owns them (a capture retains them for its traces' life)."""
+
+        self._validate_lane_state(state)
+        if output.logits is None:
+            raise ValueError("the lane epilogue needs the step's logits")
+        lm_head = self.model_io.lm_head
+        candidates = lm_head.greedy_candidates_lanes(output.logits)
+        token_row = lm_head.resolve_greedy_lanes_on_device(candidates)
+        key = _tensor_key(state.token_row)
+        copied = ttnn.copy(token_row, state.token_row)
+        if _tensor_key(state.token_row) != key or (copied is not None and _tensor_key(copied) != key):
+            raise RuntimeError("lane token row copy did not write the resident token row in place")
+        return candidates, token_row
+
+    def capture_decode_lanes(
+        self,
+        state: Qwen38TTNNTextModelLaneState,
+        *,
+        residue: int,
+        guard: Callable[[str], AbstractContextManager[Any]],
+        epilogue: Callable[[Qwen38TTNNGenericDecodeOutput], Any],
+        phase_observer: Callable[[str], None] | None = None,
+        cq_id: int = 0,
+        clock_ns: Callable[[], int] = time.monotonic_ns,
+    ) -> Qwen38TTNNGenericDecodeCapture:
+        """Capture one residue class of the lane body as one single-body trace (:meth:`capture_decode_generic`'s
+        discipline: ``ttnn.corruptible_allocation_scope``, the caller's ``guard`` and ``epilogue``).  The position
+        row's residue and every GDN lane state's ring phase must be ``residue`` (the residue rule made concrete);
+        capture records without executing, so the host bookkeeping advances as if the body ran while the device
+        state is unchanged.  A body failure poisons this owner and leaves the capture open; the process must exit."""
+
+        if phase_observer is not None and not callable(phase_observer):
+            raise TypeError("capture phase observer must be callable")
+        self._validate_lane_state(state)
+        if not isinstance(residue, int) or not 0 <= residue < gdn_module.CONV_KERNEL_SIZE:
+            raise ValueError(f"lane trace residue must be an int in [0,{gdn_module.CONV_KERNEL_SIZE}), got {residue!r}")
+        phases = {
+            index: layer_state.attention.conv_phase
+            for index, layer_state in enumerate(state.layers)
+            if isinstance(layer_state.attention, gdn_module.Qwen38TTNNGDNState)
+        }
+        if state.position.residue != residue or set(phases.values()) != {residue}:
+            raise RuntimeError(
+                f"lane capture residue {residue}: the position row's residue is {state.position.residue} and the GDN "
+                f"ring phases are {sorted(set(phases.values()))}; all must equal the residue"
+            )
+        if phase_observer is not None:
+            phase_observer("before-body-capture")
+        with ttnn.corruptible_allocation_scope(self.mesh_device):
+            trace_id = ttnn.begin_trace_capture(self.mesh_device, cq_id=cq_id)
+            started_ns = clock_ns()
+            with guard(f"lanes body capture residue {residue}") as blocked:
+                output = self.forward_decode_lanes(state)
+                epilogue_result = epilogue(output)
+            ttnn.end_trace_capture(self.mesh_device, trace_id, cq_id=cq_id)
+            capture_ns = clock_ns() - started_ns
+        if phase_observer is not None:
+            phase_observer("after-body-capture")
+        return Qwen38TTNNGenericDecodeCapture(
+            residue=residue,
+            regime=0,
+            parts=GENERIC_TRACE_PARTS_SINGLE,
+            trace_ids={Qwen38TTNNGenericTraceKey("body", residue, 0): trace_id},
+            head=None,
+            output=output,
+            epilogue=epilogue_result,
+            capture_ns={"body": capture_ns},
+            guard_attempts=tuple(blocked or ()),
+        )
+
 
 def validate_model_static_contract() -> None:
     """No-device guard for model geometry, order, and RoPE block routing."""
@@ -2856,6 +3325,7 @@ __all__ = [
     "Qwen38TTNNTextModel",
     "Qwen38TTNNTextModelGenericSnapshot",
     "Qwen38TTNNTextModelGenericState",
+    "Qwen38TTNNTextModelLaneState",
     "Qwen38TTNNTextModelOutput",
     "Qwen38TTNNTextModelSnapshot",
     "Qwen38TTNNTextModelState",

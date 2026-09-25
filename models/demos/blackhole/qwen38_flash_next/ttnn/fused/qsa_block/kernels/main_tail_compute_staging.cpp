@@ -3,7 +3,8 @@
 //
 // main_tail, staging core compute (fp32 dest): per lane the patched staging tiles times the ones tile on the SFPU
 // (the chain's one-hot select arithmetic: bf16 RNE store, zero rule), kept for the writer (TILE write-back) and
-// untilized into 32 row-major rows for the cache write (the chain's to_layout).  Runtime arg 0: rows.
+// untilized into 32 row-major rows for the cache write (the chain's to_layout).  Runtime arg 0: this core's lane
+// count (one staging core per lane).
 
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/eltwise_binary.h"
@@ -15,10 +16,10 @@
 using namespace main_tail;
 
 void kernel_main() {
-    const uint32_t rows = get_arg_val<uint32_t>(0);
+    const uint32_t lane_count = get_arg_val<uint32_t>(0);
     compute_kernel_hw_startup(CB_STG, CB_ONES, CB_STGC);
     cb_wait_front(CB_ONES, 1);
-    for (uint32_t lane = 0; lane < rows; ++lane) {
+    for (uint32_t i = 0; i < lane_count; ++i) {
         cb_wait_front(CB_STG, PACK_TILES);
         cb_reserve_back(CB_STGC, PACK_TILES);
         cb_reserve_back(CB_STGW, PACK_TILES);

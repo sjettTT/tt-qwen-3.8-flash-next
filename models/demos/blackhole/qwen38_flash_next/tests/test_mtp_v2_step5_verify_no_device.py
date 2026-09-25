@@ -880,7 +880,7 @@ def test_verify_token_rows_pad_with_the_zero_embedding_token_and_readback_parses
 
 
 def test_moe_row_admission_and_flags_are_untouched() -> None:
-    assert moe_module.SUPPORTED_ROWS == (1, 5, 32, 128)
+    assert moe_module.SUPPORTED_ROWS == (*range(1, 33), 128)
     assert moe_module.ROWS5_HARDWARE_PROVEN is True and moe_module.ROWS32_HARDWARE_PROVEN is True
     assert [mtp_v2.moe_rows_for(k + 1) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, 32]
     assert mtp_v2.SUPPORTED_DRAFTS == (3, 4, 5) and mtp_v2.DEFAULT_DRAFTS == 4

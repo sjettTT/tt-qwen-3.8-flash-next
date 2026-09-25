@@ -49,12 +49,15 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROW_COUNTS,
     CHUNK_ROWS,
     LONG_CHUNK_ROWS,
+    MAX_LANES,
     MESH_SHAPE,
+    POSITION_INDEX_ROW_SHAPE,
     Qwen38MeshContract,
     TensorPlacement,
     chunk_row_tiles,
     is_slab_rows,
     replicate_tensor_2d_mesh_mapper,
+    require_lane_count,
     tensor_metadata,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
@@ -1625,6 +1628,422 @@ def qsa_verify_constant_rows(rows: int, allocated_compressed_blocks: int) -> dic
     }
 
 
+# --------------------------------------------------------------------------- batched lanes (32 rows)
+# B lanes decode together in one 32-row tile (row u = lane u); the position row [1,1,1,32] carries P_u.  The
+# layout (one entry point per lane count, the 1-row path untouched):
+# * KV cache: one [1,1,B*C,512] ROW_MAJOR tensor, lane u at rows [uC, (u+1)C).  sparse_sdpa reads one contiguous
+#   cache by absolute row id with batch-1 KV and a [1,1,S,TOPK] index tensor, so the lane offset u*C is carried
+#   in every id of row u (the expanded block starts and the tail ids) and one call serves the B query rows.
+# * compressed cache: [B,1,blocks+32,128] TILE, user u = lane u: paged_update_cache writes all B rows in one
+#   call from a [1,B,1,128] input (one user per core).  The indexer scores it either as the flat view
+#   [1,1,B*(blocks+32),128] (one call, lane u's blocks at columns [u*(blocks+32), +blocks)) or per lane with
+#   cache_batch_idx (B calls); either way lane u's row is sliced out, so the mask / top-k / index rows stay at
+#   the lane-local [32, blocks] shapes.
+# * staging [1,B,32,512] and raw-key ring [1,B,32,128]: lane u's slot tiles; the per-lane one-hots are selection
+#   tiles (u; r, c) = (r == P_u mod m) * (c == u) whose matmul with the 32-row tile places row u of every lane
+#   at its own slot in one op, and keep columns (u; r) = 1 - (r == P_u mod m).
+# The derivation is the chunk derivation in column form (row u of every same-shape template is P_u) plus the
+# lane offsets; the emulation is the 1-row emulation per lane with the offsets applied.
+
+INDEXER_FORMS = ("wide", "per_lane")
+LANE_CORE_GRID_WIDTH = 8
+
+
+def lane_kv_offsets(lanes: int, allocated_context: int) -> list[int]:
+    """Row offset of every lane's KV region in the flat cache: ``u * C`` for the active lanes, 0 for idle rows (their
+    ids then point into lane 0's region, always in range)."""
+
+    lanes = require_lane_count(lanes, label="QSA lane count")
+    capacity = validate_qsa_cache_capacity(allocated_context)
+    return [lane * capacity if lane < lanes else 0 for lane in range(MAX_LANES)]
+
+
+def qsa_lane_constant_rows(lanes: int, allocated_context: int) -> dict[str, torch.Tensor]:
+    """Host images of the lane constants (UINT32 rows as int64; the bf16 select tiles as float).
+
+    ``arange32_tile`` ``[1,1,32,32]`` element ``(r, u) = r``; ``lane_indicator`` ``[1,B,32,32]`` element
+    ``(u; r, c) = c == u``; ``kv_offsets_row`` ``[1,1,1,32]`` lane ``u = u*C`` (0 past the active lanes);
+    ``block_offsets_lanes`` ``[1,1,32,2048]`` and ``arange_slots_lanes`` ``[1,1,32,2080]``: the chunk's rows plus
+    row ``u``'s offset.
+    """
+
+    offsets = torch.tensor(lane_kv_offsets(lanes, allocated_context), dtype=torch.int64)
+    rows = torch.arange(MAX_LANES, dtype=torch.int64)
+    indicator = torch.zeros(1, lanes, MAX_LANES, MAX_LANES)
+    for lane in range(lanes):
+        indicator[0, lane, :, lane] = 1.0
+    return {
+        "arange32_tile": rows.reshape(1, 1, MAX_LANES, 1).expand(1, 1, MAX_LANES, MAX_LANES).contiguous(),
+        "lane_indicator": indicator,
+        "kv_offsets_row": offsets.reshape(1, 1, 1, MAX_LANES),
+        "block_offsets_lanes": qsa_row_constants()["block_offsets"].reshape(1, 1, 1, TOKEN_BUDGET)
+        + offsets.reshape(1, 1, MAX_LANES, 1),
+        "arange_slots_lanes": torch.arange(SPARSE_INDEX_CAPACITY, dtype=torch.int64).reshape(1, 1, 1, -1)
+        + offsets.reshape(1, 1, MAX_LANES, 1),
+    }
+
+
+def lane_core_range_set(lanes: int):
+    """``lanes`` cores row-wise over an 8-wide grid: one compressed-row user per core for ``paged_update_cache``."""
+
+    lanes = require_lane_count(lanes, label="QSA lane count")
+    return ttnn.num_cores_to_corerangeset(
+        lanes, ttnn.CoreCoord(LANE_CORE_GRID_WIDTH, -(-lanes // LANE_CORE_GRID_WIDTH)), True
+    )
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNQSALaneConstants:
+    """Replicated constants of one lane count, one set per model (see :func:`qsa_lane_constant_rows`).
+
+    UINT32 TILE ``arange32_tile``; BF16 TILE ``lane_indicator``; UINT32 ROW_MAJOR ``kv_offsets_row``,
+    ``block_offsets_lanes``, ``arange_slots_lanes``; ``compressed_rows_memory_config`` height-shards the
+    ``[1,B,1,128]`` compressed rows one user per core; ``indexer_form`` picks the wide or the per-lane indexer.
+    """
+
+    lanes: int
+    allocated_context: int
+    indexer_form: str
+    arange32_tile: Any
+    lane_indicator: Any
+    kv_offsets_row: Any
+    block_offsets_lanes: Any
+    arange_slots_lanes: Any
+    compressed_rows_memory_config: Any
+
+    @classmethod
+    def build(
+        cls,
+        mesh_device,
+        mesh_contract: Qwen38MeshContract,
+        *,
+        lanes: int,
+        allocated_context: int,
+        indexer_form: str = "wide",
+    ) -> "Qwen38TTNNQSALaneConstants":
+        mesh_contract.validate_mesh(mesh_device)
+        lanes = require_lane_count(lanes, label="QSA lane count")
+        allocated_context = validate_qsa_cache_capacity(allocated_context)
+        if indexer_form not in INDEXER_FORMS:
+            raise ValueError(f"QSA lane indexer form must be one of {INDEXER_FORMS}, got {indexer_form!r}")
+        host = qsa_lane_constant_rows(lanes, allocated_context)
+        uploaded: list[Any] = []
+
+        def upload_uint32(name: str, layout):
+            tensor = _upload_uint32(mesh_device, mesh_contract, host[name], layout=layout)
+            uploaded.append(tensor)
+            return tensor
+
+        try:
+            indicator = ttnn.from_torch(
+                host["lane_indicator"].to(torch.bfloat16),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=mesh_device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=replicate_tensor_2d_mesh_mapper(mesh_device),
+            )
+            uploaded.append(indicator)
+            _require_shape(indicator, (1, lanes, MAX_LANES, MAX_LANES), "QSA lane indicator")
+            mesh_contract.validate_tensor(indicator, placement=TensorPlacement.REPLICATED)
+            return cls(
+                lanes=lanes,
+                allocated_context=allocated_context,
+                indexer_form=indexer_form,
+                arange32_tile=upload_uint32("arange32_tile", ttnn.TILE_LAYOUT),
+                lane_indicator=indicator,
+                kv_offsets_row=upload_uint32("kv_offsets_row", ttnn.ROW_MAJOR_LAYOUT),
+                block_offsets_lanes=upload_uint32("block_offsets_lanes", ttnn.ROW_MAJOR_LAYOUT),
+                arange_slots_lanes=upload_uint32("arange_slots_lanes", ttnn.ROW_MAJOR_LAYOUT),
+                compressed_rows_memory_config=ttnn.create_sharded_memory_config(
+                    (ttnn.TILE_SIZE, INDEX_HEAD_DIM),
+                    lane_core_range_set(lanes),
+                    ttnn.ShardStrategy.HEIGHT,
+                    ttnn.ShardOrientation.ROW_MAJOR,
+                    use_height_and_width_as_shard_shape=True,
+                ),
+            )
+        except BaseException:
+            _deallocate(*uploaded)
+            raise
+
+    def deallocate(self) -> None:
+        _deallocate(
+            self.arange32_tile,
+            self.lane_indicator,
+            self.kv_offsets_row,
+            self.block_offsets_lanes,
+            self.arange_slots_lanes,
+        )
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNQSALaneInputs:
+    """Per-step device tensors derived from the position row; shared by all QSA layers.
+
+    ``kv_row_start_row`` UINT32 ROW_MAJOR ``[1,1,1,32]`` (lane ``u = u*C + (P_u & ~31)``, the flat-cache row of
+    lane ``u``'s slab) and ``kv_row_start_lanes``, its B ``[1,1,1,1]`` scalars for ``update_padded_kv_cache``;
+    ``block_index_i32`` INT32 ``[B]`` (lane ``u = P_u // 4``, the per-user index of ``paged_update_cache``);
+    the BF16 TILE selection tiles ``kv_hit_tiles`` / ``ring_hit_tiles`` ``[1,B,32,32]`` and keep columns
+    ``kv_keep_col`` / ``ring_keep_col`` ``[1,B,32,1]``; ``indexer_neg_mask`` BF16 ROW_MAJOR ``[1,1,32,blocks]``
+    and the UINT32 ROW_MAJOR ``[1,1,32,2080]`` ``row_keep_bits`` / ``row_fill`` (row ``u`` is the 1-row input at
+    ``P_u``, the tail ids carrying lane ``u``'s offset).  ``kv_block_start`` UINT32 ROW_MAJOR ``[1,1,1,32]`` (lane
+    ``u = P_u & ~31``, no lane offset) and ``kv_row_hit`` BF16 TILE ``[1,B,32,1]`` (lane ``u``'s one-hot column of
+    ``P_u % 32``) are the chain's 1-row position fields per lane: the fused QSA kernels read ``P_u`` from them, so
+    this object is the ``position`` of the fused lane body (:meth:`Qwen38TTNNQSA._forward_decode_lanes_fused`).
+    """
+
+    kv_row_start_row: Any
+    kv_row_start_lanes: tuple[Any, ...]
+    block_index_i32: Any
+    kv_hit_tiles: Any
+    kv_keep_col: Any
+    ring_hit_tiles: Any
+    ring_keep_col: Any
+    indexer_neg_mask: Any
+    row_keep_bits: Any
+    row_fill: Any
+    kv_block_start: Any
+    kv_row_hit: Any
+
+    def deallocate(self) -> None:
+        _deallocate(
+            self.kv_row_start_row,
+            *self.kv_row_start_lanes,
+            self.block_index_i32,
+            self.kv_hit_tiles,
+            self.kv_keep_col,
+            self.ring_hit_tiles,
+            self.ring_keep_col,
+            self.indexer_neg_mask,
+            self.row_keep_bits,
+            self.row_fill,
+            self.kv_block_start,
+            self.kv_row_hit,
+        )
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNQSAFusedLaneInputs:
+    """The fused QSA lane body's position inputs alone (the fused position derive's lane form): the five fields of
+    :class:`Qwen38TTNNQSALaneInputs` the six programs read.  ``kv_block_start`` UINT32 ROW_MAJOR ``[1,1,1,32]``
+    (P_u & ~31), ``kv_row_hit`` BF16 TILE ``[1,B,32,1]``, ``indexer_neg_mask`` BF16 ROW_MAJOR ``[1,1,32,blocks]``,
+    ``row_keep_bits`` / ``row_fill`` UINT32 ROW_MAJOR ``[1,1,32,2080]``.  The lane chain refuses it (it needs the
+    selection tiles and scalars)."""
+
+    kv_block_start: Any
+    kv_row_hit: Any
+    indexer_neg_mask: Any
+    row_keep_bits: Any
+    row_fill: Any
+
+    def deallocate(self) -> None:
+        _deallocate(self.kv_block_start, self.kv_row_hit, self.indexer_neg_mask, self.row_keep_bits, self.row_fill)
+
+
+FUSED_LANE_INPUT_FIELDS = tuple(Qwen38TTNNQSAFusedLaneInputs.__dataclass_fields__)
+
+
+def derive_qsa_lane_inputs(
+    position_row,
+    constants: Qwen38TTNNQSAPositionConstants,
+    chunk: Qwen38TTNNQSAChunkConstants,
+    lanes: Qwen38TTNNQSALaneConstants,
+) -> Qwen38TTNNQSALaneInputs:
+    """:func:`derive_qsa_position_inputs` for the lanes of a position row: the chunk's same-shape templates with
+    row u = ``P_u`` (the row reshaped to a ``[32,1]`` column and repeated along the width, no arithmetic), then the
+    chunk derivation's exact UINT32 ops with lane u's KV offset in the tail ids; the one-hots compare the
+    ``arange32_tile`` rows against the row's remainders (row broadcast) and become the per-lane selection tiles
+    through the lane indicator (batch broadcast of the one-hot) and the keep columns through a row sum."""
+
+    _require_shape(position_row, POSITION_INDEX_ROW_SHAPE, "QSA position row")
+    if position_row.dtype != ttnn.uint32 or position_row.layout != ttnn.ROW_MAJOR_LAYOUT:
+        raise RuntimeError(f"QSA position row must be UINT32 ROW_MAJOR, got {tensor_metadata(position_row)}")
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    u32 = ttnn.uint32
+    blocks = chunk.allocated_compressed_blocks
+    if blocks != constants.allocated_compressed_blocks:
+        raise ValueError(
+            f"QSA chunk constants were built for {blocks} blocks, "
+            f"the position constants for {constants.allocated_compressed_blocks}"
+        )
+    if lanes.allocated_context != blocks * COMPRESS_RATIO:
+        raise ValueError(
+            f"QSA lane constants were built for {lanes.allocated_context} tokens, "
+            f"the position constants for {blocks * COMPRESS_RATIO}"
+        )
+    count = lanes.lanes
+
+    # Lane u's slab row in the flat cache, as one row and as B scalars; its compressed block as B INT32 users.
+    # kv_block_start (no lane offset) is kept: the fused kernels read lane u's P_u & ~31 from it.
+    kv_block_start = ttnn.bitwise_and(position_row, constants.high27_mask, memory_config=dram)
+    kv_row_start_row = ttnn.add(kv_block_start, lanes.kv_offsets_row, memory_config=dram)
+    kv_row_start_lanes = tuple(
+        ttnn.slice(kv_row_start_row, (0, 0, 0, lane), (1, 1, 1, lane + 1), memory_config=dram) for lane in range(count)
+    )
+    block_index = ttnn.bitwise_right_shift(position_row, 2, memory_config=dram)
+    block_index_lanes = (
+        block_index
+        if count == MAX_LANES
+        else ttnn.slice(block_index, (0, 0, 0, 0), (1, 1, 1, count), memory_config=dram)
+    )
+    block_index_i32 = ttnn.reshape(ttnn.typecast(block_index_lanes, ttnn.int32, memory_config=dram), (count,))
+    _deallocate(block_index, None if block_index_lanes is block_index else block_index_lanes)
+
+    def one_hot(modulus_mask: int):
+        # Row broadcast of the [1,1,1,32] remainder row over the [1,1,32,32] arange rows: element (r, u) hits when
+        # r == P_u mod (mask + 1).  eq() writes 0/1 UINT32; the typecast is exact.  The lane indicator keeps column
+        # u of lane u's copy (the selection tile); its row sum is that column (the hit column), and rsub(x, 1.0) is
+        # exact on {0.0, 1.0}.
+        remainder = ttnn.bitwise_and(position_row, modulus_mask, memory_config=dram)
+        remainder_tiled = ttnn.to_layout(remainder, ttnn.TILE_LAYOUT, memory_config=dram)
+        hit_bits = ttnn.eq(lanes.arange32_tile, remainder_tiled, dtype=u32, memory_config=dram)
+        hit = ttnn.typecast(hit_bits, ttnn.bfloat16, memory_config=dram)
+        hit_tiles = ttnn.multiply(lanes.lane_indicator, hit, memory_config=dram)
+        hit_col = ttnn.sum(hit_tiles, dim=3, keepdim=True, memory_config=dram)
+        keep_col = ttnn.rsub(hit_col, 1.0, memory_config=dram)
+        _deallocate(remainder, remainder_tiled, hit_bits, hit)
+        return hit_tiles, keep_col, hit_col
+
+    # The KV hit column (lane u's one-hot of P_u % 32) is kept: it is the fused kernels' kv_row_hit per lane.
+    kv_hit_tiles, kv_keep_col, kv_row_hit = one_hot(KV_ROW_MASK)
+    ring_hit_tiles, ring_keep_col, ring_hit_col = one_hot(COMPRESS_RATIO - 1)
+    _deallocate(ring_hit_col)
+
+    # Column form of the templates: row u carries P_u along the whole width.  The column is a ROW_MAJOR view of
+    # the resident row (fresh id, same buffer): never deallocated.
+    lane_column = ttnn.reshape(position_row, (1, 1, MAX_LANES, 1))
+    context_blocks = ttnn.repeat(lane_column, (1, 1, 1, blocks), memory_config=dram)
+    positions = ttnn.repeat(lane_column, (1, 1, 1, SPARSE_INDEX_CAPACITY), memory_config=dram)
+
+    # Per lane u: context = P_u + 1, complete = context // 4; blocks at or past complete are masked.
+    context_blocks_plus = ttnn.add(context_blocks, 1, memory_config=dram)
+    complete_blocks_rows = ttnn.bitwise_right_shift(context_blocks_plus, 2, memory_config=dram)
+    valid_bits = ttnn.lt(chunk.arange_blocks_rows, complete_blocks_rows, dtype=u32, memory_config=dram)
+    valid = ttnn.typecast(valid_bits, ttnn.bfloat16, memory_config=dram)
+    invalid = ttnn.rsub(valid, 1.0, memory_config=dram)
+    indexer_neg_mask = ttnn.multiply(invalid, INDEXER_MASK_VALUE, memory_config=dram)
+    _deallocate(context_blocks, context_blocks_plus, complete_blocks_rows, valid_bits, valid, invalid)
+
+    # The sparse row per lane u, as the 1-row chain on [1,1,32,2080] operands (the chunk derivation's ops); the
+    # tail ids start from row u's offset arange, so they address lane u's region of the flat cache.
+    context_length = ttnn.add(positions, 1, memory_config=dram)
+    complete_blocks = ttnn.bitwise_right_shift(context_length, 2, memory_config=dram)
+    selected_blocks = ttnn.minimum(complete_blocks, BLOCK_TOPK, memory_config=dram)
+    lo = ttnn.bitwise_left_shift(selected_blocks, 2, memory_config=dram)
+    tail_count = ttnn.bitwise_and(context_length, COMPRESS_RATIO - 1, memory_config=dram)
+    hi = ttnn.add(lo, tail_count, memory_config=dram)
+    before_lo = ttnn.lt(chunk.arange_slots_rows, lo, dtype=u32, memory_config=dram)
+    row_keep_bits = ttnn.multiply(before_lo, chunk.all_ones_rows, memory_config=dram)
+    skipped_blocks = ttnn.subtract(complete_blocks, selected_blocks, memory_config=dram)
+    tail_shift = ttnn.bitwise_left_shift(skipped_blocks, 2, memory_config=dram)
+    tail_ids = ttnn.add(lanes.arange_slots_lanes, tail_shift, memory_config=dram)
+    from_lo = ttnn.ge(chunk.arange_slots_rows, lo, dtype=u32, memory_config=dram)
+    before_hi = ttnn.lt(chunk.arange_slots_rows, hi, dtype=u32, memory_config=dram)
+    tail_bits = ttnn.multiply(from_lo, before_hi, memory_config=dram)
+    row_tail_fill = ttnn.multiply(tail_ids, tail_bits, memory_config=dram)
+    from_hi = ttnn.ge(chunk.arange_slots_rows, hi, dtype=u32, memory_config=dram)
+    row_sentinel_bits = ttnn.multiply(from_hi, chunk.all_ones_rows, memory_config=dram)
+    row_fill = ttnn.bitwise_or(row_tail_fill, row_sentinel_bits, memory_config=dram)
+    _deallocate(
+        positions,
+        context_length,
+        complete_blocks,
+        selected_blocks,
+        lo,
+        tail_count,
+        hi,
+        before_lo,
+        skipped_blocks,
+        tail_shift,
+        tail_ids,
+        from_lo,
+        before_hi,
+        tail_bits,
+        row_tail_fill,
+        from_hi,
+        row_sentinel_bits,
+    )
+    inputs = Qwen38TTNNQSALaneInputs(
+        kv_row_start_row=kv_row_start_row,
+        kv_row_start_lanes=kv_row_start_lanes,
+        block_index_i32=block_index_i32,
+        kv_hit_tiles=kv_hit_tiles,
+        kv_keep_col=kv_keep_col,
+        ring_hit_tiles=ring_hit_tiles,
+        ring_keep_col=ring_keep_col,
+        indexer_neg_mask=indexer_neg_mask,
+        row_keep_bits=row_keep_bits,
+        row_fill=row_fill,
+        kv_block_start=kv_block_start,
+        kv_row_hit=kv_row_hit,
+    )
+    for name, tensor, shape, dtype, layout in (
+        ("kv_row_start_row", kv_row_start_row, POSITION_INDEX_ROW_SHAPE, u32, ttnn.ROW_MAJOR_LAYOUT),
+        *(
+            (f"kv_row_start_lanes[{lane}]", scalar, (1, 1, 1, 1), u32, ttnn.ROW_MAJOR_LAYOUT)
+            for lane, scalar in enumerate(kv_row_start_lanes)
+        ),
+        ("block_index_i32", block_index_i32, (count,), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT),
+        ("kv_hit_tiles", kv_hit_tiles, (1, count, MAX_LANES, MAX_LANES), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+        ("kv_keep_col", kv_keep_col, (1, count, MAX_LANES, 1), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+        ("ring_hit_tiles", ring_hit_tiles, (1, count, MAX_LANES, MAX_LANES), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+        ("ring_keep_col", ring_keep_col, (1, count, MAX_LANES, 1), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+        ("indexer_neg_mask", indexer_neg_mask, (1, 1, MAX_LANES, blocks), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT),
+        ("row_keep_bits", row_keep_bits, (1, 1, MAX_LANES, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
+        ("row_fill", row_fill, (1, 1, MAX_LANES, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
+        ("kv_block_start", kv_block_start, POSITION_INDEX_ROW_SHAPE, u32, ttnn.ROW_MAJOR_LAYOUT),
+        ("kv_row_hit", kv_row_hit, (1, count, MAX_LANES, 1), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+    ):
+        _require_shape(tensor, shape, f"QSA lane input {name}")
+        if tensor.dtype != dtype or tensor.layout != layout:
+            raise RuntimeError(
+                f"QSA lane input {name} must be {dtype} {layout} {list(shape)}, got {tensor_metadata(tensor)}"
+            )
+    return inputs
+
+
+def emulate_qsa_lane_inputs(positions, *, allocated_compressed_blocks: int, lanes: int) -> dict[str, torch.Tensor]:
+    """Torch reference of :func:`derive_qsa_lane_inputs` (same names as its tensor fields): row / user u is
+    :func:`emulate_qsa_position_inputs` at ``positions[u]`` (32 lane positions, any residues: the emulation does
+    not enforce the residue rule) with lane u's KV offset added to its slab row and its tail ids."""
+
+    values = [int(value) for value in positions]
+    if len(values) != MAX_LANES:
+        raise ValueError(f"QSA lane emulation needs {MAX_LANES} lane positions, got {len(values)}")
+    blocks = validate_qsa_cache_capacity(allocated_compressed_blocks * COMPRESS_RATIO) // COMPRESS_RATIO
+    offsets = lane_kv_offsets(lanes, blocks * COMPRESS_RATIO)
+    rows = [emulate_qsa_position_inputs(value, allocated_compressed_blocks=blocks) for value in values]
+    slots = torch.arange(SPARSE_INDEX_CAPACITY, dtype=torch.int64).reshape(1, 1, 1, SPARSE_INDEX_CAPACITY)
+    fills = []
+    for lane, (value, row) in enumerate(zip(values, rows)):
+        geometry = qsa_selection_geometry(value + 1)
+        lo = geometry.complete_token_count
+        tail = ((slots >= lo) & (slots < lo + geometry.tail_count)).to(torch.int64)
+        fills.append(row["row_fill"] + offsets[lane] * tail)
+    indicator = torch.zeros(1, lanes, MAX_LANES, MAX_LANES, dtype=torch.bfloat16)
+    for lane in range(lanes):
+        indicator[0, lane, :, lane] = 1.0
+    hit = {
+        name: torch.stack([rows[lane][name][0, 0] for lane in range(lanes)]).reshape(1, lanes, MAX_LANES, 1)
+        for name in ("kv_row_hit", "ring_hit")
+    }
+    return {
+        "kv_row_start_row": torch.cat([row["kv_block_start"] for row in rows], dim=3)
+        + torch.tensor(offsets, dtype=torch.int64).reshape(1, 1, 1, MAX_LANES),
+        "block_index_i32": torch.cat([rows[lane]["block_index_i32"] for lane in range(lanes)]),
+        "kv_hit_tiles": hit["kv_row_hit"] * indicator,
+        "kv_keep_col": torch.tensor(1.0, dtype=torch.bfloat16) - hit["kv_row_hit"],
+        "ring_hit_tiles": hit["ring_hit"] * indicator,
+        "ring_keep_col": torch.tensor(1.0, dtype=torch.bfloat16) - hit["ring_hit"],
+        "indexer_neg_mask": torch.cat([row["indexer_neg_mask"] for row in rows], dim=2),
+        "row_keep_bits": torch.cat([row["row_keep_bits"] for row in rows], dim=2),
+        "row_fill": torch.cat(fills, dim=2),
+        "kv_block_start": torch.cat([row["kv_block_start"] for row in rows], dim=3),
+        "kv_row_hit": hit["kv_row_hit"],
+    }
+
+
 @dataclass(frozen=True)
 class Qwen38TTNNQSAVerifyConstants:
     """Replicated constants of the verify path for one row count, beside one set of chunk constants.
@@ -1950,6 +2369,607 @@ class Qwen38TTNNQSAGenericState:
     raw_key_ring: Any
 
 
+@dataclass(frozen=True)
+class Qwen38TTNNQSALaneState:
+    """Fixed-address QSA state of B decode lanes (the layout of the batched-lanes section).
+
+    ``packed_kv_cache`` ``[1,1,B*C,512]`` BF16 ROW_MAJOR (lane u at rows ``[uC, (u+1)C)``);
+    ``compressed_index_cache`` ``[B,1,blocks+32,128]`` BF16 TILE (user u = lane u, the last tile of every user
+    the never-written indexer window) and ``compressed_index_cache_flat``, the same buffer viewed
+    ``[1,1,B*(blocks+32),128]`` for the wide indexer (a view: released with the cache, never alone);
+    ``kv_staging`` ``[1,B,32,512]`` and ``raw_key_ring`` ``[1,B,32,128]`` BF16 TILE, lane u's slot tiles.
+    """
+
+    layer_index: int
+    epoch: int
+    lanes: int
+    packed_kv_cache: Any
+    compressed_index_cache: Any
+    compressed_index_cache_flat: Any
+    kv_staging: Any
+    raw_key_ring: Any
+    # Scratch rows past the last lane's region ([B*C, B*C + kv_scratch_rows)): the MTP lanes verify redirects an
+    # inactive lane's two KV block writes there, so no write of a parked lane can land in another lane's region.
+    kv_scratch_rows: int = 0
+
+
+# --------------------------------------------------------------------------- lane verify (B lanes x R rows, one tile)
+# The MTP lanes verify: B lanes each verify R = k + 1 consecutive positions in ONE 32-row tile, lane-major (row
+# u*R + j = lane u's row j; rows B*R .. 31 pad).  The dense stages (the all-gather, the five linears, the RoPE rows,
+# the sparse attention over the flat cache, the output projection) are the chunk path's 32-row forms and
+# row-independent; the per-lane cache writes take lane u's rows out of the tile with exact 0/1 selects: the raw
+# index keys into lane u's raw-rows tile, the two compressed block means of every lane pooled into ONE tile (row
+# 2u + i = lane u's block i) before the norm and the block-start RoPE (whose cos / sin rows are lanes 2u + i), the
+# packed KV rows into every lane's current and next block through the lane-indicator staging selects, written per
+# lane at the lane's flat-cache rows (an inactive lane's writes redirected to the scratch rows past the last lane).
+# The wide indexer scores the lane-major tile against the flat compressed cache once; row r's window is lane_of(r)'s.
+
+
+def qsa_lane_verify_constant_rows(lanes: int, rows: int, allocated_context: int) -> dict[str, torch.Tensor]:
+    """Host images of the lane verify constants (UINT32 rows as int64, the bf16 select tiles as float).
+
+    Rows ``[1,1,1,32]``: ``lane_of_row`` (row r -> lane ``r // R``; pad rows lane 0), ``draft_of_row`` (``r % R``; pad
+    rows ``R - 1``: lane 0's last real row's geometry, never read or written into a cache), ``block_lane_of_row`` /
+    ``block_offset_row`` (pooled-tile row ``2u + i`` -> lane u, ``4i``; pad rows 0, 0), ``scratch_row`` (``B*C`` on
+    every lane: the inactive lane's KV write rows); ``arange_per_lane`` ``[1,1,1,B*32]`` (``u*32 + i -> i``: the
+    current-block row lookup).  Templates ``block_offsets_lanes`` ``[1,1,32,2048]`` / ``arange_slots_rows``
+    ``[1,1,32,2080]``: the chunk rows' index templates plus ``C * lane_of(r)`` (row r's ids address lane_of(r)'s
+    region).  Tiles: ``expand_select`` ``[B*32, 32]`` (row ``u*32 + j`` <- row ``u*R + j``), ``lane_indicator_rows``
+    ``[B, 32, 32]`` (``(u; i, c) = [lane_of(c) == u]``, zero on the pad columns), ``pick_pooled`` ``[32, B*32]``
+    (``(2u + i, u*32 + i) = 1``), ``pick_users`` ``[2, B, 32, 32]`` (``(i; u; 0, 2u + i) = 1``).
+    """
+
+    lanes = require_lane_count(lanes, label="QSA lane verify lanes")
+    if not 1 <= rows <= VERIFY_MAX_ROWS or lanes * rows > CHUNK_ROWS:
+        raise ValueError(
+            f"QSA lane verify admits 1..{VERIFY_MAX_ROWS} rows per lane and B x R <= {CHUNK_ROWS}, got {lanes} x {rows}"
+        )
+    capacity = validate_qsa_cache_capacity(allocated_context)
+    real = lanes * rows
+    lane_of = [row // rows if row < real else 0 for row in range(CHUNK_ROWS)]
+    draft_of = [row % rows if row < real else rows - 1 for row in range(CHUNK_ROWS)]
+    block_lane_of = [row // 2 if row < 2 * lanes else 0 for row in range(CHUNK_ROWS)]
+    block_offset = [COMPRESS_RATIO * (row % 2) if row < 2 * lanes else 0 for row in range(CHUNK_ROWS)]
+    offsets = torch.tensor([capacity * lane for lane in lane_of], dtype=torch.int64).reshape(1, 1, CHUNK_ROWS, 1)
+    expand = torch.zeros(lanes * CHUNK_ROWS, CHUNK_ROWS)
+    indicator = torch.zeros(lanes, CHUNK_ROWS, CHUNK_ROWS)
+    pick_pooled = torch.zeros(CHUNK_ROWS, lanes * CHUNK_ROWS)
+    pick_users = torch.zeros(VERIFY_COMPLETED_BLOCKS, lanes, CHUNK_ROWS, CHUNK_ROWS)
+    for lane in range(lanes):
+        for row in range(rows):
+            expand[lane * CHUNK_ROWS + row, lane * rows + row] = 1.0
+            indicator[lane, :, lane * rows + row] = 1.0
+        for block in range(VERIFY_COMPLETED_BLOCKS):
+            pick_pooled[2 * lane + block, lane * CHUNK_ROWS + block] = 1.0
+            pick_users[block, lane, 0, 2 * lane + block] = 1.0
+    row = lambda values: torch.tensor(values, dtype=torch.int64).reshape(1, 1, 1, CHUNK_ROWS)  # noqa: E731
+    return {
+        "lane_of_row": row(lane_of),
+        "draft_of_row": row(draft_of),
+        "block_lane_of_row": row(block_lane_of),
+        "block_offset_row": row(block_offset),
+        "scratch_row": torch.full((1, 1, 1, CHUNK_ROWS), lanes * capacity, dtype=torch.int64),
+        "arange_per_lane": torch.arange(CACHE_WRITE_ROWS, dtype=torch.int64).repeat(lanes).reshape(1, 1, 1, -1),
+        "block_offsets_lanes": qsa_row_constants()["block_offsets"].reshape(1, 1, 1, TOKEN_BUDGET) + offsets,
+        "arange_slots_rows": torch.arange(SPARSE_INDEX_CAPACITY, dtype=torch.int64).reshape(1, 1, 1, -1) + offsets,
+        "expand_select": expand,
+        "lane_indicator_rows": indicator,
+        "pick_pooled": pick_pooled,
+        "pick_users": pick_users,
+    }
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNQSALaneVerifyConstants:
+    """Replicated constants of the lane verify for one ``(lanes, rows, allocated_context)`` (see
+    :func:`qsa_lane_verify_constant_rows`); ``lanes_of_rows`` is the host tuple the wide indexer's row windows take.
+    UINT32 ROW_MAJOR rows and templates; BF16 TILE selects; ``block_offsets_lanes`` is named as the plain lanes'
+    template so :meth:`Qwen38TTNNQSA._materialize_rows_lanes` reads it unchanged (per row here, per lane there)."""
+
+    lanes: int
+    rows: int
+    allocated_context: int
+    lanes_of_rows: tuple[int, ...]
+    lane_of_row: Any
+    draft_of_row: Any
+    block_lane_of_row: Any
+    block_offset_row: Any
+    scratch_row: Any
+    arange_per_lane: Any
+    block_offsets_lanes: Any
+    arange_slots_rows: Any
+    expand_select: Any
+    lane_indicator_rows: Any
+    pick_pooled: Any
+    pick_users: tuple[Any, Any]
+    select_compute_config: Any
+
+    @classmethod
+    def build(
+        cls, mesh_device, mesh_contract: Qwen38MeshContract, *, lanes: int, rows: int, allocated_context: int
+    ) -> "Qwen38TTNNQSALaneVerifyConstants":
+        mesh_contract.validate_mesh(mesh_device)
+        host = qsa_lane_verify_constant_rows(lanes, rows, allocated_context)
+        uploaded: list[Any] = []
+
+        def upload_uint32(name: str):
+            tensor = _upload_uint32(mesh_device, mesh_contract, host[name], layout=ttnn.ROW_MAJOR_LAYOUT)
+            uploaded.append(tensor)
+            return tensor
+
+        def upload_bf16(values: torch.Tensor, label: str):
+            tensor = ttnn.from_torch(
+                values.to(torch.bfloat16),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=mesh_device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=replicate_tensor_2d_mesh_mapper(mesh_device),
+            )
+            uploaded.append(tensor)
+            _require_shape(tensor, tuple(values.shape), label)
+            mesh_contract.validate_tensor(tensor, placement=TensorPlacement.REPLICATED)
+            return tensor
+
+        try:
+            return cls(
+                lanes=lanes,
+                rows=rows,
+                allocated_context=validate_qsa_cache_capacity(allocated_context),
+                lanes_of_rows=tuple(int(value) for value in host["lane_of_row"].reshape(-1).tolist()),
+                lane_of_row=upload_uint32("lane_of_row"),
+                draft_of_row=upload_uint32("draft_of_row"),
+                block_lane_of_row=upload_uint32("block_lane_of_row"),
+                block_offset_row=upload_uint32("block_offset_row"),
+                scratch_row=upload_uint32("scratch_row"),
+                arange_per_lane=upload_uint32("arange_per_lane"),
+                block_offsets_lanes=upload_uint32("block_offsets_lanes"),
+                arange_slots_rows=upload_uint32("arange_slots_rows"),
+                expand_select=upload_bf16(
+                    host["expand_select"].reshape(1, 1, lanes * CHUNK_ROWS, CHUNK_ROWS), "QSA lane verify expand"
+                ),
+                lane_indicator_rows=upload_bf16(
+                    host["lane_indicator_rows"].reshape(1, lanes, CHUNK_ROWS, CHUNK_ROWS), "QSA lane row indicator"
+                ),
+                pick_pooled=upload_bf16(
+                    host["pick_pooled"].reshape(1, 1, CHUNK_ROWS, lanes * CHUNK_ROWS), "QSA lane pooled pick"
+                ),
+                pick_users=tuple(
+                    upload_bf16(
+                        host["pick_users"][block].reshape(1, lanes, CHUNK_ROWS, CHUNK_ROWS),
+                        f"QSA lane users pick {block}",
+                    )
+                    for block in range(VERIFY_COMPLETED_BLOCKS)
+                ),
+                select_compute_config=ttnn.WormholeComputeKernelConfig(
+                    math_fidelity=ttnn.MathFidelity.HiFi4,
+                    math_approx_mode=False,
+                    fp32_dest_acc_en=True,
+                    packer_l1_acc=False,
+                ),
+            )
+        except BaseException:
+            _deallocate(*uploaded)
+            raise
+
+    def deallocate(self) -> None:
+        _deallocate(
+            self.lane_of_row,
+            self.draft_of_row,
+            self.block_lane_of_row,
+            self.block_offset_row,
+            self.scratch_row,
+            self.arange_per_lane,
+            self.block_offsets_lanes,
+            self.arange_slots_rows,
+            self.expand_select,
+            self.lane_indicator_rows,
+            self.pick_pooled,
+            *self.pick_users,
+        )
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNQSALaneVerifyInputs:
+    """Per-pass device tensors of the lane verify, derived from the lane position row (lane u = P_u), the active
+    mask and the lane-major row positions (row r = P_{lane_of(r)} + draft_of(r)); shared by every QSA layer.
+
+    Per row (the chunk derivation's forms): ``indexer_neg_mask`` BF16 ROW_MAJOR ``[1,1,32,blocks]``, ``row_keep_bits`` /
+    ``row_fill`` UINT32 ``[1,1,32,2080]`` (the tail ids carry lane_of(r)'s offset).  Per lane: ``block_index_i32`` two
+    INT32 ``[B]`` (P_u // 4, + 1), ``kv_row_start_lanes`` / ``kv_row_start_next_lanes`` B UINT32 ``[1,1,1,1]`` each
+    (``active_u * (u*C + (P_u & ~31)) + (1 - active_u) * B*C`` and + 32), ``kv_read_indices`` UINT32 ``[1,1,B*32]``
+    (lane u's current block rows; a view of the rank-4 ``kv_read_row``), ``stage_keep`` BF16 TILE ``[1,B,32,1]``
+    (``[i < P_u % 32]``), ``stage_a_select`` / ``stage_b_select`` BF16 TILE ``[1,B,32,32]`` (``(u; i, c) = [i ==
+    P_row[c] % 32] * [c's block is lane u's current / next block] * [lane_of(c) == u]``), ``pool_select`` BF16 TILE
+    ``[1,B,32,64]`` (lane u's 0.25-valued block pools over ``[raw_history_u | raw_rows_u]``).
+    """
+
+    lanes: int
+    indexer_neg_mask: Any
+    row_keep_bits: Any
+    row_fill: Any
+    block_index_i32: tuple[Any, Any]
+    kv_row_start_lanes: tuple[Any, ...]
+    kv_row_start_next_lanes: tuple[Any, ...]  # () in the single-row form
+    kv_read_indices: Any
+    kv_read_row: Any
+    stage_keep: Any
+    stage_a_select: Any
+    stage_b_select: Any  # None in the single-row form
+    pool_select: Any
+    single_row: bool = False
+
+    def deallocate(self) -> None:
+        _deallocate(
+            self.indexer_neg_mask,
+            self.row_keep_bits,
+            self.row_fill,
+            *self.block_index_i32,
+            *self.kv_row_start_lanes,
+            *self.kv_row_start_next_lanes,
+            self.kv_read_row,
+            self.stage_keep,
+            self.stage_a_select,
+            self.stage_b_select,
+            self.pool_select,
+        )  # ``_deallocate`` skips None (the single-row form's next-block select)
+
+
+def derive_qsa_lane_verify_inputs(
+    position_row,
+    active_row,
+    inactive_row,
+    row_positions,
+    constants: Qwen38TTNNQSAPositionConstants,
+    chunk: Qwen38TTNNQSAChunkConstants,
+    verify: Qwen38TTNNQSAVerifyConstants,
+    lanes: Qwen38TTNNQSALaneConstants,
+    lane_verify: Qwen38TTNNQSALaneVerifyConstants,
+    *,
+    single_row: bool = False,
+) -> Qwen38TTNNQSALaneVerifyInputs:
+    """The lane verify's per-pass inputs from the UINT32 ROW_MAJOR ``[1,1,1,32]`` rows ``position_row`` (lane u =
+    P_u), ``active_row`` / ``inactive_row`` (0/1 per lane, host-written) and ``row_positions`` (row r = P_row[r]):
+    exact UINT32 ops, the 0/1 selects cast to BF16 by the comparisons, the pool select one row of the verify constants'
+    0.25-valued stack per lane (one nonzero term per element).  No value is read back to the host.  ``single_row``
+    (one real row per lane: the draft rows) leaves out the next KV block's row starts and select and the second
+    compressed block index (the B=1 ``derive_qsa_verify_inputs(single_row=True)``): a lane's one row never reaches
+    them, and at the lane's last block the next block is the next lane's first."""
+
+    for name, tensor in (
+        ("position row", position_row),
+        ("active row", active_row),
+        ("inactive row", inactive_row),
+        ("row positions", row_positions),
+    ):
+        _require_shape(tensor, POSITION_INDEX_ROW_SHAPE, f"QSA lane verify {name}")
+        if tensor.dtype != ttnn.uint32 or tensor.layout != ttnn.ROW_MAJOR_LAYOUT:
+            raise RuntimeError(f"QSA lane verify {name} must be UINT32 ROW_MAJOR, got {tensor_metadata(tensor)}")
+    if verify.rows != lane_verify.rows or lanes.lanes != lane_verify.lanes:
+        raise ValueError(
+            f"QSA lane verify constants are {lane_verify.lanes} x {lane_verify.rows}, the verify constants have "
+            f"{verify.rows} rows and the lane constants {lanes.lanes} lanes"
+        )
+    if chunk.rows != CHUNK_ROWS or chunk.allocated_compressed_blocks != constants.allocated_compressed_blocks:
+        raise ValueError("QSA lane verify needs the 32-row chunk constants of the position constants' blocks")
+    if lanes.allocated_context != lane_verify.allocated_context:
+        raise ValueError("QSA lane and lane verify constants were built for different contexts")
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    u32 = ttnn.uint32
+    count, blocks = lanes.lanes, chunk.allocated_compressed_blocks
+    allocated: list[Any] = []
+
+    def keep(tensor):
+        allocated.append(tensor)
+        return tensor
+
+    try:
+        # Per lane: the flat-cache rows of the current block (redirected to the scratch rows when inactive), the
+        # next block, the current block's row lookup and the two compressed block indices.
+        kv_block_start = ttnn.bitwise_and(position_row, constants.high27_mask, memory_config=dram)
+        own_rows = ttnn.add(kv_block_start, lanes.kv_offsets_row, memory_config=dram)
+        active_rows = ttnn.multiply(own_rows, active_row, memory_config=dram)
+        scratch_rows = ttnn.multiply(lane_verify.scratch_row, inactive_row, memory_config=dram)
+        row_start = ttnn.add(active_rows, scratch_rows, memory_config=dram)
+        row_start_next = ttnn.add(row_start, CACHE_WRITE_ROWS, memory_config=dram)
+        kv_row_start_lanes = tuple(
+            keep(ttnn.slice(row_start, (0, 0, 0, lane), (1, 1, 1, lane + 1), memory_config=dram))
+            for lane in range(count)
+        )
+        kv_row_start_next_lanes = tuple(
+            keep(ttnn.slice(row_start_next, (0, 0, 0, lane), (1, 1, 1, lane + 1), memory_config=dram))
+            for lane in (() if single_row else range(count))
+        )
+        starts = ttnn.slice(row_start, (0, 0, 0, 0), (1, 1, 1, count), memory_config=dram)
+        repeated = ttnn.repeat_interleave(starts, repeats=CACHE_WRITE_ROWS, dim=3, memory_config=dram)
+        kv_read_row = keep(ttnn.add(repeated, lane_verify.arange_per_lane, memory_config=dram))
+        kv_read_indices = ttnn.reshape(kv_read_row, (1, 1, count * CACHE_WRITE_ROWS))
+        block_index = ttnn.bitwise_right_shift(position_row, 2, memory_config=dram)
+        block_next = ttnn.add(block_index, 1, memory_config=dram)
+        block_index_i32 = []
+        for source in (block_index,) if single_row else (block_index, block_next):
+            first = ttnn.slice(source, (0, 0, 0, 0), (1, 1, 1, count), memory_config=dram)
+            block_index_i32.append(keep(ttnn.reshape(ttnn.typecast(first, ttnn.int32, memory_config=dram), (count,))))
+            _deallocate(first)
+        _deallocate(kv_block_start, own_rows, active_rows, scratch_rows, row_start_next, starts, repeated, block_next)
+
+        # Per lane one-hots over the 32 rows (the lane derive's form): column u of ``arange32_tile op remainder`` kept
+        # by the lane indicator, then the row sum; the pool one-hot goes on as the matmul row of the stack.
+        def lane_columns(remainder_row, compare):
+            remainder_tiled = ttnn.to_layout(remainder_row, ttnn.TILE_LAYOUT, memory_config=dram)
+            bits = compare(lanes.arange32_tile, remainder_tiled, dtype=u32, memory_config=dram)
+            hit = ttnn.typecast(bits, ttnn.bfloat16, memory_config=dram)
+            per_lane = ttnn.multiply(lanes.lane_indicator, hit, memory_config=dram)
+            column = ttnn.sum(per_lane, dim=3, keepdim=True, memory_config=dram)
+            _deallocate(remainder_tiled, bits, hit, per_lane)
+            return column
+
+        remainder32 = ttnn.bitwise_and(position_row, KV_ROW_MASK, memory_config=dram)
+        stage_keep = keep(lane_columns(remainder32, ttnn.lt))
+        remainder4 = ttnn.bitwise_and(position_row, COMPRESS_RATIO - 1, memory_config=dram)
+        pool_column = lane_columns(remainder4, ttnn.eq)
+        pool_onehot = ttnn.transpose(pool_column, 2, 3, memory_config=dram)
+        _require_shape(pool_onehot, (1, count, 1, CHUNK_ROWS), "QSA lane verify pool one-hot row")
+        select_flat = ttnn.matmul(
+            pool_onehot,
+            verify.pool_select_stack,
+            memory_config=dram,
+            compute_kernel_config=verify.select_compute_config,
+        )
+        _require_shape(select_flat, (1, count, 1, CHUNK_ROWS * RAW_WINDOW_TILE_ROWS), "QSA lane verify pool select row")
+        pool_select = keep(ttnn.reshape(select_flat, (1, count, CHUNK_ROWS, RAW_WINDOW_TILE_ROWS)))
+        _deallocate(remainder32, remainder4, pool_column, pool_onehot, select_flat)
+
+        # Per row: the staging row ``P_row[r] % 32`` in lane_of(r)'s current block (``P_row[r] & ~31 == P_u & ~31``)
+        # or next block, kept on lane_of(r)'s batch by the row indicator.
+        row_mod = ttnn.bitwise_and(row_positions, KV_ROW_MASK, memory_config=dram)
+        row_mod_tiled = ttnn.to_layout(row_mod, ttnn.TILE_LAYOUT, memory_config=dram)
+        hit_bits = ttnn.eq(lanes.arange32_tile, row_mod_tiled, dtype=u32, memory_config=dram)
+        hit_rows = ttnn.typecast(hit_bits, ttnn.bfloat16, memory_config=dram)
+        row_block = ttnn.bitwise_and(row_positions, constants.high27_mask, memory_config=dram)
+        base_block_lanes = ttnn.bitwise_and(position_row, constants.high27_mask, memory_config=dram)
+        base_block = ttnn.gather(base_block_lanes, 3, lane_verify.lane_of_row, memory_config=dram)
+        current_bits = ttnn.eq(row_block, base_block, dtype=u32, memory_config=dram)
+        current_tiled = ttnn.to_layout(current_bits, ttnn.TILE_LAYOUT, memory_config=dram)
+        current = ttnn.typecast(current_tiled, ttnn.bfloat16, memory_config=dram)
+        following = ttnn.rsub(current, 1.0, memory_config=dram)
+        hit_current = ttnn.multiply(hit_rows, current, memory_config=dram)
+        hit_next = ttnn.multiply(hit_rows, following, memory_config=dram)
+        stage_a_select = keep(ttnn.multiply(hit_current, lane_verify.lane_indicator_rows, memory_config=dram))
+        stage_b_select = (
+            None if single_row else keep(ttnn.multiply(hit_next, lane_verify.lane_indicator_rows, memory_config=dram))
+        )
+        _deallocate(
+            row_mod,
+            row_mod_tiled,
+            hit_bits,
+            hit_rows,
+            row_block,
+            base_block_lanes,
+            base_block,
+            current_bits,
+            current_tiled,
+            current,
+            following,
+            hit_current,
+            hit_next,
+        )
+
+        # Per row: the indexer mask and the sparse row at P_row[r], the tail ids from lane_of(r)'s offset arange (the
+        # lane derive's column form on the row positions).
+        lane_column = ttnn.reshape(row_positions, (1, 1, MAX_LANES, 1))
+        context_blocks = ttnn.repeat(lane_column, (1, 1, 1, blocks), memory_config=dram)
+        positions = ttnn.repeat(lane_column, (1, 1, 1, SPARSE_INDEX_CAPACITY), memory_config=dram)
+        context_blocks_plus = ttnn.add(context_blocks, 1, memory_config=dram)
+        complete_blocks_rows = ttnn.bitwise_right_shift(context_blocks_plus, 2, memory_config=dram)
+        valid_bits = ttnn.lt(chunk.arange_blocks_rows, complete_blocks_rows, dtype=u32, memory_config=dram)
+        valid = ttnn.typecast(valid_bits, ttnn.bfloat16, memory_config=dram)
+        invalid = ttnn.rsub(valid, 1.0, memory_config=dram)
+        indexer_neg_mask = keep(ttnn.multiply(invalid, INDEXER_MASK_VALUE, memory_config=dram))
+        _deallocate(context_blocks, context_blocks_plus, complete_blocks_rows, valid_bits, valid, invalid)
+        context_length = ttnn.add(positions, 1, memory_config=dram)
+        complete_blocks = ttnn.bitwise_right_shift(context_length, 2, memory_config=dram)
+        selected_blocks = ttnn.minimum(complete_blocks, BLOCK_TOPK, memory_config=dram)
+        lo = ttnn.bitwise_left_shift(selected_blocks, 2, memory_config=dram)
+        tail_count = ttnn.bitwise_and(context_length, COMPRESS_RATIO - 1, memory_config=dram)
+        hi = ttnn.add(lo, tail_count, memory_config=dram)
+        before_lo = ttnn.lt(chunk.arange_slots_rows, lo, dtype=u32, memory_config=dram)
+        row_keep_bits = keep(ttnn.multiply(before_lo, chunk.all_ones_rows, memory_config=dram))
+        skipped_blocks = ttnn.subtract(complete_blocks, selected_blocks, memory_config=dram)
+        tail_shift = ttnn.bitwise_left_shift(skipped_blocks, 2, memory_config=dram)
+        tail_ids = ttnn.add(lane_verify.arange_slots_rows, tail_shift, memory_config=dram)
+        from_lo = ttnn.ge(chunk.arange_slots_rows, lo, dtype=u32, memory_config=dram)
+        before_hi = ttnn.lt(chunk.arange_slots_rows, hi, dtype=u32, memory_config=dram)
+        tail_bits = ttnn.multiply(from_lo, before_hi, memory_config=dram)
+        row_tail_fill = ttnn.multiply(tail_ids, tail_bits, memory_config=dram)
+        from_hi = ttnn.ge(chunk.arange_slots_rows, hi, dtype=u32, memory_config=dram)
+        row_sentinel_bits = ttnn.multiply(from_hi, chunk.all_ones_rows, memory_config=dram)
+        row_fill = keep(ttnn.bitwise_or(row_tail_fill, row_sentinel_bits, memory_config=dram))
+        _deallocate(
+            positions,
+            context_length,
+            complete_blocks,
+            selected_blocks,
+            lo,
+            tail_count,
+            hi,
+            before_lo,
+            skipped_blocks,
+            tail_shift,
+            tail_ids,
+            from_lo,
+            before_hi,
+            tail_bits,
+            row_tail_fill,
+            from_hi,
+            row_sentinel_bits,
+        )
+    except BaseException:
+        _deallocate(*allocated)
+        raise
+    inputs = Qwen38TTNNQSALaneVerifyInputs(
+        lanes=count,
+        indexer_neg_mask=indexer_neg_mask,
+        row_keep_bits=row_keep_bits,
+        row_fill=row_fill,
+        block_index_i32=tuple(block_index_i32),
+        kv_row_start_lanes=kv_row_start_lanes,
+        kv_row_start_next_lanes=kv_row_start_next_lanes,
+        kv_read_indices=kv_read_indices,
+        kv_read_row=kv_read_row,
+        stage_keep=stage_keep,
+        stage_a_select=stage_a_select,
+        stage_b_select=stage_b_select,
+        pool_select=pool_select,
+        single_row=single_row,
+    )
+    for name, tensor, shape, dtype, layout in (
+        ("indexer_neg_mask", indexer_neg_mask, (1, 1, MAX_LANES, blocks), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT),
+        ("row_keep_bits", row_keep_bits, (1, 1, MAX_LANES, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
+        ("row_fill", row_fill, (1, 1, MAX_LANES, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
+        *(
+            (f"block_index_i32[{i}]", t, (count,), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+            for i, t in enumerate(block_index_i32)
+        ),
+        *(
+            (f"kv_row_start_lanes[{i}]", t, (1, 1, 1, 1), u32, ttnn.ROW_MAJOR_LAYOUT)
+            for i, t in enumerate(kv_row_start_lanes)
+        ),
+        ("kv_read_indices", kv_read_indices, (1, 1, count * CACHE_WRITE_ROWS), u32, ttnn.ROW_MAJOR_LAYOUT),
+        ("stage_keep", stage_keep, (1, count, CACHE_WRITE_ROWS, 1), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+        ("stage_a_select", stage_a_select, (1, count, CACHE_WRITE_ROWS, CHUNK_ROWS), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+        *(
+            ()
+            if single_row
+            else (
+                (
+                    "stage_b_select",
+                    stage_b_select,
+                    (1, count, CACHE_WRITE_ROWS, CHUNK_ROWS),
+                    ttnn.bfloat16,
+                    ttnn.TILE_LAYOUT,
+                ),
+            )
+        ),
+        ("pool_select", pool_select, (1, count, CHUNK_ROWS, RAW_WINDOW_TILE_ROWS), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+    ):
+        _require_shape(tensor, shape, f"QSA lane verify input {name}")
+        if tensor.dtype != dtype or tensor.layout != layout:
+            raise RuntimeError(
+                f"QSA lane verify input {name} must be {dtype} {layout} {list(shape)}, got {tensor_metadata(tensor)}"
+            )
+    return inputs
+
+
+def emulate_qsa_lane_verify_inputs(
+    positions: Sequence[int],
+    active: Sequence[int],
+    *,
+    lanes: int,
+    rows: int,
+    allocated_compressed_blocks: int,
+    single_row: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Torch reference of :func:`derive_qsa_lane_verify_inputs` (the tensor fields' names): row r's chunk fields
+    are the 1-row derivation at ``P_{lane_of(r)} + draft_of(r)`` with lane_of(r)'s KV offset on its tail ids; the
+    per-lane fields are the host constants at ``P_u``; an inactive lane's KV rows are the scratch rows."""
+
+    if len(positions) != lanes or len(active) != lanes:
+        raise ValueError(f"lane verify emulation needs {lanes} positions and active flags")
+    capacity = allocated_compressed_blocks * COMPRESS_RATIO
+    host = qsa_lane_verify_constant_rows(lanes, rows, capacity)
+    verify_host = qsa_verify_constant_rows(rows, allocated_compressed_blocks)
+    lane_of = host["lane_of_row"].reshape(-1).tolist()
+    draft_of = host["draft_of_row"].reshape(-1).tolist()
+    row_positions = [positions[lane_of[row]] + draft_of[row] for row in range(CHUNK_ROWS)]
+    per_row = [
+        emulate_qsa_position_inputs(position, allocated_compressed_blocks=allocated_compressed_blocks)
+        for position in row_positions
+    ]
+    offsets = [capacity * lane for lane in lane_of]
+    row_fill = torch.cat([row["row_fill"] for row in per_row], dim=2)
+    row_keep_bits = torch.cat([row["row_keep_bits"] for row in per_row], dim=2)
+    sentinel = row_fill == ALL_ONES_U32
+    tail = (row_keep_bits == 0) & ~sentinel
+    row_fill = torch.where(
+        tail, row_fill + torch.tensor(offsets, dtype=torch.int64).reshape(1, 1, CHUNK_ROWS, 1), row_fill
+    )
+    lane_index = torch.arange(CHUNK_ROWS, dtype=torch.int64)
+    stage_keep = torch.zeros(1, lanes, CHUNK_ROWS, 1)
+    stage_a = torch.zeros(1, lanes, CHUNK_ROWS, CHUNK_ROWS)
+    stage_b = torch.zeros(1, lanes, CHUNK_ROWS, CHUNK_ROWS)
+    pool_select = torch.zeros(1, lanes, CHUNK_ROWS, RAW_WINDOW_TILE_ROWS)
+    kv_row_start, kv_row_start_next = [], []
+    for lane in range(lanes):
+        position = positions[lane]
+        stage_keep[0, lane, :, 0] = (lane_index < position % CACHE_WRITE_ROWS).float()
+        for column in range(lanes * rows):
+            if lane_of[column] != lane:
+                continue
+            row_position = row_positions[column]
+            same_block = (row_position & KV_BLOCK_START_MASK) == (position & KV_BLOCK_START_MASK)
+            target = stage_a if same_block else stage_b
+            target[0, lane, row_position % CACHE_WRITE_ROWS, column] = 1.0
+        pool_select[0, lane] = verify_host["pool_select_stack"][0, 0, position % COMPRESS_RATIO].reshape(
+            CHUNK_ROWS, RAW_WINDOW_TILE_ROWS
+        )
+        start = lane * capacity + (position & KV_BLOCK_START_MASK) if active[lane] else lanes * capacity
+        kv_row_start.append(start)
+        kv_row_start_next.append(start + CACHE_WRITE_ROWS)
+    return {
+        "row_positions": torch.tensor(row_positions, dtype=torch.int64).reshape(1, 1, 1, CHUNK_ROWS),
+        "indexer_neg_mask": torch.cat([row["indexer_neg_mask"] for row in per_row], dim=2),
+        "row_keep_bits": row_keep_bits,
+        "row_fill": row_fill,
+        "block_index_i32": tuple(
+            torch.tensor([position // COMPRESS_RATIO + block for position in positions], dtype=torch.int32)
+            for block in range(1 if single_row else VERIFY_COMPLETED_BLOCKS)
+        ),
+        "kv_row_start_lanes": torch.tensor(kv_row_start, dtype=torch.int64),
+        "kv_row_start_next_lanes": torch.tensor([] if single_row else kv_row_start_next, dtype=torch.int64),
+        "kv_read_indices": torch.cat(
+            [torch.arange(CACHE_WRITE_ROWS, dtype=torch.int64) + start for start in kv_row_start]
+        ).reshape(1, 1, lanes * CACHE_WRITE_ROWS),
+        "stage_keep": stage_keep.to(torch.bfloat16),
+        "stage_a_select": stage_a.to(torch.bfloat16),
+        "stage_b_select": None if single_row else stage_b.to(torch.bfloat16),
+        "pool_select": pool_select.to(torch.bfloat16),
+    }
+
+
+def _lane_score_rows_of_composed(local_scores, lanes_of_rows, lanes: int, cache_rows: int, blocks: int):
+    """Row r of the wide indexer's scores ``[1,1,32,B*cache_rows]`` windowed to lane ``lanes_of_rows[r]``'s columns:
+    the chain form (one slice per row and their concat) that ttnn/fused/qsa_block.lane_score_rows_of replaces."""
+
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    windows = [
+        ttnn.slice(
+            local_scores,
+            (0, 0, row, lane * cache_rows),
+            (1, 1, row + 1, lane * cache_rows + blocks),
+            memory_config=dram,
+        )
+        for row, lane in enumerate(lanes_of_rows)
+    ]
+    stacked = ttnn.concat(windows, dim=2, memory_config=dram)
+    _deallocate(*windows)
+    return stacked
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNQSALaneVerifyState:
+    """Per-layer lane verify state beside the lane state: ``raw_history`` ``[1,B,32,128]`` BF16 TILE holds at rows
+    0..2 of lane u the raw index keys of positions ``P_u - 3 .. P_u - 1`` (rows 3..31 exactly zero); ``raw_rows``
+    ``[1,1,B*32,128]`` the last pass's raw keys per lane (the expand select's landing: lane u's row j at ``u*32 + j``),
+    read as ``[1,B,32,128]`` by the commit's history select.  Fixed addresses."""
+
+    layer_index: int
+    epoch: int
+    lanes: int
+    raw_history: Any
+    raw_rows: Any
+
+
 class Qwen38TTNNQSA:
     """One exact global-B1 QSA decode layer on an admitted 1x4 mesh."""
 
@@ -1964,6 +2984,8 @@ class Qwen38TTNNQSA:
     _widen_partial_fused = None
     _selection_row_fused = None
     _score_merge_fused = None
+    _lane_score_rows_fused = None
+    _lane_score_rows_of = staticmethod(_lane_score_rows_of_composed)  # the fused row windows when the programs are on
     # The prefill slab's dense-linear policy (ttnn/prefill_dense: the QWEN38_PREFILL_DENSE_* switches) for the slab's
     # query-gate / K / V / output projections; the index projections and every decode linear never read it.
     prefill_dense: Qwen38TTNNPrefillDense | None = None
@@ -2137,23 +3159,27 @@ class Qwen38TTNNQSA:
             self._selection_row_fused = fused_kernels.kernel("qsa_selection_row").fused
         if fused_kernels.enabled("qsa_score_merge"):
             self._score_merge_fused = fused_kernels.kernel("qsa_score_merge").fused
+            self._lane_score_rows_fused = fused_kernels.qsa_block.lane_score_rows  # the lanes' windows, one program
+            self._lane_score_rows_of = fused_kernels.qsa_block.lane_score_rows_of  # the lane verify's row windows
         # The served path's one linear for the five projections (_project_merged): both fused tails read their column
         # windows of its shard, so it needs both on and the merged weight resident (a container built without it, the
-        # dev microtests' random weights, runs the separate linears).
+        # dev microtests' random weights, runs the separate linears).  The lanes run the separate linears.
         self.merged_projections = (
             self._index_tail_fused is not None and self._main_tail_fused is not None and weights.projections is not None
         )
-        if any(
-            switch is not None
-            for switch in (
-                self._index_tail_fused,
-                self._main_tail_fused,
-                self._widen_partial_fused,
-                self._selection_row_fused,
-                self._score_merge_fused,
-            )
-        ):
+        switches = (
+            self._index_tail_fused,
+            self._main_tail_fused,
+            self._widen_partial_fused,
+            self._selection_row_fused,
+            self._score_merge_fused,
+        )
+        if any(switch is not None for switch in switches):
             self.forward_decode_generic = functools.partial(type(self)._forward_decode_generic_fused, self)
+        # The lane body runs the six programs as one piece (B-row forms throughout); with any of them off it stays
+        # the lane chain.
+        if all(switch is not None for switch in switches):
+            self.forward_decode_lanes = functools.partial(type(self)._forward_decode_lanes_fused, self)
 
     def deallocate(self) -> None:
         """Release module-owned constants after every state epoch is gone.
@@ -3523,14 +4549,18 @@ class Qwen38TTNNQSA:
         sin,
         block_start_cos,
         block_start_sin,
-        state: Qwen38TTNNQSAGenericState,
-        position: Qwen38TTNNQSAPositionInputs,
+        state,
+        position,
         projections=None,
+        *,
+        rows: int = 1,
     ):
         """The index linears, then the fused index tail (ttnn/fused/qsa_block.index_tail) in place of the chain after
         them in :meth:`_index_projection` and :meth:`_write_compressed_index_generic`.  With ``projections`` (the
-        merged shard of :meth:`_project_merged`) the linears do not run: the tail reads the index query and raw key
-        windows of that shard, which its owner releases."""
+        merged shard of :meth:`_project_merged`, the one-row served path) the linears do not run: the tail reads the
+        index query and raw key windows of that shard, which its owner releases.  ``rows`` = the row tile's valid rows:
+        1 for the decode step, B for the lanes (``state`` a lane state, ``position`` the lane inputs, the separate
+        linears)."""
 
         if projections is None:
             index_q_ws = ttnn.linear(
@@ -3568,7 +4598,7 @@ class Qwen38TTNNQSA:
         )
         if projections is None:
             _deallocate(index_q_ws, raw_key_ws)
-        _require_shape(rotated, (1, 1, 1, INDEX_HEAD_DIM), "fused local index query")
+        _require_shape(rotated, (1, 1, rows, INDEX_HEAD_DIM), "fused local index query")
         _retag_tensor(rotated, reference=full_hidden, shard_dim=1)
         self.mesh_contract.validate_tensor(rotated, placement=TensorPlacement.HEAD_SHARDED, shard_dim=1)
         return rotated
@@ -3621,36 +4651,37 @@ class Qwen38TTNNQSA:
         _require_shape(masked, (1, 1, 1, self.allocated_compressed_blocks), "masked QSA block scores")
         return masked
 
-    def _materialize_row_fused(self, masked_scores, position: Qwen38TTNNQSAPositionInputs):
+    def _materialize_row_fused(self, masked_scores, position, *, rows: int = 1, block_offsets=None):
         """The top-k, then the fused selection row (ttnn/fused/qsa_block.selection_row) in place of the integer chain
-        of :meth:`_materialize_row_generic`."""
+        of :meth:`_materialize_row_generic`.  ``rows`` valid rows; ``block_offsets`` the offsets row(s) the expanded
+        ids take (the module's one row by default; the lanes pass their per-lane rows, row u = offsets + u * C)."""
 
         block_ids = ttnn.experimental.topk_large_indices(masked_scores, k=BLOCK_TOPK)
         _deallocate(masked_scores)
-        _require_shape(block_ids, (1, 1, 1, BLOCK_TOPK), "top-k QSA block IDs")
+        _require_shape(block_ids, (1, 1, rows, BLOCK_TOPK), "top-k QSA block IDs")
         sparse_indices = self._selection_row_fused(
-            block_ids, self.sentinel_pad, self.block_offsets, position.row_keep_bits, position.row_fill
+            block_ids,
+            self.sentinel_pad,
+            self.block_offsets if block_offsets is None else block_offsets,
+            position.row_keep_bits,
+            position.row_fill,
         )
         _deallocate(block_ids)
-        _require_shape(sparse_indices, (1, 1, 1, SPARSE_INDEX_CAPACITY), "fused QSA sparse indices")
+        _require_shape(sparse_indices, (1, 1, rows, SPARSE_INDEX_CAPACITY), "fused QSA sparse indices")
         _retag_tensor(sparse_indices, reference=self.sentinel_pad, shard_dim=None)
         self.mesh_contract.validate_tensor(sparse_indices, placement=TensorPlacement.REPLICATED)
         return sparse_indices
 
     def _main_tail_step(
-        self,
-        full_hidden,
-        cos,
-        sin,
-        state: Qwen38TTNNQSAGenericState,
-        position: Qwen38TTNNQSAPositionInputs,
-        projections=None,
+        self, full_hidden, cos, sin, state, position, projections=None, *, rows: int = 1, lane_rows: int = 0
     ):
         """The three main linears, then the fused main tail (ttnn/fused/qsa_block.main_tail) in place of the chain after
         them in :meth:`_main_projection`, :meth:`_write_packed_kv_generic` and the query build of
         :meth:`_sparse_value_attention`.  Returns the sparse query and the qg shard (the gates for the post-attention
-        program, released there).  With ``projections`` (the merged shard of :meth:`_project_merged`) the linears do
-        not run: the tail reads the qg, k and v windows of that shard, which is returned as the qg shard."""
+        program, released there).  With ``projections`` (the merged shard of :meth:`_project_merged`, the one-row
+        served path) the linears do not run: the tail reads the qg, k and v windows of that shard, which is returned as
+        the qg shard.  ``rows`` valid rows; ``lane_rows`` = the KV rows per lane of a lane state's flat cache (lane u's
+        block lands at u * lane_rows + (P_u & ~31); 0 for the 1-row cache)."""
 
         if projections is None:
             qg_ws = ttnn.linear(
@@ -3689,17 +4720,20 @@ class Qwen38TTNNQSA:
             sin,
             state.kv_staging,
             state.packed_kv_cache,
+            lane_rows=lane_rows,
             qg_first=qg_first,
             k_first=k_first,
             v_first=v_first,
         )
         if projections is None:
             _deallocate(k_ws, v_ws)
-        _require_shape(sparse_query, (1, 32, 1, 2 * HEAD_DIM), "fused padded sparse QSA query")
+        _require_shape(sparse_query, (1, 32, rows, 2 * HEAD_DIM), "fused padded sparse QSA query")
         _retag_tensor(sparse_query, reference=state.packed_kv_cache, shard_dim=1)
         return sparse_query, qg_ws
 
-    def _sparse_value_attention_fused(self, sparse_query, qg_ws, sparse_indices, state, *, qg_first: int = 0):
+    def _sparse_value_attention_fused(
+        self, sparse_query, qg_ws, sparse_indices, state, *, qg_first: int = 0, rows: int = 1
+    ):
         """sparse_sdpa on the fused query, then the fused post-attention (ttnn/fused/qsa_block.post_attention) straight
         into the out-projection's activation shard; the chain's tail of :meth:`_sparse_value_attention`.  ``qg_first``
         is the first tile of the qg projection in ``qg_ws`` (its window of the merged shard, which this releases as the
@@ -3720,13 +4754,14 @@ class Qwen38TTNNQSA:
             sparse_output, qg_ws, memory_config=self.out_act_memory_config, qg_first=qg_first
         )
         _deallocate(sparse_output, qg_ws)
-        _require_shape(attention_ws, (1, 1, 1, LOCAL_QUERY_WIDTH), "fused gated QSA attention")
+        _require_shape(attention_ws, (1, 1, rows, LOCAL_QUERY_WIDTH), "fused gated QSA attention")
         _retag_tensor(attention_ws, reference=state.packed_kv_cache, shard_dim=3)
         return attention_ws
 
-    def _project_output_fused(self, local_attention, full_hidden):
+    def _project_output_fused(self, local_attention, full_hidden, *, rows: int = 1):
         """:meth:`_project_output` with the fused widen (ttnn/fused/qsa_block.widen_partial) for the reduce_scatter's
-        fp32 input when it is on, and no activation move when the input already sits in the out-projection's shard."""
+        fp32 input when it is on, and no activation move when the input already sits in the out-projection's shard.
+        ``rows`` valid rows of the tile (1 for the decode step, B for the lanes)."""
 
         if local_attention.memory_config() == self.out_act_memory_config:
             attention_ws = local_attention
@@ -3752,7 +4787,7 @@ class Qwen38TTNNQSA:
         self.mesh_contract.mark_local_partial(
             local_partial_fp32,
             replicated_reference=full_hidden,
-            expected_shape=(1, 1, 1, HIDDEN_SIZE),
+            expected_shape=(1, 1, rows, HIDDEN_SIZE),
         )
         output_fp32 = ttnn.reduce_scatter(
             local_partial_fp32,
@@ -3766,12 +4801,12 @@ class Qwen38TTNNQSA:
             output_fp32,
             replicated_reference=full_hidden,
             shard_dim=3,
-            expected_local_shape=(1, 1, 1, HIDDEN_SIZE // TP_SIZE),
+            expected_local_shape=(1, 1, rows, HIDDEN_SIZE // TP_SIZE),
         )
         output = ttnn.typecast(output_fp32, ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _retag_tensor(output, reference=output_fp32, shard_dim=3)
         _deallocate(output_fp32)
-        _require_shape(output, (1, 1, 1, HIDDEN_SIZE // TP_SIZE), "QSA output projection")
+        _require_shape(output, (1, 1, rows, HIDDEN_SIZE // TP_SIZE), "QSA output projection")
         self.mesh_contract.validate_tensor(output, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         return output
 
@@ -5331,3 +6366,1061 @@ class Qwen38TTNNQSA:
         output = self._project_output_rows(local_attention, full_hidden, constants)
         _deallocate(full_hidden)
         return output
+
+    # ------------------------------------------------------------------ batched lanes (B rows, one tile)
+    # forward_decode_lanes is forward_decode_generic for B lanes at their own positions: the chunk path's row-batched
+    # stages on the 32-row tile (row u = lane u) with the per-token staging/ring one-hots replaced by the lane
+    # selection tiles, the compressed rows written for all users in one paged_update_cache, lane u's block scored
+    # out of its own compressed cache, the KV slabs written per lane into the flat cache.  The 1-row generic body
+    # and the chunk body above are untouched.
+
+    def allocate_lane_state(self, lanes: int, *, kv_scratch_rows: int = 0) -> Qwen38TTNNQSALaneState:
+        """Allocate the fixed-address caches, staging tiles and raw-key rings of ``lanes`` decode lanes.
+
+        ``kv_scratch_rows`` (a multiple of 32) appends that many rows past the last lane's KV region: the MTP lanes
+        verify's redirect target for an inactive lane's block writes (the plain lane body never addresses them)."""
+
+        lanes = require_lane_count(lanes, label="QSA lane count")
+        if isinstance(kv_scratch_rows, bool) or type(kv_scratch_rows) is not int or kv_scratch_rows < 0:
+            raise ValueError(f"QSA lane KV scratch rows must be a non-negative int, got {kv_scratch_rows!r}")
+        if kv_scratch_rows % CACHE_WRITE_ROWS:
+            raise ValueError(
+                f"QSA lane KV scratch rows must be whole blocks of {CACHE_WRITE_ROWS}, got {kv_scratch_rows}"
+            )
+        rows = self.allocated_compressed_blocks + ttnn.TILE_SIZE
+        epoch = self._next_epoch
+        self._next_epoch += 1
+        self._live_generic_epochs.add(epoch)
+        compressed = self._allocate_replicated_tile_zeros((lanes, 1, rows, INDEX_HEAD_DIM))
+        flat = ttnn.experimental.view(compressed, (1, 1, lanes * rows, INDEX_HEAD_DIM))
+        _retag_tensor(flat, reference=compressed, shard_dim=None)
+        return Qwen38TTNNQSALaneState(
+            layer_index=self.layer_index,
+            epoch=epoch,
+            lanes=lanes,
+            packed_kv_cache=self._allocate_pair_grouped(
+                (1, 1, lanes * self.allocated_context + kv_scratch_rows, 2 * HEAD_DIM), layout=ttnn.ROW_MAJOR_LAYOUT
+            ),
+            compressed_index_cache=compressed,
+            compressed_index_cache_flat=flat,
+            kv_staging=self._allocate_pair_grouped((1, lanes, CACHE_WRITE_ROWS, 2 * HEAD_DIM), layout=ttnn.TILE_LAYOUT),
+            raw_key_ring=self._allocate_replicated_tile_zeros((1, lanes, CACHE_WRITE_ROWS, INDEX_HEAD_DIM)),
+            kv_scratch_rows=kv_scratch_rows,
+        )
+
+    def release_lane_state(self, state: Qwen38TTNNQSALaneState) -> None:
+        self._validate_lane_state(state)
+        _deallocate(state.packed_kv_cache, state.compressed_index_cache, state.kv_staging, state.raw_key_ring)
+        self._live_generic_epochs.remove(state.epoch)
+
+    def reset_lane_state_inplace(self, state: Qwen38TTNNQSALaneState) -> None:
+        """Zero every lane's staging tile and raw-key ring without changing any address (trace safe); the two
+        caches need no reset (rows past P_u are never gathered, blocks at or past the complete count are masked)."""
+
+        self._validate_lane_state(state)
+        for label, tensor in (("QSA lane KV staging", state.kv_staging), ("QSA lane raw-key ring", state.raw_key_ring)):
+            zeroed = ttnn.fill(tensor, 0.0, output_tensor=tensor)
+            if _tensor_key(zeroed) != _tensor_key(tensor):
+                raise RuntimeError(f"{label} reset was not in place")
+
+    def reset_lane_inplace(self, state: Qwen38TTNNQSALaneState, lane: int) -> None:
+        """Zero lane ``lane``'s staging tile and raw-key ring (a keep-mask multiply over the lane axis, the other
+        lanes x 1.0), no address change; the caches need no reset.  Eager host upload, never traced."""
+
+        self._validate_lane_state(state)
+        if isinstance(lane, bool) or type(lane) is not int or not 0 <= lane < state.lanes:
+            raise ValueError(f"QSA lane must be an int in [0,{state.lanes}), got {lane!r}")
+        keep = torch.ones(1, state.lanes, 1, 1, dtype=torch.bfloat16)
+        keep[0, lane] = 0.0
+        keep_lanes = ttnn.from_torch(
+            keep,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=self.mesh_device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=replicate_tensor_2d_mesh_mapper(self.mesh_device),
+        )
+        try:
+            for label, tensor in (
+                ("QSA lane KV staging", state.kv_staging),
+                ("QSA lane raw-key ring", state.raw_key_ring),
+            ):
+                kept = ttnn.multiply(tensor, keep_lanes, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                key = _tensor_key(tensor)
+                copied = ttnn.copy(kept, tensor)
+                _deallocate(kept)
+                if _tensor_key(tensor) != key or (copied is not None and _tensor_key(copied) != key):
+                    raise RuntimeError(f"{label} lane {lane} reset was not in place")
+        finally:
+            _deallocate(keep_lanes)
+
+    def _validate_lane_state(self, state: Qwen38TTNNQSALaneState) -> None:
+        if state.layer_index != self.layer_index:
+            raise ValueError(f"QSA lane state belongs to layer {state.layer_index}, expected {self.layer_index}")
+        if state.epoch not in self._live_generic_epochs:
+            raise ValueError(f"QSA lane state epoch {state.epoch} was not allocated by this module")
+        lanes = require_lane_count(state.lanes, label="QSA lane state lanes", error_type=RuntimeError)
+        rows = self.allocated_compressed_blocks + ttnn.TILE_SIZE
+        if state.kv_scratch_rows < 0 or state.kv_scratch_rows % CACHE_WRITE_ROWS:
+            raise RuntimeError(f"QSA lane KV scratch rows must be whole blocks, got {state.kv_scratch_rows}")
+        expected = (
+            (
+                "packed QSA lane cache",
+                state.packed_kv_cache,
+                (1, 1, lanes * self.allocated_context + state.kv_scratch_rows, 2 * HEAD_DIM),
+            ),
+            ("compressed lane index cache", state.compressed_index_cache, (lanes, 1, rows, INDEX_HEAD_DIM)),
+            (
+                "flat compressed lane index cache",
+                state.compressed_index_cache_flat,
+                (1, 1, lanes * rows, INDEX_HEAD_DIM),
+            ),
+            ("QSA lane KV staging", state.kv_staging, (1, lanes, CACHE_WRITE_ROWS, 2 * HEAD_DIM)),
+            ("QSA lane raw-key ring", state.raw_key_ring, (1, lanes, CACHE_WRITE_ROWS, INDEX_HEAD_DIM)),
+        )
+        for label, tensor, shape in expected:
+            _require_shape(tensor, shape, label)
+            if tensor.dtype != ttnn.bfloat16:
+                raise RuntimeError(f"{label} must be BF16, got {tensor_metadata(tensor)}")
+        if state.packed_kv_cache.layout != ttnn.ROW_MAJOR_LAYOUT:
+            raise RuntimeError(f"packed QSA lane cache must be ROW_MAJOR, got {tensor_metadata(state.packed_kv_cache)}")
+        for label, tensor, _ in expected[1:]:
+            if tensor.layout != ttnn.TILE_LAYOUT:
+                raise RuntimeError(f"{label} must be TILE, got {tensor_metadata(tensor)}")
+        for tensor in (state.packed_kv_cache, state.kv_staging):
+            self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=1)
+        for tensor in (state.compressed_index_cache, state.compressed_index_cache_flat, state.raw_key_ring):
+            self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.REPLICATED)
+
+    def _validate_fused_lane_inputs(self, inputs, lanes: int) -> None:
+        """The five position inputs the fused lane body reads (a full :class:`Qwen38TTNNQSALaneInputs` carries them
+        too; a :class:`Qwen38TTNNQSAFusedLaneInputs` carries them alone)."""
+
+        blocks = self.allocated_compressed_blocks
+        u32 = ttnn.uint32
+        if isinstance(inputs, Qwen38TTNNQSALaneInputs):
+            self._validate_lane_inputs(inputs, lanes)
+            return
+        if not isinstance(inputs, Qwen38TTNNQSAFusedLaneInputs):
+            raise TypeError("the fused QSA lane body takes Qwen38TTNNQSALaneInputs or Qwen38TTNNQSAFusedLaneInputs")
+        for name, tensor, shape, dtype, layout in (
+            ("kv_block_start", inputs.kv_block_start, POSITION_INDEX_ROW_SHAPE, u32, ttnn.ROW_MAJOR_LAYOUT),
+            ("kv_row_hit", inputs.kv_row_hit, (1, lanes, MAX_LANES, 1), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+            (
+                "indexer_neg_mask",
+                inputs.indexer_neg_mask,
+                (1, 1, MAX_LANES, blocks),
+                ttnn.bfloat16,
+                ttnn.ROW_MAJOR_LAYOUT,
+            ),
+            (
+                "row_keep_bits",
+                inputs.row_keep_bits,
+                (1, 1, MAX_LANES, SPARSE_INDEX_CAPACITY),
+                u32,
+                ttnn.ROW_MAJOR_LAYOUT,
+            ),
+            ("row_fill", inputs.row_fill, (1, 1, MAX_LANES, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
+        ):
+            _require_shape(tensor, shape, f"QSA fused lane input {name}")
+            if tensor.dtype != dtype or tensor.layout != layout:
+                raise RuntimeError(
+                    f"QSA fused lane input {name} must be {dtype} {layout} {list(shape)}, got {tensor_metadata(tensor)}"
+                )
+
+    def _validate_lane_inputs(self, inputs: Qwen38TTNNQSALaneInputs, lanes: int) -> None:
+        if not isinstance(inputs, Qwen38TTNNQSALaneInputs):
+            raise TypeError("the QSA lane chain takes Qwen38TTNNQSALaneInputs (the selection tiles and scalars)")
+        blocks = self.allocated_compressed_blocks
+        u32 = ttnn.uint32
+        expected = (
+            ("kv_row_start_row", inputs.kv_row_start_row, POSITION_INDEX_ROW_SHAPE, u32, ttnn.ROW_MAJOR_LAYOUT),
+            *(
+                (f"kv_row_start_lanes[{lane}]", scalar, (1, 1, 1, 1), u32, ttnn.ROW_MAJOR_LAYOUT)
+                for lane, scalar in enumerate(inputs.kv_row_start_lanes)
+            ),
+            ("block_index_i32", inputs.block_index_i32, (lanes,), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT),
+            ("kv_hit_tiles", inputs.kv_hit_tiles, (1, lanes, MAX_LANES, MAX_LANES), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+            ("kv_keep_col", inputs.kv_keep_col, (1, lanes, MAX_LANES, 1), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+            (
+                "ring_hit_tiles",
+                inputs.ring_hit_tiles,
+                (1, lanes, MAX_LANES, MAX_LANES),
+                ttnn.bfloat16,
+                ttnn.TILE_LAYOUT,
+            ),
+            ("ring_keep_col", inputs.ring_keep_col, (1, lanes, MAX_LANES, 1), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+            (
+                "indexer_neg_mask",
+                inputs.indexer_neg_mask,
+                (1, 1, MAX_LANES, blocks),
+                ttnn.bfloat16,
+                ttnn.ROW_MAJOR_LAYOUT,
+            ),
+            (
+                "row_keep_bits",
+                inputs.row_keep_bits,
+                (1, 1, MAX_LANES, SPARSE_INDEX_CAPACITY),
+                u32,
+                ttnn.ROW_MAJOR_LAYOUT,
+            ),
+            ("row_fill", inputs.row_fill, (1, 1, MAX_LANES, SPARSE_INDEX_CAPACITY), u32, ttnn.ROW_MAJOR_LAYOUT),
+            ("kv_block_start", inputs.kv_block_start, POSITION_INDEX_ROW_SHAPE, u32, ttnn.ROW_MAJOR_LAYOUT),
+            ("kv_row_hit", inputs.kv_row_hit, (1, lanes, MAX_LANES, 1), ttnn.bfloat16, ttnn.TILE_LAYOUT),
+        )
+        if len(inputs.kv_row_start_lanes) != lanes:
+            raise ValueError(f"QSA lane inputs carry {len(inputs.kv_row_start_lanes)} slab rows, expected {lanes}")
+        for name, tensor, shape, dtype, layout in expected:
+            _require_shape(tensor, shape, f"QSA lane input {name}")
+            if tensor.dtype != dtype or tensor.layout != layout:
+                raise RuntimeError(
+                    f"QSA lane input {name} must be {dtype} {layout} {list(shape)}, got {tensor_metadata(tensor)}"
+                )
+
+    def _write_compressed_index_lanes(
+        self,
+        state: Qwen38TTNNQSALaneState,
+        raw_key,
+        block_start_cos,
+        block_start_sin,
+        lanes: Qwen38TTNNQSALaneInputs,
+        lane_constants: Qwen38TTNNQSALaneConstants,
+    ) -> None:
+        count = state.lanes
+        # Ring slot P_u % 4 of lane u <- its raw key row: the selection matmul places row u of the raw-key tile at
+        # row P_u % 4 of lane u's ring tile (one nonzero term per element, fp32 accumulation), the keep column
+        # zeroes that slot first.
+        placed = ttnn.matmul(
+            lanes.ring_hit_tiles,
+            raw_key,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+        )
+        _deallocate(raw_key)
+        _require_shape(placed, (1, count, CACHE_WRITE_ROWS, INDEX_HEAD_DIM), "placed lane raw index keys")
+        kept = ttnn.multiply(state.raw_key_ring, lanes.ring_keep_col, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ring = ttnn.add(kept, placed, output_tensor=state.raw_key_ring, fast_and_approximate_mode=False)
+        if _tensor_key(ring) != _tensor_key(state.raw_key_ring):
+            raise RuntimeError("raw QSA lane index key ring update was not in place")
+        _deallocate(kept, placed)
+
+        # Each lane's tile reduces as the 1-row ring (rows 4-31 exactly zero, the 1/4-scaled sum over 32 rows), then
+        # the B pooled rows become one 32-row tile (rows past B zero) for the row norm and block-start RoPE.
+        pooled = ttnn.sum(
+            state.raw_key_ring,
+            dim=2,
+            keepdim=True,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+            scalar=1.0 / COMPRESS_RATIO,
+        )
+        _require_shape(pooled, (1, count, 1, INDEX_HEAD_DIM), "pooled lane raw index keys")
+        pooled_row_major = ttnn.to_layout(pooled, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(pooled)
+        pooled_rows = ttnn.experimental.view(pooled_row_major, (1, 1, count, INDEX_HEAD_DIM))  # same pages
+        padded_rows = (
+            pooled_rows
+            if count == MAX_LANES
+            else ttnn.pad(
+                pooled_rows,
+                [(0, 0), (0, 0), (0, MAX_LANES - count), (0, 0)],
+                0.0,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+        )
+        pooled_tile = ttnn.to_layout(padded_rows, ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(pooled_row_major, None if padded_rows is pooled_rows else padded_rows)
+        _retag_tensor(pooled_tile, reference=state.compressed_index_cache, shard_dim=None)
+        _require_shape(pooled_tile, (1, 1, MAX_LANES, INDEX_HEAD_DIM), "pooled lane index key rows")
+        normalized = ttnn.rms_norm(
+            pooled_tile,
+            epsilon=self.rms_norm_eps,
+            weight=self.weights.index_k_norm,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+        )
+        _deallocate(pooled_tile)
+        rotated = apply_partial_rope_prefill(normalized, block_start_cos, block_start_sin, 1, ROPE_DIM)
+        _deallocate(normalized)
+        _retag_tensor(rotated, reference=state.compressed_index_cache, shard_dim=None)
+        self.mesh_contract.validate_tensor(rotated, placement=TensorPlacement.REPLICATED)
+        _require_shape(rotated, (1, 1, MAX_LANES, INDEX_HEAD_DIM), "rotated lane index key rows")
+
+        # Rows to users: lane u's row is user u's one-head input, one user per core, all users in one write.
+        rotated_row_major = ttnn.to_layout(rotated, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(rotated)
+        lane_rows = (
+            rotated_row_major
+            if count == MAX_LANES
+            else ttnn.slice(
+                rotated_row_major, (0, 0, 0, 0), (1, 1, count, INDEX_HEAD_DIM), memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+        )
+        users = ttnn.experimental.view(lane_rows, (1, count, 1, INDEX_HEAD_DIM))  # same pages
+        users_tiled = ttnn.to_layout(users, ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(rotated_row_major, None if lane_rows is rotated_row_major else lane_rows)
+        _require_shape(users_tiled, (1, count, 1, INDEX_HEAD_DIM), "compressed lane rows as users")
+        users_sharded = ttnn.to_memory_config(users_tiled, lane_constants.compressed_rows_memory_config)
+        _deallocate(users_tiled)
+        result = ttnn.experimental.paged_update_cache(
+            state.compressed_index_cache, users_sharded, update_idxs_tensor=lanes.block_index_i32
+        )
+        if _tensor_key(result) != _tensor_key(state.compressed_index_cache):
+            raise RuntimeError("compressed QSA lane index update was not in place")
+        _deallocate(users_sharded)
+
+    def _score_blocks_lanes(
+        self,
+        index_query,
+        state: Qwen38TTNNQSALaneState,
+        lanes: Qwen38TTNNQSALaneInputs,
+        lane_constants: Qwen38TTNNQSALaneConstants,
+    ):
+        count, blocks = state.lanes, self.allocated_compressed_blocks
+        rows = blocks + ttnn.TILE_SIZE
+        # Row u of the 32-row query tile is scored against lane u's blocks only: the wide form scores the flat
+        # view once (its window is the last user's never-written tile, so every column is visible) and slices
+        # lane u's column range; the per-lane form scores user u's slots per call.  Lane u's row is then row u
+        # of the lane-local [32, blocks] score rows the chunk stages take (rows past B zero).
+        lane_rows = []
+        if lane_constants.indexer_form == "wide":
+            local_scores = ttnn.experimental.indexer_score_dsa(
+                index_query,
+                state.compressed_index_cache_flat,
+                self.index_gate,
+                chunk_start_idx=count * rows - ttnn.TILE_SIZE,
+                compute_kernel_config=self.indexer_compute_config,
+                seq_shard_axes=[STAGING_AXIS],
+            )
+            for lane in range(count):
+                lane_rows.append(
+                    ttnn.slice(
+                        local_scores,
+                        (0, 0, lane, lane * rows),
+                        (1, 1, lane + 1, lane * rows + blocks),
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    )
+                )
+            _deallocate(local_scores)
+        else:
+            for lane in range(count):
+                local_scores = ttnn.experimental.indexer_score_dsa(
+                    index_query,
+                    state.compressed_index_cache,
+                    self.index_gate,
+                    chunk_start_idx=self.indexer_chunk_start,
+                    cache_batch_idx=lane,
+                    compute_kernel_config=self.indexer_compute_config,
+                    seq_shard_axes=[STAGING_AXIS],
+                )
+                lane_rows.append(
+                    ttnn.slice(
+                        local_scores, (0, 0, lane, 0), (1, 1, lane + 1, blocks), memory_config=ttnn.DRAM_MEMORY_CONFIG
+                    )
+                )
+                _deallocate(local_scores)
+        stacked = lane_rows[0] if count == 1 else ttnn.concat(lane_rows, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        if count > 1:
+            _deallocate(*lane_rows)
+        score_rows = (
+            stacked
+            if count == MAX_LANES
+            else ttnn.pad(
+                stacked, [(0, 0), (0, 0), (0, MAX_LANES - count), (0, 0)], 0.0, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+        )
+        if score_rows is not stacked:
+            _deallocate(stacked)
+        self.mesh_contract.mark_local_partial(
+            score_rows,
+            replicated_reference=state.compressed_index_cache,
+            expected_shape=(1, 1, MAX_LANES, blocks),
+        )
+        scores = ttnn.all_reduce(
+            score_rows,
+            cluster_axis=TP_AXIS,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            topology=self.collective_topology,
+        )
+        _deallocate(score_rows)
+        self.mesh_contract.validate_tensor(scores, placement=TensorPlacement.REPLICATED)
+        masked = ttnn.add(
+            scores,
+            lanes.indexer_neg_mask,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            fast_and_approximate_mode=False,
+        )
+        _deallocate(scores)
+        _require_shape(masked, (1, 1, MAX_LANES, blocks), "masked QSA lane block scores")
+        if masked.dtype != ttnn.bfloat16 or masked.layout != ttnn.ROW_MAJOR_LAYOUT:
+            raise RuntimeError(f"masked QSA lane block scores must be BF16 ROW_MAJOR, got {tensor_metadata(masked)}")
+        return masked
+
+    def _materialize_rows_lanes(
+        self,
+        masked_scores,
+        lanes: Qwen38TTNNQSALaneInputs,
+        constants: Qwen38TTNNQSAChunkConstants,
+        lane_constants: Qwen38TTNNQSALaneConstants,
+    ):
+        # The chunk's row materialization with lane u's KV offset folded into its block-offset row: the expanded
+        # ids and the tail ids (lanes.row_fill) address lane u's region of the flat cache; the sentinels are
+        # untouched (the offset rows are added before the keep mask and the OR).
+        block_ids = ttnn.experimental.topk_large_indices(masked_scores, k=BLOCK_TOPK)
+        _deallocate(masked_scores)
+        _require_shape(block_ids, (1, 1, MAX_LANES, BLOCK_TOPK), "top-k QSA lane block IDs")
+        if block_ids.dtype != ttnn.uint32 or block_ids.layout != ttnn.ROW_MAJOR_LAYOUT:
+            raise RuntimeError(
+                f"topk_large_indices must return UINT32 ROW_MAJOR block IDs, got {tensor_metadata(block_ids)}"
+            )
+        starts = ttnn.bitwise_left_shift(block_ids, 2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(block_ids)
+        repeated = ttnn.repeat_interleave(starts, repeats=COMPRESS_RATIO, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(starts)
+        expanded = ttnn.add(repeated, lane_constants.block_offsets_lanes, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(repeated)
+        _require_shape(expanded, (1, 1, MAX_LANES, TOKEN_BUDGET), "expanded QSA lane block indices")
+        template = ttnn.concat([expanded, constants.sentinel_pad_rows], dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(expanded)
+        kept = ttnn.bitwise_and(template, lanes.row_keep_bits, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(template)
+        sparse_indices = ttnn.bitwise_or(kept, lanes.row_fill, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(kept)
+        _require_shape(sparse_indices, (1, 1, MAX_LANES, SPARSE_INDEX_CAPACITY), "QSA lane sparse indices")
+        if sparse_indices.dtype != ttnn.uint32 or sparse_indices.layout != ttnn.ROW_MAJOR_LAYOUT:
+            raise RuntimeError(f"sparse QSA indices must be UINT32 ROW_MAJOR, got {tensor_metadata(sparse_indices)}")
+        self.mesh_contract.validate_tensor(sparse_indices, placement=TensorPlacement.REPLICATED)
+        return sparse_indices
+
+    def _write_packed_kv_lanes(
+        self,
+        state: Qwen38TTNNQSALaneState,
+        key,
+        value,
+        lanes: Qwen38TTNNQSALaneInputs,
+    ) -> None:
+        count = state.lanes
+        packed_rows = ttnn.concat([value, key], dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(value, key)
+        _require_shape(packed_rows, (1, 1, MAX_LANES, 2 * HEAD_DIM), "packed QSA lane KV rows")
+        # Staging row P_u % 32 of lane u <- its packed row (the selection matmul and the keep column, in place on
+        # the TILE staging), then one untilize of every lane's tile feeds the per-lane ROW_MAJOR slab writes at
+        # row u*C + (P_u & ~31), read on device from the lane's metadata scalar.
+        placed = ttnn.matmul(
+            lanes.kv_hit_tiles,
+            packed_rows,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+        )
+        _deallocate(packed_rows)
+        _require_shape(placed, (1, count, CACHE_WRITE_ROWS, 2 * HEAD_DIM), "placed packed QSA lane KV")
+        kept = ttnn.multiply(state.kv_staging, lanes.kv_keep_col, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        staged = ttnn.add(kept, placed, output_tensor=state.kv_staging, fast_and_approximate_mode=False)
+        if _tensor_key(staged) != _tensor_key(state.kv_staging):
+            raise RuntimeError("QSA lane KV staging update was not in place")
+        _deallocate(kept, placed)
+        self._write_kv_slabs_lanes(
+            state, state.kv_staging, lanes.kv_row_start_lanes, label="filled QSA lane KV staging"
+        )
+
+    def _write_kv_slabs_lanes(self, state: Qwen38TTNNQSALaneState, staging_tiled, row_starts, *, label: str) -> None:
+        """One untilize of every lane's ``[1,B,32,512]`` staging tile, then lane u's slab written at its flat-cache
+        row ``row_starts[u]`` (read on device from the lane's metadata scalar); the staging is left to the caller."""
+
+        count = state.lanes
+        slabs = ttnn.to_layout(staging_tiled, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _retag_tensor(slabs, reference=state.packed_kv_cache, shard_dim=1)
+        _require_shape(slabs, (1, count, CACHE_WRITE_ROWS, 2 * HEAD_DIM), label)
+        for lane in range(count):
+            slab = (
+                slabs
+                if count == 1
+                else ttnn.slice(
+                    slabs,
+                    (0, lane, 0, 0),
+                    (1, lane + 1, CACHE_WRITE_ROWS, 2 * HEAD_DIM),
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+            )
+            _retag_tensor(slab, reference=state.packed_kv_cache, shard_dim=1)
+            self.mesh_contract.validate_tensor(slab, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=1)
+            result = ttnn.experimental.deepseek_prefill.update_padded_kv_cache(
+                state.packed_kv_cache,
+                slab,
+                self.slot_zero,
+                row_starts[lane],
+                0,  # layer_idx inside this one-layer cache
+                1,  # num_layers
+                STAGING_AXIS,
+            )
+            if _tensor_key(result) != _tensor_key(state.packed_kv_cache):
+                raise RuntimeError("row-major QSA lane KV update was not in place")
+            if slab is not slabs:
+                _deallocate(slab)
+        _deallocate(slabs)
+
+    def forward_decode_lanes(
+        self,
+        hidden_rows,
+        state: Qwen38TTNNQSALaneState,
+        *,
+        cos,
+        sin,
+        block_start_cos,
+        block_start_sin,
+        lanes: Qwen38TTNNQSALaneInputs,
+        constants: Qwen38TTNNQSAChunkConstants,
+        lane_constants: Qwen38TTNNQSALaneConstants,
+    ):
+        """Decode one token per lane at the lanes' own positions; same op sequence for every position row.
+
+        ``hidden_rows`` is the ``[1,1,32,640]`` hidden-sharded tile with row u = lane u (rows past the lane count
+        idle); ``state`` is mutated in place and keeps its addresses; ``lanes`` holds the per-step tensors of
+        :func:`derive_qsa_lane_inputs`; the RoPE rows are the table lookups at ``P_u`` and ``P_u & ~3``.  Returns
+        the ``[1,1,32,640]`` BF16 TILE hidden-sharded output rows; the input is left for the caller to release.
+        """
+
+        self._validate_lane_state(state)
+        self._validate_rope_rows(cos, sin, CHUNK_ROWS, "QSA lane RoPE")
+        self._validate_rope_rows(block_start_cos, block_start_sin, CHUNK_ROWS, "QSA lane block-start RoPE")
+        self._validate_lane_inputs(lanes, state.lanes)
+        if constants.rows != CHUNK_ROWS:
+            raise ValueError(
+                f"QSA lanes run on the {CHUNK_ROWS}-row tile, the chunk constants have {constants.rows} rows"
+            )
+        if constants.allocated_compressed_blocks != self.allocated_compressed_blocks:
+            raise ValueError(
+                f"QSA chunk constants were built for {constants.allocated_compressed_blocks} blocks, "
+                f"the layer has {self.allocated_compressed_blocks}"
+            )
+        if lane_constants.lanes != state.lanes or lane_constants.allocated_context != self.allocated_context:
+            raise ValueError(
+                f"QSA lane constants were built for {lane_constants.lanes} lanes at {lane_constants.allocated_context} "
+                f"tokens, the state has {state.lanes} lanes at {self.allocated_context}"
+            )
+
+        full_hidden = self._all_gather_hidden_rows(hidden_rows, constants)
+        index_query, raw_key = self._index_projection_rows(full_hidden, None, cos, sin, constants)
+        self._write_compressed_index_lanes(state, raw_key, block_start_cos, block_start_sin, lanes, lane_constants)
+        masked_scores = self._score_blocks_lanes(index_query, state, lanes, lane_constants)
+        _deallocate(index_query)
+        sparse_indices = self._materialize_rows_lanes(masked_scores, lanes, constants, lane_constants)
+
+        query, gate, key, value = self._main_projection_rows(full_hidden, None, cos, sin, constants)
+        self._write_packed_kv_lanes(state, key, value, lanes)
+        local_attention = self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)
+        _deallocate(sparse_indices)
+        output = self._project_output_rows(local_attention, full_hidden, constants)
+        _deallocate(full_hidden)
+        return output
+
+    # ------------------------------------------------------------------ lane verify (B lanes x R rows, one tile)
+
+    def allocate_lane_verify_state(self, lanes: int) -> Qwen38TTNNQSALaneVerifyState:
+        lanes = require_lane_count(lanes, label="QSA lane verify lanes")
+        epoch = self._next_epoch
+        self._next_epoch += 1
+        self._live_generic_epochs.add(epoch)
+        return Qwen38TTNNQSALaneVerifyState(
+            layer_index=self.layer_index,
+            epoch=epoch,
+            lanes=lanes,
+            raw_history=self._allocate_replicated_tile_zeros((1, lanes, CACHE_WRITE_ROWS, INDEX_HEAD_DIM)),
+            raw_rows=self._allocate_replicated_tile_zeros((1, 1, lanes * CACHE_WRITE_ROWS, INDEX_HEAD_DIM)),
+        )
+
+    def release_lane_verify_state(self, state: Qwen38TTNNQSALaneVerifyState) -> None:
+        self._validate_lane_verify_state(state)
+        _deallocate(state.raw_history, state.raw_rows)
+        self._live_generic_epochs.remove(state.epoch)
+
+    def _validate_lane_verify_state(self, state: Qwen38TTNNQSALaneVerifyState) -> int:
+        if state.layer_index != self.layer_index:
+            raise ValueError(f"QSA lane verify state belongs to layer {state.layer_index}, expected {self.layer_index}")
+        if state.epoch not in self._live_generic_epochs:
+            raise ValueError(f"QSA lane verify state epoch {state.epoch} was not allocated by this module")
+        lanes = require_lane_count(state.lanes, label="QSA lane verify lanes", error_type=RuntimeError)
+        for label, tensor, shape in (
+            ("QSA lane raw history", state.raw_history, (1, lanes, CACHE_WRITE_ROWS, INDEX_HEAD_DIM)),
+            ("QSA lane raw rows", state.raw_rows, (1, 1, lanes * CACHE_WRITE_ROWS, INDEX_HEAD_DIM)),
+        ):
+            _require_shape(tensor, shape, label)
+            if tensor.dtype != ttnn.bfloat16 or tensor.layout != ttnn.TILE_LAYOUT:
+                raise RuntimeError(f"{label} must be BF16 TILE, got {tensor_metadata(tensor)}")
+            self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.REPLICATED)
+        if _tensor_key(state.raw_history) == _tensor_key(state.raw_rows):
+            raise RuntimeError("QSA lane raw history and raw rows must be distinct buffers")
+        return lanes
+
+    def _raw_window_lanes(self, verify_state: Qwen38TTNNQSALaneVerifyState):
+        """``[raw_history_u | raw_rows_u]`` per lane, ``[1,B,64,128]``: the raw rows viewed ``[1,B,32,128]`` (whole
+        tiles, the same pages) beside the history tiles."""
+
+        rows = ttnn.experimental.view(verify_state.raw_rows, (1, verify_state.lanes, CACHE_WRITE_ROWS, INDEX_HEAD_DIM))
+        _retag_tensor(rows, reference=verify_state.raw_rows, shard_dim=None)
+        window = ttnn.concat([verify_state.raw_history, rows], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _retag_tensor(window, reference=verify_state.raw_rows, shard_dim=None)
+        _require_shape(window, (1, verify_state.lanes, RAW_WINDOW_TILE_ROWS, INDEX_HEAD_DIM), "QSA lane raw window")
+        return window
+
+    def commit_verify_lanes(
+        self,
+        verify_state: Qwen38TTNNQSALaneVerifyState,
+        selectors,
+        *,
+        target: Qwen38TTNNQSALaneVerifyState | None = None,
+    ) -> None:
+        """``raw_history_u <- window_u[c_u : c_u + 3]`` for every lane: one equal-batch exact 0/1 selection matmul
+        against the pass's per-lane ``history_select`` ``[1,B,32,64]``, landing in the persistent history tiles (the
+        KEEP row copies an inactive lane's history unchanged).  With ``target`` the selected histories land in
+        ``target.raw_history`` and ``verify_state`` is read only: the lane draft body derives the MTP layer's
+        committed histories into its own state while the alignment state keeps its windows for the pass's real
+        commit (the B=1 :meth:`commit_verify` ``target``)."""
+
+        lanes = self._validate_lane_verify_state(verify_state)
+        target = verify_state if target is None else target
+        if self._validate_lane_verify_state(target) != lanes:
+            raise ValueError("QSA lane commit target must hold the same lane count")
+        _require_shape(
+            selectors.history_select, (1, lanes, CHUNK_ROWS, RAW_WINDOW_TILE_ROWS), "QSA lane history select"
+        )
+        if selectors.history_select.dtype != ttnn.bfloat16:
+            raise RuntimeError(f"QSA lane history select must be BF16, got {selectors.history_select.dtype}")
+        window = self._raw_window_lanes(verify_state)
+        landed = ttnn.matmul(
+            selectors.history_select,
+            window,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+            optional_output_tensor=target.raw_history,
+        )
+        if landed is not None and _tensor_key(landed) != _tensor_key(target.raw_history):
+            raise RuntimeError("QSA lane raw history select did not land in its persistent buffer")
+        _deallocate(window)
+
+    def _write_compressed_index_lanes_verify(
+        self,
+        state: Qwen38TTNNQSALaneState,
+        verify_state: Qwen38TTNNQSALaneVerifyState,
+        raw_key,
+        block_start_cos,
+        block_start_sin,
+        inputs: Qwen38TTNNQSALaneVerifyInputs,
+        lane_constants: Qwen38TTNNQSALaneConstants,
+        lane_verify: Qwen38TTNNQSALaneVerifyConstants,
+    ) -> None:
+        """The lane-major raw keys into every lane's raw rows (the expand select: exact row copies), the two block
+        means of every lane pooled over its raw window (one 0.25-select matmul per lane, equal batch) and gathered
+        into ONE 32-row tile (row ``2u + i`` = lane u's block i) before the norm and the block-start RoPE whose cos /
+        sin rows are lanes ``2u + i``; then, per block, every lane's row picked into user u's row 0 and written by one
+        ``paged_update_cache`` at the lanes' block indices.  An inactive lane's pooled rows are junk landing in blocks
+        at or past ``P_u // 4`` that its own indexer mask hides until its next real pass rewrites them."""
+
+        count = state.lanes
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        landed = ttnn.matmul(
+            lane_verify.expand_select,
+            raw_key,
+            memory_config=dram,
+            compute_kernel_config=self.compute_config,
+            optional_output_tensor=verify_state.raw_rows,
+        )
+        if landed is not None and _tensor_key(landed) != _tensor_key(verify_state.raw_rows):
+            raise RuntimeError("QSA lane verify raw rows were not landed in place")
+        _deallocate(raw_key)
+        window = self._raw_window_lanes(verify_state)
+        pooled_lanes = ttnn.matmul(
+            inputs.pool_select, window, memory_config=dram, compute_kernel_config=self.compute_config
+        )
+        _deallocate(window)
+        _require_shape(pooled_lanes, (1, count, CHUNK_ROWS, INDEX_HEAD_DIM), "pooled QSA lane verify index keys")
+        pooled_flat = ttnn.experimental.view(pooled_lanes, (1, 1, count * CHUNK_ROWS, INDEX_HEAD_DIM))
+        _retag_tensor(pooled_flat, reference=pooled_lanes, shard_dim=None)
+        pooled = ttnn.matmul(
+            lane_verify.pick_pooled, pooled_flat, memory_config=dram, compute_kernel_config=self.compute_config
+        )
+        _deallocate(pooled_lanes)
+        _retag_tensor(pooled, reference=state.compressed_index_cache, shard_dim=None)
+        _require_shape(pooled, (1, 1, CHUNK_ROWS, INDEX_HEAD_DIM), "pooled QSA lane verify index tile")
+        normalized = ttnn.rms_norm(
+            pooled,
+            epsilon=self.rms_norm_eps,
+            weight=self.weights.index_k_norm,
+            memory_config=dram,
+            compute_kernel_config=self.compute_config,
+        )
+        _deallocate(pooled)
+        rotated = apply_partial_rope_prefill(normalized, block_start_cos, block_start_sin, 1, ROPE_DIM)
+        _deallocate(normalized)
+        _retag_tensor(rotated, reference=state.compressed_index_cache, shard_dim=None)
+        self.mesh_contract.validate_tensor(rotated, placement=TensorPlacement.REPLICATED)
+        _require_shape(rotated, (1, 1, CHUNK_ROWS, INDEX_HEAD_DIM), "rotated QSA lane verify index keys")
+        for block, block_index in enumerate(inputs.block_index_i32):
+            picked = ttnn.matmul(
+                lane_verify.pick_users[block], rotated, memory_config=dram, compute_kernel_config=self.compute_config
+            )
+            _retag_tensor(picked, reference=rotated, shard_dim=None)
+            _require_shape(picked, (1, count, CHUNK_ROWS, INDEX_HEAD_DIM), f"picked QSA lane verify users {block}")
+            users = ttnn.reshape(
+                picked, ttnn.Shape((1, count, 1, INDEX_HEAD_DIM)), ttnn.Shape(tuple(picked.padded_shape))
+            )  # row 0 of every lane's tile: the same pages
+            users.update_tensor_topology(picked.tensor_topology())
+            users_sharded = ttnn.to_memory_config(users, lane_constants.compressed_rows_memory_config)
+            _deallocate(picked)
+            result = ttnn.experimental.paged_update_cache(
+                state.compressed_index_cache, users_sharded, update_idxs_tensor=block_index
+            )
+            if _tensor_key(result) != _tensor_key(state.compressed_index_cache):
+                raise RuntimeError("compressed QSA lane verify index update was not in place")
+            _deallocate(users_sharded)
+        _deallocate(rotated)
+
+    def _score_blocks_lanes_verify(
+        self,
+        index_query,
+        state: Qwen38TTNNQSALaneState,
+        inputs: Qwen38TTNNQSALaneVerifyInputs,
+        lane_verify: Qwen38TTNNQSALaneVerifyConstants,
+    ):
+        """The wide indexer once over the lane-major query tile and the flat compressed cache, row r windowed to
+        lane_of(r)'s columns (the fused row windows, or the chain's slices), the score all-reduce and the per-row mask.
+        """
+
+        count, blocks = state.lanes, self.allocated_compressed_blocks
+        rows = blocks + ttnn.TILE_SIZE
+        local_scores = ttnn.experimental.indexer_score_dsa(
+            index_query,
+            state.compressed_index_cache_flat,
+            self.index_gate,
+            chunk_start_idx=count * rows - ttnn.TILE_SIZE,
+            compute_kernel_config=self.indexer_compute_config,
+            seq_shard_axes=[STAGING_AXIS],
+        )
+        score_rows = self._lane_score_rows_of(local_scores, lane_verify.lanes_of_rows, count, rows, blocks)
+        _deallocate(local_scores)
+        _require_shape(score_rows, (1, 1, CHUNK_ROWS, blocks), "local QSA lane verify block scores")
+        self.mesh_contract.mark_local_partial(
+            score_rows, replicated_reference=state.compressed_index_cache, expected_shape=(1, 1, CHUNK_ROWS, blocks)
+        )
+        scores = ttnn.all_reduce(
+            score_rows,
+            cluster_axis=TP_AXIS,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            topology=self.collective_topology,
+        )
+        _deallocate(score_rows)
+        self.mesh_contract.validate_tensor(scores, placement=TensorPlacement.REPLICATED)
+        masked = ttnn.add(
+            scores, inputs.indexer_neg_mask, memory_config=ttnn.DRAM_MEMORY_CONFIG, fast_and_approximate_mode=False
+        )
+        _deallocate(scores)
+        _require_shape(masked, (1, 1, CHUNK_ROWS, blocks), "masked QSA lane verify block scores")
+        if masked.dtype != ttnn.bfloat16 or masked.layout != ttnn.ROW_MAJOR_LAYOUT:
+            raise RuntimeError(
+                f"masked QSA lane verify block scores must be BF16 ROW_MAJOR, got {tensor_metadata(masked)}"
+            )
+        return masked
+
+    def _write_packed_kv_lanes_verify(
+        self, state: Qwen38TTNNQSALaneState, key, value, inputs: Qwen38TTNNQSALaneVerifyInputs
+    ) -> None:
+        """Every lane's current block: its resident rows read out of the flat cache at the lane's (redirected) rows,
+        the rows below ``P_u % 32`` kept, the lane's new rows placed by the staging select (an A-batched matmul
+        against the lane-major packed tile), untilized once and written per lane; then every lane's next block."""
+
+        count = state.lanes
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        packed_tiled = ttnn.concat([value, key], dim=3, memory_config=dram)
+        _deallocate(value, key)
+        _require_shape(packed_tiled, (1, 1, CHUNK_ROWS, 2 * HEAD_DIM), "packed QSA lane verify KV rows")
+        looked_up = ttnn.embedding(
+            inputs.kv_read_indices,
+            state.packed_kv_cache,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            memory_config=dram,
+        )
+        resident = ttnn.unsqueeze_to_4D(looked_up) if len(looked_up.shape) == 3 else looked_up
+        _retag_tensor(resident, reference=state.packed_kv_cache, shard_dim=1)
+        _require_shape(resident, (1, 1, count * CACHE_WRITE_ROWS, 2 * HEAD_DIM), "resident QSA lane KV block rows")
+        blocks = ttnn.experimental.view(resident, (1, count, CACHE_WRITE_ROWS, 2 * HEAD_DIM))
+        _retag_tensor(blocks, reference=state.packed_kv_cache, shard_dim=1)
+        kept = ttnn.multiply(blocks, inputs.stage_keep, memory_config=dram)
+        _deallocate(resident)  # the 4D owner of the lookup's buffer (the lane view shares it)
+        placed = ttnn.matmul(
+            inputs.stage_a_select, packed_tiled, memory_config=dram, compute_kernel_config=self.compute_config
+        )
+        _retag_tensor(placed, reference=state.packed_kv_cache, shard_dim=1)
+        staged = ttnn.add(kept, placed, memory_config=dram, fast_and_approximate_mode=False)
+        _deallocate(kept, placed)
+        _retag_tensor(staged, reference=state.packed_kv_cache, shard_dim=1)
+        self._write_kv_slabs_lanes(state, staged, inputs.kv_row_start_lanes, label="QSA lane verify current blocks")
+        _deallocate(staged)
+        if inputs.single_row:  # one row per lane: it never reaches the next block (the B=1 draft rows' rule)
+            _deallocate(packed_tiled)
+            return
+        placed_next = ttnn.matmul(
+            inputs.stage_b_select, packed_tiled, memory_config=dram, compute_kernel_config=self.compute_config
+        )
+        _deallocate(packed_tiled)
+        _retag_tensor(placed_next, reference=state.packed_kv_cache, shard_dim=1)
+        self._write_kv_slabs_lanes(
+            state, placed_next, inputs.kv_row_start_next_lanes, label="QSA lane verify next blocks"
+        )
+        _deallocate(placed_next)
+
+    def forward_verify_lanes(
+        self,
+        hidden_rows,
+        state: Qwen38TTNNQSALaneState,
+        verify_state: Qwen38TTNNQSALaneVerifyState,
+        *,
+        cos,
+        sin,
+        block_start_cos,
+        block_start_sin,
+        inputs: Qwen38TTNNQSALaneVerifyInputs,
+        constants: Qwen38TTNNQSAChunkConstants,
+        lane_constants: Qwen38TTNNQSALaneConstants,
+        lane_verify: Qwen38TTNNQSALaneVerifyConstants,
+    ):
+        """The R rows ``P_u .. P_u + R - 1`` of every lane in one lane-major 32-row tile; same op sequence for every
+        position row.  ``hidden_rows`` is the ``[1,1,32,640]`` tile (rows past B*R zero); ``state`` is mutated in
+        place (lane u's KV rows across its current and next block, its compressed blocks ``P_u // 4`` and + 1; an
+        inactive lane's KV writes land in the scratch rows); ``verify_state.raw_rows`` takes the pass's raw keys per
+        lane and ``raw_history`` is read only (:meth:`commit_verify_lanes` commits it).  The RoPE rows are the
+        lookups at ``P_row[r]`` and at the block starts of lanes ``2u + i``.  Returns the ``[1,1,32,640]`` BF16 TILE
+        hidden-sharded rows; the input is left for the caller to release.
+        """
+
+        self._validate_lane_state(state)
+        lanes = self._validate_lane_verify_state(verify_state)
+        self._validate_rope_rows(cos, sin, CHUNK_ROWS, "QSA lane verify RoPE")
+        self._validate_rope_rows(block_start_cos, block_start_sin, CHUNK_ROWS, "QSA lane verify block-start RoPE")
+        if state.lanes != lanes or lane_constants.lanes != lanes or lane_verify.lanes != lanes:
+            raise ValueError(
+                f"QSA lane verify: state {state.lanes}, verify state {lanes}, lane constants {lane_constants.lanes} "
+                f"and lane verify constants {lane_verify.lanes} lanes must agree"
+            )
+        if inputs.lanes != lanes or state.kv_scratch_rows < 2 * CACHE_WRITE_ROWS:
+            raise ValueError(
+                f"QSA lane verify inputs are for {inputs.lanes} lanes and the flat cache has {state.kv_scratch_rows} "
+                f"scratch rows; the redirect needs {2 * CACHE_WRITE_ROWS}"
+            )
+        if constants.rows != CHUNK_ROWS or constants.allocated_compressed_blocks != self.allocated_compressed_blocks:
+            raise ValueError("QSA lane verify runs on the layer's 32-row chunk constants")
+        if (
+            lane_constants.allocated_context != self.allocated_context
+            or lane_verify.allocated_context != self.allocated_context
+        ):
+            raise ValueError("QSA lane constants were built for another context")
+
+        full_hidden = self._all_gather_hidden_rows(hidden_rows, constants)
+        index_query, raw_key = self._index_projection_rows(full_hidden, None, cos, sin, constants)
+        self._write_compressed_index_lanes_verify(
+            state, verify_state, raw_key, block_start_cos, block_start_sin, inputs, lane_constants, lane_verify
+        )
+        masked_scores = self._score_blocks_lanes_verify(index_query, state, inputs, lane_verify)
+        _deallocate(index_query)
+        sparse_indices = self._materialize_rows_lanes(masked_scores, inputs, constants, lane_verify)
+
+        query, gate, key, value = self._main_projection_rows(full_hidden, None, cos, sin, constants)
+        self._write_packed_kv_lanes_verify(state, key, value, inputs)
+        local_attention = self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)
+        _deallocate(sparse_indices)
+        output = self._project_output_rows(local_attention, full_hidden, constants)
+        _deallocate(full_hidden)
+        return output
+
+    # ------------------------------------------------------------------ fused lane body (the six programs at B rows)
+    # _forward_decode_lanes_fused is _forward_decode_generic_fused over B lanes: the same six ttnn/fused/qsa_block
+    # programs with rows = lanes (each kernel reads P_u from the lane inputs' kv_block_start + kv_row_hit and takes
+    # the lane state's [B,1,H,128] compressed cache, [1,B,32,*] ring / staging and the flat KV cache with lane_rows
+    # = C), around the same kept kernels as the lane chain above.  The 32-row lane tile is viewed as its B valid
+    # rows (one tile, the same pages, the chain's zero rows past B), so every kept kernel runs the 1-row body's own
+    # configuration (the DRAM-sharded linears are one tile in either form).  Bound to forward_decode_lanes at
+    # construction when all six programs are on; with any of them off the lane chain above runs unchanged.
+
+    def _validate_lane_call(
+        self, state, cos, sin, block_start_cos, block_start_sin, lanes, constants, lane_constants
+    ) -> int:
+        """The lane body's argument checks (:meth:`forward_decode_lanes`'s, shared with the fused form)."""
+
+        self._validate_lane_state(state)
+        self._validate_rope_rows(cos, sin, CHUNK_ROWS, "QSA lane RoPE")
+        self._validate_rope_rows(block_start_cos, block_start_sin, CHUNK_ROWS, "QSA lane block-start RoPE")
+        self._validate_fused_lane_inputs(lanes, state.lanes)
+        if constants.rows != CHUNK_ROWS:
+            raise ValueError(
+                f"QSA lanes run on the {CHUNK_ROWS}-row tile, the chunk constants have {constants.rows} rows"
+            )
+        if constants.allocated_compressed_blocks != self.allocated_compressed_blocks:
+            raise ValueError(
+                f"QSA chunk constants were built for {constants.allocated_compressed_blocks} blocks, "
+                f"the layer has {self.allocated_compressed_blocks}"
+            )
+        if lane_constants.lanes != state.lanes or lane_constants.allocated_context != self.allocated_context:
+            raise ValueError(
+                f"QSA lane constants were built for {lane_constants.lanes} lanes at {lane_constants.allocated_context} "
+                f"tokens, the state has {state.lanes} lanes at {self.allocated_context}"
+            )
+        return state.lanes
+
+    @staticmethod
+    def _lane_rows_view(tensor, rows: int):
+        """``tensor`` [1, n, 32, W] (one padded row tile per dim-1 index) as the logical rows ``[1, n, rows, W]`` of
+        the same tile: a metadata view (same buffer, same pages; never released on its own -- the buffer's owner
+        releases it), the distributed topology copied over.  ``rows == 32`` returns the tensor itself."""
+
+        shape = _shape(tensor)
+        if shape[2] == rows:
+            return tensor
+        view = ttnn.reshape(
+            tensor, ttnn.Shape((shape[0], shape[1], rows, shape[3])), ttnn.Shape(tuple(tensor.padded_shape))
+        )
+        view.update_tensor_topology(tensor.tensor_topology())
+        return view
+
+    def _all_gather_hidden_lanes_fused(self, hidden_lanes, rows: int):
+        """:meth:`_all_gather_hidden` on the B-row view of the lane tile: the gathered rows land in the eight-core
+        activation shard the index and main linears read (one tile, the 1-row body's own gather)."""
+
+        _require_shape(hidden_lanes, (1, 1, rows, HIDDEN_SIZE // TP_SIZE), "QSA lane hidden rows")
+        self.mesh_contract.validate_tensor(hidden_lanes, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        full_hidden = ttnn.all_gather(
+            hidden_lanes,
+            dim=3,
+            cluster_axis=TP_AXIS,
+            memory_config=self.hidden_act_memory_config,
+        )
+        _require_shape(full_hidden, (1, 1, rows, HIDDEN_SIZE), "QSA lane hidden all-gather")
+        self.mesh_contract.validate_tensor(full_hidden, placement=TensorPlacement.REPLICATED)
+        return full_hidden
+
+    def _score_blocks_lanes_fused(
+        self,
+        index_query,
+        state: Qwen38TTNNQSALaneState,
+        lanes: Qwen38TTNNQSALaneInputs,
+        lane_constants: Qwen38TTNNQSALaneConstants,
+    ):
+        """:meth:`_score_blocks_lanes` up to the lane rows (the wide indexer on the flat cache with the lane windows
+        taken by one program, ttnn/fused/qsa_block.lane_score_rows, in place of the chain's B slices and concat; or
+        one indexer call per lane), then the 1-row fused form's collective split: the all-gather of the B local rows
+        (device d's rows at d * B) and the fused merge (ttnn/fused/qsa_block.score_merge: moreh_sum's device order,
+        then the lane inputs' mask rows, read per lane)."""
+
+        count, blocks = state.lanes, self.allocated_compressed_blocks
+        rows = blocks + ttnn.TILE_SIZE
+        tile_shape = ttnn.Shape((1, INDEX_QUERY_HEADS_PER_DEVICE, ttnn.TILE_SIZE, INDEX_HEAD_DIM))
+        query_tile = ttnn.reshape(index_query, tile_shape, tile_shape)
+        _retag_tensor(query_tile, reference=index_query, shard_dim=1)
+        lane_rows = []
+        if lane_constants.indexer_form == "wide":
+            local_scores = ttnn.experimental.indexer_score_dsa(
+                query_tile,
+                state.compressed_index_cache_flat,
+                self.index_gate,
+                chunk_start_idx=count * rows - ttnn.TILE_SIZE,
+                compute_kernel_config=self.indexer_compute_config,
+                seq_shard_axes=[STAGING_AXIS],
+            )
+            lane_rows.append(self._lane_score_rows_fused(local_scores, count, rows, blocks))
+            _deallocate(local_scores)
+        else:
+            for lane in range(count):
+                local_scores = ttnn.experimental.indexer_score_dsa(
+                    query_tile,
+                    state.compressed_index_cache,
+                    self.index_gate,
+                    chunk_start_idx=self.indexer_chunk_start,
+                    cache_batch_idx=lane,
+                    compute_kernel_config=self.indexer_compute_config,
+                    seq_shard_axes=[STAGING_AXIS],
+                )
+                lane_rows.append(
+                    ttnn.slice(
+                        local_scores, (0, 0, lane, 0), (1, 1, lane + 1, blocks), memory_config=ttnn.DRAM_MEMORY_CONFIG
+                    )
+                )
+                _deallocate(local_scores)
+        score_rows = (
+            lane_rows[0]
+            if len(lane_rows) == 1
+            else ttnn.concat(lane_rows, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        )
+        if len(lane_rows) > 1:
+            _deallocate(*lane_rows)
+        _require_shape(score_rows, (1, 1, count, blocks), "local QSA lane block scores")
+        self.mesh_contract.mark_local_partial(
+            score_rows,
+            replicated_reference=state.compressed_index_cache,
+            expected_shape=(1, 1, count, blocks),
+        )
+        # the rows as 2 KB pages, as the one-row path gathers them (ttnn.all_gather refuses a 65,536-byte page: the
+        # whole row at a 131072-token context); device d's row r page c lands at gathered page (d * count + r) * pages + c
+        pages = blocks // SCORE_GATHER_PAGE
+        paged = ttnn.reshape(score_rows, (1, 1, count * pages, SCORE_GATHER_PAGE))
+        _deallocate(score_rows)
+        gathered = ttnn.all_gather(
+            paged,
+            dim=2,
+            cluster_axis=TP_AXIS,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+        _deallocate(paged)
+        _require_shape(
+            gathered, (1, 1, TP_SIZE * count * pages, SCORE_GATHER_PAGE), "gathered QSA lane block score pages"
+        )
+        masked = self._score_merge_fused(gathered, lanes.indexer_neg_mask)
+        _deallocate(gathered)
+        _retag_tensor(masked, reference=state.compressed_index_cache, shard_dim=None)
+        self.mesh_contract.validate_tensor(masked, placement=TensorPlacement.REPLICATED)
+        _require_shape(masked, (1, 1, count, blocks), "masked QSA lane block scores")
+        return masked
+
+    def _forward_decode_lanes_fused(
+        self,
+        hidden_rows,
+        state: Qwen38TTNNQSALaneState,
+        *,
+        cos,
+        sin,
+        block_start_cos,
+        block_start_sin,
+        lanes,
+        constants: Qwen38TTNNQSAChunkConstants,
+        lane_constants: Qwen38TTNNQSALaneConstants,
+    ):
+        """:meth:`forward_decode_lanes` with the six ttnn/fused/qsa_block programs at B rows in place of the lane
+        chain's 32-row glue; bound to ``forward_decode_lanes`` at construction when all six are on (the class body
+        stays the lane chain the programs are gated against).  Same contract: the ``[1,1,32,640]`` lane tile in,
+        the state mutated in place, the ``[1,1,32,640]`` output rows (row u = lane u; rows past the lane count are
+        exact zeros: zero gates on zeroed attention rows, a zero partial, zero reduce-scatter rows), the input
+        left for the caller.  ``lanes``: the full :class:`Qwen38TTNNQSALaneInputs` or the fused derive's
+        :class:`Qwen38TTNNQSAFusedLaneInputs` (the five fields the programs read)."""
+
+        count = self._validate_lane_call(
+            state, cos, sin, block_start_cos, block_start_sin, lanes, constants, lane_constants
+        )
+        hidden_lanes = self._lane_rows_view(hidden_rows, count)
+        cos_lanes, sin_lanes, block_cos_lanes, block_sin_lanes = (
+            self._lane_rows_view(table, count) for table in (cos, sin, block_start_cos, block_start_sin)
+        )
+        full_hidden = self._all_gather_hidden_lanes_fused(hidden_lanes, count)
+        index_query = self._index_tail_step(
+            full_hidden, cos_lanes, sin_lanes, block_cos_lanes, block_sin_lanes, state, lanes, rows=count
+        )
+        masked_scores = self._score_blocks_lanes_fused(index_query, state, lanes, lane_constants)
+        _deallocate(index_query)
+        sparse_indices = self._materialize_row_fused(
+            masked_scores, lanes, rows=count, block_offsets=lane_constants.block_offsets_lanes
+        )
+        sparse_query, qg_ws = self._main_tail_step(
+            full_hidden, cos_lanes, sin_lanes, state, lanes, rows=count, lane_rows=self.allocated_context
+        )
+        local_attention = self._sparse_value_attention_fused(sparse_query, qg_ws, sparse_indices, state, rows=count)
+        _deallocate(sparse_indices)
+        output = self._project_output_fused(local_attention, full_hidden, rows=count)
+        _deallocate(full_hidden)
+        return self._lane_rows_view(output, CHUNK_ROWS)

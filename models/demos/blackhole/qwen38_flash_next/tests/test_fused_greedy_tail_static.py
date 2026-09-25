@@ -67,9 +67,9 @@ def test_registered_bitwise():
 @pytest.mark.parametrize(
     "kernel, runtime_args, tensors, named",
     [
-        ("scan", gt.SCAN_ARGS, 2, {"cb_stage", "lanes_per_tile"}),
-        ("merge", gt.MERGE_ARGS, 5, {"cb_stage", "cores"}),
-        ("resolve", gt.RESOLVE_ARGS, 6, {"cb_stage", "devices", "copy_into"}),
+        ("scan", gt.SCAN_ARGS, 2, {"cb_stage", "lanes_per_tile", "rows"}),
+        ("merge", gt.MERGE_ARGS, 5, {"cb_stage", "cores", "rows", "packed_lanes"}),
+        ("resolve", gt.RESOLVE_ARGS, 6, {"cb_stage", "devices", "copy_into", "rows", "stride"}),
     ],
 )
 def test_kernel_arg_contracts(kernel, runtime_args, tensors, named):
@@ -84,12 +84,9 @@ def test_kernel_arg_contracts(kernel, runtime_args, tensors, named):
 def test_python_side_named_args_match_the_kernels():
     source = inspect.getsource(gt)
     for kernel, expected in (
-        ("scan", {"cb_stage", "lanes_per_tile"}),
-        (
-            "merge",
-            {"cb_stage", "cores"},
-        ),
-        ("resolve", {"cb_stage", "devices", "copy_into"}),
+        ("scan", {"cb_stage", "lanes_per_tile", "rows"}),
+        ("merge", {"cb_stage", "cores", "rows", "packed_lanes"}),
+        ("resolve", {"cb_stage", "devices", "copy_into", "rows", "stride"}),
     ):
         block = source.split(f'KERNELS["{kernel}"]')[1].split("named={")[1].split("}")[0]
         assert set(re.findall(r'"([a-z_0-9]+)":', block)) == expected, kernel
@@ -215,8 +212,56 @@ def test_lm_head_hook_and_dataclass_field_are_pinned():
         "self.resolve_greedy_on_device = functools.partial(fused_greedy_tail.resolve_greedy_on_device_fused, self)"
         in init
     )
-    for method in ("greedy_candidates", "resolve_greedy_on_device"):
+    # the lanes' epilogue binds the same programs over the lane rows; the MTP rows path (resolve_greedy_rows_on_device)
+    # and the chain bodies stay the chain
+    assert (
+        "self.greedy_candidates_lanes = functools.partial(fused_greedy_tail.greedy_candidates_lanes_fused, self)"
+        in init
+    )
+    assert "fused_greedy_tail.resolve_greedy_lanes_on_device_fused, self" in init
+    assert "resolve_greedy_rows_on_device" not in init
+    for method in (
+        "greedy_candidates",
+        "resolve_greedy_on_device",
+        "greedy_candidates_lanes",
+        "resolve_greedy_lanes_on_device",
+        "resolve_greedy_rows_on_device",
+    ):
         assert "greedy_tail" not in _method_source("Qwen38TTNNLMHead", method)  # the chain bodies stay the chain
+    lanes = _method_source("Qwen38TTNNLMHead", "greedy_candidates_lanes")
+    assert lanes.rstrip().endswith("return self.greedy_candidates(logits)")
+    model = (HERE / "ttnn" / "model.py").read_text()
+    epilogue = model[model.index("    def resolve_lane_tokens(") : model.index("    def capture_decode_lanes(")]
+    assert "candidates = lm_head.greedy_candidates_lanes(output.logits)" in epilogue
+    assert "token_row = lm_head.resolve_greedy_lanes_on_device(candidates)" in epilogue
+
+
+def test_lane_forms_keep_the_one_row_paths_and_the_kernel_layouts():
+    """ROWS == 1 (with the two-lane packed row) is the decode step's own code path in every kernel; the lane forms
+    stage one 2 KB slot per tile (scan), one 64-byte packed row per lane (merge) and one gathered row per lane
+    (resolve), and the lanes' hooks gather the packed rows once."""
+
+    scan, merge, resolve = SOURCES["scan"], SOURCES["merge"], SOURCES["resolve"]
+    assert "if constexpr (ROWS == 1) {" in scan and "constexpr uint32_t LO_ROWS = ROWS < 16 ? ROWS : 16;" in scan
+    assert "{.page_id = r, .offset_bytes = 16 * core}" in scan  # row r of the pairs rows
+    assert "if constexpr (ROWS == 1 && PACKED_LANES == 2) {" in merge  # the decode step's two-lane row keeps its path
+    assert "constexpr uint32_t PACKED_ROW_BYTES = PACKED_LANES * 4;" in merge
+    assert "tile[(r >> 4) * 512 + (r & 15) * 16] = best_bits >> 16;" in merge  # lane (r, 0) of the value tile
+    assert "row[(r >> 4) * 256 + (r & 15)] = id;" in resolve  # lane (0, r) of the fp32 token tile
+    assert "const float ranked = g[STRIDE * d] - t[d];" in resolve and "g[STRIDE * owner + 1] + s[owner]" in resolve
+    assert gt.PACKED_LANES == 2 and gt.PACKED_LANES_ROWS == 16
+    assert gt.merge_stage_pages(1, gt.SCAN_CORES, gt.PACKED_LANES) == gt.MERGE_STAGE_PAGES
+    assert 2048 * gt.merge_stage_pages(32, 40, 16) >= 2048 + 32 * 640 + 32 * 64 + 64
+    source = inspect.getsource(gt.resolve_greedy_lanes_on_device_fused)
+    assert source.count("ttnn.all_gather(") == 1 and "dim=3, cluster_axis=embedding.TP_AXIS" in source
+    assert "return type(lm_head).resolve_greedy_lanes_on_device(lm_head, candidates)" in source  # chain candidates
+    assert "packed_lanes=PACKED_LANES_ROWS" in inspect.getsource(gt.greedy_candidates_lanes_fused)
+    assert "if rows != 1:" in inspect.getsource(gt.greedy_candidates_fused)  # the MTP rows path keeps the chain
+    # the decode step's packed row is the 64-byte form too: its 8-byte row made ttnn.all_gather fall back to the
+    # slower composite ("input rows (8 B) are padded to the 64 B memory alignment", 2026-09-18)
+    assert "greedy_candidates(logits.tensor, packed_lanes=PACKED_LANES_ROWS)" in inspect.getsource(
+        gt.greedy_candidates_fused
+    )
 
 
 def test_manifest_lists_the_files():

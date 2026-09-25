@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Tenstorrent AI ULC
 // SPDX-License-Identifier: Apache-2.0
 //
-// main_tail, staging core reader: the ones tile, the positions, the value tiles into pack tiles 0..7 (the key's
-// rotated tiles 8, 9 and normalized tiles 10..15 arrive from the key cores); per lane the lane's KV staging tiles
-// with row (P % 32) replaced by the lane's packed row [v | k] (-0 -> +0 as the chain's SFPU one-hot select does).
+// main_tail, staging core reader (one staging core per lane): the ones tile, the positions, the value tiles into pack
+// tiles 0..7 (the key's rotated tiles 8, 9 and normalized tiles 10..15 arrive from the key cores); for this core's
+// lanes (lane_first .. lane_first + lane_count - 1) the lane's KV staging tiles with row (P % 32) replaced by the
+// lane's packed row [v | k] (-0 -> +0 as the chain's SFPU one-hot select does).
 // Compile-time args: TensorAccessorArgs staging, v, kv_block_start, kv_row_hit.  Runtime args: 0 staging, 1 v, 2
 // kv_block_start, 3 kv_row_hit, 4 rows, 5 first tile of the value in v (0 for the separate projection shard; the v
-// window's first tile in the merged projection shard).
+// window's first tile in the merged projection shard), 6 lane_first, 7 lane_count (this staging core's lanes).
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -24,6 +25,8 @@ void kernel_main() {
     const uint32_t hit_addr = get_arg_val<uint32_t>(3);
     const uint32_t rows = get_arg_val<uint32_t>(4);
     const uint32_t v_first = get_arg_val<uint32_t>(5);
+    const uint32_t lane_first = get_arg_val<uint32_t>(6);
+    const uint32_t lane_count = get_arg_val<uint32_t>(7);
     constexpr auto stg_args = TensorAccessorArgs<0>();
     constexpr auto v_args = TensorAccessorArgs<stg_args.next_compile_time_args_offset()>();
     constexpr auto pos_args = TensorAccessorArgs<v_args.next_compile_time_args_offset()>();
@@ -53,7 +56,8 @@ void kernel_main() {
     sem_knorm.wait_min(1);
     invalidate_l1_cache();
 
-    for (uint32_t lane = 0; lane < rows; ++lane) {
+    for (uint32_t i = 0; i < lane_count; ++i) {
+        const uint32_t lane = lane_first + i;
         const uint32_t slot = positions[lane] & 31;
         cb_reserve_back(CB_STG, PACK_TILES);
         const uint32_t stg_l1 = get_write_ptr(CB_STG);

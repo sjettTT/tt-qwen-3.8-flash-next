@@ -37,6 +37,8 @@ POST_ATTENTION_READER = fp.kernel_source(NAME, "post_attention_reader.cpp")
 POST_ATTENTION_COMPUTE = fp.kernel_source(NAME, "post_attention_compute.cpp")
 WIDEN_COMPUTE = fp.kernel_source(NAME, "widen_compute.cpp")
 SELECTION_ROW = fp.kernel_source(NAME, "selection_row.cpp")
+LANE_SCORE_ROWS = fp.kernel_source(NAME, "lane_score_rows.cpp")
+LANE_COLUMNS = 8  # lane u's core sits in column u % 8 of its core row: up to 32 lanes on 4 core rows
 SCORE_MERGE = {role: fp.kernel_source(NAME, f"score_merge_{role}.cpp") for role in ("reader", "compute", "writer")}
 MAIN_TAIL = {
     role: fp.kernel_source(NAME, f"main_tail_{role}.cpp")
@@ -176,10 +178,11 @@ def rope64(x, cos, sin, *, dest: str = "dest16"):
 # ----------------------------------------------------------------------------------------------- program A: index tail
 # One program for the index projection's tail and the compressed-index write (chain programs 510-527, 18 per layer):
 # index_q rms_norm + partial RoPE -> the indexer's query tile; the raw-key ring's one-hot slot update, the 0.25-scaled
-# row sum, index_k rms_norm + block-start RoPE -> one row of the compressed index cache.  Two cores: the norm core
-# (fp32 dest: rms_norm, ring, sum) hands the RoPE tiles to the rope core (the op's 16-bit dest) over the NoC.  Rows
-# are lanes: row r of the query/raw-key tiles belongs to lane r, whose ring is tile row r of ``ring`` and whose
-# compressed cache is batch r of ``compressed_cache``; ``positions`` holds P_r.  CB indices: index_tail_cbs.h.
+# row sum, index_k rms_norm + block-start RoPE -> one row of the compressed index cache.  One core pair per lane: the
+# norm core (fp32 dest: rms_norm, ring, sum) hands the RoPE tiles to its rope core (the op's 16-bit dest) over the
+# NoC; the first pair also takes the index query tile.  Rows are lanes: row r of the query/raw-key tiles belongs to
+# lane r, whose ring is tile row r of ``ring`` and whose compressed cache is batch r of ``compressed_cache``;
+# ``positions`` holds P_r.  CB indices: index_tail_cbs.h.
 
 INDEX_HEAD_DIM = 128
 INDEX_TILES = INDEX_HEAD_DIM // fp.TILE
@@ -251,6 +254,29 @@ def noc_coords(mesh, cores) -> dict[tuple[int, int], tuple[int, int]]:
     words = per_device[0]
     _NOC_COORDS[key] = {(c.x, c.y): (int(words[i, 0]), int(words[i, 1])) for i, c in enumerate(probed)}
     return _NOC_COORDS[key]
+
+
+def _lane_cores(rows: int, first_row: int, row_stride: int = 1) -> list:
+    """Lane u's core: column ``u % 8``, core row ``first_row + row_stride * (u // 8)`` (one core per lane)."""
+
+    return [ttnn.CoreCoord(u % LANE_COLUMNS, first_row + row_stride * (u // LANE_COLUMNS)) for u in range(rows)]
+
+
+def _core_rows(cores) -> ttnn.CoreRangeSet:
+    """The cores as one CoreRange per core row (the columns of a row are consecutive): one kernel group per row."""
+
+    by_row: dict[int, list[int]] = {}
+    for core in cores:
+        by_row.setdefault(core.y, []).append(core.x)
+    return ttnn.CoreRangeSet(
+        [ttnn.CoreRange(ttnn.CoreCoord(min(xs), y), ttnn.CoreCoord(max(xs), y)) for y, xs in sorted(by_row.items())]
+    )
+
+
+def _require_grid(mesh, x: int, y: int, label: str) -> None:
+    grid = mesh.compute_with_storage_grid_size()
+    if grid.x < x or grid.y < y:
+        raise ValueError(f"{label} needs a {x} x {y} core grid, the device has {grid.x} x {grid.y}")
 
 
 def _position_inputs(position, rows: int):
@@ -351,9 +377,14 @@ def index_tail(
     lane_tile_rows = cache_shape[2] // fp.TILE
     mesh = index_q_ws.device()
     out = fp.allocate((1, 1, rows, INDEX_HEAD_DIM), BF16, ttnn.TILE_LAYOUT, mesh)
-    norm_core, rope_core = ttnn.CoreCoord(0, 0), ttnn.CoreCoord(1, 0)
-    coords = noc_coords(mesh, [norm_core, rope_core])
-    norm_set, rope_set, both = _rect(0, 0, 0, 0), _rect(1, 0, 1, 0), _rect(0, 0, 1, 0)
+    # one core pair per lane: lane u's norm core on row 2 * (u // 8), its rope core on the row below; the first pair also
+    # takes the index query tile (its rows are all the lanes' rows)
+    pair_rows = -(-rows // LANE_COLUMNS)
+    _require_grid(mesh, min(rows, LANE_COLUMNS), 2 * pair_rows, "index_tail lanes")
+    norm_cores, rope_cores = _lane_cores(rows, 0, 2), _lane_cores(rows, 1, 2)
+    coords = noc_coords(mesh, [*norm_cores, *rope_cores])
+    norm_set, rope_set = _core_rows(norm_cores), _core_rows(rope_cores)
+    both = _rect(0, 0, min(rows, LANE_COLUMNS) - 1, 2 * pair_rows - 1)
     cbs = [fp.cb_descriptor(index, dtype, fp.TILE_BYTES[dtype], pages, both) for index, dtype, pages in _INDEX_TAIL_CBS]
     cbs.append(
         ttnn.CBDescriptor(  # the canonical ring: the compute's reduce input and the writer's drain, one allocation
@@ -369,7 +400,8 @@ def index_tail(
     cbs += [fp.cb_descriptor(cb, ttnn.uint32, POSC_BYTES, 1, both) for cb in (CB_POSCR, CB_POSCW)]
     eps_bits = _bits(eps)
     acc = fp.accessor_args
-    (nx, ny), (rx, ry) = coords[(norm_core.x, norm_core.y)], coords[(rope_core.x, rope_core.y)]
+    xy = lambda c: coords[(c.x, c.y)]
+    lanes = range(rows)  # pair u: lane_first = u, lane_count = 1, do_query = (u == 0)
     kernels = [
         fp.reader_kernel(
             INDEX_TAIL["reader_norm"],
@@ -386,7 +418,7 @@ def index_tail(
             ],
             [
                 (
-                    norm_core,
+                    norm_cores[u],
                     [
                         index_q_ws.buffer_address(),
                         raw_key_ws.buffer_address(),
@@ -398,18 +430,24 @@ def index_tail(
                         rows,
                         index_q_first,
                         index_k_first,
+                        u,
+                        1,
+                        int(u == 0),
                     ],
                 )
+                for u in lanes
             ],
         ),
-        fp.compute_kernel(INDEX_TAIL["compute_norm"], norm_set, [], [(norm_core, [rows])], fp32_dest=True),
+        fp.compute_kernel(
+            INDEX_TAIL["compute_norm"], norm_set, [], [(norm_cores[u], [1, int(u == 0)]) for u in lanes], fp32_dest=True
+        ),
         fp.writer_kernel(
             INDEX_TAIL["writer_norm"],
             norm_set,
             [*acc(out), *acc(ring), *acc(compressed_cache), *acc(block_start), *acc(row_hit)],
             [
                 (
-                    norm_core,
+                    norm_cores[u],
                     [
                         out.buffer_address(),
                         ring.buffer_address(),
@@ -418,10 +456,13 @@ def index_tail(
                         row_hit.buffer_address(),
                         rows,
                         lane_tile_rows,
-                        rx,
-                        ry,
+                        *xy(rope_cores[u]),
+                        u,
+                        1,
+                        int(u == 0),
                     ],
                 )
+                for u in lanes
             ],
         ),
         fp.reader_kernel(
@@ -430,27 +471,36 @@ def index_tail(
             [*acc(cos), *acc(sin), *acc(block_cos), *acc(block_sin)],
             [
                 (
-                    rope_core,
+                    rope_cores[u],
                     [
                         cos.buffer_address(),
                         sin.buffer_address(),
                         block_cos.buffer_address(),
                         block_sin.buffer_address(),
                         rows,
-                        nx,
-                        ny,
+                        *xy(norm_cores[u]),
+                        u,
+                        1,
+                        int(u == 0),
                     ],
                 )
+                for u in lanes
             ],
         ),
-        fp.compute_kernel(INDEX_TAIL["compute_rope"], rope_set, [], [(rope_core, [rows])], fp32_dest=False),
+        fp.compute_kernel(
+            INDEX_TAIL["compute_rope"],
+            rope_set,
+            [],
+            [(rope_cores[u], [1, int(u == 0)]) for u in lanes],
+            fp32_dest=False,
+        ),
         fp.writer_kernel(
             INDEX_TAIL["writer_rope"],
             rope_set,
             [*acc(out), *acc(compressed_cache), *acc(block_start), *acc(row_hit)],
             [
                 (
-                    rope_core,
+                    rope_cores[u],
                     [
                         out.buffer_address(),
                         compressed_cache.buffer_address(),
@@ -458,8 +508,12 @@ def index_tail(
                         row_hit.buffer_address(),
                         rows,
                         lane_tile_rows,
+                        u,
+                        1,
+                        int(u == 0),
                     ],
                 )
+                for u in lanes
             ],
         ),
     ]
@@ -562,7 +616,8 @@ register(
 # One program for the main projection's tail, the packed-KV write and the sparse query (chain programs 548-572, 25 per
 # layer): per query head rms_norm + partial RoPE (six norm cores, six rope cores), k rms_norm + RoPE (one norm core,
 # one rope core), the KV staging one-hot row update, its write-back and its untilized 32-row block into the KV cache
-# (the staging core), and the 32-head ROW_MAJOR sparse query [zeros | q_h] with zero rows for the 26 absent heads.
+# (one staging core per lane), and the 32-head ROW_MAJOR sparse query [zeros | q_h] with zero rows for the 26 absent
+# heads.
 # Rows are lanes: row r of the q/k/v tiles is lane r, whose staging is tile row r of ``staging`` and whose KV rows
 # start at r * lane_rows in ``kv_cache``; ``positions`` holds P_r.  CB indices: main_tail_cbs.h.
 
@@ -661,15 +716,16 @@ def main_tail(
     query = fp.allocate((1, SPARSE_HEADS, rows, KV_WIDTH), BF16, ttnn.ROW_MAJOR_LAYOUT, mesh)
     q_norm_cores = [ttnn.CoreCoord(h, 0) for h in range(LOCAL_HEADS)]
     q_rope_cores = [ttnn.CoreCoord(h, 1) for h in range(LOCAL_HEADS)]
-    k_norm_core, k_rope_core, staging_core = (
-        ttnn.CoreCoord(LOCAL_HEADS, 0),
-        ttnn.CoreCoord(LOCAL_HEADS, 1),
-        ttnn.CoreCoord(LOCAL_HEADS + 1, 0),
-    )
-    every = [*q_norm_cores, *q_rope_cores, k_norm_core, k_rope_core, staging_core]
+    k_norm_core, k_rope_core = ttnn.CoreCoord(LOCAL_HEADS, 0), ttnn.CoreCoord(LOCAL_HEADS, 1)
+    # one staging core per lane on the core rows below the head and key cores; the key cores hand their tiles to each
+    staging_rows = -(-rows // LANE_COLUMNS)
+    _require_grid(mesh, LOCAL_HEADS + 2, 2 + staging_rows, "main_tail lanes")
+    staging_cores = _lane_cores(rows, 2)
+    every = [*q_norm_cores, *q_rope_cores, k_norm_core, k_rope_core, *staging_cores]
     coords = noc_coords(mesh, every)
     xy = lambda c: coords[(c.x, c.y)]
-    all_set = _rect(0, 0, LOCAL_HEADS + 1, 1)  # the bounding rectangle (its (7, 1) corner runs no kernel)
+    all_set = _rect(0, 0, LOCAL_HEADS + 1, 1 + staging_rows)  # the bounding rectangle (idle corners run no kernel)
+    staging_xy = [len(staging_cores)] + [v for c in staging_cores for v in xy(c)]
     cbs = [
         fp.cb_descriptor(index, dtype, fp.TILE_BYTES[dtype], pages, all_set) for index, dtype, pages in _MAIN_TAIL_CBS
     ]
@@ -687,14 +743,10 @@ def main_tail(
     cbs += [fp.cb_descriptor(cb, ttnn.uint32, POSC_BYTES, 1, all_set) for cb in (CB_MT_POSCR, CB_MT_POSCW)]
     eps_bits = _bits(eps)
     acc = fp.accessor_args
-    st_x, st_y = xy(staging_core)
     norm_set, rope_set = _rect(0, 0, LOCAL_HEADS, 0), _rect(0, 1, LOCAL_HEADS, 1)
     q_norm_set, q_rope_set = _rect(0, 0, LOCAL_HEADS - 1, 0), _rect(0, 1, LOCAL_HEADS - 1, 1)
-    k_norm_set, k_rope_set, staging_set = (
-        _rect(LOCAL_HEADS, 0, LOCAL_HEADS, 0),
-        _rect(LOCAL_HEADS, 1, LOCAL_HEADS, 1),
-        _rect(LOCAL_HEADS + 1, 0, LOCAL_HEADS + 1, 0),
-    )
+    k_norm_set, k_rope_set = _rect(LOCAL_HEADS, 0, LOCAL_HEADS, 0), _rect(LOCAL_HEADS, 1, LOCAL_HEADS, 1)
+    staging_set = _core_rows(staging_cores)
     kernels = [
         fp.reader_kernel(
             MAIN_TAIL["reader_norm"],
@@ -718,16 +770,13 @@ def main_tail(
             MAIN_TAIL["writer_norm"],
             q_norm_set,
             [0, *acc(query)],
-            [
-                (c, [query.buffer_address(), rows, h, *xy(q_rope_cores[h]), st_x, st_y])
-                for h, c in enumerate(q_norm_cores)
-            ],
+            [(c, [query.buffer_address(), rows, h, *xy(q_rope_cores[h]), 0]) for h, c in enumerate(q_norm_cores)],
         ),
         fp.writer_kernel(
             MAIN_TAIL["writer_norm"],
             k_norm_set,
             [1, *acc(query)],
-            [(k_norm_core, [query.buffer_address(), rows, 0, *xy(k_rope_core), st_x, st_y])],
+            [(k_norm_core, [query.buffer_address(), rows, 0, *xy(k_rope_core), *staging_xy])],
         ),
         fp.reader_kernel(
             MAIN_TAIL["reader_rope"],
@@ -742,13 +791,13 @@ def main_tail(
             MAIN_TAIL["writer_rope"],
             q_rope_set,
             [0, *acc(query)],
-            [(c, [query.buffer_address(), rows, h, st_x, st_y]) for h, c in enumerate(q_rope_cores)],
+            [(c, [query.buffer_address(), rows, h, 0]) for h, c in enumerate(q_rope_cores)],
         ),
         fp.writer_kernel(
             MAIN_TAIL["writer_rope"],
             k_rope_set,
             [1, *acc(query)],
-            [(k_rope_core, [query.buffer_address(), rows, 0, st_x, st_y])],
+            [(k_rope_core, [query.buffer_address(), rows, 0, *staging_xy])],
         ),
         fp.reader_kernel(
             MAIN_TAIL["reader_staging"],
@@ -756,7 +805,7 @@ def main_tail(
             [*acc(staging), *acc(v_ws), *acc(block_start), *acc(row_hit)],
             [
                 (
-                    staging_core,
+                    core,
                     [
                         staging.buffer_address(),
                         v_ws.buffer_address(),
@@ -764,18 +813,23 @@ def main_tail(
                         row_hit.buffer_address(),
                         rows,
                         v_first,
+                        u,
+                        1,
                     ],
                 )
+                for u, core in enumerate(staging_cores)
             ],
         ),
-        fp.compute_kernel(MAIN_TAIL["compute_staging"], staging_set, [], [(staging_core, [rows])], fp32_dest=True),
+        fp.compute_kernel(
+            MAIN_TAIL["compute_staging"], staging_set, [], [(core, [1]) for core in staging_cores], fp32_dest=True
+        ),
         fp.writer_kernel(
             MAIN_TAIL["writer_staging"],
             staging_set,
             [*acc(staging), *acc(kv_cache), *acc(block_start), *acc(row_hit)],
             [
                 (
-                    staging_core,
+                    core,
                     [
                         staging.buffer_address(),
                         kv_cache.buffer_address(),
@@ -783,8 +837,11 @@ def main_tail(
                         row_hit.buffer_address(),
                         rows,
                         lane_rows,
+                        u,
+                        1,
                     ],
                 )
+                for u, core in enumerate(staging_cores)
             ],
         ),
     ]
@@ -907,6 +964,7 @@ PARTIAL_TILES = PARTIAL_WIDTH // fp.TILE  # 80
 WIDEN_CORES = 16
 SELECTION_WIDTH, EXPANDED_WIDTH, BLOCK_IDS = 2080, 2048, 512
 SELECTION_SLICES = 8
+SELECTION_ROW_GROUPS = 8  # the lanes' rows spread over up to 8 core rows (row r on core row r % 8)
 
 
 def post_attention(attention, qg_ws, *, memory_config=None, qg_first: int = 0):
@@ -1007,10 +1065,28 @@ def widen_partial_composed(out_ws):
     return out
 
 
+def _rows_at_least(tensor, rows: int, width: int, label: str) -> None:
+    """A uint32 ROW_MAJOR [1, 1, >= rows, width] row tensor whose first ``rows`` rows the kernel reads (the 1-row
+    inputs have one row; the lanes pass their 32-row inputs and read rows 0 .. B-1)."""
+
+    shape = tuple(tensor.shape)
+    if (
+        len(shape) != 4
+        or shape[:2] != (1, 1)
+        or shape[2] < rows
+        or shape[3] != width
+        or tensor.dtype != ttnn.uint32
+        or tensor.layout != ttnn.ROW_MAJOR_LAYOUT
+    ):
+        raise ValueError(f"{label} must be uint32 ROW_MAJOR [1, 1, >= {rows}, {width}], got {shape}")
+
+
 def selection_row(block_ids, sentinel_pad, block_offsets, row_keep_bits, row_fill):
     """The sparse-attention row of token ids [1, 1, rows, 2080] uint32 ROW_MAJOR from the top-k block ids
-    [1, 1, rows, 512] and the position-derived keep / fill rows (the module's constant rows ``sentinel_pad`` [1, 1, 1, 32]
-    and ``block_offsets`` [1, 1, 1, 2048])."""
+    [1, 1, rows, 512] and the position-derived keep / fill rows (rows 0 .. rows-1 of [1, 1, >= rows, 2080] tensors)
+    with the module's constant rows ``sentinel_pad`` [1, 1, 1, 32] and ``block_offsets``: one row [1, 1, 1, 2048]
+    shared by every row (the decode step), or per-row offsets [1, 1, >= rows, 2048] (the lanes: row u = the offsets
+    + lane u's KV region start, the chain's ``block_offsets_lanes``)."""
 
     shape = tuple(block_ids.shape)
     if (
@@ -1022,17 +1098,19 @@ def selection_row(block_ids, sentinel_pad, block_offsets, row_keep_bits, row_fil
     ):
         raise ValueError(f"block ids must be uint32 ROW_MAJOR [1, 1, rows, {BLOCK_IDS}], got {shape}")
     rows = shape[2]
-    for label, tensor, expected in (
-        ("sentinel_pad", sentinel_pad, (1, 1, 1, SELECTION_WIDTH - EXPANDED_WIDTH)),
-        ("block_offsets", block_offsets, (1, 1, 1, EXPANDED_WIDTH)),
-        ("row_keep_bits", row_keep_bits, (1, 1, rows, SELECTION_WIDTH)),
-        ("row_fill", row_fill, (1, 1, rows, SELECTION_WIDTH)),
-    ):
+    for label, tensor, expected in (("sentinel_pad", sentinel_pad, (1, 1, 1, SELECTION_WIDTH - EXPANDED_WIDTH)),):
         if tuple(tensor.shape) != expected or tensor.dtype != ttnn.uint32 or tensor.layout != ttnn.ROW_MAJOR_LAYOUT:
             raise ValueError(f"{label} must be uint32 ROW_MAJOR {expected}, got {tuple(tensor.shape)}")
+    _rows_at_least(block_offsets, 1, EXPANDED_WIDTH, "block_offsets")
+    offset_rows = tuple(block_offsets.shape)[2]
+    if offset_rows != 1 and offset_rows < rows:
+        raise ValueError(f"block_offsets must hold one row or >= {rows} rows, got {offset_rows}")
+    _rows_at_least(row_keep_bits, rows, SELECTION_WIDTH, "row_keep_bits")
+    _rows_at_least(row_fill, rows, SELECTION_WIDTH, "row_fill")
     mesh = block_ids.device()
     out = fp.allocate((1, 1, rows, SELECTION_WIDTH), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, mesh)
-    cores = _rect(0, 0, SELECTION_SLICES - 1, 0)
+    row_groups = min(rows, SELECTION_ROW_GROUPS)  # core (slice, g) takes rows g, g + row_groups, ...
+    cores = _rect(0, 0, SELECTION_SLICES - 1, row_groups - 1)
     tensors = (block_ids, block_offsets, sentinel_pad, row_keep_bits, row_fill, out)
     compile_args = [a for t in tensors for a in fp.accessor_args(t)]
     addresses = [t.buffer_address() for t in tensors]
@@ -1040,7 +1118,11 @@ def selection_row(block_ids, sentinel_pad, block_offsets, row_keep_bits, row_fil
         SELECTION_ROW,
         cores,
         compile_args,
-        [(ttnn.CoreCoord(i, 0), [*addresses, rows, i]) for i in range(SELECTION_SLICES)],
+        [
+            (ttnn.CoreCoord(i, g), [*addresses, rows, i, offset_rows, g, row_groups])
+            for g in range(row_groups)
+            for i in range(SELECTION_SLICES)
+        ],
     )
     cbs = [fp.cb_descriptor(0, ttnn.uint32, 8192, 1, cores)]
     return fp.run_program([*tensors[:-1], out], fp.program_descriptor([kernel], cbs=cbs))
@@ -1095,6 +1177,80 @@ register(
 )
 
 
+def lane_score_rows(local_scores, lanes: int, cache_rows: int, blocks: int):
+    """Row u of the local block scores [1, 1, lanes, blocks] bf16 ROW_MAJOR = lane u's window (row u, columns
+    u * cache_rows .. + blocks) of the wide indexer's scores [1, 1, 32, lanes * cache_rows]: the lane chain's B slices and
+    concat as one program, one core per lane (row copies at the 64-byte grain)."""
+
+    return lane_score_rows_of(local_scores, tuple(range(lanes)), lanes, cache_rows, blocks)
+
+
+def lane_score_rows_of(local_scores, lanes_of_rows, lanes: int, cache_rows: int, blocks: int):
+    """Row r of the local block scores [1, 1, len(lanes_of_rows), blocks] = lane ``lanes_of_rows[r]``'s window (row r,
+    columns lane * cache_rows .. + blocks) of the wide indexer's scores [1, 1, 32, lanes * cache_rows]: the MTP lanes
+    verify's lane-major rows (row u*R + j reads lane u's columns), one core per output row."""
+
+    rows = len(lanes_of_rows)
+    shape = tuple(local_scores.shape)
+    if (
+        len(shape) != 4
+        or shape[:2] != (1, 1)
+        or shape[2] < rows
+        or shape[3] != lanes * cache_rows
+        or local_scores.dtype != BF16
+        or local_scores.layout != ttnn.ROW_MAJOR_LAYOUT
+    ):
+        raise ValueError(f"lane scores must be ROW_MAJOR bf16 [1, 1, >= {rows}, {lanes} * {cache_rows}], got {shape}")
+    if not 1 <= rows <= fp.ROWS_MAX or blocks > cache_rows or cache_rows % fp.TILE or blocks % fp.TILE:
+        raise ValueError(
+            f"lane windows need 1..32 rows and whole-tile cache_rows >= blocks, got {rows}, {cache_rows}, {blocks}"
+        )
+    if any(not 0 <= lane < lanes for lane in lanes_of_rows):
+        raise ValueError(f"every row's lane must be in 0..{lanes - 1}, got {tuple(lanes_of_rows)}")
+    mesh = local_scores.device()
+    out = fp.allocate((1, 1, rows, blocks), BF16, ttnn.ROW_MAJOR_LAYOUT, mesh)
+    cores = _lane_cores(rows, 0)
+    core_set = _core_rows(cores)
+    kernel = fp.reader_kernel(
+        LANE_SCORE_ROWS,
+        core_set,
+        [*fp.accessor_args(local_scores), *fp.accessor_args(out)],
+        [
+            (core, [local_scores.buffer_address(), out.buffer_address(), row, int(lane), cache_rows, blocks])
+            for row, (core, lane) in enumerate(zip(cores, lanes_of_rows))
+        ],
+    )
+    cbs = [fp.cb_descriptor(0, BF16, blocks * 2, 1, core_set)]
+    return fp.run_program([local_scores, out], fp.program_descriptor([kernel], cbs=cbs))
+
+
+def lane_score_rows_composed(local_scores, lanes: int, cache_rows: int, blocks: int):
+    """The lane chain's windows (ttnn/qsa.py ``_score_blocks_lanes``, wide form): B slices and their concat."""
+
+    return lane_score_rows_of_composed(local_scores, tuple(range(lanes)), lanes, cache_rows, blocks)
+
+
+def lane_score_rows_of_composed(local_scores, lanes_of_rows, lanes: int, cache_rows: int, blocks: int):
+    """:func:`lane_score_rows_of` as the chain: one slice per output row and their concat."""
+
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    windows = [
+        ttnn.slice(
+            local_scores,
+            (0, 0, row, lane * cache_rows),
+            (1, 1, row + 1, lane * cache_rows + blocks),
+            memory_config=dram,
+        )
+        for row, lane in enumerate(lanes_of_rows)
+    ]
+    if len(windows) == 1:
+        return windows[0]
+    out = ttnn.concat(windows, dim=2, memory_config=dram)
+    for w in windows:
+        ttnn.deallocate(w)
+    return out
+
+
 # ------------------------------------------------------------------------------------------- program B1: score merge
 # Replaces chain programs 532-535 (tilize, moreh_sum over the four devices, untilize, the mask add) after the
 # all-gather of the local score rows: eight cores of 1024 columns, moreh_sum's 16-bit-dest add_tiles accumulation in
@@ -1107,9 +1263,10 @@ DEVICES = 4
 
 def score_merge(gathered, mask):
     """The gathered score rows as 2 KB pages, ``[1, 1, 4 * rows * chunks, 1024]`` bf16 ROW_MAJOR (device d's row r,
-    chunk c at page ``(d * rows + r) * chunks + c``: the all_gather of the row reshaped to ``[1, 1, chunks, 1024]``,
-    the page form ttnn.all_gather takes at every context), + mask ``[1, 1, rows, W]`` -> the masked block scores
-    ``[1, 1, rows, W]`` bf16 ROW_MAJOR for the top-k."""
+    chunk c at page ``(d * rows + r) * chunks + c``: the all_gather of the rows reshaped to ``[1, 1, rows * chunks, 1024]``,
+    the page form ttnn.all_gather takes at every context), + mask ``[1, 1, >= rows, W]`` (rows 0 .. rows-1 read: the
+    one-row chain passes its row, the lanes pass their 32-row mask) -> the masked block scores ``[1, 1, rows, W]``
+    bf16 ROW_MAJOR for the top-k."""
 
     shape, mshape = tuple(gathered.shape), tuple(mask.shape)
     if (
@@ -1119,16 +1276,24 @@ def score_merge(gathered, mask):
         or mask.dtype != BF16
         or mask.layout != ttnn.ROW_MAJOR_LAYOUT
     ):
-        raise ValueError(f"mask must be ROW_MAJOR bf16 [1, 1, rows, k * {SCORE_CHUNK}], got {mask.layout} {mshape}")
-    rows, width = mshape[2], mshape[3]
+        raise ValueError(f"mask must be ROW_MAJOR bf16 [1, 1, >= rows, k * {SCORE_CHUNK}], got {mask.layout} {mshape}")
+    width = mshape[3]
     chunks = width // SCORE_CHUNK
     if (
-        shape != (1, 1, DEVICES * rows * chunks, SCORE_CHUNK)
+        len(shape) != 4
+        or shape[:2] != (1, 1)
+        or shape[3] != SCORE_CHUNK
+        or shape[2] % (DEVICES * chunks)
         or gathered.dtype != BF16
         or gathered.layout != ttnn.ROW_MAJOR_LAYOUT
     ):
         raise ValueError(
-            f"gathered score pages must be ROW_MAJOR bf16 [1, 1, {DEVICES * rows * chunks}, {SCORE_CHUNK}], got {gathered.layout} {shape}"
+            f"gathered score pages must be ROW_MAJOR bf16 [1, 1, {DEVICES} * rows * {chunks}, {SCORE_CHUNK}], got {gathered.layout} {shape}"
+        )
+    rows = shape[2] // (DEVICES * chunks)
+    if not 1 <= rows <= ttnn.TILE_SIZE or mshape[2] < rows:
+        raise ValueError(
+            f"score merge takes 1..{ttnn.TILE_SIZE} rows with a mask of at least as many rows, got {rows} rows, mask {mshape}"
         )
     mesh = gathered.device()
     out = fp.allocate((1, 1, rows, width), BF16, ttnn.ROW_MAJOR_LAYOUT, mesh)

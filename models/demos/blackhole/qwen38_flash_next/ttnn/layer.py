@@ -52,8 +52,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import Qwen38BF4Streamer
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROW_COUNTS,
     CHUNK_ROWS,
+    MESH_SHAPE,
     Qwen38MeshContract,
     TensorPlacement,
+    require_lane_count,
     tensor_metadata,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.gdn import (
@@ -75,6 +77,8 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import LONG_CHUNK_R
 from models.demos.blackhole.qwen38_flash_next.ttnn.moe import SUPPORTED_ROWS, Qwen38TTNNMoE, Qwen38TTNNRouting
 from models.demos.blackhole.qwen38_flash_next.ttnn.ple import (
     Qwen38TTNNPLE,
+    Qwen38TTNNPLELanesPreparedInput,
+    Qwen38TTNNPLELanesState,
     Qwen38TTNNPLEPreparedInput,
     Qwen38TTNNPLEResult,
     Qwen38TTNNPLERowsPreparedInput,
@@ -191,6 +195,25 @@ class Qwen38TTNNDecoderLayerChunkState:
     ple: Qwen38TTNNPLERowsState | None
     moe: Qwen38TTNNMoE
     rows: int = CHUNK_ROWS
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNDecoderLayerLaneState:
+    """Fixed-address state of one layer for B batched decode lanes (lane u = row / batch index u).
+
+    ``attention`` is the B-lane GDN state (recurrent ``[B,12,128,128]``, ring slots ``[1,1,B,2560]``, one shared
+    phase) or the QSA lane state; ``ple`` the PLE lanes state on the PLE layer; ``moe`` a rows-B instance over the
+    layer's router and shared weights (its own ``[10,B,2560]`` combine buffer); ``attention_rows`` the persistent
+    ``[1,1,B,640]`` hidden-sharded rows a QSA layer's 32-row output is sliced into (None on GDN layers and at B = 32).
+    """
+
+    namespace: Qwen38TTNNLayerNamespace
+    layer_index: int
+    lanes: int
+    attention: Qwen38TTNNGDNState | Any
+    ple: Qwen38TTNNPLELanesState | None
+    moe: Qwen38TTNNMoE
+    attention_rows: Any | None
 
 
 @dataclass
@@ -1491,6 +1514,247 @@ class Qwen38TTNNDecoderLayer:
         if state.ple is not None:
             state.ple.store_to_state(generic_state.ple)
             generic_state.ple.token_context = None  # the generic body's caller owns the n-gram context
+
+    # ------------------------------------------------------------------ lanes path (batched decode)
+    # forward_decode_lanes is forward_decode_generic over B lanes (row u = lane u): PLE lanes -> attention GR
+    # read_rows -> GDN forward_decode_lanes or QSA forward_decode_lanes on the 32-row tile -> attention GR
+    # write_rows -> MLP GR read_rows -> the rows-B MoE -> MLP GR write_rows.  The lane state is fixed-address and
+    # updated in place; the 1-row bodies above are untouched.
+
+    def _validate_rows(self, tensor, expected: tuple[int, ...], *, label: str) -> None:
+        if _shape(tensor) != expected or tensor.dtype != ttnn.bfloat16 or tensor.layout != ttnn.TILE_LAYOUT:
+            raise ValueError(f"{label} must be BF16 TILE {list(expected)}, got {tensor_metadata(tensor)}")
+        self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+
+    def _validate_lane_state(self, state: Qwen38TTNNDecoderLayerLaneState) -> int:
+        if not isinstance(state, Qwen38TTNNDecoderLayerLaneState):
+            raise TypeError(f"decoder layer requires Qwen38TTNNDecoderLayerLaneState, got {type(state).__name__}")
+        if state.namespace is not self.namespace or state.layer_index != self.layer_index:
+            raise ValueError(
+                f"lane state identity {(state.namespace, state.layer_index)} does not match "
+                f"{(self.namespace.value, self.layer_index)}"
+            )
+        lanes = require_lane_count(state.lanes, label="decoder-layer lanes")
+        if isinstance(self.attention, Qwen38TTNNGDN):
+            if not isinstance(state.attention, Qwen38TTNNGDNState) or state.attention.batch_size != lanes:
+                raise TypeError(f"layer {self.layer_index} lane attention state is not a {lanes}-lane GDN state")
+            if state.attention_rows is not None:
+                raise ValueError("a GDN layer's lane state carries no attention rows buffer")
+        else:
+            if not isinstance(state.attention, qsa_module.Qwen38TTNNQSALaneState) or state.attention.lanes != lanes:
+                raise TypeError(f"layer {self.layer_index} lane attention state is not a {lanes}-lane QSA state")
+            if (state.attention_rows is None) != (lanes == CHUNK_ROWS):
+                raise ValueError("a QSA layer's lane state carries an attention rows buffer exactly below 32 lanes")
+            if state.attention_rows is not None:
+                self._validate_rows(
+                    state.attention_rows, (1, 1, lanes, LOCAL_HIDDEN_SIZE), label="QSA lane attention rows"
+                )
+        if (self.ple is None) != (state.ple is None):
+            raise ValueError("PLE lanes state must be present exactly on the PLE layer")
+        if state.ple is not None and state.ple.lanes != lanes:
+            raise ValueError(f"PLE lanes state holds {state.ple.lanes} lanes, expected {lanes}")
+        if state.moe.rows != lanes or state.moe.weights is not self.mlp.weights:
+            raise ValueError(f"lane MoE must be a rows-{lanes} instance over this layer's weights")
+        return lanes
+
+    def allocate_lane_state(self, lanes: int) -> Qwen38TTNNDecoderLayerLaneState:
+        """Allocate this layer's B-lane buffers before any capture: the lane attention state, the PLE lanes state,
+        the rows-B MoE and (a QSA layer below 32 lanes) the persistent attention rows."""
+
+        lanes = require_lane_count(lanes, label="decoder-layer lanes")
+        attention = self.attention.allocate_lane_state(lanes)
+        ple = None
+        moe = None
+        attention_rows = None
+        try:
+            ple = None if self.ple is None else self.ple.allocate_lanes_state(lanes)
+            moe = Qwen38TTNNMoE(
+                self.mlp.mesh_device,
+                self.mlp.mesh_contract,
+                self.mlp.weights,
+                tt_ccl=self.mlp.tt_ccl,
+                collective_topology=self.mlp.collective_topology,
+                rows=lanes,
+                synchronization_policy=self.mlp.synchronization_policy,
+            )
+            if isinstance(self.attention, Qwen38TTNNQSA) and lanes < CHUNK_ROWS:
+                mesh_device = self.attention.mesh_device
+                attention_rows = ttnn.from_torch(
+                    torch.zeros((1, 1, lanes, HIDDEN_SIZE), dtype=torch.bfloat16),
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=mesh_device,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3)),
+                )
+            result = Qwen38TTNNDecoderLayerLaneState(
+                self.namespace, self.layer_index, lanes, attention, ple, moe, attention_rows
+            )
+            self._validate_lane_state(result)
+            return result
+        except BaseException as error:
+            actions = []
+            if attention_rows is not None:
+                actions.append(("QSA lane attention rows", lambda: _deallocate_unique(attention_rows)))
+            if moe is not None:
+                actions.append(("lane MoE buffers", moe.release_owned_buffers))
+            if ple is not None:
+                actions.append(("PLE lanes state", ple.deallocate))
+            actions.append(("lane attention state", lambda: self._release_lane_attention_state(attention)))
+            _run_cleanup_actions("decoder-layer lane state allocation", actions, primary=error)
+            raise
+
+    def _release_lane_attention_state(self, attention_state) -> None:
+        if isinstance(self.attention, Qwen38TTNNGDN):
+            attention_state.deallocate()
+        else:
+            self.attention.release_lane_state(attention_state)
+
+    def release_lane_state(self, state: Qwen38TTNNDecoderLayerLaneState) -> None:
+        self._validate_lane_state(state)
+        actions = [
+            ("lane MoE buffers", state.moe.release_owned_buffers),
+            ("lane attention state", lambda: self._release_lane_attention_state(state.attention)),
+        ]
+        if state.attention_rows is not None:
+            actions.append(("QSA lane attention rows", lambda: _deallocate_unique(state.attention_rows)))
+        if state.ple is not None:
+            actions.append(("PLE lanes state", state.ple.deallocate))
+        _run_cleanup_actions("decoder-layer lane state", actions)
+
+    def reset_lane_state_inplace(self, state: Qwen38TTNNDecoderLayerLaneState) -> None:
+        """Every lane back to its position-zero contents at every captured address (a new batch)."""
+
+        self._validate_lane_state(state)
+        if isinstance(self.attention, Qwen38TTNNGDN):
+            state.attention.reset_inplace()
+        else:
+            self.attention.reset_lane_state_inplace(state.attention)
+        if state.ple is not None:
+            state.ple.reset_inplace()
+
+    def reset_lane_inplace(self, state: Qwen38TTNNDecoderLayerLaneState, lane: int) -> None:
+        """One lane back to position zero (keep-mask writes: the other lanes hold their state), no address change;
+        the caller admits the lane at a step of its position's residue class."""
+
+        lanes = self._validate_lane_state(state)
+        if isinstance(lane, bool) or type(lane) is not int or not 0 <= lane < lanes:
+            raise ValueError(f"lane must be an int in [0,{lanes}), got {lane!r}")
+        if isinstance(self.attention, Qwen38TTNNGDN):
+            state.attention.reset_lane_inplace(lane)
+        else:
+            self.attention.reset_lane_inplace(state.attention, lane)
+        if state.ple is not None:
+            state.ple.reset_lane_inplace(lane)
+
+    def forward_decode_lanes(
+        self,
+        residual_lanes,
+        state: Qwen38TTNNDecoderLayerLaneState,
+        *,
+        prepared_ple: Qwen38TTNNPLELanesPreparedInput | None,
+        rope,
+        qsa_lanes: qsa_module.Qwen38TTNNQSALaneInputs | None,
+        qsa_constants: qsa_module.Qwen38TTNNQSAChunkConstants | None,
+        qsa_lane_constants: qsa_module.Qwen38TTNNQSALaneConstants | None,
+    ):
+        """Advance one token per lane through this layer; the ``[1,4,B,640]`` input rows are consumed and every
+        state buffer is updated in place.
+
+        No host position: ``rope`` holds the per-lane RoPE rows (``Qwen38TTNNRoPEInputs`` of the 32-lane lookup)
+        and ``qsa_lanes`` the derived lane inputs, both shared by every layer.  The caller owns the PLE n-gram
+        contexts: the prepared lanes are looked up context-free and the state's contexts are pinned to None at every
+        step (the generic body's rule).  Returns the ``[1,4,B,640]`` residual rows.
+        """
+
+        lanes = self._validate_lane_state(state)
+        residual_shape = (1, RESIDUAL_BRANCHES, lanes, LOCAL_HIDDEN_SIZE)
+        block_shape = (1, 1, lanes, LOCAL_HIDDEN_SIZE)
+        self._validate_rows(residual_lanes, residual_shape, label="lane residual rows")
+        if self.ple is not None:
+            if prepared_ple is None:
+                raise ValueError("the PLE layer's lanes need the prepared persistent PLE rows")
+            if tuple(prepared_ple.source_contexts) != (None,) * lanes:
+                raise ValueError("the lane PLE rows must be prepared without host n-gram contexts")
+            state.ple.token_contexts = (None,) * lanes
+            residual = self.ple.inject_lanes(residual_lanes, prepared_ple, state.ple)
+        else:
+            if prepared_ple is not None:
+                raise ValueError("prepared PLE lanes were supplied outside checkpoint layer 1")
+            residual = residual_lanes
+        self._validate_rows(residual, residual_shape, label="lane PLE-injected residual rows")
+
+        attention_input, attention_gr_state = self.attention_gr.read_rows(residual, flat_views=True)
+        self._validate_rows(attention_input, block_shape, label="lane attention GR read")
+        if isinstance(self.attention, Qwen38TTNNGDN):
+            result = self.attention.forward_decode_lanes(attention_input, state.attention)
+            if result.state is not state.attention:
+                raise RuntimeError("lane GDN decode replaced its fixed-address state")
+            attention_hidden = result.hidden_sharded
+            persistent_hidden = False
+        else:
+            if rope is None or qsa_lanes is None or qsa_constants is None or qsa_lane_constants is None:
+                raise ValueError("lane QSA needs the RoPE rows, the lane inputs, the chunk and the lane constants")
+            # The QSA lane body runs on the 32-row tile (rows past the lane count idle): the lane rows are zero
+            # padded inside their own tile (ttnn.pad returns a view of its input on this runtime, so it is never
+            # released here) and the output's lane rows land in the persistent attention rows.
+            if lanes == CHUNK_ROWS:
+                hidden_rows = attention_input
+            else:
+                hidden_rows = ttnn.pad(
+                    attention_input,
+                    [(0, 0), (0, 0), (0, CHUNK_ROWS - lanes), (0, 0)],
+                    0.0,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
+                hidden_rows.update_tensor_topology(attention_input.tensor_topology())
+            output_rows = self.attention.forward_decode_lanes(
+                hidden_rows,
+                state.attention,
+                cos=rope.cos,
+                sin=rope.sin,
+                block_start_cos=rope.block_start_cos,
+                block_start_sin=rope.block_start_sin,
+                lanes=qsa_lanes,
+                constants=qsa_constants,
+                lane_constants=qsa_lane_constants,
+            )
+            if lanes == CHUNK_ROWS:
+                attention_hidden = output_rows
+                persistent_hidden = False
+            else:
+                landed = ttnn.slice(
+                    output_rows, (0, 0, 0, 0), (1, 1, lanes, LOCAL_HIDDEN_SIZE), output_tensor=state.attention_rows
+                )
+                if landed is not None and _tensor_key(landed) != _tensor_key(state.attention_rows):
+                    raise RuntimeError("lane QSA output slice did not land in the persistent attention rows")
+                _deallocate_unique(output_rows)
+                attention_hidden = state.attention_rows
+                persistent_hidden = True
+        _deallocate_unique(attention_input)
+        self._validate_rows(attention_hidden, block_shape, label="lane attention output")
+
+        residual = self.attention_gr.write_rows(attention_hidden, attention_gr_state)
+        _deallocate_unique(
+            None if persistent_hidden else attention_hidden,
+            attention_gr_state.residual,
+            attention_gr_state.injection,
+        )
+        self._validate_rows(residual, residual_shape, label="lane post-attention residual rows")
+
+        mlp_input, mlp_gr_state = self.mlp_gr.read_rows(residual, flat_views=True)
+        self._validate_rows(mlp_input, block_shape, label="lane MLP GR read")
+        with self.expert_streamer.layer(self.layer_index, namespace=self.namespace.value) as packed_experts:
+            if not isinstance(packed_experts, tuple) or len(packed_experts) != 2:
+                raise RuntimeError("BF4 streamer must yield exactly (packed_w0_w1, packed_w2)")
+            mlp_result = state.moe.forward(mlp_input, packed_experts[0], packed_experts[1])
+        _deallocate_unique(mlp_input)
+        self._validate_rows(mlp_result.hidden_sharded, block_shape, label="lane routed/shared MoE output")
+
+        residual = self.mlp_gr.write_rows(mlp_result.hidden_sharded, mlp_gr_state)
+        _deallocate_unique(mlp_result.hidden_sharded, mlp_gr_state.residual, mlp_gr_state.injection)
+        self._validate_rows(residual, residual_shape, label="lane decoder-layer output residual rows")
+        return residual
 
 
 def validate_layer_static_contract() -> None:

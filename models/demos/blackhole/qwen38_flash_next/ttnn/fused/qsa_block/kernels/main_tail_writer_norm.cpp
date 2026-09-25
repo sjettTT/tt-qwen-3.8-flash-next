@@ -4,9 +4,10 @@
 // main_tail, norm core writer: hands the normalized row's RoPE tiles (0, 1 and swapped) to its rope core.  A query
 // head (ROLE 0) then writes, per lane, the head's sparse-query row: 512 zero bytes, the normalized tiles 2..7 at
 // bytes 640..1023 (the rope core fills 512..639), and zero rows for the heads 6, 12, .. of its residue class.  The
-// key (ROLE 1) hands its tiles 2..7 to the staging core instead.
+// key (ROLE 1) hands its tiles 2..7 to every staging core instead (one staging core per lane).
 // Compile-time args: 0 ROLE, then TensorAccessorArgs query.
-// Runtime args: 0 query address, 1 rows, 2 head, 3 rope core x, 4 rope core y, 5 staging core x, 6 staging core y.
+// Runtime args: 0 query address, 1 rows, 2 head, 3 rope core x, 4 rope core y, 5 staging core count, then the staging
+// cores' (x, y) pairs.
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -22,8 +23,7 @@ void kernel_main() {
     const uint32_t head = get_arg_val<uint32_t>(2);
     const uint32_t rope_x = get_arg_val<uint32_t>(3);
     const uint32_t rope_y = get_arg_val<uint32_t>(4);
-    const uint32_t st_x = get_arg_val<uint32_t>(5);
-    const uint32_t st_y = get_arg_val<uint32_t>(6);
+    const uint32_t staging_cores = get_arg_val<uint32_t>(5);
     constexpr uint32_t ROLE = get_compile_time_arg_val(0);
     constexpr auto query_args = TensorAccessorArgs<1>();
     const auto query = TensorAccessor(query_args, query_addr);
@@ -58,12 +58,17 @@ void kernel_main() {
         }
         noc_async_write_barrier();
     } else {
-        noc_async_write(
-            l1 + ROPE_TILES * TILE_BYTES,
-            get_noc_addr(st_x, st_y, get_write_ptr(CB_PACK) + (HEAD_TILES + ROPE_TILES) * TILE_BYTES),
-            (HEAD_TILES - ROPE_TILES) * TILE_BYTES);
+        for (uint32_t s = 0; s < staging_cores; ++s) {
+            const uint32_t st_x = get_arg_val<uint32_t>(6 + 2 * s), st_y = get_arg_val<uint32_t>(7 + 2 * s);
+            noc_async_write(
+                l1 + ROPE_TILES * TILE_BYTES,
+                get_noc_addr(st_x, st_y, get_write_ptr(CB_PACK) + (HEAD_TILES + ROPE_TILES) * TILE_BYTES),
+                (HEAD_TILES - ROPE_TILES) * TILE_BYTES);
+        }
         noc_async_write_barrier();
-        sem_knorm.up(noc, st_x, st_y, 1);
+        for (uint32_t s = 0; s < staging_cores; ++s) {
+            sem_knorm.up(noc, get_arg_val<uint32_t>(6 + 2 * s), get_arg_val<uint32_t>(7 + 2 * s), 1);
+        }
     }
     cb_pop_front(CB_N, HEAD_TILES);
     noc_async_atomic_barrier();

@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from models.demos.blackhole.qwen38_flash_next.ttnn import gr as gr_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.gr import (
@@ -103,17 +104,30 @@ def _gr_fake():
         return FakeTensor([full.clone() for _ in range(TP)], tensor.dtype, tensor.layout)
 
     def fast_reduce_nc(tensor, *, dims, output, compute_kernel_config, memory_config):
+        # The device reports the 32-row tile as the row count of a TILE result below 32 rows (zero pad rows):
+        # the rows bodies restore the logical rows with ttnn.reshape(t, logical, padded).
         (dim,) = dims
-        return FakeTensor([_sequential_sum(x, dim) for x in tensor.torch_shards()], tensor.dtype, tensor.layout)
+        shards = [_sequential_sum(x, dim) for x in tensor.torch_shards()]
+        if tensor.layout == TILE and dim != 2 and shards[0].shape[2] % 32:
+            shards = [F.pad(x, (0, 0, 0, 32 - x.shape[2] % 32)) for x in shards]
+        return FakeTensor(shards, tensor.dtype, tensor.layout)
+
+    def reshape(tensor, shape, padded_shape=None, memory_config=None):
+        shards = tensor.torch_shards()
+        if padded_shape is not None and tuple(shape) != tuple(shards[0].shape):
+            assert tuple(padded_shape) == tuple(shards[0].shape), (padded_shape, shards[0].shape)
+            shards = [x.narrow(2, 0, shape[2]) for x in shards]
+        return FakeTensor([x.reshape(tuple(shape)).clone() for x in shards], tensor.dtype, tensor.layout)
 
     def view(tensor, shape):
         return FakeTensor([x.reshape(tuple(shape)) for x in tensor.torch_shards()], tensor.dtype, tensor.layout)
 
     fake.linear = linear
     fake.multiply = multiply
+    fake.reshape = reshape
     fake.rms_norm_post_all_gather = post_all_gather
     # ttnn.experimental.view as the step-4 fake models it: the same tile pages under the new shape (a torch reshape
-    # would give the 1-row shapes the same values but not the 32-row flat rows, which is the claim under test).
+    # would give the 1-row shapes the same values but not the rows' flat rows, which is the claim under test).
     fake.experimental = SimpleNamespace(
         all_gather_async=all_gather_async, fast_reduce_nc=fast_reduce_nc, view=step4._view, torch_view=view
     )
@@ -220,34 +234,37 @@ def _calls(function: ast.FunctionDef) -> list[str]:
     return [ast.unparse(node.func) for node in ast.walk(function) if isinstance(node, ast.Call)]
 
 
-def test_flat_views_read_rows_is_the_permute_form_bitwise(fake) -> None:
-    """Every branch is one 32-row tile row, so the branch-major tile sequence is the flat rows' tile sequence: the
-    view over the same pages reads what the permute + reshape pair materializes (the fake models the tile pages)."""
+@pytest.mark.parametrize("rows", (2, 8, ROWS))
+def test_flat_views_read_rows_is_the_permute_form_bitwise(fake, rows: int) -> None:
+    """Every branch is one 32-row tile row whatever the row count, so the branch-major tile sequence is the flat rows'
+    tile sequence: the view over the same pages reads what the permute + reshape pair materializes (the fake models
+    the tile pages, the rows below 32 as their tile padding)."""
 
     module = _gr_module(fake)
-    torch.manual_seed(13)
-    residual_rows = FakeTensor([_bf16(*RESIDUAL_ROWS_LOCAL_SHAPE) for _ in range(TP)], BF16, TILE, 3)
+    torch.manual_seed(13 + rows)
+    shapes = gr_module.gr_rows_shapes(rows)
+    residual_rows = FakeTensor([_bf16(*shapes["residual"]) for _ in range(TP)], BF16, TILE, 3)
     permuted, permuted_state = module.read_rows(residual_rows)
     viewed, viewed_state = module.read_rows(residual_rows, flat_views=True)
-    _equal(viewed, [permuted], dim=2, label="GR read block input (flat views vs permutes)")
-    _equal(
-        viewed_state.injection, [permuted_state.injection], dim=2, label="GR read injection (flat views vs permutes)"
-    )
-    unit = FakeTensor([_bf16(*RESIDUAL_ROWS_LOCAL_SHAPE) for _ in range(TP)], BF16, TILE, 3)
-    flat_shape = (1, 1, ROWS, FLAT_LOCAL_WIDTH)
-    by_view = fake.experimental.view(unit, flat_shape)
-    by_permute = fake.reshape(fake.permute(unit, (0, 2, 1, 3)), flat_shape)
-    _equal(by_view, [by_permute], dim=2, label="flat rows view vs permute + reshape")
-    assert not torch.equal(
-        by_view.torch_shards()[0].view(torch.int16),
-        fake.experimental.torch_view(unit, flat_shape).torch_shards()[0].view(torch.int16),
-    )  # a plain torch reshape of the 32-row branch-major tensor is not the device view: the fake's model matters
+    _equal(viewed, [permuted], dim=2, label=f"GR read block input at {rows} rows (flat views vs permutes)")
+    _equal(viewed_state.injection, [permuted_state.injection], dim=2, label=f"GR read injection at {rows} rows")
+    unit = FakeTensor([_bf16(*shapes["residual"]) for _ in range(TP)], BF16, TILE, 3)
+    by_view = fake.experimental.view(unit, shapes["flat"])
+    by_permute = fake.reshape(fake.permute(unit, (0, 2, 1, 3)), shapes["flat"])
+    _equal(by_view, [by_permute], dim=2, label=f"flat rows view vs permute + reshape at {rows} rows")
+    assert by_view.padded_shape == shapes["flat_padded"]
+    if rows > 1:
+        # A plain torch reshape of the branch-major rows is not the device view: the fake's tile-page model matters.
+        assert not torch.equal(
+            by_view.torch_shards()[0].view(torch.int16),
+            fake.experimental.torch_view(unit, shapes["flat"]).torch_shards()[0].view(torch.int16),
+        )
 
 
 def test_rows_bodies_walk_the_layout_by_permutes_or_flat_views_and_touch_no_host() -> None:
     read_calls = _calls(_method("read_rows"))
     assert read_calls.count("ttnn.permute") == 2 and read_calls.count("ttnn.experimental.view") == 2
-    assert read_calls.count("ttnn.reshape") == 3  # stats, flat rows, token-major rows
+    assert read_calls.count("ttnn.reshape") == 5  # stats, flat rows, token-major rows, the two row restores
     assert read_calls.count("ttnn.linear") == 2 and read_calls.count("ttnn.experimental.fast_reduce_nc") == 2
     assert read_calls.count("ttnn.experimental.all_gather_async") == 1 and "ttnn.all_reduce" not in read_calls
     write_calls = _calls(_method("write_rows"))
@@ -255,11 +272,14 @@ def test_rows_bodies_walk_the_layout_by_permutes_or_flat_views_and_touch_no_host
     for calls in (read_calls, write_calls):
         for forbidden in ("ttnn.from_torch", "ttnn.to_torch", "ttnn.copy_host_to_device_tensor"):
             assert forbidden not in calls
-    # The rows path derives no shape from a runtime int: every shape is a module constant.
+    # The rows path derives its shapes from the validated row count of its input (1..32 lanes; 32 or 128 = the
+    # chunk forms; the slab counts), never from a runtime int of its own: every shape comes from the module's
+    # row-shape helpers, and below 32 rows the padded shapes are one tile (tile_rows).
     source = inspect.getsource(Qwen38TTNNGatedResidual.read_rows) + inspect.getsource(
         Qwen38TTNNGatedResidual.write_rows
     )
-    assert "CHUNK_ROWS" in source and ".shape[" not in source
+    assert source.count("residual_rows_shape(rows)") >= 3 and ".shape[" not in source
+    assert "tile_rows = max(rows, CHUNK_ROWS)" in source and "block_rows_shape(rows)" in source
 
 
 def test_one_row_read_and_write_keep_their_views_and_op_walk() -> None:

@@ -170,9 +170,13 @@ def mtp_capacity_admission(allocated_context: int, *, ring_size: int = max(BLACK
     :data:`MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND`, against the free bytes per bank the build leaves after its captures
     (:data:`RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES`).  Every byte count is in the record; ``fits`` decides."""
 
-    free, largest = RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES[
-        Qwen38ResidentContext(allocated_context).allocated_context
-    ]
+    context = Qwen38ResidentContext(allocated_context).allocated_context
+    # A context below the smallest measured one (8,192: the batched lanes' small context) is admitted against the
+    # smallest measured context's readings: its resident build leaves more room, so the admission is conservative.
+    measured_at = [c for c in sorted(RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES) if c >= context]
+    if not measured_at:
+        raise ValueError(f"no free-bytes-after-captures measurement at or above {context} tokens")
+    free, largest = RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES[measured_at[0]]
     w01_bytes, w2_bytes = packed_bf4_bytes_per_device(ring_size=ring_size)
     w01_per_bank = -(-(w01_bytes // BF4_TILE_BYTES) // RESIDENT_DRAM_BANKS) * BF4_TILE_BYTES
     w2_per_bank = -(-(w2_bytes // BF4_TILE_BYTES) // RESIDENT_DRAM_BANKS) * BF4_TILE_BYTES
@@ -183,6 +187,7 @@ def mtp_capacity_admission(allocated_context: int, *, ring_size: int = max(BLACK
         "allocated_context": allocated_context,
         "ring_size": ring_size,
         "num_banks": RESIDENT_DRAM_BANKS,
+        "free_bytes_measured_at_context": measured_at[0],
         "free_bytes_per_bank_after_captures": free,
         "largest_contiguous_bytes_free_per_bank_after_captures": largest,
         "resident_pair_bytes_per_bank": w01_per_bank + w2_per_bank,
@@ -319,10 +324,12 @@ class Qwen38ChatSession:
         context_limit: int | None = None,
         clock_ns: Callable[[], int] = time.perf_counter_ns,
         prefill_mode: str = DEFAULT_PREFILL_MODE,
+        allocated_context: int | None = None,
     ) -> None:
-        # The chain's allocated context (a scripted test chain without one is the default build's); the limit
-        # defaults to that context less the headroom.
-        allocated_context = getattr(chain, "allocated_context", RESIDENT_MAX_QSA_CACHE_CAPACITY)
+        # The chain's allocated context (a scripted test chain without one is the default build's; a renderer
+        # without a chain names it); the limit defaults to that context less the headroom.
+        if allocated_context is None:
+            allocated_context = getattr(chain, "allocated_context", RESIDENT_MAX_QSA_CACHE_CAPACITY)
         if context_limit is None:
             context_limit = Qwen38ResidentContext(allocated_context).context_limit
         if type(context_limit) is not int or not 1 < context_limit <= allocated_context:

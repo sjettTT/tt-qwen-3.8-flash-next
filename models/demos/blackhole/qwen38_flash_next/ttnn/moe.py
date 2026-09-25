@@ -35,6 +35,7 @@ from models.demos.blackhole.qwen38_flash_next.tt.moe import Qwen38MoEWeights
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROWS,
     LONG_CHUNK_ROWS,
+    MAX_LANES,
     MESH_SHAPE,
     Qwen38MeshContract,
     TensorPlacement,
@@ -65,7 +66,7 @@ EP_AXIS = 1
 TARGET_VERIFIER_ROWS = 5
 PREFILL_CHUNK_ROWS = CHUNK_ROWS
 LONG_PREFILL_CHUNK_ROWS = LONG_CHUNK_ROWS
-SUPPORTED_ROWS = (1, TARGET_VERIFIER_ROWS, PREFILL_CHUNK_ROWS, LONG_PREFILL_CHUNK_ROWS)
+SUPPORTED_ROWS = (*range(1, MAX_LANES + 1), LONG_PREFILL_CHUNK_ROWS)  # 1 = decode, 5 = MTP verify, 32 = chunk or B lanes, 128
 # moe_compute processes the tokens of one expert in 32-token chunks and admits at most
 # TOKEN_SIZE x num_data_parallel_cores x output_height_shard_dim tokens per call; num_data_parallel_cores is
 # the largest d <= 4 dividing both the hidden tile count (80) and the live DRAM bank count (the matmul ring).
@@ -161,6 +162,10 @@ class Qwen38TTNNMoESyncPolicy(str, Enum):
 
 def _shape(tensor) -> tuple[int, ...]:
     return tuple(int(item) for item in tensor.shape)
+
+
+def _tensor_key(tensor) -> tuple[str, int]:
+    return (str(tensor.device()), int(tensor.tensor_id))
 
 
 def _deallocate(*tensors) -> None:
@@ -933,19 +938,19 @@ class Qwen38TTNNMoE:
         phase_observer("before-routed-dispatch")
         # Keep the ordinary one-row call byte/API-compatible with the existing
         # rank-four input.  A multi-row instance must expose its rows in dim 1:
-        # moe_compute derives total_tokens from sparse_input.shape[0:2].
-        sparse_source = full_hidden
-        if self.rows != 1:
-            # A tiled reshape un-shards its input internally (reshape_tiled);
-            # do it explicitly so the multi-row input keeps the interleaved path.
-            sparse_source = ttnn.reshape(
-                ttnn.to_memory_config(full_hidden, ttnn.DRAM_MEMORY_CONFIG), self.row_contract.moe_sparse_input
-            )
+        # moe_compute derives total_tokens from sparse_input.shape[0:2].  The
+        # rows are untilized first (the one-row op on the same 32-row tile) and
+        # reshaped ROW_MAJOR: the same bytes, no un-shard or relayout kernel.
         sparse_input = ttnn.to_layout(
-            sparse_source,
+            full_hidden,
             ttnn.ROW_MAJOR_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
+        if self.rows != 1:
+            untilized_rows = sparse_input
+            sparse_input = ttnn.reshape(untilized_rows, self.row_contract.moe_sparse_input)
+            if _tensor_key(sparse_input) != _tensor_key(untilized_rows):
+                _deallocate(untilized_rows)
         if _shape(sparse_input) != self.row_contract.moe_sparse_input:
             raise RuntimeError(
                 f"moe_compute sparse input must be {self.row_contract.moe_sparse_input}, got {_shape(sparse_input)}"

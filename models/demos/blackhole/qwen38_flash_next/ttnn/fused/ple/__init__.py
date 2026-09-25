@@ -200,7 +200,7 @@ def gate(key_global, query_global, value, *, debug: bool = False):
         one,
         [GLOBAL_TILES, LOCAL_TILES]
         + sum((fp.accessor_args(t) for t in (key_global, query_global, value, scale, zero)), []),
-        [(core, [t.buffer_address() for t in (key_global, query_global, value, scale, zero)])],
+        [(core, [t.buffer_address() for t in (key_global, query_global, value, scale, zero)] + [0, 0])],
     )
     compute = fp.compute_kernel(
         GATE_COMPUTE,
@@ -213,7 +213,7 @@ def gate(key_global, query_global, value, *, debug: bool = False):
         GATE_WRITER,
         one,
         [LOCAL_TILES, int(debug)] + sum((fp.accessor_args(t) for t in (out, dbg[0], dbg[1])), []),
-        [(core, [out.buffer_address(), dbg[0].buffer_address(), dbg[1].buffer_address()])],
+        [(core, [out.buffer_address(), dbg[0].buffer_address(), dbg[1].buffer_address(), 0])],
     )
     io = [key_global, query_global, value, scale, zero, out] + (dbg if debug else [])
     fp.run_program(io, fp.program_descriptor([reader, compute, writer], cbs=cbs))
@@ -306,7 +306,7 @@ def conv(
         CONV_READER,
         cores,
         [per_core, int(shift), int(inject)] + sum((fp.accessor_args(t) for t in reader_tensors), []),
-        [(w.core, [t.buffer_address() for t in reader_tensors] + [w.start]) for w in work],
+        [(w.core, [t.buffer_address() for t in reader_tensors] + [w.start, w.start]) for w in work],
     )
     compute = fp.compute_kernel(
         CONV_COMPUTE, cores, [per_core, int(mac_form), int(debug_stage), int(inject)], fp32_dest=False
@@ -459,12 +459,298 @@ def ple_composed(module, residual, prepared, state):
     return type(module).forward_prepared(module, residual, prepared, state)
 
 
+# ---------------------------------------------------------------------------------------------- the lanes (B row-blocks)
+# forward_prepared_lanes runs the same stages on [1, B, 4, 640] tensors (lane u = dim-1 index u, its own 20-tile
+# row-block); every stage is per row-block or per element, so the lane forms run the 1-row programs' kernels with one
+# core per lane (stats, normalize, gate: the lane's pages) or per column block over the B x 20 tiles (conv: a block
+# never spans two lanes, so its tap tiles are the block's columns).  The layer's inject_lanes keeps its permutes and
+# the residual add (a lane's delta rows land in every branch tile: not a per-core write).
+
+LANE_COLUMNS = 8
+
+
+def _lane_core_set(lanes: int):
+    cores = [ttnn.CoreCoord(u % LANE_COLUMNS, u // LANE_COLUMNS) for u in range(lanes)]
+    by_row: dict[int, list[int]] = {}
+    for core in cores:
+        by_row.setdefault(core.y, []).append(core.x)
+    return cores, ttnn.CoreRangeSet(
+        [ttnn.CoreRange(ttnn.CoreCoord(min(xs), y), ttnn.CoreCoord(max(xs), y)) for y, xs in sorted(by_row.items())]
+    )
+
+
+def _expect_lanes(tensor, lanes: int, width: int, dtype, label: str) -> None:
+    got = tuple(int(v) for v in tensor.shape)
+    if got != (1, lanes, BRANCHES, width) or tensor.dtype != dtype or tensor.layout != ttnn.TILE_LAYOUT:
+        raise ValueError(
+            f"{label} must be {dtype} TILE {(1, lanes, BRANCHES, width)}, got {tensor.dtype} {tensor.layout} {got}"
+        )
+
+
+def stats_lanes(x, lanes: int):
+    """``rms_norm_pre_all_gather`` of the B row-blocks ``[1,B,4,640]`` -> their stats tiles ``[1,B,4,32]`` (the chain's
+    reshape to (1, B, 4, 32) is this shape); one core per lane."""
+
+    from .. import gr_read as gr
+
+    _expect_lanes(x, lanes, LOCAL_HIDDEN, BF16, "PLE lanes group-norm input")
+    mesh = x.device()
+    out = fp.allocate((1, lanes, BRANCHES, fp.TILE), BF16, ttnn.TILE_LAYOUT, mesh)
+    cores, core_set = _lane_core_set(lanes)
+    cbs = [
+        fp.cb_descriptor(0, BF16, TILE_BF16, LOCAL_TILES, core_set),
+        fp.cb_descriptor(1, FP32, TILE_FP32, 1, core_set),
+        fp.cb_descriptor(2, FP32, TILE_FP32, LOCAL_TILES, core_set),
+        fp.cb_descriptor(16, BF16, TILE_BF16, 1, core_set),
+    ]
+    reader = gr._reader(
+        core_set,
+        [(x, 0)],
+        [(gr.CONST_SCALER, 1)],
+        [
+            (c, ([gr._stream(x, 1, LOCAL_TILES, u * LOCAL_TILES, 1, 0, 4)], [gr._bits(1.0)]))
+            for u, c in enumerate(cores)
+        ],
+    )
+    compute = fp.compute_kernel(gr.STATS, core_set, [LOCAL_TILES], fp32_dest=True)
+    writer = gr._writer(core_set, [(out, 16)], [(c, [(1, u, 1, 1)]) for u, c in enumerate(cores)])
+    return fp.run_program([x, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+
+
+def normalize_lanes(x, gathered_stats, weight, lanes: int):
+    """``rms_norm_post_all_gather(x, gathered, eps, weight=)`` of the B row-blocks: ``gathered_stats`` ``[1,B,4,128]``
+    (lane u's four devices' stats tiles), ``weight`` fp32 TILE ``[1,1,4,640]`` (every lane); one core per lane."""
+
+    from .. import gr_read as gr
+
+    _expect_lanes(x, lanes, LOCAL_HIDDEN, BF16, "PLE lanes group-norm input")
+    _expect_lanes(gathered_stats, lanes, fp.TILE * STATS_TILES, BF16, "PLE lanes gathered stats")
+    _expect(weight, (1, 1, BRANCHES, LOCAL_HIDDEN), FP32, "PLE norm weight")
+    mesh = x.device()
+    out = fp.allocate((1, lanes, BRANCHES, LOCAL_HIDDEN), BF16, ttnn.TILE_LAYOUT, mesh)
+    scaler_bits, scaler_dtype = gr.avg_scaler("chain")
+    cores, core_set = _lane_core_set(lanes)
+    cbs = [
+        fp.cb_descriptor(0, BF16, TILE_BF16, LOCAL_TILES, core_set),
+        fp.cb_descriptor(1, BF16, TILE_BF16, STATS_TILES, core_set),
+        fp.cb_descriptor(2, scaler_dtype, fp.TILE_BYTES[scaler_dtype], 1, core_set),
+        fp.cb_descriptor(3, BF16, TILE_BF16, 1, core_set),
+        fp.cb_descriptor(4, FP32, TILE_FP32, LOCAL_TILES, core_set),
+        fp.cb_descriptor(5, FP32, TILE_FP32, 1, core_set),
+        fp.cb_descriptor(6, FP32, TILE_FP32, 1, core_set),
+        fp.cb_descriptor(7, FP32, TILE_FP32, LOCAL_TILES, core_set),
+        fp.cb_descriptor(16, BF16, TILE_BF16, LOCAL_TILES, core_set),
+    ]
+    reader = gr._reader(
+        core_set,
+        [(gathered_stats, 1), (x, 0), (weight, 4)],
+        [(gr.CONST_SCALER, 2), (gr.CONST_COL_SCALAR, 3)],
+        [
+            (
+                c,
+                (
+                    [
+                        gr._stream(gathered_stats, 1, STATS_TILES, u * STATS_TILES, 1, 0, STATS_TILES),
+                        gr._stream(x, 1, LOCAL_TILES, u * LOCAL_TILES, 1, 0, 4),
+                        gr._stream(weight, 1, LOCAL_TILES, 0, 1, 0, 4),
+                    ],
+                    [scaler_bits, gr._bits(EPS)],
+                ),
+            )
+            for u, c in enumerate(cores)
+        ],
+    )
+    compute = fp.compute_kernel(NORM_COMPUTE, core_set, [LOCAL_TILES, STATS_TILES, 4, 16], fp32_dest=True)
+    writer = gr._writer(
+        core_set, [(out, 16)], [(c, [(LOCAL_TILES, u * LOCAL_TILES, 1, 4)]) for u, c in enumerate(cores)]
+    )
+    return fp.run_program([x, gathered_stats, weight, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+
+
+def gate_lanes(key_global, query_global, value, lanes: int):
+    """``_gate_rows`` after its all_gathers on B lanes: ``key_global`` / ``query_global`` bf16 TILE ``[1,B,4,2560]``,
+    ``value`` bf16 TILE ``[1,B,1,640]`` -> gated bf16 ``[1,B,4,640]``; one core per lane (the 1-row gate program on
+    the lane's pages)."""
+
+    _expect_lanes(key_global, lanes, HIDDEN, BF16, "PLE lanes key global norm")
+    _expect_lanes(query_global, lanes, HIDDEN, BF16, "PLE lanes query global norm")
+    got = tuple(int(v) for v in value.shape)
+    if got != (1, lanes, 1, LOCAL_HIDDEN) or value.dtype != BF16 or value.layout != ttnn.TILE_LAYOUT:
+        raise ValueError(f"PLE lanes value projection must be bf16 TILE {(1, lanes, 1, LOCAL_HIDDEN)}, got {got}")
+    mesh = key_global.device()
+    scale, zero = constants(mesh)
+    out = fp.allocate((1, lanes, BRANCHES, LOCAL_HIDDEN), BF16, ttnn.TILE_LAYOUT, mesh)
+    cores, core_set = _lane_core_set(lanes)
+    cbs = [
+        fp.cb_descriptor(0, BF16, TILE_BF16, GLOBAL_TILES, core_set),
+        fp.cb_descriptor(1, BF16, TILE_BF16, GLOBAL_TILES, core_set),
+        fp.cb_descriptor(2, FP32, TILE_FP32, GLOBAL_TILES, core_set),
+        fp.cb_descriptor(3, FP32, TILE_FP32, 1, core_set),
+        fp.cb_descriptor(4, FP32, TILE_FP32, 1, core_set),
+        fp.cb_descriptor(5, FP32, TILE_FP32, 1, core_set),
+        fp.cb_descriptor(6, FP32, TILE_FP32, 1, core_set),
+        fp.cb_descriptor(7, FP32, TILE_FP32, 1, core_set),
+        fp.cb_descriptor(8, FP32, TILE_FP32, 1, core_set),
+        fp.cb_descriptor(9, BF16, TILE_BF16, LOCAL_TILES, core_set),
+        fp.cb_descriptor(16, BF16, TILE_BF16, LOCAL_TILES, core_set),
+    ]
+    tensors = (key_global, query_global, value, scale, zero)
+    reader = fp.reader_kernel(
+        GATE_READER,
+        core_set,
+        [GLOBAL_TILES, LOCAL_TILES] + sum((fp.accessor_args(t) for t in tensors), []),
+        [(c, [t.buffer_address() for t in tensors] + [u * GLOBAL_TILES, u * LOCAL_TILES]) for u, c in enumerate(cores)],
+    )
+    compute = fp.compute_kernel(
+        GATE_COMPUTE, core_set, [GLOBAL_TILES, LOCAL_TILES, 0], fp32_dest=True, unpack_to_dest_fp32=(2, 4, 5, 6, 7, 8)
+    )
+    writer = fp.writer_kernel(
+        GATE_WRITER,
+        core_set,
+        [LOCAL_TILES, 0] + sum((fp.accessor_args(t) for t in (out, out, out)), []),
+        [
+            (c, [out.buffer_address(), out.buffer_address(), out.buffer_address(), u * LOCAL_TILES])
+            for u, c in enumerate(cores)
+        ],
+    )
+    fp.run_program([*tensors, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+    return out
+
+
+def conv_lanes(state_rows, normalized, taps, gated, lanes: int, *, mac_form: int = MAC_FORM, shift: bool = True):
+    """``_convolve_lanes`` + the delta add on the B row-blocks: ``state_rows`` = the nine bf16 ``[1,B,4,640]`` slots
+    (fixed addresses, shifted in place by the reader), ``normalized`` / ``gated`` ``[1,B,4,640]``, ``taps`` the four
+    bf16 ``[1,1,4,640]`` tap tensors -> the delta ``[1,B,4,640]``.  The B x 20 tiles in column blocks of T tiles (T
+    divides 20: a block stays inside one lane, its tap tiles are the block's columns), one block per core."""
+
+    if len(state_rows) != CONV_STATE_LENGTH or len(taps) != CONV_TAPS:
+        raise ValueError("PLE conv takes nine state rows and four taps")
+    for label, t in (
+        ("normalized", normalized),
+        ("gated", gated),
+        *((f"state row {i}", r) for i, r in enumerate(state_rows)),
+    ):
+        _expect_lanes(t, lanes, LOCAL_HIDDEN, BF16, f"PLE lanes conv {label}")
+    for i, w in enumerate(taps):
+        _expect(w, (1, 1, BRANCHES, LOCAL_HIDDEN), BF16, f"PLE conv tap {i}")
+    mesh = normalized.device()
+    out = fp.allocate((1, lanes, BRANCHES, LOCAL_HIDDEN), BF16, ttnn.TILE_LAYOUT, mesh)
+    grid = mesh.compute_with_storage_grid_size()
+    tiles = lanes * LOCAL_TILES
+    per_core = next(T for T in (1, 2, 4, 5, 10, 20) if tiles // T <= grid.x * grid.y)
+    work = fp.split_work(tiles // per_core, mesh)  # one block of per_core consecutive tiles per core
+    cores = fp.core_rectangle(work, mesh)
+    inputs = [state_rows[0], state_rows[3], state_rows[6], normalized, *taps, gated]
+    others = [state_rows[i] for i in (1, 2, 4, 5, 7, 8)]
+    reader_tensors = inputs + others + [gated]  # the sixteenth accessor slot (the residual, unused without INJECT)
+    cbs = [fp.cb_descriptor(i, BF16, TILE_BF16, per_core, cores) for i in range(9)]
+    cbs += [fp.cb_descriptor(i, BF16, TILE_BF16, 1, cores) for i in (9, 10, 11)]
+    cbs += [
+        fp.cb_descriptor(16, BF16, TILE_BF16, per_core, cores),
+        fp.cb_descriptor(17, BF16, TILE_BF16, per_core, cores),
+    ]
+    reader = fp.reader_kernel(
+        CONV_READER,
+        cores,
+        [per_core, int(shift), 0] + sum((fp.accessor_args(t) for t in reader_tensors), []),
+        [
+            (
+                w.core,
+                [t.buffer_address() for t in reader_tensors] + [w.start * per_core, (w.start * per_core) % LOCAL_TILES],
+            )
+            for w in work
+        ],
+    )
+    compute = fp.compute_kernel(CONV_COMPUTE, cores, [per_core, int(mac_form), 0, 0], fp32_dest=False)
+    writer = fp.writer_kernel(
+        CONV_WRITER,
+        cores,
+        [per_core, 0] + fp.accessor_args(out) + fp.accessor_args(out),
+        [(w.core, [out.buffer_address(), w.start * per_core, out.buffer_address()]) for w in work],
+    )
+    io = list(inputs) + others + [out]  # each buffer once
+    fp.run_program(io, fp.program_descriptor([reader, compute, writer], cbs=cbs))
+    return out
+
+
+def _group_norm_lanes(module, x, weight, lanes: int):
+    """``_distributed_group_norm_rows`` on the fused lane programs around the chain's stats all_gather."""
+
+    from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import TensorPlacement
+
+    s = stats_lanes(x, lanes)
+    s.update_tensor_topology(x.tensor_topology())
+    module.mesh_contract.validate_tensor(s, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+    gathered = ttnn.all_gather(s, dim=3, cluster_axis=TP_AXIS, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    ttnn.deallocate(s)
+    module.mesh_contract.validate_tensor(gathered, placement=TensorPlacement.REPLICATED)
+    out = normalize_lanes(x, gathered, weight, lanes)
+    ttnn.deallocate(gathered)
+    out.update_tensor_topology(x.tensor_topology())
+    module._validate_rows_residual(out, lanes, label="PLE lanes group-norm output")
+    return out
+
+
+def ple_lanes_fused(module, residual_lanes, prepared, lanes_state):
+    """``Qwen38TTNNPLE.forward_prepared_lanes`` on the fused lane programs: the chain's validations, tilize and
+    ``_project_rows`` (the embedding gather and the two linears), then the fused group norms, gate and convolution
+    around the chain's collectives (the state shift happens in the conv program's reader); the contexts advance."""
+
+    from models.demos.blackhole.qwen38_flash_next.ttnn import ple as pm
+    from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import TensorPlacement
+
+    lanes_state.validate()
+    lanes = lanes_state.lanes
+    module._validate_rows_residual(residual_lanes, lanes, label="PLE lanes residual input")
+    if not isinstance(prepared, pm.Qwen38TTNNPLELanesPreparedInput) or not prepared.active:
+        raise TypeError("PLE lanes input must be a live Qwen38TTNNPLELanesPreparedInput")
+    if prepared.source_contexts != lanes_state.token_contexts:
+        raise RuntimeError(
+            f"prepared PLE lanes were looked up from contexts {prepared.source_contexts}, the state holds "
+            f"{lanes_state.token_contexts}"
+        )
+    module._validate_prepared_rows(prepared.embedding_rows, lanes, label="prepared PLE lanes")
+    embedding_tile = ttnn.to_layout(prepared.embedding_rows, ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    embedding_tile.update_tensor_topology(prepared.embedding_rows.tensor_topology())
+    module.mesh_contract.validate_tensor(embedding_tile, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+    key, value = module._project_rows(embedding_tile, lanes)
+    key_norm = _group_norm_lanes(module, key, module.weights.norm_key, lanes)
+    query_norm = _group_norm_lanes(module, residual_lanes, module.weights.norm_query, lanes)
+    ttnn.deallocate(key)
+    key_global = ttnn.all_gather(key_norm, dim=3, cluster_axis=TP_AXIS, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    query_global = ttnn.all_gather(query_norm, dim=3, cluster_axis=TP_AXIS, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    ttnn.deallocate(key_norm)
+    ttnn.deallocate(query_norm)
+    for tensor in (key_global, query_global):
+        module.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.REPLICATED)
+    gated = gate_lanes(key_global, query_global, value, lanes)
+    ttnn.deallocate(key_global)
+    ttnn.deallocate(query_global)
+    ttnn.deallocate(value)
+    gated.update_tensor_topology(residual_lanes.tensor_topology())
+    module._validate_rows_residual(gated, lanes, label="PLE lanes gated value")
+    normalized = _group_norm_lanes(module, gated, module.weights.norm_conv, lanes)
+    output = conv_lanes(lanes_state.conv, normalized, module.weights.conv_taps, gated, lanes, shift=True)
+    ttnn.deallocate(normalized)
+    ttnn.deallocate(gated)
+    output.update_tensor_topology(residual_lanes.tensor_topology())
+    module._validate_rows_residual(output, lanes, label="PLE lanes residual delta")
+    lanes_state.token_contexts = prepared.next_contexts
+    lanes_state.validate()
+    return output
+
+
+def ple_lanes_composed(module, residual_lanes, prepared, lanes_state):
+    return type(module).forward_prepared_lanes(module, residual_lanes, prepared, lanes_state)
+
+
 register(
     FusedKernel(
         name=NAME,
         replaces="Qwen38TTNNPLE.forward_prepared (layer 1, once per step): the group norms (3 x [pre, reshape, post]), the "
         "gate chain (12 programs), the convolution (multiply, 3 mac, silu), the delta add and the 10 state copies -> stats x3, "
-        "normalize x3, gate, conv = 8 programs; tilize, the embedding gather, the two linears and the 6 collectives stay",
+        "normalize x3, gate, conv = 8 programs; tilize, the embedding gather, the two linears and the 6 collectives stay; "
+        "forward_prepared_lanes runs the same 8 programs on the B row-blocks (one core per lane, the conv per column block)",
         tolerance=BITWISE,
         fused=ple_fused,
         composed=ple_composed,

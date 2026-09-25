@@ -38,6 +38,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     Qwen38MeshContract,
     TensorPlacement,
     replicate_tensor_2d_mesh_mapper,
+    require_lane_count,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
@@ -147,9 +148,9 @@ def rows_window_select_tiles(rows: int) -> dict[str, torch.Tensor]:
     for head in range(QK_HEADS_PER_DEVICE):
         for repeat in range(QK_REPEAT_FACTOR):
             value_head = head * QK_REPEAT_FACTOR + repeat
-            expand[
-                head * HEAD_DIM : (head + 1) * HEAD_DIM, value_head * HEAD_DIM : (value_head + 1) * HEAD_DIM
-            ] = torch.eye(HEAD_DIM)
+            expand[head * HEAD_DIM : (head + 1) * HEAD_DIM, value_head * HEAD_DIM : (value_head + 1) * HEAD_DIM] = (
+                torch.eye(HEAD_DIM)
+            )
     return {
         "conv_taps": taps,
         "history_select_stack": stack,
@@ -233,6 +234,12 @@ def softplus_gate(a_fp32, dt_bias, *, memory_config):
     softplus = ttnn.softplus(shifted, beta=1.0, threshold=20.0, memory_config=memory_config)
     _deallocate(shifted)
     return softplus
+
+
+def _exact_lane(lane, lanes: int) -> int:
+    if isinstance(lane, bool) or type(lane) is not int or not 0 <= lane < lanes:
+        raise ValueError(f"lane must be an int in [0,{lanes}), got {lane!r}")
+    return lane
 
 
 def _retag_head_shard_after_reshape(tensor, *, reference, shard_dim: int) -> None:
@@ -567,19 +574,21 @@ class Qwen38TTNNGDNSnapshot:
     conv: tuple[Any, Any, Any, Any]
     captured: bool = False
     conv_phase: int = 0
+    batch_size: int = 1
 
     def validate(self, mesh_contract: Qwen38MeshContract) -> None:
+        batch = require_lane_count(self.batch_size, label="GDN snapshot batch size", error_type=RuntimeError)
         mesh_contract.validate_tensor(self.recurrent, placement=TensorPlacement.HEAD_SHARDED, shard_dim=1)
         _require_shape(
             self.recurrent,
-            (1, VALUE_HEADS_PER_DEVICE, HEAD_DIM, HEAD_DIM),
+            (batch, VALUE_HEADS_PER_DEVICE, HEAD_DIM, HEAD_DIM),
             label="GDN snapshot recurrent state",
         )
         if self.recurrent.dtype != ttnn.float32:
             raise RuntimeError(f"GDN snapshot recurrent state must be FP32, got {self.recurrent.dtype}")
         for index, tensor in enumerate(self.conv):
             mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
-            _require_shape(tensor, (1, 1, 1, QKV_WIDTH_PER_DEVICE), label=f"GDN snapshot conv[{index}]")
+            _require_shape(tensor, (1, 1, batch, QKV_WIDTH_PER_DEVICE), label=f"GDN snapshot conv[{index}]")
         if not 0 <= self.conv_phase < CONV_KERNEL_SIZE:
             raise RuntimeError(f"GDN snapshot conv phase must be in [0,{CONV_KERNEL_SIZE}), got {self.conv_phase}")
 
@@ -606,6 +615,9 @@ class Qwen38TTNNGDNState:
     zero_conv: Any
     mesh_contract: Qwen38MeshContract
     conv_phase: int = 0
+    # Lanes of the batched layout: recurrent [B,12,128,128], conv slots [1,1,B,2560] (lane u = batch index u /
+    # row u).  The 1-row decode body (forward_decode) admits batch 1 only; the batched step is a separate path.
+    batch_size: int = 1
 
     @classmethod
     def allocate(
@@ -617,8 +629,7 @@ class Qwen38TTNNGDNState:
         batch_size: int = 1,
     ) -> "Qwen38TTNNGDNState":
         mesh_contract.validate_mesh(mesh_device)
-        if batch_size != 1:
-            raise ValueError(f"Qwen3.8 interactive GDN admits true global batch one, got {batch_size}")
+        batch_size = require_lane_count(batch_size, label="GDN state batch size")
         if layer_index < 0:
             raise ValueError("layer_index must be nonnegative")
 
@@ -656,6 +667,7 @@ class Qwen38TTNNGDNState:
                 zero_recurrent=allocate_recurrent("GDN zero recurrent source"),
                 zero_conv=allocate_conv("GDN zero conv source"),
                 mesh_contract=mesh_contract,
+                batch_size=batch_size,
             )
             result.validate()
             return result
@@ -664,6 +676,7 @@ class Qwen38TTNNGDNState:
             raise
 
     def validate(self) -> None:
+        batch = require_lane_count(self.batch_size, label="GDN state batch size", error_type=RuntimeError)
         if len(self.conv) != CONV_KERNEL_SIZE:
             raise RuntimeError(f"GDN state requires {CONV_KERNEL_SIZE} conv buffers, got {len(self.conv)}")
         owned = (self.recurrent, *self.conv, self.zero_recurrent, self.zero_conv)
@@ -671,15 +684,15 @@ class Qwen38TTNNGDNState:
             raise RuntimeError("GDN state requires seven distinct backing tensors")
         self.mesh_contract.validate_tensor(self.recurrent, placement=TensorPlacement.HEAD_SHARDED, shard_dim=1)
         self.mesh_contract.validate_tensor(self.zero_recurrent, placement=TensorPlacement.HEAD_SHARDED, shard_dim=1)
-        recurrent_shape = (1, VALUE_HEADS_PER_DEVICE, HEAD_DIM, HEAD_DIM)
-        _require_shape(self.recurrent, recurrent_shape, label="GDN recurrent state")
-        _require_shape(self.zero_recurrent, recurrent_shape, label="GDN zero recurrent source")
+        recurrent_shape = (batch, VALUE_HEADS_PER_DEVICE, HEAD_DIM, HEAD_DIM)
+        _require_shape(self.recurrent, recurrent_shape, label=f"GDN recurrent state (batch {batch})")
+        _require_shape(self.zero_recurrent, recurrent_shape, label=f"GDN zero recurrent source (batch {batch})")
         if self.recurrent.dtype != ttnn.float32 or self.zero_recurrent.dtype != ttnn.float32:
             raise RuntimeError("GDN recurrent state and zero source must both be FP32")
 
         for name, tensor in (("zero_conv", self.zero_conv), *[(f"conv[{i}]", t) for i, t in enumerate(self.conv)]):
             self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
-            _require_shape(tensor, (1, 1, 1, QKV_WIDTH_PER_DEVICE), label=f"GDN {name}")
+            _require_shape(tensor, (1, 1, batch, QKV_WIDTH_PER_DEVICE), label=f"GDN {name} (batch {batch})")
             if tensor.dtype != ttnn.bfloat16:
                 raise RuntimeError(f"GDN {name} must be BF16, got {tensor.dtype}")
         if not 0 <= self.conv_phase < CONV_KERNEL_SIZE:
@@ -720,9 +733,46 @@ class Qwen38TTNNGDNState:
             )
             for tensor in self.conv
         )
-        snapshot = Qwen38TTNNGDNSnapshot(self.layer_index, recurrent, conv)
+        snapshot = Qwen38TTNNGDNSnapshot(self.layer_index, recurrent, conv, batch_size=self.batch_size)
         snapshot.validate(self.mesh_contract)
         return snapshot
+
+    def reset_lane_inplace(self, lane: int) -> None:
+        """Zero lane ``lane`` of the recurrent state and of every ring slot, every other lane unchanged, no address
+        change: a keep-mask multiply (lane 1.0 everywhere but 0.0 at ``lane``; x * 1.0 is x, x * 0.0 is the zero
+        source's +0.0) landed by an in-place copy.  Eager host uploads: a lifecycle op between steps, never traced.
+        The ring phase is shared, so the lane joins the resident residue class (the caller admits it at a step of
+        its position's residue)."""
+
+        self.validate()
+        lane = _exact_lane(lane, self.batch_size)
+        keep = torch.ones(self.batch_size, dtype=torch.float32)
+        keep[lane] = 0.0
+        device = self.recurrent.device()
+        mapper = replicate_tensor_2d_mesh_mapper(device)
+
+        def upload(host: torch.Tensor, dtype):
+            return ttnn.from_torch(
+                host,
+                dtype=dtype,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=mapper,
+            )
+
+        recurrent_keep = upload(keep.reshape(self.batch_size, 1, 1, 1), ttnn.float32)
+        conv_keep = upload(keep.reshape(1, 1, self.batch_size, 1).to(torch.bfloat16), ttnn.bfloat16)
+        try:
+            kept = ttnn.multiply(self.recurrent, recurrent_keep, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _copy_inplace(kept, self.recurrent, label=f"GDN lane {lane} recurrent reset")
+            _deallocate(kept)
+            for index, slot in enumerate(self.conv):
+                kept = ttnn.multiply(slot, conv_keep, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                _copy_inplace(kept, slot, label=f"GDN lane {lane} conv[{index}] reset")
+                _deallocate(kept)
+        finally:
+            _deallocate(recurrent_keep, conv_keep)
 
     def capture_into(self, snapshot: Qwen38TTNNGDNSnapshot) -> None:
         if snapshot.layer_index != self.layer_index:
@@ -865,27 +915,31 @@ class Qwen38TTNNGDNRowsConstants:
                     torch.arange(CHUNK_SIZE).float().reshape(1, 1, 1, CHUNK_SIZE), ttnn.float32, "arange row"
                 ),
                 one=upload(torch.ones(1, 1, 1, 1), ttnn.float32, "one"),
-                conv_taps=()
-                if slab
-                else tuple(
-                    upload(
-                        selects["conv_taps"][tap].reshape(1, 1, tile_rows, window_rows),
-                        ttnn.bfloat16,
-                        f"conv tap {tap} select",
+                conv_taps=(
+                    ()
+                    if slab
+                    else tuple(
+                        upload(
+                            selects["conv_taps"][tap].reshape(1, 1, tile_rows, window_rows),
+                            ttnn.bfloat16,
+                            f"conv tap {tap} select",
+                        )
+                        for tap in range(CONV_HISTORY_ROWS)
                     )
-                    for tap in range(CONV_HISTORY_ROWS)
                 ),
                 history_select_stack=upload(
                     selects["history_select_stack"].reshape(1, 1, CHUNK_SIZE, CHUNK_SIZE * CONV_WINDOW_TILE_ROWS),
                     ttnn.bfloat16,
                     "history select stack",
                 ),
-                history_select_full=None
-                if slab
-                else upload(
-                    selects["history_select_full"].reshape(1, 1, CHUNK_SIZE, window_rows),
-                    ttnn.bfloat16,
-                    "history select full",
+                history_select_full=(
+                    None
+                    if slab
+                    else upload(
+                        selects["history_select_full"].reshape(1, 1, CHUNK_SIZE, window_rows),
+                        ttnn.bfloat16,
+                        "history select full",
+                    )
                 ),
                 qk_expand=upload(
                     selects["qk_expand"].reshape(1, 1, QK_WIDTH_PER_DEVICE, VALUE_WIDTH_PER_DEVICE),
@@ -1067,23 +1121,33 @@ class Qwen38TTNNGDNRowsState:
                     if history is None
                     else history
                 ),
-                qkv=body.qkv
-                if body is not None
-                else zero((1, 1, tile_rows, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows qkv"),
+                qkv=(
+                    body.qkv
+                    if body is not None
+                    else zero((1, 1, tile_rows, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows qkv")
+                ),
                 q=body.q if body is not None else zero(qk_shape, ttnn.bfloat16, 2, "GDN rows q"),
                 k=body.k if body is not None else zero(qk_shape, ttnn.bfloat16, 2, "GDN rows k"),
-                v=body.v
-                if body is not None
-                else zero((1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows v"),
-                beta=body.beta
-                if body is not None
-                else zero((1, 1, tile_rows, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3, "GDN rows beta"),
-                g=body.g
-                if body is not None
-                else zero((1, 1, tile_rows, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3, "GDN rows log decay"),
-                output=body.output
-                if body is not None
-                else zero((1, 1, constants.rows, HIDDEN_SIZE_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows output"),
+                v=(
+                    body.v
+                    if body is not None
+                    else zero((1, 1, tile_rows, VALUE_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows v")
+                ),
+                beta=(
+                    body.beta
+                    if body is not None
+                    else zero((1, 1, tile_rows, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3, "GDN rows beta")
+                ),
+                g=(
+                    body.g
+                    if body is not None
+                    else zero((1, 1, tile_rows, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3, "GDN rows log decay")
+                ),
+                output=(
+                    body.output
+                    if body is not None
+                    else zero((1, 1, constants.rows, HIDDEN_SIZE_PER_DEVICE), ttnn.bfloat16, 3, "GDN rows output")
+                ),
                 mesh_contract=mesh_contract,
                 owns_history=history is None,
                 owns_body=body is None,
@@ -1121,6 +1185,352 @@ class Qwen38TTNNGDNRowsState:
             *((self.history,) if self.owns_history else ()),
             *((self.qkv, self.q, self.k, self.v, self.beta, self.g, self.output) if self.owns_body else ()),
         )
+
+
+# --------------------------------------------------------------------------- lane rows path (the MTP lanes verify)
+# B lanes verify R = k + 1 rows each in ONE 32-row tile, lane-major (row u*R + j = lane u's row j; rows B*R .. 31 pad).
+# The dense work (all-gather, projection, output projection, reduce-scatter) runs on that tile exactly as the
+# rows path does; the per-lane work (FIR history, chunk kernel from lane u's recurrent state, commit) runs on a
+# batch axis: one exact 0/1 ``expand_select`` copies lane u's rows into its own 32-row tile (rows R .. 31 zero),
+# one batched kernel call takes ``[B, 32, 12, 128]`` from ``recurrent [B, 12, 128, 128]`` (bitwise per lane: the
+# single-chip microbench of stage 0b), and one ``fold_select`` brings the per-lane outputs back to the lane-major
+# tile before the gate.  Every select is one nonzero term per output element under HiFi4 / fp32 accumulation.
+
+
+def lane_rows_select_tiles(lanes: int, rows: int) -> dict[str, torch.Tensor]:
+    """Host images of the lane rows path's exact 0/1 selects.
+
+    ``expand_select`` ``[B*32, 32]``: row ``u*32 + j`` takes lane-major row ``u*R + j`` for ``j < R``;
+    ``fold_select`` ``[32, B*32]`` is its transpose; ``history_select_stack`` ``[32, 2048]``: row ``c`` (``c = 0 ..
+    R``) is the flattened ``[32, 64]`` select whose rows 0..2 pick logical window rows ``c .. c + 2`` -- the FIR
+    history after committing ``c`` rows (row 0 = the KEEP row: an inactive or freshly admitted lane commits nothing
+    and its history is copied unchanged).
+    """
+
+    lanes = require_lane_count(lanes, label="lane rows lanes")
+    if not 1 <= rows <= CHUNK_SIZE or lanes * rows > CHUNK_SIZE:
+        raise ValueError(f"lane rows admit B x R <= {CHUNK_SIZE} rows in one tile, got {lanes} x {rows}")
+    expand = torch.zeros(lanes * CHUNK_SIZE, CHUNK_SIZE)
+    for lane in range(lanes):
+        for row in range(rows):
+            expand[lane * CHUNK_SIZE + row, lane * rows + row] = 1.0
+    stack = torch.zeros(CHUNK_SIZE, CHUNK_SIZE * CONV_WINDOW_TILE_ROWS)
+    for committed in range(rows + 1):
+        select = torch.zeros(CHUNK_SIZE, CONV_WINDOW_TILE_ROWS)
+        for index in range(CONV_HISTORY_ROWS):
+            select[index, _window_buffer_row(committed + index)] = 1.0
+        stack[committed] = select.reshape(-1)
+    return {"expand_select": expand, "fold_select": expand.t().contiguous(), "history_select_stack": stack}
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNGDNLaneRowsConstants:
+    """Read-only device tensors of the lane rows path for one ``(lanes, rows)``, beside the ``rows``-row
+    :class:`Qwen38TTNNGDNRowsConstants` (whose ``qk_expand`` and chunk tiles the lane path shares).
+
+    ``expand_select`` ``[1,1,B*32,32]`` / ``fold_select`` ``[1,1,32,B*32]`` BF16; ``history_select_stack``
+    ``[1,1,32,2048]`` BF16 indexed by committed rows (the KEEP row at 0); ``conv_taps`` 3 x ``[1,B,32,64]`` BF16 (the
+    rows path's tap selects, one copy per lane: the A operand of an equal-batch matmul carries the batch);
+    ``row_mask_bf16`` ``[B,32,1,1]``, ``row_mask_bf16_col`` / ``row_mask_fp32`` ``[1,B,32,1]`` (1.0 below ``rows``);
+    ``arange`` ``[1,B,32,1]`` and ``arange_row`` ``[1,B,1,32]`` FP32 row indices per lane (the per-lane comparisons
+    against a ``[1,B,1,1]`` count).
+    """
+
+    lanes: int
+    rows: int
+    expand_select: Any
+    fold_select: Any
+    history_select_stack: Any
+    conv_taps: tuple[Any, Any, Any]
+    row_mask_bf16: Any
+    row_mask_bf16_col: Any
+    row_mask_fp32: Any
+    arange: Any
+    arange_row: Any
+    select_compute_config: Any
+    mesh_contract: Qwen38MeshContract
+
+    @classmethod
+    def allocate(
+        cls, mesh_device, mesh_contract: Qwen38MeshContract, *, lanes: int, rows: int
+    ) -> "Qwen38TTNNGDNLaneRowsConstants":
+        mesh_contract.validate_mesh(mesh_device)
+        selects = lane_rows_select_tiles(lanes, rows)
+        taps = rows_window_select_tiles(rows)["conv_taps"]  # [3, 32, 64]
+        keep = (torch.arange(CHUNK_SIZE) < rows).float()
+        arange = torch.arange(CHUNK_SIZE).float()
+        uploaded: list[Any] = []
+
+        def upload(host: torch.Tensor, dtype, label: str):
+            tensor = _upload_replicated_constant(mesh_device, mesh_contract, host, dtype, label=label)
+            uploaded.append(tensor)
+            return tensor
+
+        try:
+            return cls(
+                lanes=lanes,
+                rows=rows,
+                expand_select=upload(
+                    selects["expand_select"].reshape(1, 1, lanes * CHUNK_SIZE, CHUNK_SIZE), ttnn.bfloat16, "lane expand"
+                ),
+                fold_select=upload(
+                    selects["fold_select"].reshape(1, 1, CHUNK_SIZE, lanes * CHUNK_SIZE), ttnn.bfloat16, "lane fold"
+                ),
+                history_select_stack=upload(
+                    selects["history_select_stack"].reshape(1, 1, CHUNK_SIZE, CHUNK_SIZE * CONV_WINDOW_TILE_ROWS),
+                    ttnn.bfloat16,
+                    "lane history select stack",
+                ),
+                conv_taps=tuple(
+                    upload(
+                        taps[tap]
+                        .reshape(1, 1, CHUNK_SIZE, CONV_WINDOW_TILE_ROWS)
+                        .expand(1, lanes, -1, -1)
+                        .contiguous(),
+                        ttnn.bfloat16,
+                        f"lane conv tap {tap} select",
+                    )
+                    for tap in range(CONV_HISTORY_ROWS)
+                ),
+                row_mask_bf16=upload(
+                    keep.reshape(1, CHUNK_SIZE, 1, 1).expand(lanes, -1, -1, -1).contiguous().to(torch.bfloat16),
+                    ttnn.bfloat16,
+                    "lane row mask",
+                ),
+                row_mask_bf16_col=upload(
+                    keep.reshape(1, 1, CHUNK_SIZE, 1).expand(1, lanes, -1, -1).contiguous().to(torch.bfloat16),
+                    ttnn.bfloat16,
+                    "lane row mask column",
+                ),
+                row_mask_fp32=upload(
+                    keep.reshape(1, 1, CHUNK_SIZE, 1).expand(1, lanes, -1, -1).contiguous(),
+                    ttnn.float32,
+                    "lane row mask fp32",
+                ),
+                arange=upload(
+                    arange.reshape(1, 1, CHUNK_SIZE, 1).expand(1, lanes, -1, -1).contiguous(),
+                    ttnn.float32,
+                    "lane arange",
+                ),
+                arange_row=upload(
+                    arange.reshape(1, 1, 1, CHUNK_SIZE).expand(1, lanes, -1, -1).contiguous(),
+                    ttnn.float32,
+                    "lane arange row",
+                ),
+                select_compute_config=ttnn.WormholeComputeKernelConfig(
+                    math_fidelity=ttnn.MathFidelity.HiFi4,
+                    math_approx_mode=False,
+                    fp32_dest_acc_en=True,
+                    packer_l1_acc=False,
+                ),
+                mesh_contract=mesh_contract,
+            )
+        except BaseException:
+            _deallocate(*uploaded)
+            raise
+
+    def deallocate(self) -> None:
+        _deallocate(
+            self.expand_select,
+            self.fold_select,
+            self.history_select_stack,
+            *self.conv_taps,
+            self.row_mask_bf16,
+            self.row_mask_bf16_col,
+            self.row_mask_fp32,
+            self.arange,
+            self.arange_row,
+        )
+
+
+@dataclass
+class Qwen38TTNNGDNLaneRowsState:
+    """Per-layer persistent buffers of the lane rows path (fixed addresses across passes): the rows state of
+    :class:`Qwen38TTNNGDNRowsState` with the lane on a batch axis.
+
+    ``qkv`` ``[1,1,32,2560]`` is the lane-major projected tile; ``qkv_lanes`` ``[1,1,B*32,2560]`` its expand (lane
+    u's rows at ``u*32 .. u*32 + R - 1``, viewed ``[1,B,32,2560]`` by the batched ops); ``history`` ``[1,B,32,2560]``
+    (rows 0..2 of every lane valid); ``q`` / ``k`` ``[B,32,12,128]``, ``v`` ``[1,B,32,1536]``, ``beta`` / ``g``
+    ``[1,B,32,12]`` FP32 the chunk kernel's inputs, kept for the commit's masked rerun.
+    """
+
+    layer_index: int
+    lanes: int
+    constants: Qwen38TTNNGDNRowsConstants
+    lane_constants: Qwen38TTNNGDNLaneRowsConstants
+    history: Any
+    qkv: Any
+    qkv_lanes: Any
+    q: Any
+    k: Any
+    v: Any
+    beta: Any
+    g: Any
+    mesh_contract: Qwen38MeshContract
+
+    @classmethod
+    def allocate(
+        cls,
+        mesh_device,
+        mesh_contract: Qwen38MeshContract,
+        constants: Qwen38TTNNGDNRowsConstants,
+        lane_constants: Qwen38TTNNGDNLaneRowsConstants,
+        *,
+        layer_index: int,
+    ) -> "Qwen38TTNNGDNLaneRowsState":
+        mesh_contract.validate_mesh(mesh_device)
+        if constants.mesh_contract != mesh_contract or lane_constants.mesh_contract != mesh_contract:
+            raise ValueError("GDN lane rows constants belong to a different physical mesh contract")
+        if constants.rows != lane_constants.rows or constants.tile_rows != CHUNK_SIZE:
+            raise ValueError(
+                f"GDN lane rows need the {lane_constants.rows}-row one-tile constants, got rows {constants.rows} "
+                f"on {constants.tile_rows} kernel rows"
+            )
+        lanes = lane_constants.lanes
+        allocated: list[Any] = []
+
+        def zero(local_shape: tuple[int, ...], dtype, shard_dim: int, label: str):
+            tensor = _allocate_head_sharded_zero(
+                mesh_device, mesh_contract, local_shape=local_shape, dtype=dtype, shard_dim=shard_dim, label=label
+            )
+            allocated.append(tensor)
+            return tensor
+
+        qk_shape = (lanes, CHUNK_SIZE, VALUE_HEADS_PER_DEVICE, HEAD_DIM)
+        try:
+            result = cls(
+                layer_index=layer_index,
+                lanes=lanes,
+                constants=constants,
+                lane_constants=lane_constants,
+                history=zero((1, lanes, CHUNK_SIZE, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN lane rows history"),
+                qkv=zero((1, 1, CHUNK_SIZE, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN lane rows qkv"),
+                qkv_lanes=zero(
+                    (1, 1, lanes * CHUNK_SIZE, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN lane rows qkv lanes"
+                ),
+                q=zero(qk_shape, ttnn.bfloat16, 2, "GDN lane rows q"),
+                k=zero(qk_shape, ttnn.bfloat16, 2, "GDN lane rows k"),
+                v=zero((1, lanes, CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE), ttnn.bfloat16, 3, "GDN lane rows v"),
+                beta=zero((1, lanes, CHUNK_SIZE, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3, "GDN lane rows beta"),
+                g=zero((1, lanes, CHUNK_SIZE, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3, "GDN lane rows log decay"),
+                mesh_contract=mesh_contract,
+            )
+            result.validate()
+            return result
+        except BaseException:
+            _deallocate(*allocated)
+            raise
+
+    def validate(self) -> None:
+        owned = (self.history, self.qkv, self.qkv_lanes, self.q, self.k, self.v, self.beta, self.g)
+        if len({_tensor_key(tensor) for tensor in owned}) != len(owned):
+            raise RuntimeError("GDN lane rows state requires eight distinct backing tensors")
+        lanes = self.lanes
+        expected = {
+            "history": ((1, lanes, CHUNK_SIZE, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3),
+            "qkv": ((1, 1, CHUNK_SIZE, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3),
+            "qkv_lanes": ((1, 1, lanes * CHUNK_SIZE, QKV_WIDTH_PER_DEVICE), ttnn.bfloat16, 3),
+            "q": ((lanes, CHUNK_SIZE, VALUE_HEADS_PER_DEVICE, HEAD_DIM), ttnn.bfloat16, 2),
+            "k": ((lanes, CHUNK_SIZE, VALUE_HEADS_PER_DEVICE, HEAD_DIM), ttnn.bfloat16, 2),
+            "v": ((1, lanes, CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE), ttnn.bfloat16, 3),
+            "beta": ((1, lanes, CHUNK_SIZE, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3),
+            "g": ((1, lanes, CHUNK_SIZE, VALUE_HEADS_PER_DEVICE), ttnn.float32, 3),
+        }
+        for name, (shape, dtype, shard_dim) in expected.items():
+            tensor = getattr(self, name)
+            _require_shape(tensor, shape, label=f"GDN lane rows {name}")
+            if tensor.dtype != dtype:
+                raise RuntimeError(f"GDN lane rows {name} must be {dtype}, got {tensor.dtype}")
+            self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HEAD_SHARDED, shard_dim=shard_dim)
+
+    def deallocate(self) -> None:
+        _deallocate(self.history, self.qkv, self.qkv_lanes, self.q, self.k, self.v, self.beta, self.g)
+
+
+@dataclass(frozen=True)
+class Qwen38TTNNRowsSelectorsLanes:
+    """Per-pass device selects of the lane commit, derived once from the per-lane accept counts and the active mask
+    and shared by every layer's commit.
+
+    ``c_u = (a_u + 1) * active_u`` committed rows per lane (``a_u = -1`` for a seeded, not yet verified lane, 0 for
+    an inactive one: the KEEP row).  ``committed_mask`` ``[1,B,32,1]`` FP32 = ``arange < c_u``; ``history_select``
+    ``[1,B,32,64]`` BF16 the stack row ``c_u`` per lane; ``commit_col`` / ``keep_col`` ``[B,1,1,1]`` FP32 = ``[c_u >= 1]``
+    and its complement (the exact per-lane state select of the commit: an inactive or freshly seeded lane keeps its
+    recurrent state bitwise); ``onehot_bf16[c]`` ``[B,1,1,1]`` BF16 = ``c_u == c`` for ``c = 0 .. R``
+    (the PLE lane commit's multiply/add select, the KEEP candidate at 0).
+    """
+
+    lanes: int
+    rows: int
+    committed_mask: Any
+    history_select: Any
+    commit_col: Any
+    keep_col: Any
+    onehot_bf16: tuple[Any, ...]
+
+    def validate(self, lanes: int, rows: int) -> None:
+        if (self.lanes, self.rows) != (lanes, rows) or len(self.onehot_bf16) != rows + 1:
+            raise ValueError(
+                f"lane selectors were built for {self.lanes} x {self.rows}, the path runs {lanes} x {rows}"
+            )
+        _require_shape(self.committed_mask, (1, lanes, CHUNK_SIZE, 1), label="lane committed rows mask")
+        _require_shape(self.history_select, (1, lanes, CHUNK_SIZE, CONV_WINDOW_TILE_ROWS), label="lane history select")
+        for name, tensor in (("commit_col", self.commit_col), ("keep_col", self.keep_col)):
+            _require_shape(tensor, (lanes, 1, 1, 1), label=f"lane selector {name}")
+            if tensor.dtype != ttnn.float32:
+                raise RuntimeError(f"lane selector {name} must be FP32, got {tensor.dtype}")
+        if self.committed_mask.dtype != ttnn.float32 or self.history_select.dtype != ttnn.bfloat16:
+            raise RuntimeError(
+                f"lane selector dtypes are {self.committed_mask.dtype} (mask) / {self.history_select.dtype} (select)"
+            )
+        for index, bf16 in enumerate(self.onehot_bf16):
+            _require_shape(bf16, (lanes, 1, 1, 1), label=f"lane selector onehot_bf16[{index}]")
+            if bf16.dtype != ttnn.bfloat16:
+                raise RuntimeError(f"lane selector onehot_bf16[{index}] dtype is {bf16.dtype}")
+
+    def deallocate(self) -> None:
+        _deallocate(self.committed_mask, self.history_select, self.commit_col, self.keep_col, *self.onehot_bf16)
+
+
+def build_rows_selectors_lanes(
+    accepted_lanes, active_lanes, constants: Qwen38TTNNGDNLaneRowsConstants
+) -> Qwen38TTNNRowsSelectorsLanes:
+    """Derive the lane commit selects from the per-lane accept counts and the active mask (both FP32 TILE
+    ``[1,B,1,1]``, replicated): ``rows + 8`` tiny ops per pass, not per layer.  Comparisons on fp32 integers are
+    exact; the history select is one row of the stack per lane (``onehot_row @ stack``, one nonzero term)."""
+
+    lanes, rows = constants.lanes, constants.rows
+    for name, tensor in (("accept counts", accepted_lanes), ("active mask", active_lanes)):
+        _require_shape(tensor, (1, lanes, 1, 1), label=f"lane {name}")
+        if tensor.dtype != ttnn.float32:
+            raise RuntimeError(f"lane {name} must be FP32, got {tensor.dtype}")
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    plus_one = ttnn.add(accepted_lanes, 1.0, memory_config=dram)
+    committed = ttnn.multiply(plus_one, active_lanes, memory_config=dram)
+    committed_mask = ttnn.lt(constants.arange, committed, memory_config=dram)
+    onehot_row = ttnn.eq(constants.arange_row, committed, dtype=ttnn.bfloat16, memory_config=dram)
+    _require_shape(onehot_row, (1, lanes, 1, CHUNK_SIZE), label="lane committed one-hot row")
+    select_flat = ttnn.matmul(
+        onehot_row,
+        constants.history_select_stack,
+        memory_config=dram,
+        compute_kernel_config=constants.select_compute_config,
+    )
+    _require_shape(select_flat, (1, lanes, 1, CHUNK_SIZE * CONV_WINDOW_TILE_ROWS), label="lane history select row")
+    history_select = ttnn.reshape(select_flat, (1, lanes, CHUNK_SIZE, CONV_WINDOW_TILE_ROWS))
+    # [1, B, 1, 1] -> [B, 1, 1, 1]: the same B one-element tiles, a metadata view.
+    committed_col = ttnn.experimental.view(committed, (lanes, 1, 1, 1))
+    commit_col = ttnn.ge(committed_col, 1.0, memory_config=dram)
+    keep_col = ttnn.rsub(commit_col, 1.0, memory_config=dram)
+    onehot_bf16 = tuple(
+        ttnn.eq(committed_col, float(count), dtype=ttnn.bfloat16, memory_config=dram) for count in range(rows + 1)
+    )
+    _deallocate(plus_one, onehot_row, select_flat, committed)  # ``committed_col`` is a view of ``committed``
+    selectors = Qwen38TTNNRowsSelectorsLanes(
+        lanes, rows, committed_mask, history_select, commit_col, keep_col, onehot_bf16
+    )
+    selectors.validate(lanes, rows)
+    return selectors
 
 
 @dataclass(frozen=True)
@@ -1247,6 +1657,8 @@ class Qwen38TTNNGDN:
         if state.mesh_contract != self.mesh_contract:
             raise ValueError("GDN state belongs to a different physical mesh contract")
         state.validate()
+        if state.batch_size != 1:
+            raise ValueError(f"the 1-row GDN decode body admits a batch-1 state, got batch {state.batch_size}")
 
     def _all_gather_hidden(self, hidden_sharded):
         _require_shape(hidden_sharded, (1, 1, 1, HIDDEN_SIZE_PER_DEVICE), label="GDN decode input")
@@ -1590,6 +2002,266 @@ class Qwen38TTNNGDN:
             _deallocate(*outputs)
         self.mesh_contract.validate_tensor(output, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         _require_shape(output, (1, 1, shape[2], HIDDEN_SIZE_PER_DEVICE), label="GDN prefill output")
+        return Qwen38TTNNGDNResult(output, state)
+
+    # ------------------------------------------------------------------ lanes path (batched decode)
+    #
+    # ``forward_decode_lanes`` is ``forward_decode`` on B lanes: the same ops on ``[1,1,B,*]`` rows (row u = lane
+    # u), the recurrent operands ``[B,12,1,128]`` (lane u's heads at batch index u) against the ``[B,12,128,128]``
+    # state, the ring slots ``[1,1,B,2560]`` under one shared phase (the residue rule: every resident lane's
+    # position is congruent to the slot mod 4).  Every op is per row / per (lane, head) tile or a batched matmul
+    # over (lane, head) with the 1-row program config (per_core_M = 1), so lane u is the 1-row path on user u's
+    # stream.  Lanes without a session replay harmlessly in their own rows; a lane joins through
+    # ``Qwen38TTNNGDNState.reset_lane_inplace`` at a step of its position's residue class.
+
+    def allocate_lane_state(self, lanes: int) -> Qwen38TTNNGDNState:
+        return Qwen38TTNNGDNState.allocate(
+            self.mesh_device, self.mesh_contract, layer_index=self.weights.layer_index, batch_size=lanes
+        )
+
+    def _validate_lane_state(self, state: Qwen38TTNNGDNState) -> int:
+        if state.layer_index != self.weights.layer_index:
+            raise ValueError(f"GDN layer {self.weights.layer_index} received state owned by layer {state.layer_index}")
+        if state.mesh_contract != self.mesh_contract:
+            raise ValueError("GDN state belongs to a different physical mesh contract")
+        state.validate()
+        return state.batch_size
+
+    def _all_gather_hidden_lanes(self, hidden_lanes, lanes: int):
+        _require_shape(hidden_lanes, (1, 1, lanes, HIDDEN_SIZE_PER_DEVICE), label="GDN lanes input")
+        self.mesh_contract.validate_tensor(hidden_lanes, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        full_hidden = ttnn.all_gather(
+            hidden_lanes,
+            dim=3,
+            cluster_axis=TP_AXIS,
+            memory_config=self.in_proj_act_memory_config,
+        )
+        self.mesh_contract.validate_tensor(full_hidden, placement=TensorPlacement.REPLICATED)
+        _require_shape(full_hidden, (1, 1, lanes, HIDDEN_SIZE), label="GDN lanes gathered hidden")
+        return full_hidden
+
+    def _project_lanes(self, full_hidden, newest, lanes: int):
+        """``_project`` on B rows; row u's q/k/v columns land in row u of ``newest``, the ring slot of this step."""
+
+        projected_ws = ttnn.linear(
+            full_hidden,
+            self.weights.qkvzab,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.in_proj_program_config,
+            compute_kernel_config=self.projection_compute_config,
+        )
+        projected = ttnn.to_memory_config(projected_ws, ttnn.L1_MEMORY_CONFIG)
+        _deallocate(projected_ws)
+        self.mesh_contract.validate_tensor(projected, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
+        _require_shape(projected, (1, 1, lanes, PROJECTION_WIDTH_PER_DEVICE), label="GDN lanes fused projection")
+        landed = ttnn.slice(projected, (0, 0, 0, 0), (1, 1, lanes, QKV_WIDTH_PER_DEVICE), output_tensor=newest)
+        _require_landed(landed, newest, label="GDN lanes ring slot write")
+        pieces = {}
+        for name, (start, end) in (
+            ("z", (QKV_WIDTH_PER_DEVICE, A_COLUMN)),
+            ("a", (A_COLUMN, A_COLUMN + VALUE_HEADS_PER_DEVICE)),
+            ("b", (B_COLUMN, B_COLUMN + VALUE_HEADS_PER_DEVICE)),
+        ):
+            piece = ttnn.slice(projected, (0, 0, 0, start), (1, 1, lanes, end), memory_config=ttnn.L1_MEMORY_CONFIG)
+            self.mesh_contract.validate_tensor(piece, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
+            _require_shape(piece, (1, 1, lanes, end - start), label=f"GDN lanes projected {name}")
+            pieces[name] = piece
+        _deallocate(projected)
+        return pieces["z"], pieces["a"], pieces["b"]
+
+    def _causal_conv_lanes(self, window, lanes: int):
+        # ``_causal_conv_decode`` row for row: the [1,1,1,2560] taps broadcast over the lane rows.
+        conv = ttnn.multiply(window[0], self.weights.conv_taps[0], memory_config=ttnn.L1_MEMORY_CONFIG)
+        for index in range(1, CONV_KERNEL_SIZE):
+            previous = conv
+            conv = ttnn.mac(window[index], self.weights.conv_taps[index], previous)
+            if _tensor_key(conv) != _tensor_key(previous):
+                _deallocate(previous)
+        conv = ttnn.silu(conv, memory_config=ttnn.L1_MEMORY_CONFIG)
+        self.mesh_contract.validate_tensor(conv, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
+        _require_shape(conv, (1, 1, lanes, QKV_WIDTH_PER_DEVICE), label="GDN lanes causal convolution")
+        return conv
+
+    def _make_recurrent_inputs_lanes(self, conv, a, b, lanes: int):
+        """``_make_recurrent_inputs`` on B rows: row u's heads become batch index u of the ``[B,H,1,128]`` operands
+        (the same head split per row, so lane u's tiles hold what the 1-row path's would)."""
+
+        l1 = ttnn.L1_MEMORY_CONFIG
+        q_slice = ttnn.slice(conv, (0, 0, 0, 0), (1, 1, lanes, QK_WIDTH_PER_DEVICE), memory_config=l1)
+        k_slice = ttnn.slice(
+            conv, (0, 0, 0, QK_WIDTH_PER_DEVICE), (1, 1, lanes, 2 * QK_WIDTH_PER_DEVICE), memory_config=l1
+        )
+        v_slice = ttnn.slice(
+            conv, (0, 0, 0, 2 * QK_WIDTH_PER_DEVICE), (1, 1, lanes, QKV_WIDTH_PER_DEVICE), memory_config=l1
+        )
+        _deallocate(conv)
+        q_heads = ttnn.reshape(q_slice, (lanes, QK_HEADS_PER_DEVICE, 1, HEAD_DIM))
+        k_heads = ttnn.reshape(k_slice, (lanes, QK_HEADS_PER_DEVICE, 1, HEAD_DIM), pad_value=0.0)
+        q = ttnn.repeat_interleave(q_heads, QK_REPEAT_FACTOR, dim=1, memory_config=l1)
+        k = ttnn.repeat_interleave(k_heads, QK_REPEAT_FACTOR, dim=1, memory_config=l1)
+        v = ttnn.reshape(v_slice, (lanes, VALUE_HEADS_PER_DEVICE, 1, HEAD_DIM))
+        for tensor, reference in ((q, q_slice), (k, k_slice), (v, v_slice)):
+            _retag_head_shard_after_reshape(tensor, reference=reference, shard_dim=1)
+        _deallocate(q_slice, k_slice, v_slice, q_heads, k_heads)
+        for name, tensor in (("query", q), ("key", k), ("value", v)):
+            self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HEAD_SHARDED, shard_dim=1)
+            _require_shape(tensor, (lanes, VALUE_HEADS_PER_DEVICE, 1, HEAD_DIM), label=f"GDN lanes recurrent {name}")
+
+        b_fp32 = ttnn.typecast(b, ttnn.float32, memory_config=l1)
+        beta_fp32 = ttnn.sigmoid(b_fp32, memory_config=l1)
+        beta = ttnn.reshape(beta_fp32, (lanes, VALUE_HEADS_PER_DEVICE, 1, 1), memory_config=l1)
+        _retag_head_shard_after_reshape(beta, reference=beta_fp32, shard_dim=1)
+        beta_producers = (b, b_fp32, beta_fp32)
+
+        a_fp32 = ttnn.typecast(a, ttnn.float32, memory_config=l1)
+        _deallocate(a)
+        softplus = softplus_gate(a_fp32, self.weights.dt_bias, memory_config=l1)
+        _deallocate(a_fp32)
+        log_decay_raw = ttnn.multiply(self.weights.neg_exp_A, softplus, memory_config=l1)
+        _deallocate(softplus)
+        log_decay = ttnn.reshape(log_decay_raw, (lanes, VALUE_HEADS_PER_DEVICE, 1, 1), memory_config=l1)
+        _retag_head_shard_after_reshape(log_decay, reference=log_decay_raw, shard_dim=1)
+        beta_producers = (*beta_producers, log_decay_raw)
+        for name, tensor in (("beta", beta), ("log_decay", log_decay)):
+            self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HEAD_SHARDED, shard_dim=1)
+            _require_shape(tensor, (lanes, VALUE_HEADS_PER_DEVICE, 1, 1), label=f"GDN lanes recurrent {name}")
+        if log_decay.dtype != ttnn.float32:
+            raise RuntimeError(f"GDN lanes log decay must be FP32, got {log_decay.dtype}")
+        return q, k, v, beta, log_decay, beta_producers
+
+    def _recurrent_decode_lanes(self, q, k, v, beta, log_decay, beta_producers, state: Qwen38TTNNGDNState, lanes: int):
+        """``_recurrent_decode`` with (lane, head) as the batch: the same FP32 step per (u, h) tile into
+        ``state.recurrent[u]``; the matmuls keep the 1-row program config (one output tile per core)."""
+
+        l1 = ttnn.L1_MEMORY_CONFIG
+        q_normed = ttnn.rms_norm(q, epsilon=QK_L2_NORM_EPS / HEAD_DIM)
+        q_unit = ttnn.multiply(q_normed, HEAD_DIM**-0.5, memory_config=l1)
+        k_normed = ttnn.rms_norm(k, epsilon=QK_L2_NORM_EPS / HEAD_DIM)
+        k_unit = ttnn.multiply(k_normed, HEAD_DIM**-0.5, memory_config=l1)
+        _deallocate(q, k, q_normed, k_normed)
+        q_fp32 = ttnn.typecast(q_unit, ttnn.float32, memory_config=l1)
+        k_row = ttnn.typecast(k_unit, ttnn.float32, memory_config=l1)
+        _deallocate(q_unit, k_unit)
+        q_row = ttnn.multiply(q_fp32, HEAD_DIM**-0.5, memory_config=l1)
+        _deallocate(q_fp32)
+
+        decayed = ttnn.multiply(
+            state.recurrent,
+            log_decay,
+            input_tensor_b_activations=[ttnn.UnaryOpType.EXP],
+            memory_config=l1,
+        )
+        v_read = ttnn.matmul(
+            k_row,
+            decayed,
+            memory_config=l1,
+            program_config=self.recurrent_matmul_program_config,
+            compute_kernel_config=self.recurrent_read_compute_config,
+        )
+        delta = ttnn.subtract(v, v_read, dtype=ttnn.float32, memory_config=l1)
+        _deallocate(v, v_read)
+        k_col = ttnn.transpose(k_row, 2, 3, memory_config=l1)
+        _deallocate(k_row)
+        outer = ttnn.matmul(
+            k_col,
+            delta,
+            memory_config=l1,
+            compute_kernel_config=self.recurrent_write_compute_config,
+        )
+        _deallocate(k_col, delta)
+        update = ttnn.multiply(outer, beta, memory_config=l1)
+        _deallocate(outer)
+        new_recurrent = ttnn.add(decayed, update, output_tensor=state.recurrent)
+        _deallocate(decayed, update, beta, log_decay, *beta_producers)
+        _require_landed(new_recurrent, state.recurrent, label="GDN lanes recurrent update")
+        _require_shape(
+            state.recurrent, (lanes, VALUE_HEADS_PER_DEVICE, HEAD_DIM, HEAD_DIM), label="GDN lanes next recurrent state"
+        )
+        if state.recurrent.dtype != ttnn.float32:
+            raise RuntimeError(f"GDN lanes next recurrent state must be FP32, got {state.recurrent.dtype}")
+
+        output = ttnn.matmul(
+            q_row,
+            state.recurrent,
+            memory_config=l1,
+            program_config=self.recurrent_matmul_program_config,
+            compute_kernel_config=self.recurrent_read_compute_config,
+        )
+        _deallocate(q_row)
+        _require_shape(output, (lanes, VALUE_HEADS_PER_DEVICE, 1, HEAD_DIM), label="GDN lanes recurrent output")
+        return output
+
+    def _gate_and_project_lanes(self, recurrent_output, z, full_hidden, lanes: int):
+        """``_gate_and_project`` on B rows: lane u's heads fold back to row u of the ``[1,1,B,1536]`` gate input."""
+
+        l1 = ttnn.L1_MEMORY_CONFIG
+        output_bf16 = (
+            recurrent_output
+            if recurrent_output.dtype == ttnn.bfloat16
+            else ttnn.typecast(recurrent_output, ttnn.bfloat16, memory_config=l1)
+        )
+        if output_bf16 is not recurrent_output:
+            _deallocate(recurrent_output)
+        normalized_heads = ttnn.rms_norm(output_bf16, weight=self.weights.norm, epsilon=RMS_NORM_EPS, memory_config=l1)
+        _deallocate(output_bf16)
+        normalized = ttnn.reshape(normalized_heads, (1, 1, lanes, VALUE_WIDTH_PER_DEVICE))
+        _retag_head_shard_after_reshape(normalized, reference=normalized_heads, shard_dim=3)
+        _deallocate(normalized_heads)
+        self.mesh_contract.validate_tensor(normalized, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
+        _require_shape(normalized, (1, 1, lanes, VALUE_WIDTH_PER_DEVICE), label="GDN lanes normalized output")
+
+        z_fp32 = ttnn.typecast(z, ttnn.float32, memory_config=l1)
+        _deallocate(z)
+        sigmoid_fp32 = ttnn.sigmoid(z_fp32, memory_config=l1)
+        _deallocate(z_fp32)
+        sigmoid_bf16 = ttnn.typecast(sigmoid_fp32, ttnn.bfloat16, memory_config=l1)
+        _deallocate(sigmoid_fp32)
+        gated = ttnn.multiply(normalized, sigmoid_bf16, memory_config=self.out_proj_act_memory_config)
+        _deallocate(normalized, sigmoid_bf16)
+        self.mesh_contract.validate_tensor(gated, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
+        _require_shape(gated, (1, 1, lanes, VALUE_WIDTH_PER_DEVICE), label="GDN lanes sigmoid-gated output")
+
+        partial_ws = ttnn.linear(
+            gated,
+            self.weights.out,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.out_proj_program_config,
+            compute_kernel_config=self.projection_compute_config,
+        )
+        _deallocate(gated)
+        self.mesh_contract.mark_local_partial(
+            partial_ws, replicated_reference=full_hidden, expected_shape=(1, 1, lanes, HIDDEN_SIZE)
+        )
+        output = ttnn.reduce_scatter(
+            partial_ws,
+            dim=3,
+            cluster_axis=TP_AXIS,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            topology=self.collective_topology,
+        )
+        _deallocate(partial_ws)
+        self.mesh_contract.mark_collective_shard(
+            output,
+            replicated_reference=full_hidden,
+            shard_dim=3,
+            expected_local_shape=(1, 1, lanes, HIDDEN_SIZE_PER_DEVICE),
+        )
+        _deallocate(full_hidden)
+        return output
+
+    def forward_decode_lanes(self, hidden_lanes, state: Qwen38TTNNGDNState) -> Qwen38TTNNGDNResult:
+        """Advance one token per lane (``hidden_lanes`` ``[1,1,B,640]``, row u = lane u) and mutate ``state`` in
+        place; the ring phase advances once for every lane.  Returns the ``[1,1,B,640]`` hidden-sharded rows."""
+
+        lanes = self._validate_lane_state(state)
+        full_hidden = self._all_gather_hidden_lanes(hidden_lanes, lanes)
+        window = state.conv_window()
+        z, a, b = self._project_lanes(full_hidden, window[-1], lanes)
+        state.advance_conv_window()
+        conv = self._causal_conv_lanes(window, lanes)
+        q, k, v, beta, log_decay, beta_producers = self._make_recurrent_inputs_lanes(conv, a, b, lanes)
+        recurrent_output = self._recurrent_decode_lanes(q, k, v, beta, log_decay, beta_producers, state, lanes)
+        output = self._gate_and_project_lanes(recurrent_output, z, full_hidden, lanes)
         return Qwen38TTNNGDNResult(output, state)
 
     # ------------------------------------------------------------------ rows path (MTP v2 verify)
@@ -2420,6 +3092,313 @@ class Qwen38TTNNGDN:
                 output_tensor=rows_state.history,
             )
             _deallocate(window)
+        state.validate()
+
+    # ------------------------------------------------------------------ lane rows path (MTP lanes verify)
+
+    def allocate_lane_rows_constants(self, lanes: int, rows: int) -> Qwen38TTNNGDNLaneRowsConstants:
+        return Qwen38TTNNGDNLaneRowsConstants.allocate(self.mesh_device, self.mesh_contract, lanes=lanes, rows=rows)
+
+    def allocate_lane_rows_state(
+        self, constants: Qwen38TTNNGDNRowsConstants, lane_constants: Qwen38TTNNGDNLaneRowsConstants
+    ) -> Qwen38TTNNGDNLaneRowsState:
+        return Qwen38TTNNGDNLaneRowsState.allocate(
+            self.mesh_device, self.mesh_contract, constants, lane_constants, layer_index=self.weights.layer_index
+        )
+
+    def _validate_lane_rows_state(self, rows_state: Qwen38TTNNGDNLaneRowsState, state: Qwen38TTNNGDNState) -> int:
+        if rows_state.layer_index != self.weights.layer_index:
+            raise ValueError(
+                f"GDN layer {self.weights.layer_index} received lane rows state owned by layer {rows_state.layer_index}"
+            )
+        if rows_state.mesh_contract != self.mesh_contract:
+            raise ValueError("GDN lane rows state belongs to a different physical mesh contract")
+        rows_state.validate()
+        if self._validate_lane_state(state) != rows_state.lanes:
+            raise ValueError(f"GDN lane state has {state.batch_size} lanes, the lane rows state {rows_state.lanes}")
+        return rows_state.constants.rows
+
+    def _qkv_lanes_view(self, rows_state: Qwen38TTNNGDNLaneRowsState):
+        """``qkv_lanes`` ``[1,1,B*32,2560]`` as the batched ops read it, ``[1,B,32,2560]``: whole tiles, the same
+        pages (never released on its own: the state owns the buffer)."""
+
+        view = ttnn.experimental.view(rows_state.qkv_lanes, (1, rows_state.lanes, CHUNK_SIZE, QKV_WIDTH_PER_DEVICE))
+        _retag_head_shard_after_reshape(view, reference=rows_state.qkv, shard_dim=3)
+        return view
+
+    def _expand_lane_rows(self, piece, rows_state: Qwen38TTNNGDNLaneRowsState):
+        """``expand_select @ piece``: the lane-major ``[1,1,32,W]`` rows as ``[1,B,32,W]`` per-lane tiles (rows
+        ``R .. 31`` of every lane exact zeros); ``piece`` is consumed."""
+
+        width = _shape(piece)[3]
+        expanded = ttnn.matmul(
+            rows_state.lane_constants.expand_select,
+            piece,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            compute_kernel_config=self.compute_config,
+        )
+        _deallocate(piece)
+        _require_shape(expanded, (1, 1, rows_state.lanes * CHUNK_SIZE, width), label="GDN lane rows expand")
+        lanes = ttnn.experimental.view(expanded, (1, rows_state.lanes, CHUNK_SIZE, width))
+        _retag_head_shard_after_reshape(lanes, reference=rows_state.qkv, shard_dim=3)
+        return lanes
+
+    def _lane_conv_window(self, rows_state: Qwen38TTNNGDNLaneRowsState):
+        """``[history | qkv_lanes]`` per lane: ``[1,B,64,2560]``, whole tiles on dim 2."""
+
+        window = ttnn.concat(
+            [rows_state.history, self._qkv_lanes_view(rows_state)], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+        _retag_head_shard_after_reshape(window, reference=rows_state.qkv, shard_dim=3)
+        _require_shape(
+            window,
+            (1, rows_state.lanes, CONV_WINDOW_TILE_ROWS, QKV_WIDTH_PER_DEVICE),
+            label="GDN lane rows conv window",
+        )
+        return window
+
+    def _causal_conv_rows_lanes(self, rows_state: Qwen38TTNNGDNLaneRowsState):
+        """The rows path's FIR on every lane's own tile: the three tap selects as equal-batch matmuls over the
+        per-lane windows, tap 3 the lane's new rows; the same tap arithmetic as ``_causal_conv_rows``."""
+
+        l1 = ttnn.L1_MEMORY_CONFIG
+        window = self._lane_conv_window(rows_state)
+        pieces = [
+            ttnn.matmul(select, window, memory_config=l1, compute_kernel_config=self.compute_config)
+            for select in rows_state.lane_constants.conv_taps
+        ]
+        _deallocate(window)
+        pieces.append(self._qkv_lanes_view(rows_state))
+        conv = ttnn.multiply(pieces[0], self.weights.conv_taps[0], memory_config=l1)
+        for index in range(1, CONV_KERNEL_SIZE):
+            previous = conv
+            conv = ttnn.mac(pieces[index], self.weights.conv_taps[index], previous)
+            if _tensor_key(conv) != _tensor_key(previous):
+                _deallocate(previous)
+        _deallocate(*pieces[:CONV_HISTORY_ROWS])
+        conv = ttnn.silu(conv, memory_config=l1)
+        _retag_head_shard_after_reshape(conv, reference=rows_state.qkv, shard_dim=3)
+        _require_shape(
+            conv, (1, rows_state.lanes, CHUNK_SIZE, QKV_WIDTH_PER_DEVICE), label="GDN lane rows causal convolution"
+        )
+        return conv
+
+    def _make_chunk_inputs_lanes(self, conv, a_lanes, b_lanes, rows_state: Qwen38TTNNGDNLaneRowsState) -> None:
+        """``_make_chunk_inputs`` on the per-lane tiles: the kernel's q / k ``[B,32,12,128]``, flat v, beta and log
+        decay land in the persistent lane buffers with every lane's rows past ``R`` zeroed by the lane row masks."""
+
+        l1 = ttnn.L1_MEMORY_CONFIG
+        constants, lane_constants, lanes = rows_state.constants, rows_state.lane_constants, rows_state.lanes
+        q_slice = ttnn.slice(conv, (0, 0, 0, 0), (1, lanes, CHUNK_SIZE, QK_WIDTH_PER_DEVICE), memory_config=l1)
+        k_slice = ttnn.slice(
+            conv, (0, 0, 0, QK_WIDTH_PER_DEVICE), (1, lanes, CHUNK_SIZE, 2 * QK_WIDTH_PER_DEVICE), memory_config=l1
+        )
+        v_slice = ttnn.slice(
+            conv, (0, 0, 0, 2 * QK_WIDTH_PER_DEVICE), (1, lanes, CHUNK_SIZE, QKV_WIDTH_PER_DEVICE), memory_config=l1
+        )
+        _deallocate(conv)
+        for name, source, target in (("query", q_slice, rows_state.q), ("key", k_slice, rows_state.k)):
+            expanded = ttnn.matmul(
+                source, constants.qk_expand, memory_config=l1, compute_kernel_config=self.compute_config
+            )
+            _retag_head_shard_after_reshape(expanded, reference=source, shard_dim=3)
+            _require_shape(expanded, (1, lanes, CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE), label=f"GDN lane rows {name}")
+            _deallocate(source)
+            heads_tensor = ttnn.reshape(expanded, (lanes, CHUNK_SIZE, VALUE_HEADS_PER_DEVICE, HEAD_DIM), pad_value=0.0)
+            _retag_head_shard_after_reshape(heads_tensor, reference=expanded, shard_dim=2)
+            _deallocate(expanded)
+            normed = ttnn.rms_norm(heads_tensor, epsilon=QK_L2_NORM_EPS / HEAD_DIM)
+            _deallocate(heads_tensor)
+            unit = ttnn.multiply(normed, HEAD_DIM**-0.5, memory_config=l1)
+            landed = ttnn.multiply(unit, lane_constants.row_mask_bf16, output_tensor=target)
+            _require_landed(landed, target, label=f"GDN lane rows {name}")
+            _deallocate(unit, normed)
+        landed = ttnn.multiply(v_slice, lane_constants.row_mask_bf16_col, output_tensor=rows_state.v)
+        _require_landed(landed, rows_state.v, label="GDN lane rows value")
+        _deallocate(v_slice)
+
+        b_fp32 = ttnn.typecast(b_lanes, ttnn.float32, memory_config=l1)
+        _deallocate(b_lanes)
+        beta_fp32 = ttnn.sigmoid(b_fp32, memory_config=l1)
+        landed = ttnn.multiply(beta_fp32, lane_constants.row_mask_fp32, output_tensor=rows_state.beta)
+        _require_landed(landed, rows_state.beta, label="GDN lane rows beta")
+        _deallocate(b_fp32, beta_fp32)
+
+        a_fp32 = ttnn.typecast(a_lanes, ttnn.float32, memory_config=l1)
+        _deallocate(a_lanes)
+        softplus = softplus_gate(a_fp32, self.weights.dt_bias, memory_config=l1)
+        _deallocate(a_fp32)
+        log_decay = ttnn.multiply(self.weights.neg_exp_A, softplus, memory_config=l1)
+        landed = ttnn.multiply(log_decay, lane_constants.row_mask_fp32, output_tensor=rows_state.g)
+        _require_landed(landed, rows_state.g, label="GDN lane rows log decay")
+        _deallocate(softplus, log_decay)
+        rows_state.validate()
+
+    def _chunk_rows_lanes(self, rows_state: Qwen38TTNNGDNLaneRowsState, initial_state, committed_mask=None):
+        """ONE ``chunk_gated_delta_rule`` call over the B lanes from ``initial_state`` ``[B,12,128,128]`` (read only):
+        head-major output ``[B*12,32,128]`` and the FP32 final states ``[B,12,128,128]`` in a new buffer; with
+        ``committed_mask`` ``[1,B,32,1]`` beta and g of the rows past each lane's committed prefix are zeroed first."""
+
+        lanes, constants = rows_state.lanes, rows_state.constants
+        if committed_mask is None:
+            beta, g, masked = rows_state.beta, rows_state.g, ()
+        else:
+            beta = ttnn.multiply(rows_state.beta, committed_mask, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            g = ttnn.multiply(rows_state.g, committed_mask, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            masked = (beta, g)
+        # [1, B, T, HV] -> [B, T, HV] and [1, B, T, HV * V] -> [B, T, HV * V]: the tile grid is unchanged, views.
+        beta_rows = ttnn.reshape(beta, (lanes, CHUNK_SIZE, VALUE_HEADS_PER_DEVICE))
+        g_rows = ttnn.reshape(g, (lanes, CHUNK_SIZE, VALUE_HEADS_PER_DEVICE))
+        v_rows = ttnn.reshape(rows_state.v, (lanes, CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE))
+        output, final_state = ttnn.transformer.chunk_gated_delta_rule(
+            rows_state.q,
+            rows_state.k,
+            v_rows,
+            g_rows,
+            beta_rows,
+            scale=HEAD_DIM**-0.5,
+            initial_state=initial_state,
+            output_final_state=True,
+            chunk_size=CHUNK_SIZE,
+            output_head_major=True,
+            eye=constants.eye,
+            tril=constants.tril,
+            ones=constants.ones,
+            masks=constants.masks,
+        )
+        _deallocate(*masked)
+        if final_state is None:
+            raise RuntimeError("chunk_gated_delta_rule returned no final state")
+        _retag_head_shard_after_reshape(final_state, reference=initial_state, shard_dim=1)
+        _require_shape(
+            final_state, (lanes, VALUE_HEADS_PER_DEVICE, HEAD_DIM, HEAD_DIM), label="GDN lane rows final state"
+        )
+        if final_state.dtype != ttnn.float32:
+            raise RuntimeError(f"GDN lane rows final state must be FP32, got {final_state.dtype}")
+        _retag_head_shard_after_reshape(output, reference=rows_state.v, shard_dim=0)
+        _require_shape(
+            output, (lanes * VALUE_HEADS_PER_DEVICE, CHUNK_SIZE, HEAD_DIM), label="GDN lane rows recurrent output"
+        )
+        if output.dtype not in (ttnn.bfloat16, ttnn.float32) or output.layout != ttnn.TILE_LAYOUT:
+            raise RuntimeError(
+                f"GDN lane rows recurrent output must be BF16 or FP32 TILE, got {output.dtype} {output.layout}"
+            )
+        return output, final_state
+
+    def _gate_and_project_rows_lanes(self, recurrent_output, z, full_hidden, rows_state: Qwen38TTNNGDNLaneRowsState):
+        """``_gate_and_project_rows`` on the per-lane head-major output: the per-head RMS norm on ``[B,12,32,128]``,
+        the fold view ``[1,1,B*32,1536]`` (tile ``(b, h, c)`` sits at ``b*48 + 4h + c`` in both layouts), the
+        ``fold_select`` back to the lane-major tile, the gate and the one-tile output projection.  Returns the
+        ``[1,1,32,640]`` reduce-scatter output (rows past ``B*R`` exact zeros) in a new buffer."""
+
+        lanes = rows_state.lanes
+        l1 = ttnn.L1_MEMORY_CONFIG
+        head_rows = ttnn.reshape(recurrent_output, (lanes, VALUE_HEADS_PER_DEVICE, CHUNK_SIZE, HEAD_DIM))
+        _retag_head_shard_after_reshape(head_rows, reference=z, shard_dim=1)
+        head_rows_bf16 = ttnn.typecast(head_rows, ttnn.bfloat16, memory_config=l1)
+        _deallocate(recurrent_output)
+        _retag_head_shard_after_reshape(head_rows_bf16, reference=z, shard_dim=1)
+        normalized_heads = ttnn.rms_norm(
+            head_rows_bf16, weight=self.weights.norm, epsilon=RMS_NORM_EPS, memory_config=l1
+        )
+        _deallocate(head_rows_bf16)
+        _require_shape(
+            normalized_heads,
+            (lanes, VALUE_HEADS_PER_DEVICE, CHUNK_SIZE, HEAD_DIM),
+            label="GDN lane rows normalized heads",
+        )
+        z_fp32 = ttnn.typecast(z, ttnn.float32, memory_config=l1)
+        _deallocate(z)
+        sigmoid_fp32 = ttnn.sigmoid(z_fp32, memory_config=l1)
+        _deallocate(z_fp32)
+        sigmoid_bf16 = ttnn.typecast(sigmoid_fp32, ttnn.bfloat16, memory_config=l1)
+        _deallocate(sigmoid_fp32)
+        flat = ttnn.experimental.view(normalized_heads, (1, 1, lanes * CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE))
+        _retag_head_shard_after_reshape(flat, reference=z, shard_dim=3)
+        normalized = ttnn.matmul(
+            rows_state.lane_constants.fold_select, flat, memory_config=l1, compute_kernel_config=self.compute_config
+        )
+        _deallocate(normalized_heads)  # the fold view shares its buffer
+        _retag_head_shard_after_reshape(normalized, reference=z, shard_dim=3)
+        self.mesh_contract.validate_tensor(normalized, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
+        _require_shape(normalized, (1, 1, CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE), label="GDN lane rows folded output")
+        gated = ttnn.multiply(normalized, sigmoid_bf16, memory_config=self.out_proj_act_memory_config)
+        _deallocate(normalized, sigmoid_bf16)
+        self.mesh_contract.validate_tensor(gated, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
+        _require_shape(gated, (1, 1, CHUNK_SIZE, VALUE_WIDTH_PER_DEVICE), label="GDN lane rows gated output")
+        output = self._out_proj_tile(gated, full_hidden)
+        _deallocate(full_hidden)
+        _require_shape(output, (1, 1, CHUNK_SIZE, HIDDEN_SIZE_PER_DEVICE), label="GDN lane rows output tile")
+        self.mesh_contract.validate_tensor(output, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        return output
+
+    def forward_rows_lanes(
+        self, hidden_rows, state: Qwen38TTNNGDNState, rows_state: Qwen38TTNNGDNLaneRowsState
+    ) -> Qwen38TTNNGDNRowsResult:
+        """Run R consecutive positions of every lane from the lanes' committed states without committing anything.
+
+        ``hidden_rows`` is the lane-major ``[1,1,32,640]`` tile (row ``u*R + j`` = lane u's row j, rows past ``B*R``
+        zero); ``state.recurrent`` ``[B,12,128,128]`` is read only.  The result's ``hidden_rows`` is the whole
+        ``[1,1,32,640]`` output tile in a new buffer (rows past ``B*R`` exact zeros) and ``final_state`` the lanes'
+        states after all rows, a new buffer the caller deallocates.
+        """
+
+        rows = self._validate_lane_rows_state(rows_state, state)
+        full_hidden = self._all_gather_rows(hidden_rows, rows)
+        z, a, b = self._project_rows(full_hidden, rows_state)
+        self._select_rows(
+            rows_state.lane_constants.expand_select,
+            rows_state.qkv,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            label="GDN lane rows expand",
+            output_tensor=rows_state.qkv_lanes,
+        )
+        a_lanes = self._expand_lane_rows(a, rows_state)
+        b_lanes = self._expand_lane_rows(b, rows_state)
+        conv = self._causal_conv_rows_lanes(rows_state)
+        self._make_chunk_inputs_lanes(conv, a_lanes, b_lanes, rows_state)
+        recurrent_output, final_state = self._chunk_rows_lanes(rows_state, initial_state=state.recurrent)
+        output = self._gate_and_project_rows_lanes(recurrent_output, z, full_hidden, rows_state)
+        return Qwen38TTNNGDNRowsResult(output, final_state, state, rows_state)
+
+    def commit_rows_lanes(
+        self,
+        state: Qwen38TTNNGDNState,
+        rows_state: Qwen38TTNNGDNLaneRowsState,
+        selectors: Qwen38TTNNRowsSelectorsLanes,
+    ) -> None:
+        """Commit ``c_u`` rows of the last ``forward_rows_lanes`` pass into lane u's state in place.
+
+        The catch-up reruns the batched kernel from the committed states with every lane's beta and g masked past
+        its committed prefix; the final states land in ``state.recurrent`` through the exact fp32 0/1 select
+        ``recurrent * [c_u == 0] + final * [c_u >= 1]`` (a lane committing nothing -- inactive, or seeded and not yet
+        verified -- keeps its recurrent bitwise: the masked rerun is an identity only to TF32 precision), and every
+        lane's FIR history moves forward by ``c_u``
+        rows with one equal-batch 0/1 selection matmul (the KEEP row copies an inactive lane's history unchanged).
+        """
+
+        rows = self._validate_lane_rows_state(rows_state, state)
+        selectors.validate(rows_state.lanes, rows)
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        output, final_state = self._chunk_rows_lanes(
+            rows_state, initial_state=state.recurrent, committed_mask=selectors.committed_mask
+        )
+        _deallocate(output)
+        kept = ttnn.multiply(state.recurrent, selectors.keep_col, memory_config=dram)
+        taken = ttnn.multiply(final_state, selectors.commit_col, memory_config=dram)
+        landed = ttnn.add(kept, taken, output_tensor=state.recurrent)
+        _require_landed(landed, state.recurrent, label="GDN lane rows committed states")
+        _deallocate(kept, taken, final_state)
+        window = self._lane_conv_window(rows_state)
+        landed = ttnn.matmul(
+            selectors.history_select,
+            window,
+            memory_config=dram,
+            compute_kernel_config=self.compute_config,
+            optional_output_tensor=rows_state.history,
+        )
+        _require_landed(landed, rows_state.history, label="GDN lane rows history select")
+        _deallocate(window)
         state.validate()
 
 

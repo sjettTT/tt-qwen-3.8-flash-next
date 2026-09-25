@@ -124,7 +124,7 @@ BUILDER_FORMAT_VERSION = 1
 # configuration).  RESIDENT_MAX_QSA_CACHE_CAPACITY keeps the default's historical name: demo/production.py and the
 # 32k pins read it.
 RESIDENT_DEFAULT_QSA_CACHE_CAPACITY = 32_768
-RESIDENT_QSA_CACHE_CAPACITIES = (RESIDENT_DEFAULT_QSA_CACHE_CAPACITY, 65_536, 131_072, 262_144)
+RESIDENT_QSA_CACHE_CAPACITIES = (8_192, RESIDENT_DEFAULT_QSA_CACHE_CAPACITY, 65_536, 131_072, 262_144)
 RESIDENT_MAX_QSA_CACHE_CAPACITY = RESIDENT_DEFAULT_QSA_CACHE_CAPACITY
 # Admission bucket of the resident build per device beyond the 49 BF4 expert pairs at the default context: the
 # non-expert weights, the persistent state, model I/O, allocator padding, transient output and MoE workspace.

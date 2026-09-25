@@ -38,9 +38,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     Qwen38MeshContract,
     TensorPlacement,
     replicate_tensor_2d_mesh_mapper,
+    require_lane_count,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
-from models.demos.blackhole.qwen38_flash_next.ttnn.gdn import Qwen38TTNNRowsSelectors
+from models.demos.blackhole.qwen38_flash_next.ttnn.gdn import Qwen38TTNNRowsSelectors, Qwen38TTNNRowsSelectorsLanes
 
 TP_AXIS = 1
 TP_SIZE = 4
@@ -537,6 +538,194 @@ class Qwen38TTNNPLERowsResult:
     rows_state: Qwen38TTNNPLERowsState
 
 
+@dataclass
+class Qwen38TTNNPLELaneRowsState:
+    """The rows state (:class:`Qwen38TTNNPLERowsState`) of B lanes, the MTP lanes verify: ``history`` ``[B,9,4,640]``
+    holds lane u's CONV_STATE_LENGTH normalized rows before its first new row, ``normalized`` ``[B,R,4,640]`` lane u's
+    conv input rows of this pass (kept for the commit's history select), one host n-gram context per lane.  Fixed
+    addresses; every op of the lane rows body is per row or per element, so lane u is the rows path on its stream."""
+
+    lanes: int
+    rows: int
+    history: Any
+    normalized: Any
+    mesh_contract: Qwen38MeshContract
+    token_contexts: tuple[tuple[int, int] | None, ...]
+
+    @classmethod
+    def allocate(
+        cls, mesh_device, mesh_contract: Qwen38MeshContract, *, lanes: int, rows: int
+    ) -> "Qwen38TTNNPLELaneRowsState":
+        mesh_contract.validate_mesh(mesh_device)
+        lanes = require_lane_count(lanes, label="PLE lane rows lanes")
+        if not 1 <= rows <= ttnn.TILE_SIZE or lanes * rows > ttnn.TILE_SIZE:
+            raise ValueError(f"PLE lane rows admit B x R <= {ttnn.TILE_SIZE} rows in one tile, got {lanes} x {rows}")
+        mapper = ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3))
+
+        def upload_zero(token_rows: int):
+            return ttnn.from_torch(
+                torch.zeros((lanes, token_rows, RESIDUAL_BRANCHES, HIDDEN_SIZE), dtype=torch.bfloat16),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=mesh_device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=mapper,
+            )
+
+        history = upload_zero(CONV_STATE_LENGTH)
+        try:
+            state = cls(lanes, rows, history, upload_zero(rows), mesh_contract, (None,) * lanes)
+            state.validate()
+            return state
+        except BaseException:
+            _deallocate(history)
+            raise
+
+    def validate(self) -> None:
+        lanes = require_lane_count(self.lanes, label="PLE lane rows lanes", error_type=RuntimeError)
+        for name, tensor, token_rows in (
+            ("history", self.history, CONV_STATE_LENGTH),
+            ("normalized", self.normalized, self.rows),
+        ):
+            expected = (lanes, token_rows, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE)
+            if _shape(tensor) != expected or tensor.dtype != ttnn.bfloat16:
+                raise RuntimeError(f"PLE lane rows {name} must be BF16 {expected}, got {tensor.dtype} {_shape(tensor)}")
+            self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        if _tensor_key(self.history) == _tensor_key(self.normalized):
+            raise RuntimeError("PLE lane rows history and normalized rows must be distinct buffers")
+        self.token_contexts = _validate_lane_contexts(self.token_contexts, lanes, label="PLE lane rows token contexts")
+
+    def deallocate(self) -> None:
+        _deallocate(self.history, self.normalized)
+
+
+def _lanes_residual_shape(lanes: int) -> tuple[int, int, int, int]:
+    return (1, lanes, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE)
+
+
+def _validate_lane_contexts(contexts, lanes: int, *, label: str) -> tuple[tuple[int, int] | None, ...]:
+    values = tuple(contexts)
+    if len(values) != lanes:
+        raise ValueError(f"{label} needs one n-gram context per lane: got {len(values)}, expected {lanes}")
+    for lane, context in enumerate(values):
+        if context is not None and (
+            len(context) != NGRAM_SIZE - 1
+            or any(isinstance(value, bool) or type(value) is not int for value in context)
+        ):
+            raise ValueError(f"{label} lane {lane} must be {NGRAM_SIZE - 1} ints or None, got {context!r}")
+    return values
+
+
+@dataclass
+class Qwen38TTNNPLELanesState:
+    """The 1-row PLE state over ``lanes`` users: nine fixed-address conv slots of token-major ``[1,lanes,4,640]``
+    (lane u = dim-1 index u, each lane its own nine-row dilated history, shifted per step exactly as the 1-row
+    ring) and one host n-gram context per lane.  Lanes are independent: every op of the lanes body is per row or
+    per element, so lane u is the 1-row path on user u's stream."""
+
+    lanes: int
+    conv: tuple[Any, ...]
+    zero_conv: Any
+    mesh_contract: Qwen38MeshContract
+    token_contexts: tuple[tuple[int, int] | None, ...]
+
+    @classmethod
+    def allocate(cls, mesh_device, mesh_contract: Qwen38MeshContract, *, lanes: int) -> "Qwen38TTNNPLELanesState":
+        mesh_contract.validate_mesh(mesh_device)
+        lanes = require_lane_count(lanes, label="PLE lanes")
+        mapper = ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3))
+        host = torch.zeros((1, lanes, RESIDUAL_BRANCHES, HIDDEN_SIZE), dtype=torch.bfloat16)
+
+        def upload_zero():
+            return ttnn.from_torch(
+                host,
+                dtype=ttnn.bfloat16,
+                layout=ttnn.TILE_LAYOUT,
+                device=mesh_device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=mapper,
+            )
+
+        state = cls(
+            lanes, tuple(upload_zero() for _ in range(CONV_STATE_LENGTH)), upload_zero(), mesh_contract, (None,) * lanes
+        )
+        state.validate()
+        return state
+
+    def validate(self) -> None:
+        lanes = require_lane_count(self.lanes, label="PLE lanes", error_type=RuntimeError)
+        if len(self.conv) != CONV_STATE_LENGTH:
+            raise RuntimeError(f"PLE lanes conv state holds {len(self.conv)} slots, expected {CONV_STATE_LENGTH}")
+        expected = _lanes_residual_shape(lanes)
+        for index, tensor in enumerate((*self.conv, self.zero_conv)):
+            if _shape(tensor) != expected or tensor.dtype != ttnn.bfloat16:
+                raise RuntimeError(
+                    f"PLE lanes slot {index} must be BF16 {expected}, got {tensor.dtype} {_shape(tensor)}"
+                )
+            self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        if len({_tensor_key(tensor) for tensor in (*self.conv, self.zero_conv)}) != CONV_STATE_LENGTH + 1:
+            raise RuntimeError("PLE lanes slots must be distinct buffers")
+        self.token_contexts = _validate_lane_contexts(self.token_contexts, lanes, label="PLE lanes token contexts")
+
+    def reset_inplace(self) -> None:
+        self.validate()
+        for index, tensor in enumerate(self.conv):
+            _copy_inplace(self.zero_conv, tensor, label=f"PLE lanes conv[{index}] reset")
+        self.token_contexts = (None,) * self.lanes
+
+    def reset_lane_inplace(self, lane: int) -> None:
+        """Zero lane ``lane`` of every slot (a keep-mask multiply, the other lanes x 1.0) and clear its context, no
+        address change.  Eager host upload: a lifecycle op between steps, never traced."""
+
+        self.validate()
+        if isinstance(lane, bool) or type(lane) is not int or not 0 <= lane < self.lanes:
+            raise ValueError(f"PLE lane must be an int in [0,{self.lanes}), got {lane!r}")
+        keep = torch.ones(1, self.lanes, 1, 1, dtype=torch.bfloat16)
+        keep[0, lane] = 0.0
+        device = self.zero_conv.device()
+        keep_lanes = ttnn.from_torch(
+            keep,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            device=device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=replicate_tensor_2d_mesh_mapper(device),
+        )
+        try:
+            for index, slot in enumerate(self.conv):
+                kept = ttnn.multiply(slot, keep_lanes, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+                _copy_inplace(kept, slot, label=f"PLE lane {lane} conv[{index}] reset")
+                _deallocate(kept)
+        finally:
+            _deallocate(keep_lanes)
+        contexts = list(self.token_contexts)
+        contexts[lane] = None
+        self.token_contexts = tuple(contexts)
+
+    def deallocate(self) -> None:
+        _deallocate(*self.conv, self.zero_conv)
+
+
+@dataclass
+class Qwen38TTNNPLELanesPreparedInput:
+    """Host-resolved PLE rows of one batched step: lane u's token looked up with lane u's own context, uploaded as
+    one persistent ROW_MAJOR BF16 ``[1,1,lanes,640]`` per device (rewritten in place between replays from
+    :meth:`Qwen38TTNNPLE.host_lanes`; the body tilizes it).  ``next_contexts[u]`` is lane u's context after
+    this step."""
+
+    embedding_rows: Any
+    tokens: tuple[int, ...]
+    source_contexts: tuple[tuple[int, int] | None, ...]
+    next_contexts: tuple[tuple[int, int], ...]
+    active: bool = True
+
+    def release(self) -> None:
+        if not self.active:
+            raise RuntimeError("prepared PLE lanes input was already released")
+        _deallocate(self.embedding_rows)
+        self.active = False
+
+
 def ngram_token_ids_decode_step(
     token_id: int,
     context: tuple[int, int] | None,
@@ -670,6 +859,70 @@ class Qwen38ResidentPLELookup:
             contexts.append(context)
         return self._read_rows(hashed), tuple(contexts)
 
+    def lookup_tokens_lanes(
+        self, tokens_by_lane: Sequence[Sequence[int]], contexts: Sequence[tuple[int, int] | None]
+    ) -> tuple[bytearray, tuple[tuple[tuple[int, int] | None, ...], ...]]:
+        """:meth:`lookup_tokens` over B lanes in ONE read: lane u's tokens chained from ``contexts[u]``, every lane's
+        rows in one ``_read_rows`` batch (lane-major payload: lane u's rows follow lane u - 1's) and per lane its
+        R + 1 contexts (the MTP lanes' per-pass PLE input)."""
+
+        if len(tokens_by_lane) != len(contexts) or not tokens_by_lane:
+            raise ValueError(
+                f"PLE lane rows need one context per lane: got {len(tokens_by_lane)} lanes, {len(contexts)} contexts"
+            )
+        hashed: list[int] = []
+        lane_contexts = []
+        for lane, (tokens, context) in enumerate(zip(tokens_by_lane, contexts)):
+            for value in (*tokens, *(() if context is None else context)):
+                if isinstance(value, bool) or type(value) is not int or not 0 <= value < self.vocab_size:
+                    raise ValueError(
+                        f"PLE lane {lane} tokens must be exact integers in [0,{self.vocab_size}), got {value!r}"
+                    )
+            chain: list[tuple[int, int] | None] = [context]
+            for token in tokens:
+                ids, context = ngram_token_ids_decode_step(
+                    token,
+                    context,
+                    eos_token_id=self.eos_token_id,
+                    multipliers=self.multipliers,
+                    head_vocab_sizes=self.head_vocab_sizes,
+                    head_offsets=self.head_offsets,
+                )
+                hashed += ids
+                chain.append(context)
+            lane_contexts.append(tuple(chain))
+        return self._read_rows(hashed), tuple(lane_contexts)
+
+    def lookup_lanes(
+        self, tokens: Sequence[int], contexts: Sequence[tuple[int, int] | None]
+    ) -> tuple[bytearray, tuple[tuple[int, int], ...]]:
+        """One batched step: lane u's sixteen rows hashed from ``(tokens[u], contexts[u])``, every lane's rows
+        advised and read in one pass (one payload of ``lanes x 5,120`` B, lane-major), and the next contexts."""
+
+        if len(tokens) != len(contexts) or not tokens:
+            raise ValueError(
+                f"PLE lane lookup needs one context per token: got {len(tokens)} tokens, {len(contexts)} contexts"
+            )
+        ids: list[int] = []
+        next_contexts = []
+        for lane, (token_id, context) in enumerate(zip(tokens, contexts)):
+            for value in (token_id, *(() if context is None else context)):
+                if isinstance(value, bool) or type(value) is not int or not 0 <= value < self.vocab_size:
+                    raise ValueError(
+                        f"PLE lane {lane} tokens must be exact integers in [0,{self.vocab_size}), got {value!r}"
+                    )
+            lane_ids, next_context = ngram_token_ids_decode_step(
+                token_id,
+                context,
+                eos_token_id=self.eos_token_id,
+                multipliers=self.multipliers,
+                head_vocab_sizes=self.head_vocab_sizes,
+                head_offsets=self.head_offsets,
+            )
+            ids.extend(lane_ids)
+            next_contexts.append(next_context)
+        return self._read_rows(ids), tuple(next_contexts)
+
     def close(self) -> None:
         for reader in self.readers:
             reader.close()
@@ -679,6 +932,7 @@ class Qwen38TTNNPLE:
     """Synchronous global-B1 PLE decode for zero-based language layer one."""
 
     _fused_forward_prepared = None  # QWEN38_FUSED=ple binds ttnn/fused/ple per instance; the body is the chain
+    _fused_forward_prepared_lanes = None  # its lane form (forward_prepared_lanes on the B row-blocks)
 
     def __init__(
         self,
@@ -712,6 +966,7 @@ class Qwen38TTNNPLE:
 
         if fused_kernels.enabled("ple"):
             self._fused_forward_prepared = functools.partial(fused_kernels.kernel("ple").fused, self)
+            self._fused_forward_prepared_lanes = functools.partial(fused_kernels.ple.ple_lanes_fused, self)
 
     def allocate_state(self) -> Qwen38TTNNPLEState:
         return Qwen38TTNNPLEState.allocate(self.mesh_device, self.mesh_contract)
@@ -1035,6 +1290,21 @@ class Qwen38TTNNPLE:
         host = torch.frombuffer(bytearray(payload), dtype=torch.bfloat16).reshape(1, 1, len(tokens), EMBEDDING_WIDTH)
         return host, contexts
 
+    def host_rows_lanes(
+        self, tokens_by_lane: Sequence[Sequence[int]], contexts: Sequence[tuple[int, int] | None]
+    ) -> tuple[torch.Tensor, tuple[tuple[tuple[int, int] | None, ...], ...]]:
+        """:meth:`host_rows` for B lanes in one table read: the lane-major ``[1,1,B*R,2560]`` rows (lane u's R rows at
+        ``u*R``, looked up from lane u's own context) and per lane its R + 1 contexts."""
+
+        if not tokens_by_lane or any(len(tokens) == 0 for tokens in tokens_by_lane):
+            raise ValueError("PLE lane rows need at least one token per lane")
+        payload, lane_contexts = self.resident_lookup.lookup_tokens_lanes(
+            [[int(token) for token in tokens] for tokens in tokens_by_lane], contexts
+        )
+        rows = sum(len(tokens) for tokens in tokens_by_lane)
+        host = torch.frombuffer(bytearray(payload), dtype=torch.bfloat16).reshape(1, 1, rows, EMBEDDING_WIDTH)
+        return host, lane_contexts
+
     def _validate_prepared_rows(self, tensor, rows: int, *, label: str) -> None:
         self.mesh_contract.validate_tensor(tensor, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         expected = (1, 1, rows, LOCAL_HIDDEN_SIZE)
@@ -1125,10 +1395,13 @@ class Qwen38TTNNPLE:
             raise RuntimeError(f"PLE rows key projection has local shape {_shape(key_flat)}")
         if _shape(value_flat) != (1, 1, rows, LOCAL_HIDDEN_SIZE):
             raise RuntimeError(f"PLE rows value projection has local shape {_shape(value_flat)}")
-        # Token t's 2560 key columns become its [4,640] branch block; the value row becomes [1,640] per token.
+        # Token t's 2560 key columns become its [4,640] branch block; the value row becomes [1,640] per token.  At one
+        # row the value keeps its shape: a same-shape reshape is a view of its input on this runtime (releasing the
+        # input freed the view: PLE lanes at B = 1, 2026-09-04), so the row is used as it is.
         key = ttnn.reshape(key_flat, _rows_residual_shape(rows))
-        value = ttnn.reshape(value_flat, (1, rows, 1, LOCAL_HIDDEN_SIZE))
-        _deallocate(key_flat, value_flat)
+        value_shape = (1, rows, 1, LOCAL_HIDDEN_SIZE)
+        value = value_flat if _shape(value_flat) == value_shape else ttnn.reshape(value_flat, value_shape)
+        _deallocate(key_flat, None if value is value_flat else value_flat)
         self._validate_rows_residual(key, rows, label="PLE rows key projection")
         if _shape(value) != (1, rows, 1, LOCAL_HIDDEN_SIZE):
             raise RuntimeError(
@@ -1311,6 +1584,151 @@ class Qwen38TTNNPLE:
             raise RuntimeError("PLE rows history select did not land in its persistent buffer")
         _deallocate(acc, terms[-1])
 
+    # ------------------------------------------------------------------ lane rows path (MTP lanes verify)
+    # B lanes of R rows in one 32-row tile, lane-major (row u*R + j = lane u's row j): the projection, gate and
+    # group norm are the rows forms over the B*R token rows (row-independent); the dilated FIR runs on every lane's
+    # own window ``[history_u | normalized_u]`` through the batch axis; the commit selects lane u's next history with
+    # the pass's per-lane one-hots (the KEEP candidate for a lane that commits nothing).
+
+    def allocate_lane_rows_state(self, lanes: int, rows: int) -> Qwen38TTNNPLELaneRowsState:
+        return Qwen38TTNNPLELaneRowsState.allocate(self.mesh_device, self.mesh_contract, lanes=lanes, rows=rows)
+
+    def _lane_rows_window(self, lanes_state: Qwen38TTNNPLELaneRowsState):
+        """``[history | normalized]`` per lane on the token dim: ``[B, 9 + R, 4, 640]``."""
+
+        window = ttnn.concat(
+            [lanes_state.history, lanes_state.normalized], dim=1, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+        expected = (lanes_state.lanes, CONV_STATE_LENGTH + lanes_state.rows, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE)
+        if _shape(window) != expected:
+            raise RuntimeError(f"PLE lane rows conv window has shape {_shape(window)}, expected {expected}")
+        return window
+
+    def _convolve_rows_lanes(self, lanes_state: Qwen38TTNNPLELaneRowsState):
+        """The rows path's dilated FIR on every lane's window: tap t reads window rows ``3t .. 3t + R - 1`` of every
+        lane (one slice over the batch), the same tap arithmetic as ``_convolve_rows``; ``[B, R, 4, 640]``."""
+
+        lanes, rows = lanes_state.lanes, lanes_state.rows
+        window = self._lane_rows_window(lanes_state)
+        pieces = [
+            ttnn.slice(
+                window,
+                (0, tap * CONV_DILATION, 0, 0),
+                (lanes, tap * CONV_DILATION + rows, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE),
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )
+            for tap in range(CONV_KERNEL_SIZE)
+        ]
+        _deallocate(window)
+        convolution = ttnn.multiply(pieces[0], self.weights.conv_taps[0], memory_config=ttnn.L1_MEMORY_CONFIG)
+        for piece, tap in zip(pieces[1:], self.weights.conv_taps[1:]):
+            previous = convolution
+            convolution = ttnn.mac(piece, tap, previous)
+            if _tensor_key(convolution) != _tensor_key(previous):
+                _deallocate(previous)
+        _deallocate(*pieces)
+        convolution = ttnn.silu(convolution, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        expected = (lanes, rows, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE)
+        if _shape(convolution) != expected:
+            raise RuntimeError(f"PLE lane rows convolution has shape {_shape(convolution)}, expected {expected}")
+        return convolution
+
+    def forward_prepared_rows_lanes(
+        self, residual_rows, prepared: Qwen38TTNNPLERowsPreparedInput, lanes_state: Qwen38TTNNPLELaneRowsState
+    ):
+        """The residual delta for the B*R lane-major token rows ``[1,B*R,4,640]``; the histories are not advanced
+        (see :meth:`commit_rows_lanes`).  ``prepared`` holds the B*R rows looked up per lane from the lanes' own
+        contexts (the caller's host work); the conv input rows land in ``normalized`` per lane through a view."""
+
+        lanes_state.validate()
+        lanes, rows = lanes_state.lanes, lanes_state.rows
+        total = lanes * rows
+        self._validate_rows_residual(residual_rows, total, label="PLE lane rows residual input")
+        if not isinstance(prepared, Qwen38TTNNPLERowsPreparedInput) or not prepared.active:
+            raise TypeError("PLE lane rows input must be a live Qwen38TTNNPLERowsPreparedInput")
+        self._validate_prepared_rows(prepared.embedding_rows, total, label="prepared PLE lane rows")
+        embedding_tile = ttnn.to_layout(
+            prepared.embedding_rows, ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+        embedding_tile.update_tensor_topology(prepared.embedding_rows.tensor_topology())
+        self.mesh_contract.validate_tensor(embedding_tile, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        if _shape(embedding_tile) != (1, 1, total, LOCAL_HIDDEN_SIZE) or embedding_tile.layout != ttnn.TILE_LAYOUT:
+            raise RuntimeError(f"PLE lane rows tilize produced {embedding_tile.layout} {_shape(embedding_tile)}")
+        key, value = self._project_rows(embedding_tile, total)
+        gated = self._gate_rows(key, residual_rows, value, total)
+        _deallocate(key)
+        normalized = self._distributed_group_norm_rows(gated, self.weights.norm_conv, total)
+        # [1, B*R, 4, 640] -> [B, R, 4, 640]: whole token tiles in the same order, the same pages (a view).
+        per_lane = ttnn.experimental.view(normalized, (lanes, rows, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE))
+        per_lane.update_tensor_topology(normalized.tensor_topology())
+        _copy_inplace(per_lane, lanes_state.normalized, label="PLE lane rows normalized")
+        _deallocate(normalized)
+        convolution = self._convolve_rows_lanes(lanes_state)
+        rows_conv = ttnn.experimental.view(convolution, (1, total, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE))
+        rows_conv.update_tensor_topology(convolution.tensor_topology())
+        output = ttnn.add(gated, rows_conv, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(gated, convolution)
+        self._validate_rows_residual(output, total, label="PLE lane rows residual delta")
+        return output
+
+    def inject_rows_lanes(
+        self, residual_rows, prepared: Qwen38TTNNPLERowsPreparedInput, lanes_state: Qwen38TTNNPLELaneRowsState
+    ):
+        """PLE injection for the B*R branch-major lane-major residual rows ``[1,4,B*R,640]``; the input is consumed."""
+
+        total = lanes_state.lanes * lanes_state.rows
+        expected = (1, RESIDUAL_BRANCHES, total, LOCAL_HIDDEN_SIZE)
+        if _shape(residual_rows) != expected or residual_rows.dtype != ttnn.bfloat16:
+            raise ValueError(
+                f"lane rows residual must be BF16 TILE {expected}, got {_shape(residual_rows)} {residual_rows.dtype}"
+            )
+        self.mesh_contract.validate_tensor(residual_rows, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        token_rows = ttnn.permute(residual_rows, (0, 2, 1, 3), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        delta_rows = self.forward_prepared_rows_lanes(token_rows, prepared, lanes_state)
+        delta = ttnn.permute(delta_rows, (0, 2, 1, 3), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(token_rows, delta_rows)
+        if _shape(delta) != expected:
+            raise RuntimeError(f"PLE lane rows delta has shape {_shape(delta)}, expected {expected}")
+        injected = ttnn.add(residual_rows, delta, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(residual_rows, delta)
+        if _shape(injected) != expected:
+            raise RuntimeError(f"PLE-injected lane rows have shape {_shape(injected)}, expected {expected}")
+        self.mesh_contract.validate_tensor(injected, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        return injected
+
+    def commit_rows_lanes(
+        self, lanes_state: Qwen38TTNNPLELaneRowsState, selectors: Qwen38TTNNRowsSelectorsLanes
+    ) -> None:
+        """``history_u <- window_u[c_u : c_u + 9]`` for every lane (exact one-hot multiply/add select over the R + 1
+        candidates; ``c_u = 0`` keeps the history)."""
+
+        lanes_state.validate()
+        lanes, rows = lanes_state.lanes, lanes_state.rows
+        selectors.validate(lanes, rows)
+        window = self._lane_rows_window(lanes_state)
+        terms = []
+        for committed in range(rows + 1):
+            candidate = ttnn.slice(
+                window,
+                (0, committed, 0, 0),
+                (lanes, committed + CONV_STATE_LENGTH, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE),
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            terms.append(
+                ttnn.multiply(candidate, selectors.onehot_bf16[committed], memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            )
+            _deallocate(candidate)
+        _deallocate(window)
+        acc = terms[0]
+        for term in terms[1:-1]:
+            previous = acc
+            acc = ttnn.add(previous, term, memory_config=ttnn.DRAM_MEMORY_CONFIG, fast_and_approximate_mode=False)
+            _deallocate(previous, term)
+        landed = ttnn.add(acc, terms[-1], output_tensor=lanes_state.history, fast_and_approximate_mode=False)
+        if landed is not None and _tensor_key(landed) != _tensor_key(lanes_state.history):
+            raise RuntimeError("PLE lane rows history select did not land in its persistent buffer")
+        _deallocate(acc, terms[-1])
+
     def commit_rows_full(self, rows_state: Qwen38TTNNPLERowsState) -> None:
         """``history <- normalized[rows - 9 : rows]``: every row committed (the long chunk), one slice and one copy."""
 
@@ -1340,6 +1758,135 @@ class Qwen38TTNNPLE:
             raise RuntimeError("prepared PLE rows were not looked up from this state's host context")
         rows_state.token_context = prepared.contexts[accepted + 1]
         rows_state.validate()
+
+    # ------------------------------------------------------------------ lanes path (batched decode)
+    #
+    # ``forward_prepared_lanes`` is the 1-row body on ``[1,lanes,4,640]`` (token-major: dim 1 is the lane, each
+    # lane keeps its [4,640] branch block): the rows path's projection, gate and norm over ``lanes`` rows, then
+    # the 1-row dilated conv on the nine per-lane slots (taps at slots 0, 3, 6 and the new row) with the same
+    # shift; lane u is bitwise the 1-row path on user u's stream.  The host looks every lane's token up with
+    # that lane's own context in one batched read (:meth:`host_lanes`).
+
+    def allocate_lanes_state(self, lanes: int) -> Qwen38TTNNPLELanesState:
+        return Qwen38TTNNPLELanesState.allocate(self.mesh_device, self.mesh_contract, lanes=lanes)
+
+    def host_lanes(
+        self, tokens: Sequence[int], contexts: Sequence[tuple[int, int] | None]
+    ) -> tuple[torch.Tensor, tuple[tuple[int, int], ...]]:
+        """The n-gram rows of lane u's ``tokens[u]`` under ``contexts[u]`` as BF16 ``[1,1,lanes,2560]`` and the next
+        context per lane.  Same hash, bytes and row order as the 1-row decode step, lane by lane."""
+
+        lanes = require_lane_count(len(tokens), label="PLE lanes token count")
+        payload, next_contexts = self.resident_lookup.lookup_lanes(
+            [int(token) for token in tokens], _validate_lane_contexts(contexts, lanes, label="PLE lanes contexts")
+        )
+        host = torch.frombuffer(bytearray(payload), dtype=torch.bfloat16).reshape(1, 1, lanes, EMBEDDING_WIDTH)
+        return host, next_contexts
+
+    def prepare_lanes_input(
+        self, tokens: Sequence[int], lanes_state: Qwen38TTNNPLELanesState
+    ) -> Qwen38TTNNPLELanesPreparedInput:
+        """Look up and upload every lane's token (host work, before capture or between replays)."""
+
+        lanes_state.validate()
+        if len(tokens) != lanes_state.lanes:
+            raise ValueError(f"PLE lanes input needs {lanes_state.lanes} tokens (one per lane), got {len(tokens)}")
+        host, next_contexts = self.host_lanes(tokens, lanes_state.token_contexts)
+        tensor = ttnn.from_torch(
+            host.contiguous(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=self.mesh_device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3)),
+        )
+        self._validate_prepared_rows(tensor, lanes_state.lanes, label="PLE lanes upload")
+        return Qwen38TTNNPLELanesPreparedInput(
+            tensor, tuple(int(token) for token in tokens), tuple(lanes_state.token_contexts), next_contexts
+        )
+
+    def _convolve_lanes(self, normalized, lanes_state: Qwen38TTNNPLELanesState):
+        """The 1-row ``_convolve`` on the per-lane slots: taps at slots 0, 3, 6 and the new rows, then the shift."""
+
+        rows = (lanes_state.conv[0], lanes_state.conv[3], lanes_state.conv[6], normalized)
+        convolution = ttnn.multiply(rows[0], self.weights.conv_taps[0], memory_config=ttnn.L1_MEMORY_CONFIG)
+        for row, tap in zip(rows[1:], self.weights.conv_taps[1:]):
+            previous = convolution
+            convolution = ttnn.mac(row, tap, previous)
+            if _tensor_key(convolution) != _tensor_key(previous):
+                _deallocate(previous)
+        convolution = ttnn.silu(convolution, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        self._validate_rows_residual(convolution, lanes_state.lanes, label="PLE lanes convolution")
+        for index in range(CONV_STATE_LENGTH - 1):
+            _copy_inplace(lanes_state.conv[index + 1], lanes_state.conv[index], label=f"PLE lanes conv shift {index}")
+        _copy_inplace(normalized, lanes_state.conv[-1], label="PLE lanes conv newest rows")
+        return convolution
+
+    def forward_prepared_lanes(
+        self, residual_lanes, prepared: Qwen38TTNNPLELanesPreparedInput, lanes_state: Qwen38TTNNPLELanesState
+    ) -> Any:
+        """The residual delta ``[1,lanes,4,640]`` for one token per lane; the slots shift and the contexts advance."""
+
+        if self._fused_forward_prepared_lanes is not None:
+            return self._fused_forward_prepared_lanes(residual_lanes, prepared, lanes_state)
+        lanes_state.validate()
+        lanes = lanes_state.lanes
+        self._validate_rows_residual(residual_lanes, lanes, label="PLE lanes residual input")
+        if not isinstance(prepared, Qwen38TTNNPLELanesPreparedInput) or not prepared.active:
+            raise TypeError("PLE lanes input must be a live Qwen38TTNNPLELanesPreparedInput")
+        if prepared.source_contexts != lanes_state.token_contexts:
+            raise RuntimeError(
+                f"prepared PLE lanes were looked up from contexts {prepared.source_contexts}, the state holds "
+                f"{lanes_state.token_contexts}"
+            )
+        self._validate_prepared_rows(prepared.embedding_rows, lanes, label="prepared PLE lanes")
+        embedding_tile = ttnn.to_layout(
+            prepared.embedding_rows, ttnn.TILE_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
+        )
+        embedding_tile.update_tensor_topology(prepared.embedding_rows.tensor_topology())
+        self.mesh_contract.validate_tensor(embedding_tile, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        if _shape(embedding_tile) != (1, 1, lanes, LOCAL_HIDDEN_SIZE) or embedding_tile.layout != ttnn.TILE_LAYOUT:
+            raise RuntimeError(
+                f"PLE lanes tilize produced {embedding_tile.layout} {_shape(embedding_tile)}, expected "
+                f"{ttnn.TILE_LAYOUT} {(1, 1, lanes, LOCAL_HIDDEN_SIZE)}"
+            )
+        key, value = self._project_rows(embedding_tile, lanes)
+        gated = self._gate_rows(key, residual_lanes, value, lanes)
+        _deallocate(key)
+        normalized = self._distributed_group_norm_rows(gated, self.weights.norm_conv, lanes)
+        convolution = self._convolve_lanes(normalized, lanes_state)
+        _deallocate(normalized)
+        output = ttnn.add(gated, convolution, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(gated, convolution)
+        self._validate_rows_residual(output, lanes, label="PLE lanes residual delta")
+        lanes_state.token_contexts = prepared.next_contexts
+        lanes_state.validate()
+        return output
+
+    def inject_lanes(
+        self, residual_lanes, prepared: Qwen38TTNNPLELanesPreparedInput, lanes_state: Qwen38TTNNPLELanesState
+    ):
+        """PLE injection for ``lanes`` branch-major residual rows ``[1,4,lanes,640]``; the input is consumed."""
+
+        lanes = lanes_state.lanes
+        expected = (1, RESIDUAL_BRANCHES, lanes, LOCAL_HIDDEN_SIZE)
+        if _shape(residual_lanes) != expected or residual_lanes.dtype != ttnn.bfloat16:
+            raise ValueError(
+                f"lanes residual must be BF16 TILE {expected}, got {_shape(residual_lanes)} {residual_lanes.dtype}"
+            )
+        self.mesh_contract.validate_tensor(residual_lanes, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        lane_rows = ttnn.permute(residual_lanes, (0, 2, 1, 3), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        delta_rows = self.forward_prepared_lanes(lane_rows, prepared, lanes_state)
+        delta = ttnn.permute(delta_rows, (0, 2, 1, 3), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(lane_rows, delta_rows)
+        if _shape(delta) != expected:
+            raise RuntimeError(f"PLE lanes delta has shape {_shape(delta)}, expected {expected}")
+        injected = ttnn.add(residual_lanes, delta, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(residual_lanes, delta)
+        if _shape(injected) != expected:
+            raise RuntimeError(f"PLE-injected lanes have shape {_shape(injected)}, expected {expected}")
+        self.mesh_contract.validate_tensor(injected, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        return injected
 
 
 def validate_ple_static_contract() -> None:
@@ -1375,6 +1922,8 @@ __all__ = [
     "ngram_token_ids_decode_step",
     "Qwen38ResidentPLELookup",
     "Qwen38TTNNPLE",
+    "Qwen38TTNNPLELanesPreparedInput",
+    "Qwen38TTNNPLELanesState",
     "Qwen38TTNNPLEPreparedInput",
     "Qwen38TTNNPLEResult",
     "Qwen38TTNNPLERowsPreparedInput",

@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Tenstorrent AI ULC
 // SPDX-License-Identifier: Apache-2.0
 //
-// index_tail, norm core writer: hands the normalized query's RoPE tiles (0, 1 and swapped) to the rope core and
-// writes tiles 2, 3 of the index query; per lane drains the canonical ring to DRAM, hands the pooled key's RoPE tiles
-// over once the rope core has room, and writes row 0 of the pooled key's tiles 2, 3 into the compressed cache row
-// (P // 4) of the lane.
+// index_tail, norm core writer (one core pair per lane): the first pair hands the normalized query's RoPE tiles (0, 1
+// and swapped) to its rope core and writes tiles 2, 3 of the index query; per lane of this core drains the canonical
+// ring to DRAM, hands the pooled key's RoPE tiles over once the rope core has room, and writes row 0 of the pooled
+// key's tiles 2, 3 into the compressed cache row (P // 4) of the lane.
 // Compile-time args: TensorAccessorArgs index_query, ring, cache, kv_block_start, kv_row_hit.
 // Runtime args: 0 index_query, 1 ring, 2 cache, 3 kv_block_start, 4 kv_row_hit addresses, 5 rows, 6 lane tile rows, 7
-// peer x, 8 peer y.
+// peer x, 8 peer y, 9 lane_first, 10 lane_count, 11 do_query.
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/tensor/noc_traits.h"
@@ -26,6 +26,9 @@ void kernel_main() {
     const uint32_t lane_tile_rows = get_arg_val<uint32_t>(6);
     const uint32_t peer_x = get_arg_val<uint32_t>(7);
     const uint32_t peer_y = get_arg_val<uint32_t>(8);
+    const uint32_t lane_first = get_arg_val<uint32_t>(9);
+    const uint32_t lane_count = get_arg_val<uint32_t>(10);
+    const uint32_t do_query = get_arg_val<uint32_t>(11);
     constexpr auto out_args = TensorAccessorArgs<0>();
     constexpr auto ring_args = TensorAccessorArgs<out_args.next_compile_time_args_offset()>();
     constexpr auto cache_args = TensorAccessorArgs<ring_args.next_compile_time_args_offset()>();
@@ -52,8 +55,8 @@ void kernel_main() {
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pos_l1), pos, hit, rows, get_write_ptr(CB_POSCW));
     volatile tt_l1_ptr uint32_t* positions = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pos_l1);
 
-    cb_wait_front(CB_NQ, HEAD_TILES);
-    {
+    if (do_query) {
+        cb_wait_front(CB_NQ, HEAD_TILES);
         const uint32_t l1 = get_read_ptr(CB_NQ);
         noc_async_write(l1, peer_in_q, ROPE_TILES * TILE_BYTES);
         noc_async_write(l1 + TILE_BYTES, peer_rot_q, TILE_BYTES);
@@ -63,10 +66,11 @@ void kernel_main() {
         }
         noc_async_write_barrier();
         noc_semaphore_inc(peer_sem_q, 1);
+        cb_pop_front(CB_NQ, HEAD_TILES);
     }
-    cb_pop_front(CB_NQ, HEAD_TILES);
 
-    for (uint32_t lane = 0; lane < rows; ++lane) {
+    for (uint32_t i = 0; i < lane_count; ++i) {
+        const uint32_t lane = lane_first + i;
         cb_wait_front(CB_RINGW, HEAD_TILES);
         {
             const uint32_t l1 = get_read_ptr(CB_RINGW);
@@ -80,7 +84,7 @@ void kernel_main() {
         cb_wait_front(CB_NK, HEAD_TILES);
         {
             const uint32_t l1 = get_read_ptr(CB_NK);
-            noc_semaphore_wait_min(ready, lane + 1);
+            noc_semaphore_wait_min(ready, i + 1);
             noc_async_write(l1, peer_in_k, ROPE_TILES * TILE_BYTES);
             noc_async_write(l1 + TILE_BYTES, peer_rot_k, TILE_BYTES);
             noc_async_write(l1, peer_rot_k + TILE_BYTES, TILE_BYTES);

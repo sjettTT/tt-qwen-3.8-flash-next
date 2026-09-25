@@ -56,7 +56,8 @@ def test_slab_row_contract() -> None:
     assert moe_module.routed_tokens_per_call_for(32) == 32 and moe_module.routed_tokens_per_call_for(5) == 5
     contract = moe_module.Qwen38TTNNMoERowContract(SLAB, moe_module.SUPPORTED_ROWS + (SLAB,))
     assert contract.row_tiles == SLAB // 32 and contract.local_combine == (10, SLAB, 2560)
-    assert moe_module.SUPPORTED_ROWS == (1, 5, 32, 128)  # the slab is admitted per instance, not globally
+    # 1..32 = decode, the MTP verifier, the chunk and B lanes, 128 = the long chunk; the slab per instance, not globally
+    assert moe_module.SUPPORTED_ROWS == (*range(1, 33), 128)
     with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
         moe_module.Qwen38TTNNMoERowContract(SLAB)
 

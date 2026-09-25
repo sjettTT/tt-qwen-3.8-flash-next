@@ -253,12 +253,14 @@ def test_the_tail_programs_take_the_windows_first_tiles_and_the_readers_offset_t
     index_tail = _flat(qsa_block.index_tail)
     assert '_window(index_q_ws,index_q_first,INDEX_HEAD_DIM,"indexquery")' in index_tail
     assert '_window(raw_key_ws,index_k_first,INDEX_HEAD_DIM,"rawkey")' in index_tail
-    assert "row_hit.buffer_address(),rows,index_q_first,index_k_first,]" in index_tail
+    # the window firsts, then the lanes' lane_first / lane_count / do_query (one lane, the query on core 0)
+    assert "row_hit.buffer_address(),rows,index_q_first,index_k_first,u,1,int(u==0),]" in index_tail
     assert "io=_io(index_q_ws,raw_key_ws," in index_tail
     main_tail = _flat(qsa_block.main_tail)
     assert "(c,[qg_ws.buffer_address(),q_norm.buffer_address(),qg_first+2*HEAD_TILES*h])" in main_tail
     assert "[(k_norm_core,[k_ws.buffer_address(),k_norm.buffer_address(),k_first])]" in main_tail
-    assert "row_hit.buffer_address(),rows,v_first,]" in main_tail
+    # v_first, then the lanes' lane_first / lane_count
+    assert "row_hit.buffer_address(),rows,v_first,u,1,]" in main_tail
     assert "io=_io(qg_ws,k_ws,v_ws," in main_tail
     post = _flat(qsa_block.post_attention)
     assert '_window(qg_ws,qg_first,QG_WIDTH,"qg")' in post

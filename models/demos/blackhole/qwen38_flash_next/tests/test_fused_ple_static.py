@@ -70,7 +70,9 @@ def test_kernel_contracts():
         "get_arg_val<uint32_t>(16)" in K["CONV_READER"] and "get_arg_val<uint32_t>(1)" in K["CONV_WRITER"]
     )  # column block
     assert K["CONV_WRITER"].count("TensorAccessorArgs<") == 2
-    assert sorted({int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d+)\)", K["CONV_READER"])}) == list(range(17))
+    assert sorted({int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d+)\)", K["CONV_READER"])}) == list(range(18))
+    assert sorted({int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d+)\)", K["GATE_READER"])}) == list(range(7))
+    assert sorted({int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d+)\)", K["GATE_WRITER"])}) == list(range(4))
     assert sorted({int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d+)\)", K["CONV_WRITER"])}) == [0, 1, 2]
     assert (
         "add_tiles(c_resid, c_rows, b, b, 0);" in K["CONV_COMPUTE"]
@@ -185,3 +187,45 @@ def test_manifest_lists_the_files():
         )
     ]:
         assert path in manifest, path
+
+
+def test_lane_hook_and_lane_forms_are_pinned():
+    """forward_prepared_lanes binds the lane forms with the same switch; the lane programs are the 1-row kernels on
+    the lane's pages (stats / normalize / gate one core per lane; the conv per column block inside one lane, its taps
+    the block's columns); the layer's inject_lanes keeps its permutes and the residual add."""
+
+    assert "    _fused_forward_prepared_lanes = None  # its lane form" in PLE_SOURCE
+    assert (
+        "self._fused_forward_prepared_lanes = functools.partial(fused_kernels.ple.ple_lanes_fused, self)" in PLE_SOURCE
+    )
+    body = PLE_SOURCE[PLE_SOURCE.index("    def forward_prepared_lanes(") :]
+    branch = (
+        "        if self._fused_forward_prepared_lanes is not None:\n"
+        "            return self._fused_forward_prepared_lanes(residual_lanes, prepared, lanes_state)\n"
+    )
+    assert branch in body[: body.index("    def inject_lanes(")]
+    inject = PLE_SOURCE[PLE_SOURCE.index("    def inject_lanes(") :]
+    assert (
+        "ttnn.permute(residual_lanes, (0, 2, 1, 3)" in inject
+        and "_fused" not in inject[: inject.index("return injected")]
+    )
+    gate_reader = (fp.REPO_ROOT / ple.GATE_READER).read_text()
+    assert "const uint32_t first_kq = get_arg_val<uint32_t>(5);" in gate_reader
+    assert "const uint32_t first_v = get_arg_val<uint32_t>(6);" in gate_reader
+    assert "const uint32_t first = get_arg_val<uint32_t>(3);" in (fp.REPO_ROOT / ple.GATE_WRITER).read_text()
+    conv_reader = (fp.REPO_ROOT / ple.CONV_READER).read_text()
+    assert "const uint32_t tap_first = get_arg_val<uint32_t>(17);" in conv_reader
+    assert conv_reader.count(", tap_first);") == 4  # the four taps
+    source = inspect.getsource(ple.conv_lanes)
+    assert "per_core = next(T for T in (1, 2, 4, 5, 10, 20) if tiles // T <= grid.x * grid.y)" in source
+    assert "(w.start * per_core) % LOCAL_TILES" in source
+    assert "[0, 0])]" in inspect.getsource(ple.gate)  # the 1-row gate reads pages 0..
+    lanes_body = inspect.getsource(ple.ple_lanes_fused)
+    for call in (
+        "module._project_rows(embedding_tile, lanes)",
+        "_group_norm_lanes(module, key,",
+        "gate_lanes(key_global, query_global, value, lanes)",
+        "conv_lanes(lanes_state.conv, normalized, module.weights.conv_taps, gated, lanes, shift=True)",
+        "lanes_state.token_contexts = prepared.next_contexts",
+    ):
+        assert call in lanes_body, call

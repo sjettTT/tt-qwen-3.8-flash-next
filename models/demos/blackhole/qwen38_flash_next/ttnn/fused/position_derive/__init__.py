@@ -27,6 +27,8 @@ NAME = "position_derive"
 TILE = fp.TILE
 ROPE_DIM = 64
 KERNEL = fp.kernel_source(NAME, "derive.cpp")
+LANES_KERNEL = fp.kernel_source(NAME, "derive_lanes.cpp")
+LANE_COLUMNS = 8  # lane u's core: column u % 8, core row u // 8 (32 lanes on 4 core rows)
 ADVANCE_NAME = "position_advance"
 ADVANCE_KERNEL = fp.kernel_source(NAME, "advance.cpp")
 ADVANCE_STAGE_BYTES = 64  # the scalar page's DRAM read grain
@@ -58,6 +60,28 @@ RUNTIME_ARGS = (
     "block_start_sin",
 )
 QSA_OUTPUTS = RUNTIME_ARGS[6:15]
+LANES_RUNTIME_ARGS = (
+    "position_row",
+    "lane_offsets",
+    "bf16_templates",
+    "u32_templates",
+    "tile_templates",
+    "cos_table",
+    "sin_table",
+    "kv_block_start",
+    "kv_row_hit",
+    "indexer_neg_mask",
+    "row_keep_bits",
+    "row_fill",
+    "index_row",
+    "block_start_row",
+    "cos",
+    "sin",
+    "block_start_cos",
+    "block_start_sin",
+)
+LANES_QSA_OUTPUTS = LANES_RUNTIME_ARGS[7:12]  # the fused QSA lane body's position inputs
+LANES_STAGE_PAGES = 26  # >= derive_lanes.cpp's STAGE_BYTES (bf16 row 16 KB + uint32 row 8.3 KB + a tile + rows)
 _TEMPLATES: dict[tuple[int, int], tuple] = {}
 
 
@@ -171,6 +195,128 @@ def position_derive(position, cos_table, sin_table, *, blocks: int, memory_confi
     for tensor in outs.values():
         tensor.update_tensor_topology(topology)  # generic_op leaves the allocation's placement; these are replicated
     return outs
+
+
+def lanes_outputs(mesh, blocks: int, lanes: int, memory_config=ttnn.DRAM_MEMORY_CONFIG) -> dict:
+    """Fresh output tensors of the lane derive in the lane chain's shapes, dtypes and layouts (32 lane rows; the
+    kv_row_hit tiles of the ``lanes`` active lanes)."""
+
+    slots = _qsa().SPARSE_INDEX_CAPACITY
+    rm, tile = ttnn.ROW_MAJOR_LAYOUT, ttnn.TILE_LAYOUT
+    spec = {
+        "kv_block_start": ((1, 1, 1, TILE), ttnn.uint32, rm),
+        "kv_row_hit": ((1, lanes, TILE, 1), ttnn.bfloat16, tile),
+        "indexer_neg_mask": ((1, 1, TILE, blocks), ttnn.bfloat16, rm),
+        "row_keep_bits": ((1, 1, TILE, slots), ttnn.uint32, rm),
+        "row_fill": ((1, 1, TILE, slots), ttnn.uint32, rm),
+        "index_row": ((1, 1, 1, TILE), ttnn.uint32, rm),
+        "block_start_row": ((1, 1, 1, TILE), ttnn.uint32, rm),
+        "cos": ((1, 1, TILE, ROPE_DIM), ttnn.bfloat16, tile),
+        "sin": ((1, 1, TILE, ROPE_DIM), ttnn.bfloat16, tile),
+        "block_start_cos": ((1, 1, TILE, ROPE_DIM), ttnn.bfloat16, tile),
+        "block_start_sin": ((1, 1, TILE, ROPE_DIM), ttnn.bfloat16, tile),
+    }
+    return {
+        name: fp.allocate(shape, dtype, layout, mesh, memory_config) for name, (shape, dtype, layout) in spec.items()
+    }
+
+
+def position_derive_lanes(
+    position_row, lane_offsets, cos_table, sin_table, *, blocks: int, lanes: int, memory_config=ttnn.DRAM_MEMORY_CONFIG
+) -> dict:
+    """The lane body's position-derived tensors from the uint32 position row ``[1,1,1,32]`` (lane u = P_u; the idle
+    lanes at the row's residue, as the chain derives them too): one program, one core per lane row.  Row u of every
+    row tensor is the 1-row derive at P_u (the fill's tail ids carry ``lane_offsets[u]``, lane u's KV region start, as
+    the chain's ``block_offsets_lanes`` / ``arange_slots_lanes`` do); the four RoPE tiles hold the table rows P_u and
+    P_u & ~3 in row u; ``kv_row_hit`` is the ``lanes`` active lanes' one-hot tiles; the index row, the block-start
+    row and ``kv_block_start`` are the 32-lane rows.  By name (``LANES_RUNTIME_ARGS[7:]``)."""
+
+    qsa, contracts = _qsa(), _contracts()
+    lanes = contracts.require_lane_count(lanes, label="position derive lanes")
+    _expect(position_row, (1, 1, 1, TILE), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, "position row")
+    _expect(lane_offsets, (1, 1, 1, TILE), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, "lane offsets row")
+    for name, table in (("cos table", cos_table), ("sin table", sin_table)):
+        if table.dtype != ttnn.bfloat16 or table.layout != ttnn.ROW_MAJOR_LAYOUT or int(table.shape[-1]) != ROPE_DIM:
+            raise ValueError(f"position_derive {name} must be bf16 ROW_MAJOR [1,1,ctx,{ROPE_DIM}]")
+    mesh = position_row.device()
+    grid = mesh.compute_with_storage_grid_size()
+    if grid.x < LANE_COLUMNS or grid.y < TILE // LANE_COLUMNS:
+        raise ValueError(f"position_derive lanes needs an {LANE_COLUMNS} x {TILE // LANE_COLUMNS} core grid")
+    bf16_tpl, u32_tpl, tile_tpl = prepare(mesh, blocks)
+    outs = lanes_outputs(mesh, blocks, lanes, memory_config)
+    tensors = [position_row, lane_offsets, bf16_tpl, u32_tpl, tile_tpl, cos_table, sin_table] + [
+        outs[name] for name in LANES_RUNTIME_ARGS[7:]
+    ]
+    cores = [ttnn.CoreCoord(u % LANE_COLUMNS, u // LANE_COLUMNS) for u in range(TILE)]
+    grid_set = ttnn.CoreRangeSet(
+        [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(LANE_COLUMNS - 1, TILE // LANE_COLUMNS - 1))]
+    )
+    named = {
+        "blocks": blocks,
+        "slots": qsa.SPARSE_INDEX_CAPACITY,
+        "block_topk": qsa.BLOCK_TOPK,
+        "kv_row_mask": qsa.KV_ROW_MASK,
+        "ring_mask": qsa.COMPRESS_RATIO - 1,
+        "kv_block_start_mask": qsa.KV_BLOCK_START_MASK,
+        "lane_block_mask": contracts.BLOCK_START_LANE_MASK,
+        "all_ones": qsa.ALL_ONES_U32,
+        "one_bf16": ONE_BF16,
+        "rope_dim": ROPE_DIM,
+        "cb_stage": CB_STAGE,
+    }
+    compile_args = [a for t in tensors for a in fp.accessor_args(t)]
+    reader = fp.reader_kernel(
+        LANES_KERNEL,
+        grid_set,
+        compile_args,
+        [(core, [t.buffer_address() for t in tensors] + [u, lanes]) for u, core in enumerate(cores)],
+        named=named,
+    )
+    cbs = [fp.cb_descriptor(CB_STAGE, ttnn.bfloat16, STAGE_PAGE_BYTES, LANES_STAGE_PAGES, grid_set)]
+    fp.run_program(tensors, fp.program_descriptor([reader], cbs=cbs))
+    topology = position_row.tensor_topology()
+    for tensor in outs.values():
+        tensor.update_tensor_topology(topology)  # generic_op leaves the allocation's placement; these are replicated
+    return outs
+
+
+def derive_lanes_fused(model, state):
+    """The lane body's position derive on the fused program: ``(Qwen38TTNNRoPEInputs, Qwen38TTNNQSAFusedLaneInputs)``
+    -- the fused QSA lane body's inputs (the chain-only selection tiles and scalars are not derived)."""
+
+    from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import TensorPlacement
+    from models.demos.blackhole.qwen38_flash_next.ttnn.model import Qwen38TTNNRoPEInputs
+
+    qsa = _qsa()
+    outs = position_derive_lanes(
+        state.position.row,
+        state.qsa_lane_constants.kv_offsets_row,
+        model.rope_table.cos_table,
+        model.rope_table.sin_table,
+        blocks=model.qsa_position_constants.allocated_compressed_blocks,
+        lanes=state.lanes,
+    )
+    for name in LANES_RUNTIME_ARGS[7:]:
+        model.mesh_contract.validate_tensor(outs[name], placement=TensorPlacement.REPLICATED)
+    ttnn.deallocate(outs["index_row"])
+    ttnn.deallocate(outs["block_start_row"])
+    rope = Qwen38TTNNRoPEInputs(None, outs["cos"], outs["sin"], outs["block_start_cos"], outs["block_start_sin"])
+    return rope, qsa.Qwen38TTNNQSAFusedLaneInputs(**{name: outs[name] for name in LANES_QSA_OUTPUTS})
+
+
+def derive_lanes_composed(model, state):
+    """The lane body's chain (model.py forward_decode_lanes: the index rows, the RoPE row tiles,
+    ``derive_qsa_lane_inputs``)."""
+
+    from models.demos.blackhole.qwen38_flash_next.ttnn.model import _deallocate_unique
+
+    index_row = state.position.index_row()
+    block_start_row = state.position.block_start_index_row(index_row)
+    rope = model.rope_table.rows_chunk(index_row, block_start_row)
+    _deallocate_unique(index_row, block_start_row)
+    return rope, _qsa().derive_qsa_lane_inputs(
+        state.position.row, model.qsa_position_constants, state.qsa_chunk_constants, state.qsa_lane_constants
+    )
 
 
 _COMPOSED_CONSTANTS: dict[tuple[int, int], tuple] = {}
@@ -331,7 +477,8 @@ register(
 register(
     FusedKernel(
         name=NAME,
-        replaces="index_row, block_start_index_row, the four RoPE embedding gathers and derive_qsa_position_inputs (40 programs per step)",
+        replaces="index_row, block_start_index_row, the four RoPE embedding gathers and derive_qsa_position_inputs (40 programs per step); "
+        "the lanes' index rows, RoPE row tiles and derive_qsa_lane_inputs (the fused QSA lane body's five inputs) as one program",
         tolerance=BITWISE,
         fused=derive_fused,
         composed=derive_composed,

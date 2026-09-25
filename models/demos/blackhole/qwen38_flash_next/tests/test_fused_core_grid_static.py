@@ -182,6 +182,9 @@ def test_score_row_gather_pages_stay_under_the_all_gather_page_limit():
     assert "gathered=ttnn.all_gather(paged,dim=2,cluster_axis=TP_AXIS," in fused
     assert "_require_shape(gathered,(1,1,TP_SIZE*pages,SCORE_GATHER_PAGE)" in fused
     merge = re.sub(r"\s+", "", inspect.getsource(qsa_block.score_merge))
-    assert "shape!=(1,1,DEVICES*rows*chunks,SCORE_CHUNK)" in merge  # the check, whichever way the condition is wrapped
+    # the check, whichever way the condition is wrapped: 1024-column pages, four devices' rows of `chunks` pages each,
+    # the row count read off the page count (the mask may carry more rows: the lanes pass their 32-row mask)
+    assert "shape[3]!=SCORE_CHUNK" in merge and "shape[2]%(DEVICES*chunks)" in merge
+    assert "rows=shape[2]//(DEVICES*chunks)" in merge
     composed = re.sub(r"\s+", "", inspect.getsource(qsa_block.score_merge_composed))
     assert "stacked=ttnn.reshape(gathered,(DEVICES,1,1,width))" in composed

@@ -62,6 +62,36 @@ def chunk_row_tiles(rows: int) -> int:
             f"(a multiple of {SLAB_ROW_STEP} in {MIN_SLAB_ROWS}..{MAX_SLAB_ROWS}), got {rows!r}"
         )
     return rows // ttnn.TILE_SIZE
+# Batched decode: lane u of a [1,1,1,32] row (position, token) or row u of a [.., 32, ..] tile is user u; every
+# per-lane tensor is one tile tall, so the lane count is 1..32 and the row count of a multi-row path is the same
+# contract (1 = decode, 5 = the MTP verifier, 32 = the prefill chunk).
+MAX_LANES = ttnn.TILE_SIZE
+# The GDN ring slot is one host int per trace, so every resident lane shares ``P mod GDN_RESIDUE_CLASSES``
+# (gdn.py CONV_KERNEL_SIZE); a lane is admitted only at a step whose residue is its position's.
+GDN_RESIDUE_CLASSES = 4
+
+
+def require_lane_count(lanes, *, label: str = "lane count", error_type: type[Exception] = ValueError) -> int:
+    """``lanes`` as an exact int in [1, MAX_LANES]; the error names the actual value and the admitted range."""
+
+    value = _exact_integer(lanes, label=label, error_type=error_type)
+    if not 1 <= value <= MAX_LANES:
+        raise error_type(f"{label} must be in [1,{MAX_LANES}], got {value}")
+    return value
+
+
+def admission_wait_steps(resident_residue: int, position: int) -> int:
+    """Steps (0..3) a lane at ``position`` waits before it may join lanes whose positions are ``resident_residue``
+    mod 4 at the current step: after ``w`` steps the resident residue is ``resident_residue + w``, so the lane joins
+    at the first step where that equals ``position mod 4``.  Ragged lengths are otherwise free."""
+
+    residue = _exact_integer(resident_residue, label="resident residue", error_type=ValueError)
+    if not 0 <= residue < GDN_RESIDUE_CLASSES:
+        raise ValueError(f"resident residue must be in [0,{GDN_RESIDUE_CLASSES}), got {residue}")
+    value = _exact_integer(position, label="admission position", error_type=ValueError)
+    if value < 0:
+        raise ValueError(f"admission position must be non-negative, got {value}")
+    return (value - residue) % GDN_RESIDUE_CLASSES
 
 
 class TensorPlacement(str, Enum):
@@ -543,4 +573,176 @@ class Qwen38TTNNDevicePosition:
 
     def deallocate(self) -> None:
         for tensor in (self.scalar, self.ones_row, self.block_start_mask_row):
+            ttnn.deallocate(tensor)
+
+
+@dataclass
+class Qwen38TTNNDevicePositionRow:
+    """Device-resident per-lane positions: the ``[1,1,1,32]`` UINT32 row with lane ``u = P_u``.
+
+    The batched form of :class:`Qwen38TTNNDevicePosition`: the row itself is the
+    embedding index row of the RoPE lookup (lane ``u`` reads row ``P_u``), the
+    per-lane QSA inputs are derived from it in column form (``qsa.derive_qsa_lane_inputs``),
+    and :meth:`advance` adds 1 to every lane in place as the body's last op.  All
+    resident lanes share ``P_u mod 4`` (``GDN_RESIDUE_CLASSES``): one trace and one
+    host ring slot serve the step, so a lane joins only at a step whose residue is
+    its position's (:func:`admission_wait_steps`).  Lanes ``lanes..31`` are idle and
+    hold the row's residue (a valid position of the class; their regions receive
+    harmless writes).  ``positions`` is the host mirror the host writes come from;
+    the 1-row class is untouched.
+    """
+
+    row: Any
+    block_start_mask_row: Any
+    lanes: int
+    positions: list[int]
+    mesh_device: Any = field(repr=False, compare=False)
+    mesh_contract: Qwen38MeshContract = field(repr=False, compare=False)
+
+    @staticmethod
+    def _lane_positions(positions, *, lanes: int) -> list[int]:
+        """The 32 lane values (active lanes as given, idle lanes at the shared residue), residue checked."""
+
+        values = [
+            _exact_integer(value, label=f"lane {index} position", error_type=ValueError)
+            for index, value in enumerate(positions)
+        ]
+        if len(values) != lanes:
+            raise ValueError(f"position row needs one position per active lane: got {len(values)}, expected {lanes}")
+        for lane, value in enumerate(values):
+            if not 0 <= value < UINT32_LIMIT:
+                raise ValueError(f"lane {lane} position must be in [0,{UINT32_LIMIT}), got {value}")
+        residue = values[0] % GDN_RESIDUE_CLASSES
+        for lane, value in enumerate(values):
+            if value % GDN_RESIDUE_CLASSES != residue:
+                raise ValueError(
+                    f"lane {lane} position {value} has residue {value % GDN_RESIDUE_CLASSES}, expected the row's "
+                    f"residue {residue} (lane 0 at {values[0]}); wait {admission_wait_steps(residue, value)} steps"
+                )
+        return values + [residue] * (MAX_LANES - lanes)
+
+    @staticmethod
+    def _host_row(values: list[int]) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.int64).reshape(POSITION_INDEX_ROW_SHAPE).to(torch.uint32)
+
+    @classmethod
+    def allocate(
+        cls, mesh_device, mesh_contract: Qwen38MeshContract, positions, *, lanes: int
+    ) -> Qwen38TTNNDevicePositionRow:
+        mesh_contract.validate_mesh(mesh_device)
+        lanes = require_lane_count(lanes, label="position row lanes")
+        values = cls._lane_positions(positions, lanes=lanes)
+        uploaded: list[Any] = []
+        try:
+            for host, label in (
+                (cls._host_row(values), "device position row"),
+                (
+                    _host_uint32(
+                        POSITION_INDEX_ROW_SHAPE, BLOCK_START_LANE_MASK, label="device position block-start mask row"
+                    ),
+                    "device position block-start mask row",
+                ),
+            ):
+                tensor = ttnn.from_torch(
+                    host,
+                    dtype=ttnn.uint32,
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                    device=mesh_device,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    mesh_mapper=replicate_tensor_2d_mesh_mapper(mesh_device),
+                )
+                uploaded.append(tensor)
+                _require_uint32_row(tensor, POSITION_INDEX_ROW_SHAPE, mesh_contract, label=label)
+        except BaseException:
+            for tensor in uploaded:
+                ttnn.deallocate(tensor)
+            raise
+        return cls(uploaded[0], uploaded[1], lanes, values, mesh_device, mesh_contract)
+
+    @property
+    def residue(self) -> int:
+        return self.positions[0] % GDN_RESIDUE_CLASSES
+
+    def validate(self) -> None:
+        if len(self.positions) != MAX_LANES:
+            raise RuntimeError(f"position row mirror holds {len(self.positions)} lanes, expected {MAX_LANES}")
+        self._lane_positions(self.positions[: self.lanes], lanes=self.lanes)
+        _require_uint32_row(self.row, POSITION_INDEX_ROW_SHAPE, self.mesh_contract, label="device position row")
+
+    def _write_mirror(self) -> None:
+        """Host write of the whole row from the mirror (outside any trace); the only host path into ``row``."""
+
+        host = ttnn.from_torch(
+            self._host_row(self.positions),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=replicate_tensor_2d_mesh_mapper(self.mesh_device),
+        )
+        ttnn.copy_host_to_device_tensor(host, self.row)
+
+    def reset(self, positions) -> None:
+        """Rewrite every active lane (a new batch); the lanes must share one residue."""
+
+        self.positions = self._lane_positions(positions, lanes=self.lanes)
+        self._write_mirror()
+
+    def admit(self, lane: int, position: int) -> None:
+        """Rewrite one lane at a step of its residue class: ``position mod 4`` must equal :attr:`residue`."""
+
+        lane = _exact_integer(lane, label="admitted lane", error_type=ValueError)
+        if not 0 <= lane < self.lanes:
+            raise ValueError(f"admitted lane must be in [0,{self.lanes}), got {lane}")
+        value = _exact_integer(position, label="admitted position", error_type=ValueError)
+        if not 0 <= value < UINT32_LIMIT:
+            raise ValueError(f"admitted position must be in [0,{UINT32_LIMIT}), got {value}")
+        wait = admission_wait_steps(self.residue, value)
+        if wait:
+            raise ValueError(
+                f"lane {lane} admission at position {value} has residue {value % GDN_RESIDUE_CLASSES}, expected the "
+                f"row's residue {self.residue}; admit it {wait} steps later"
+            )
+        self.positions[lane] = value
+        self._write_mirror()
+
+    def advance(self) -> None:
+        """In-trace ``P_u += 1`` for every lane; must be the last op of the model body."""
+
+        key = _tensor_key(self.row)
+        advanced = ttnn.add(self.row, 1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        copied = ttnn.copy(advanced, self.row)
+        if _tensor_key(self.row) != key or (copied is not None and _tensor_key(copied) != key):
+            raise RuntimeError("device position row advance did not write the resident row in place")
+        ttnn.deallocate(advanced)
+        self.positions = [value + 1 for value in self.positions]
+
+    def advance_replayed(self) -> None:
+        """The mirror's ``P_u += 1`` after a captured body replayed: the trace advanced the device row without the
+        Python body, so the host that schedules admissions against :attr:`residue` calls this once per replay."""
+
+        self.positions = [value + 1 for value in self.positions]
+
+    def index_row(self):
+        """A fresh ``[1,1,1,32]`` UINT32 copy of the row (lane ``u = P_u``): the RoPE embedding index row."""
+
+        row = ttnn.add(self.row, 0, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _require_uint32_row(row, POSITION_INDEX_ROW_SHAPE, self.mesh_contract, label="device position lane index row")
+        return row
+
+    def block_start_index_row(self, index_row):
+        """``[1,1,1,32]`` UINT32 row with lane ``u = P_u & ~3`` (lane ``u``'s current index block start)."""
+
+        row = ttnn.bitwise_and(index_row, self.block_start_mask_row, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _require_uint32_row(
+            row, POSITION_INDEX_ROW_SHAPE, self.mesh_contract, label="device position lane block-start row"
+        )
+        return row
+
+    def read(self) -> list[int]:
+        """Diagnostic readback of the 32 lanes from coordinate 0 (outside any trace)."""
+
+        values = ttnn.to_torch(ttnn.get_device_tensors(self.row)[0]).reshape(-1).to(torch.int64) & (UINT32_LIMIT - 1)
+        return [int(value) for value in values.tolist()]
+
+    def deallocate(self) -> None:
+        for tensor in (self.row, self.block_start_mask_row):
             ttnn.deallocate(tensor)

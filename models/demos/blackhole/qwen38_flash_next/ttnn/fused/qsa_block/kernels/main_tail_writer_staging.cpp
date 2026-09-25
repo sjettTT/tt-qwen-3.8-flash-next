@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Tenstorrent AI ULC
 // SPDX-License-Identifier: Apache-2.0
 //
-// main_tail, staging core writer: per lane the canonical staging tiles back to DRAM (in place) and the 32 untilized
-// rows into the lane's KV cache block at P & ~31 (page = row).
+// main_tail, staging core writer (one staging core per lane): for this core's lanes the canonical staging tiles back
+// to DRAM (in place) and the 32 untilized rows into the lane's KV cache block at lane * lane_rows + (P & ~31) (page =
+// row).
 // Compile-time args: TensorAccessorArgs staging, cache, kv_block_start, kv_row_hit.
 // Runtime args: 0 staging, 1 cache, 2 kv_block_start, 3 kv_row_hit addresses, 4 rows, 5 lane rows (cache rows per
-// lane).
+// lane), 6 lane_first, 7 lane_count.
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/tensor/noc_traits.h"
@@ -21,6 +22,8 @@ void kernel_main() {
     const uint32_t hit_addr = get_arg_val<uint32_t>(3);
     const uint32_t rows = get_arg_val<uint32_t>(4);
     const uint32_t lane_rows = get_arg_val<uint32_t>(5);
+    const uint32_t lane_first = get_arg_val<uint32_t>(6);
+    const uint32_t lane_count = get_arg_val<uint32_t>(7);
     constexpr auto stg_args = TensorAccessorArgs<0>();
     constexpr auto cache_args = TensorAccessorArgs<stg_args.next_compile_time_args_offset()>();
     constexpr auto pos_args = TensorAccessorArgs<cache_args.next_compile_time_args_offset()>();
@@ -37,7 +40,8 @@ void kernel_main() {
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pos_l1), pos, hit, rows, get_write_ptr(CB_POSCW));
     volatile tt_l1_ptr uint32_t* positions = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pos_l1);
 
-    for (uint32_t lane = 0; lane < rows; ++lane) {
+    for (uint32_t i = 0; i < lane_count; ++i) {
+        const uint32_t lane = lane_first + i;
         cb_wait_front(CB_STGW, PACK_TILES);
         const uint32_t l1 = get_read_ptr(CB_STGW);
         for (uint32_t c = 0; c < PACK_TILES; ++c) {

@@ -70,6 +70,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     TensorPlacement,
     chunk_row_tiles,
     replicate_tensor_2d_mesh_mapper,
+    require_lane_count,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dense_dtype_tag,
@@ -704,6 +705,99 @@ class Qwen38TTNNSamplingCandidateConstants:
                 f"readback_row must be FP32 ROW_MAJOR {SAMPLING_CANDIDATE_ROW_SHAPE}, got {_metadata(row)}"
             )
         mesh_contract.validate_tensor(row, placement=TensorPlacement.REPLICATED)
+
+
+def resolve_greedy_lanes_on_device(
+    candidates: Qwen38GreedyCandidates,
+    *,
+    constants: Qwen38TTNNTokenRowConstants,
+    mesh_contract: Qwen38MeshContract,
+    collective_topology,
+):
+    """``Qwen38TTNNLMHead.resolve_greedy_on_device`` for ``rows`` = 1..32 candidate rows (the batched lanes).
+
+    The same gather, tie-break, argmax, rebase and 32-bit select per row.  The two ``[1,1,1,4]`` constants are
+    applied as TILE row broadcasts (exact SFPU fp32 elementwise ops on a tilized copy: no reduction touches the
+    tile padding; ``ttnn.repeat`` of a 16-byte ROW_MAJOR row crashes the pinned runtime's repeat codegen); the
+    argmax and the select stay ROW_MAJOR on the exact width-four rows.  The ``[1,1,rows,1]`` id column is padded
+    to 32 rows with zeros (rows < 32), read as the ``[1,1,1,32]`` row (a ROW_MAJOR view of the contiguous
+    column) and tilized: lane u = row u's global id, lanes ``rows..31`` zero.  Row u is bitwise ``resolve_greedy``
+    row u; the 1-row method is untouched (its token row splats the id into every column, this one fills lane u).
+    """
+
+    if not isinstance(candidates, Qwen38GreedyCandidates):
+        raise TypeError("lane greedy resolve requires Qwen38GreedyCandidates")
+    rows = require_lane_count(candidates.rows, label="greedy candidate rows")
+    if collective_topology != ttnn.Topology.Linear:
+        raise RuntimeError("on-device greedy resolve requires Linear topology")
+    mesh_contract.validate_tensor(candidates.local_indices, placement=TensorPlacement.LOCAL_PARTIAL)
+    mesh_contract.validate_tensor(candidates.local_values, placement=TensorPlacement.LOCAL_PARTIAL)
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    quad = (1, 1, rows, TP_SIZE)
+
+    gathered_values = ttnn.all_gather(candidates.local_values, dim=3, cluster_axis=TP_AXIS, memory_config=dram)
+    mesh_contract.validate_tensor(gathered_values, placement=TensorPlacement.REPLICATED)
+    if _shape(gathered_values) != quad:
+        raise RuntimeError(f"lane greedy value gather returned {_shape(gathered_values)}, expected {list(quad)}")
+    values_fp32 = ttnn.typecast(gathered_values, ttnn.float32, memory_config=dram)
+    _deallocate(gathered_values)
+    tie_break = ttnn.to_layout(constants.owner_tie_break, ttnn.TILE_LAYOUT, memory_config=dram)
+    ranked_tile = ttnn.subtract(values_fp32, tie_break, memory_config=dram)
+    _deallocate(values_fp32, tie_break)
+    ranked = ttnn.to_layout(ranked_tile, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+    _deallocate(ranked_tile)
+    if _shape(ranked) != quad or ranked.dtype != ttnn.float32 or ranked.layout != ttnn.ROW_MAJOR_LAYOUT:
+        raise RuntimeError(f"lane greedy tie-break rows must be FP32 ROW_MAJOR {list(quad)}, got {_metadata(ranked)}")
+    owner = ttnn.argmax(ranked, dim=-1, keepdim=True)
+    _deallocate(ranked)
+    if _shape(owner) != (1, 1, rows, 1) or owner.dtype != ttnn.uint32:
+        raise RuntimeError(f"lane greedy owner argmax must be UINT32 [1,1,{rows},1], got {_metadata(owner)}")
+
+    index_column = ttnn.reshape(candidates.local_indices, (1, 1, rows, 1))
+    gathered_indices = ttnn.all_gather(index_column, dim=3, cluster_axis=TP_AXIS, memory_config=dram)
+    mesh_contract.validate_tensor(gathered_indices, placement=TensorPlacement.REPLICATED)
+    if _shape(gathered_indices) != quad:
+        raise RuntimeError(f"lane greedy index gather returned {_shape(gathered_indices)}, expected {list(quad)}")
+    index_tile = ttnn.to_layout(gathered_indices, ttnn.TILE_LAYOUT, memory_config=dram)
+    _deallocate(gathered_indices)
+    index_fp32 = ttnn.typecast(index_tile, ttnn.float32, memory_config=dram)
+    _deallocate(index_tile)
+    starts = ttnn.to_layout(constants.lm_head_vocab_starts, ttnn.TILE_LAYOUT, memory_config=dram)
+    candidate_tile = ttnn.add(index_fp32, starts, memory_config=dram)
+    _deallocate(index_fp32, starts)
+    candidate_tokens = ttnn.to_layout(candidate_tile, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
+    _deallocate(candidate_tile)
+    if (
+        _shape(candidate_tokens) != quad
+        or candidate_tokens.dtype != ttnn.float32
+        or candidate_tokens.layout != ttnn.ROW_MAJOR_LAYOUT
+    ):
+        raise RuntimeError(
+            f"lane greedy candidate ids must be FP32 ROW_MAJOR {list(quad)}, got {_metadata(candidate_tokens)}"
+        )
+
+    token_column = ttnn.gather(candidate_tokens, 3, owner, memory_config=dram)
+    _deallocate(candidate_tokens, owner)
+    if (
+        _shape(token_column) != (1, 1, rows, 1)
+        or token_column.dtype != ttnn.float32
+        or token_column.layout != ttnn.ROW_MAJOR_LAYOUT
+    ):
+        raise RuntimeError(
+            f"lane greedy token select must be FP32 ROW_MAJOR [1,1,{rows},1], got {_metadata(token_column)}"
+        )
+    if rows < TILE_SIZE:
+        padded = ttnn.pad(token_column, [(0, 0), (0, 0), (0, TILE_SIZE - rows), (0, 0)], value=0.0)
+        _deallocate(token_column)
+        token_column = padded
+    # A ROW_MAJOR view of the contiguous 32-row column (fresh id, same buffer): released through the view only.
+    token_lanes = ttnn.reshape(token_column, TOKEN_ROW_SHAPE)
+    token_row = ttnn.to_layout(token_lanes, ttnn.TILE_LAYOUT, memory_config=dram)
+    _deallocate(token_lanes)
+    mesh_contract.validate_tensor(token_row, placement=TensorPlacement.REPLICATED)
+    if _shape(token_row) != TOKEN_ROW_SHAPE or token_row.dtype != ttnn.float32 or token_row.layout != ttnn.TILE_LAYOUT:
+        raise RuntimeError(f"resolved lane token row must be FP32 TILE {TOKEN_ROW_SHAPE}, got {_metadata(token_row)}")
+    return token_row
 
 
 def _validate_exact_config(checkpoint: Qwen38Checkpoint, placement: Qwen38Placement) -> None:
@@ -1756,6 +1850,11 @@ class Qwen38TTNNLMHead:
 
             self.greedy_candidates = functools.partial(fused_greedy_tail.greedy_candidates_fused, self)
             self.resolve_greedy_on_device = functools.partial(fused_greedy_tail.resolve_greedy_on_device_fused, self)
+            # the lanes' epilogue: the same programs over the lane rows (the MTP rows path keeps the chain)
+            self.greedy_candidates_lanes = functools.partial(fused_greedy_tail.greedy_candidates_lanes_fused, self)
+            self.resolve_greedy_lanes_on_device = functools.partial(
+                fused_greedy_tail.resolve_greedy_lanes_on_device_fused, self
+            )
 
     def _mark_vocab_shard(self, tensor, *, rows: int) -> None:
         expected = (1, 1, rows, LOCAL_VOCAB_SIZE)
@@ -2177,6 +2276,24 @@ class Qwen38TTNNLMHead:
                 f"resolved token lanes must be FP32 ROW_MAJOR [1,1,1,{rows}], got {_metadata(token_lanes)}"
             )
         return token_lanes
+
+    def greedy_candidates_lanes(self, logits: Qwen38ShardedLogits) -> Qwen38GreedyCandidates:
+        """The lanes' per-row candidates (rows = lanes, row u = lane u): the chain's :meth:`greedy_candidates`; the
+        fused greedy tail binds its rows form here at construction (the 1-row and MTP rows callers are untouched)."""
+
+        return self.greedy_candidates(logits)
+
+    def resolve_greedy_lanes_on_device(self, candidates: Qwen38GreedyCandidates):
+        """:func:`resolve_greedy_lanes_on_device` with this head's constants: lane u of the token row = row u's id."""
+
+        if candidates.vocab_ranges != self.weights.vocab_ranges:
+            raise ValueError("greedy candidates have different vocabulary ownership")
+        return resolve_greedy_lanes_on_device(
+            candidates,
+            constants=self.weights.token_row,
+            mesh_contract=self.mesh_contract,
+            collective_topology=self.collective_topology,
+        )
 
     def greedy_token(self, logits: Qwen38ShardedLogits) -> torch.Tensor:
         """Convenience path that transfers candidates, never full logits."""

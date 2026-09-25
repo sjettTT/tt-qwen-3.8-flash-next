@@ -4,7 +4,8 @@
 // PLE stage 3 writer, one core: the Vt gated tiles (CB 16, bf16) -> pages 0..Vt-1 of the output; with debug, the
 // fp32 sum tile (CB 17) and coefficient tile (CB 18) -> page 0 of two fp32 tile tensors.
 // Compile-time args: 0 Vt, 1 debug, then TensorAccessorArgs(out), (debug sum), (debug coefficient).
-// Runtime args: 0 out addr, 1 debug sum addr, 2 debug coefficient addr.
+// Runtime args: 0 out addr, 1 debug sum addr, 2 debug coefficient addr, 3 the first output tile (the lane's Vt block; 0
+// for the 1-row form).
 #include <cstdint>
 
 #include "api/dataflow/dataflow_api.h"
@@ -22,6 +23,7 @@ void kernel_main() {
     constexpr auto a_sum = TensorAccessorArgs<a_out.next_compile_time_args_offset()>();
     constexpr auto a_coef = TensorAccessorArgs<a_sum.next_compile_time_args_offset()>();
     const auto out = TensorAccessor(a_out, get_arg_val<uint32_t>(0));
+    const uint32_t first = get_arg_val<uint32_t>(3);
     Noc noc;
     if constexpr (DEBUG) {
         const auto dsum = TensorAccessor(a_sum, get_arg_val<uint32_t>(1));
@@ -38,7 +40,7 @@ void kernel_main() {
     DataflowBuffer o(c_out);
     o.wait_front(Vt);
     for (uint32_t t = 0; t < Vt; ++t) {
-        noc.async_write(o, out, BF16_TILE, {.offset_bytes = t * BF16_TILE}, {.page_id = t, .offset_bytes = 0});
+        noc.async_write(o, out, BF16_TILE, {.offset_bytes = t * BF16_TILE}, {.page_id = first + t, .offset_bytes = 0});
     }
     noc.async_write_barrier();
     o.pop_front(Vt);

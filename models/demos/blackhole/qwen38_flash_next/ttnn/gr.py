@@ -56,6 +56,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     Qwen38MeshContract,
     TensorPlacement,
     replicate_tensor_2d_mesh_mapper,
+    require_lane_count,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
@@ -99,10 +100,11 @@ PARTIAL_REDUCTION_ROWS_SHAPE = (1, 1, CHUNK_ROWS, PARTIAL_WIDTH)
 
 
 def residual_rows_shape(rows: int) -> tuple[int, int, int, int]:
-    """Branch-major residual rows of a chunk form (32 or 128 rows) or of a prefill slab."""
+    """Branch-major residual rows of a chunk form (32 or 128 rows), of a prefill slab, or of 1..32 batched lanes."""
 
-    if rows not in CHUNK_ROW_COUNTS and not is_slab_rows(rows):
-        raise ValueError(f"GR rows path admits {CHUNK_ROW_COUNTS} rows or a slab row count, got {rows}")
+    lanes = not isinstance(rows, bool) and type(rows) is int and 1 <= rows <= CHUNK_ROWS
+    if rows not in CHUNK_ROW_COUNTS and not is_slab_rows(rows) and not lanes:
+        raise ValueError(f"GR rows path admits 1..{CHUNK_ROWS} rows, {CHUNK_ROW_COUNTS} rows or a slab row count, got {rows}")
     return (1, RESIDUAL_BRANCHES, rows, LOCAL_HIDDEN_SIZE)
 
 
@@ -122,6 +124,32 @@ DEVICE_WEIGHTS = {
     "up": ((1, 1, PARTIAL_WIDTH, FLAT_LOCAL_WIDTH), ttnn.bfloat16, 3),
 }
 MATMUL_WEIGHTS = ("down_inject", "up")
+
+
+def gr_rows_shapes(rows_or_shape, *, label: str = "GR rows") -> dict[str, Any]:
+    """The rows path's local shapes for ``rows`` tokens (32 = the chunk constants above, 1..32 = batched lanes).
+
+    ``rows_or_shape`` is the row count or a rank-4 local shape whose dim 2 is the row count.  The flat and partial
+    tensors are one 32-row tile tall whatever the row count (the DRAM-sharded matmuls keep the decode program).
+    """
+
+    rows = rows_or_shape
+    if isinstance(rows_or_shape, tuple):
+        if len(rows_or_shape) != 4:
+            raise ValueError(f"{label} must be rank 4 [1,4,rows,640] / [1,1,rows,...], got {list(rows_or_shape)}")
+        rows = rows_or_shape[2]
+    rows = require_lane_count(rows, label=label)
+    return {
+        "rows": rows,
+        "residual": (1, RESIDUAL_BRANCHES, rows, LOCAL_HIDDEN_SIZE),
+        "token_major": (1, rows, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE),
+        "flat": (1, 1, rows, FLAT_LOCAL_WIDTH),
+        "flat_padded": (1, 1, CHUNK_ROWS, FLAT_LOCAL_WIDTH),
+        "block": (1, 1, rows, LOCAL_HIDDEN_SIZE),
+        "injection": (1, 1, rows, RESIDUAL_BRANCHES),
+        "partial": (1, 1, rows, PARTIAL_WIDTH),
+        "partial_padded": (1, 1, CHUNK_ROWS, PARTIAL_WIDTH),
+    }
 
 
 def _shape(tensor) -> tuple[int, ...]:
@@ -792,15 +820,18 @@ class Qwen38TTNNGatedResidual:
 
         ``flat_views``: the branch-major <-> flat walks as the 1-row read's ``ttnn.experimental.view`` (every branch
         is one 32-row tile row, so the branch-major tile sequence is the flat rows' tile sequence: the same pages,
-        no permute and no relayout; the 32-row form only); the default keeps the permutes (the prefill chunks' form,
-        32 or 128 rows).
+        no permute and no relayout; the forms of at most 32 rows: the chunk and the batched lanes); the default keeps
+        the permutes (the prefill chunks' form, 32 or 128 rows).  Below 32 rows (B lanes) every flat tensor is one
+        padded tile and the two fast_reduce_nc calls report the tile as their row count: the logical rows are restored.
         """
 
-        rows = _shape(residual_rows)[2]  # the chunk form: residual_rows_shape admits 32 or 128
+        rows = _shape(residual_rows)[2]  # residual_rows_shape admits 1..32, 128 and the slab counts
         self._validate_rows(residual_rows, residual_rows_shape(rows), label="GR residual rows")
         if flat_views and getattr(self, "_read_fused", None) is not None:
             return self._read_fused(self, residual_rows)
         flat_rows_shape = (1, 1, rows, FLAT_LOCAL_WIDTH)
+        tile_rows = max(rows, CHUNK_ROWS)
+        flat_rows_padded = (1, 1, tile_rows, FLAT_LOCAL_WIDTH)
         dram = ttnn.DRAM_MEMORY_CONFIG
         stats = ttnn.rms_norm_pre_all_gather(
             residual_rows, dtype=ttnn.bfloat16, memory_config=dram, compute_kernel_config=self.compute_config
@@ -826,10 +857,10 @@ class Qwen38TTNNGatedResidual:
         # whole row-tile blocks: sliced out and concatenated on the width, no token-major intermediate (whose
         # 4-row branch dim would pad to a tile: 8x the bytes through a permute and a reshape).
         if flat_views:
-            if rows != CHUNK_ROWS:
-                raise ValueError(f"GR rows flat views are the 32-row form's option, got {rows} rows")
+            if rows > CHUNK_ROWS:
+                raise ValueError(f"GR rows flat views are the option of at most {CHUNK_ROWS} rows, got {rows} rows")
             unit_flat = ttnn.experimental.view(unit, flat_rows_shape)  # the view owns unit's buffer
-        elif rows != CHUNK_ROWS:
+        elif rows > CHUNK_ROWS:
             branches = [
                 ttnn.slice(unit, (0, b, 0, 0), (1, b + 1, rows, LOCAL_HIDDEN_SIZE), memory_config=dram)
                 for b in range(RESIDUAL_BRANCHES)
@@ -843,9 +874,9 @@ class Qwen38TTNNGatedResidual:
             unit_flat = ttnn.reshape(unit_tokens, flat_rows_shape)
             if _tensor_key(unit_flat) != _tensor_key(unit_tokens):
                 _deallocate(unit_tokens)
-        if _shape(unit_flat) != flat_rows_shape or _padded_shape(unit_flat) != flat_rows_shape:
+        if _shape(unit_flat) != flat_rows_shape or _padded_shape(unit_flat) != flat_rows_padded:
             raise RuntimeError(
-                f"GR rows flat unit must be {flat_rows_shape} backed by itself, "
+                f"GR rows flat unit must be {flat_rows_shape} backed by {flat_rows_padded}, "
                 f"got {_shape(unit_flat)}/{_padded_shape(unit_flat)}"
             )
         # One tile is normalized straight into the down+inject activation shard; the long chunk normalizes
@@ -854,12 +885,12 @@ class Qwen38TTNNGatedResidual:
             unit_flat,
             self.norm_scale_flat,
             dtype=ttnn.bfloat16,
-            memory_config=self.down_inject_act_memory_config if rows == CHUNK_ROWS else dram,
+            memory_config=self.down_inject_act_memory_config if rows <= CHUNK_ROWS else dram,
         )
         _deallocate(unit_flat)
         self.mesh_contract.validate_tensor(normalized_ws, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         if _shape(normalized_ws) != flat_rows_shape or (
-            rows == CHUNK_ROWS and normalized_ws.memory_config() != self.down_inject_act_memory_config
+            rows <= CHUNK_ROWS and normalized_ws.memory_config() != self.down_inject_act_memory_config
         ):
             raise RuntimeError(
                 f"GR rows normalization produced {_shape(normalized_ws)} {normalized_ws.memory_config()}, "
@@ -871,7 +902,7 @@ class Qwen38TTNNGatedResidual:
         slab = is_slab_rows(rows)
         normalized_tiles = (
             [normalized_ws]
-            if rows == CHUNK_ROWS
+            if rows <= CHUNK_ROWS
             else []
             if slab
             else dram_sharded_row_tiles(normalized_ws, self.down_inject_act_memory_config)
@@ -889,6 +920,7 @@ class Qwen38TTNNGatedResidual:
             partial_tiles.append(ttnn.to_memory_config(partial_ws, dram))
             _deallocate(partial_ws)
         partial_rows_shape = (1, 1, rows, PARTIAL_WIDTH)
+        partial_rows_padded = (1, 1, tile_rows, PARTIAL_WIDTH)
         if slab:
             # The slab: one 2D-multicast matmul over every row on an interleaved copy of the weight (fp32 out), or on
             # the resident prefill copy and with the prefill dense policy's fidelity when its switches say so.
@@ -900,7 +932,7 @@ class Qwen38TTNNGatedResidual:
                 dtype=ttnn.float32,
                 resident_weight=self.prefill_dense.resident("down_inject"),
             )
-        elif rows == CHUNK_ROWS:
+        elif rows <= CHUNK_ROWS:
             partial = partial_tiles[0]
         else:
             # The four FP32 tile partials stacked on the rows: one gather and one reduce for the 128 rows (the
@@ -911,7 +943,7 @@ class Qwen38TTNNGatedResidual:
         self._mark_partial(partial, partial_rows_shape)
         if (
             _shape(partial) != partial_rows_shape
-            or _padded_shape(partial) != partial_rows_shape
+            or _padded_shape(partial) != partial_rows_padded
             or partial.dtype != ttnn.float32
             or partial.layout != ttnn.TILE_LAYOUT
             or partial.memory_config() != dram
@@ -941,6 +973,8 @@ class Qwen38TTNNGatedResidual:
             gathered, dims=[0], output=None, compute_kernel_config=self.compute_config, memory_config=dram
         )
         _deallocate(gathered)
+        if rows < CHUNK_ROWS and _shape(reduced) == partial_rows_padded:
+            reduced = ttnn.reshape(reduced, partial_rows_shape, reduced.padded_shape)  # the tile reported as rows
         self.mesh_contract.validate_tensor(reduced, placement=TensorPlacement.REPLICATED)
         if _shape(reduced) != partial_rows_shape or reduced.dtype != ttnn.float32:
             raise RuntimeError(
@@ -961,10 +995,11 @@ class Qwen38TTNNGatedResidual:
             )
 
         up_tiles = []
-        for tile in range(0 if slab else rows // CHUNK_ROWS):
+        low_rank_tile_shape = (1, 1, min(rows, CHUNK_ROWS), PARTIAL_WIDTH)
+        for tile in range(0 if slab else tile_rows // CHUNK_ROWS):
             reduced_tile = (
                 reduced_bf16
-                if rows == CHUNK_ROWS
+                if rows <= CHUNK_ROWS
                 else ttnn.slice(
                     reduced_bf16,
                     (0, 0, tile * CHUNK_ROWS, 0),
@@ -974,10 +1009,8 @@ class Qwen38TTNNGatedResidual:
             )
             low_rank_ws = ttnn.silu(reduced_tile, memory_config=self.up_act_memory_config)
             _deallocate(reduced_tile)
-            if _shape(low_rank_ws) != PARTIAL_REDUCTION_ROWS_SHAPE:
-                raise RuntimeError(
-                    f"GR rows low-rank tile is {_shape(low_rank_ws)}, expected {PARTIAL_REDUCTION_ROWS_SHAPE}"
-                )
+            if _shape(low_rank_ws) != low_rank_tile_shape:
+                raise RuntimeError(f"GR rows low-rank tile is {_shape(low_rank_ws)}, expected {low_rank_tile_shape}")
             if low_rank_ws.memory_config() != self.up_act_memory_config:
                 raise RuntimeError(f"GR rows low-rank rows have memory config {low_rank_ws.memory_config()}")
             self.mesh_contract.validate_tensor(low_rank_ws, placement=TensorPlacement.REPLICATED)
@@ -1001,7 +1034,7 @@ class Qwen38TTNNGatedResidual:
                 resident_weight=self.prefill_dense.resident("up"),
             )
             _deallocate(low_rank, reduced_bf16)
-        elif rows == CHUNK_ROWS:
+        elif rows <= CHUNK_ROWS:
             up_flat = up_tiles[0]
         else:
             up_flat = ttnn.concat(up_tiles, dim=2, memory_config=dram)
@@ -1017,7 +1050,7 @@ class Qwen38TTNNGatedResidual:
         # branch columns are sliced out and stacked on dim 1 (the fold's inverse, no token-major intermediate).
         if flat_views:
             gated = ttnn.experimental.view(gated_flat, residual_rows_shape(rows))  # owns gated_flat's buffer
-        elif rows != CHUNK_ROWS:
+        elif rows > CHUNK_ROWS:
             branches = [
                 ttnn.slice(
                     gated_flat,
@@ -1041,6 +1074,8 @@ class Qwen38TTNNGatedResidual:
             gated, dims=[1], output=None, compute_kernel_config=self.compute_config, memory_config=dram
         )
         _deallocate(gated)
+        if rows < CHUNK_ROWS and _shape(block_rows) == (1, 1, CHUNK_ROWS, LOCAL_HIDDEN_SIZE):
+            block_rows = ttnn.reshape(block_rows, block_rows_shape(rows), block_rows.padded_shape)  # the tile as rows
         self._validate_rows(block_rows, block_rows_shape(rows), label="GR rows block input")
 
         injection = ttnn.multiply(

@@ -75,7 +75,7 @@ def test_long_chunk_contract() -> None:
         gdn_module.rows_tile_count(1) == gdn_module.rows_tile_count(32) == 32 and gdn_module.rows_tile_count(128) == 128
     )
     assert gdn_module.LONG_CONV_WINDOW_TILE_ROWS == 160
-    assert moe_module.SUPPORTED_ROWS == (1, 5, 32, 128) and moe_module.LONG_PREFILL_CHUNK_ROWS == 128
+    assert moe_module.SUPPORTED_ROWS == (*range(1, 33), 128) and moe_module.LONG_PREFILL_CHUNK_ROWS == 128
     assert (
         moe_module.Qwen38TTNNMoERowContract(128).row_tiles == 4
         and moe_module.Qwen38TTNNMoERowContract(32).row_tiles == 1
