@@ -1056,9 +1056,9 @@ def test_committed_baselines_belong_to_baseline_pins_and_carry_their_source():
         }
     )
     assert chunked["json"] is None and forced["json"] is None
-    assert chunked == {  # the 2026-09-06 replay: the GDN decay gate through ttnn.softplus
+    assert chunked == {  # the 2026-09-25 replay: bf8 dense weights, the fused GDN step and the compact expert layout
         "json": None,
-        "chat": 43,
+        "chat": 2,
         "code": 32,
         "fact": 15,
         "list": 56,
@@ -1072,9 +1072,10 @@ def test_committed_baselines_belong_to_baseline_pins_and_carry_their_source():
     }
     mtp4 = ci.load_baseline("A3/mtp4-32k/divergence_index")["expected"]
     assert set(mtp4) == set(chunked) and mtp4["json"] is None
-    # the same replay through the MTP pass loop: later on chat, earlier on list, math and summary, where the device's
-    # own logits hold the two candidates within one bf16 step (the verify row and the 1-row TAIL break the tie apart)
-    assert mtp4 == {**chunked, "chat": 56, "list": 46, "math": 56, "summary": 1}
+    # the same replay through the MTP pass loop: later on chat and math, earlier on summary, where the device's own
+    # logits hold the two candidates within one bf16 step (the verify row and the 1-row TAIL break the tie apart; the
+    # fused GDN step serves the one-row step only)
+    assert mtp4 == {**chunked, "chat": 43, "math": 63, "summary": 1}
     items = ci.load_baseline("C2/greedy-nothink/item_pass")["expected"]
     per_task = {}
     for key, flag in items.items():
