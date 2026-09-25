@@ -37,6 +37,18 @@ SCAN_CORES_ENV = (
 )
 
 
+LANE_SPLIT_ENV = (
+    "QWEN38_FUSED_GREEDY_TAIL_LANE_SPLIT"  # dev knob: 0 runs the lanes' per-core all-rows scan (the 2026-09-25 form)
+)
+LANE_SPLIT_CORES = 128  # (row, tile-group) items over at most this many cores
+
+
+def lane_split(environ=None) -> bool:
+    import os
+
+    return (os.environ if environ is None else environ).get(LANE_SPLIT_ENV, "1").strip() != "0"
+
+
 def scan_cores(environ=None) -> int:
     import os
 
@@ -59,7 +71,8 @@ SCAN_ARGS = (
     "tile_count",
     "core_index",
     "lists_addr",
-)  # the last with candidates
+    "row",
+)  # lists: candidates; row: lane_split
 MERGE_ARGS = (
     "pairs_addr",
     "zero_tile_addr",
@@ -159,9 +172,26 @@ def greedy_candidates(
     tiles = int(logits.shape[3]) // TILE
     zero_bf16, _zero_fp32 = prepare(mesh)
     grid = mesh.compute_with_storage_grid_size()
-    work = fp.split_work(tiles, mesh, cores=min(scan_cores(), tiles, grid.x * grid.y))
+    split = rows > 1 and lane_split()
+    if split:
+        # (row, tile group) items: G groups of tiles, rows x G cores in linear core order (core r * G + g takes row r, group g)
+        groups = max(1, min(LANE_SPLIT_CORES // rows, tiles, grid.x * grid.y // rows))
+        ranges = fp.split_work(tiles, mesh, cores=groups)
+        cores = fp.split_work(rows * len(ranges), mesh, cores=rows * len(ranges))
+        work = [
+            fp.CoreWork(core=c.core, start=ranges[i % len(ranges)].start, count=ranges[i % len(ranges)].count)
+            for i, c in enumerate(cores)
+        ]
+        item_row = [i // len(ranges) for i in range(len(work))]
+        item_group = [i % len(ranges) for i in range(len(work))]
+        pairs_per_row = len(ranges)
+    else:
+        work = fp.split_work(tiles, mesh, cores=min(scan_cores(), tiles, grid.x * grid.y))
+        item_row = [0] * len(work)
+        item_group = list(range(len(work)))
+        pairs_per_row = len(work)
     grid = fp.core_rectangle(work, mesh)
-    pairs_lanes = -(-4 * len(work) // 16) * 16  # 16 bytes per core, the row padded to the 64-byte DRAM read grain
+    pairs_lanes = -(-4 * pairs_per_row // 16) * 16  # 16 bytes per pair, the row padded to the 64-byte DRAM read grain
     pairs = fp.allocate((1, 1, rows, pairs_lanes), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, mesh, memory_config)
     lists = row = None
     if candidates:
@@ -178,15 +208,29 @@ def greedy_candidates(
         [
             (
                 w.core,
-                [logits.buffer_address(), pairs.buffer_address(), w.start, w.count, i]
-                + ([lists.buffer_address()] if candidates else []),
+                [logits.buffer_address(), pairs.buffer_address(), w.start, w.count, item_group[i]]
+                + ([lists.buffer_address()] if candidates else [0])
+                + ([item_row[i]] if split else []),
             )
             for i, w in enumerate(work)
         ],
         defines=defines,
-        named={"cb_stage": CB_STAGE, "lanes_per_tile": TILE, "rows": rows, "candidates": candidates},
+        named={
+            "cb_stage": CB_STAGE,
+            "lanes_per_tile": TILE,
+            "rows": rows,
+            "candidates": candidates,
+            "lane_split": int(split),
+        },
     )
-    scan_pages = SCAN_STAGE_PAGES if rows == 1 else max(w.count for w in work) + 1  # one 2 KB slot per tile + the pairs
+    if rows == 1:
+        scan_pages = SCAN_STAGE_PAGES
+    elif split:
+        scan_pages = -(
+            -(128 * max(w.count for w in work) + 16) // 2048
+        )  # 128 bytes per tile (its two grains) + the pair
+    else:
+        scan_pages = max(w.count for w in work) + 1  # one 2 KB slot per tile + the pairs
     fp.run_program(
         scan_tensors,
         fp.program_descriptor([scan], cbs=[fp.cb_descriptor(CB_STAGE, ttnn.bfloat16, 2048, scan_pages, grid)]),
@@ -196,6 +240,7 @@ def greedy_candidates(
     packed = fp.allocate((1, 1, rows, packed_lanes), ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, mesh, memory_config)
     core, one = _one_core(mesh)
     tensors = [pairs, zero_bf16, values, indices, packed] + ([lists, vocab_start, row] if candidates else [])
+    cores = pairs_per_row  # the merge compares the pairs of each row: the tile groups (lane_split) or the scan cores
     merge = fp.reader_kernel(
         KERNELS["merge"],
         one,
@@ -204,7 +249,7 @@ def greedy_candidates(
         defines=defines,
         named={
             "cb_stage": CB_STAGE,
-            "cores": len(work),
+            "cores": cores,
             "rows": rows,
             "packed_lanes": packed_lanes,
             "candidates": candidates,
@@ -216,7 +261,7 @@ def greedy_candidates(
             [merge],
             cbs=[
                 fp.cb_descriptor(
-                    CB_STAGE, ttnn.bfloat16, 2048, merge_stage_pages(rows, len(work), packed_lanes, candidates), one
+                    CB_STAGE, ttnn.bfloat16, 2048, merge_stage_pages(rows, cores, packed_lanes, candidates), one
                 )
             ],
         ),

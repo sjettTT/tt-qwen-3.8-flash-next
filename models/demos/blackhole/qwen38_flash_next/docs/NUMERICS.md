@@ -25,41 +25,43 @@ Every number here was measured on 4x p150 unless a date and host say otherwise.
 
 Decode chains run as fused programs (`ttnn/fused/`, built on `ttnn.generic_op`) where a kernel is bitwise against the
 chain it replaces on device, leaves every pinned table above unchanged and beats the previous step time in its own
-timing slot.  On by default: `gr_read` with `gr_fold`, `gr_write`, `greedy_tail`, `moe_post`, `ple`, `position_derive`,
+timing slot. On by default: `gr_read` with `gr_fold`, `gr_write`, `greedy_tail`, `moe_post`, `ple`, `position_derive`,
 `qsa_block`, `router_tail`, `shared_expert`: the gated-residual read as two programs with its two all-gathers inside
-them (the stats, their gather, normalize + down-project and the partial gather as one program whose transport cores
-send the tiles over the 1D fabric line into the pages the stock collectives write, then low-rank + gate: 18 programs
-per read as 2, the chain's LLK sequences call for call, its reduce scaler and spill/reload rounding included; a gather
-is data movement, so the fold is bitwise, 2026-09-25); the gated-residual write as one program (SFPU multiply, FPU add, as
-the chain); the tail's greedy epilogue (24 programs as 4 plus one gather); the MoE post program (fill, tilize, the
+them (the stats, their gather, normalize + down-project and the partial gather as one program whose transport cores send
+the tiles over the 1D fabric line into the pages the stock collectives write, then low-rank + gate: 18 programs per read
+as 2, the chain's LLK sequences call for call, its reduce scaler and spill/reload rounding included; a gather is data
+movement, so the fold is bitwise, 2026-09-25); the gated-residual write as one program (SFPU multiply, FPU add, as the
+chain); the tail's greedy epilogue (24 programs as 4 plus one gather); the MoE post program (fill, tilize, the
 score-weighted reduce over the ten expert slots in slot order, the shared expert's x sigmoid and the partial add as one
-program; its reader takes each routing tensor in one read from moe_compute's drain-core shard and seeds the score
-tiles with the NoC's zeros, so the program is 7.5 -> 5.9 us at one row and flat in the row count, bitwise; at several
-rows the routed dispatch untilizes the sharded hidden directly and takes the rows view of the result, 2026-09-25); the
-prologue's position derivation (40 programs as 1); the sparse-attention block's decode glue as six
-programs (index tail, main tail, post-attention, partial widen, selection row, score merge); the MoE router tail
-(softmax, top-10, sum, div, casts and layouts: 12 programs per layer as one, its top-k on one core per eight-token
-group: the LLK sort's four independent passes, so every token sees the chain's instructions, bitwise, 88 -> 52 us per
-layer at one row, 2026-09-18); the shared expert as three programs (one
-DRAM-sharded linear over the concatenated [gate | up | scalar] weight, one silu / product / sigmoid program, the down
-linear); the layer-1 PLE (stats, group norm, gate, conv with the state shift and the layer's permute + add: 56 programs
-as 9, the SFPU `mac_tile` of `ttnn.mac`, the accurate fp32 reduce of the gate's sum); and, since 2026-09-25, `gdn_step`,
-the GDN decode step from the projection to the gated output as one program (the conv, the head split, the gates, the
-l2 norms, the fp32 delta-rule update, the read-out, the gated RMSNorm and the sigmoid gate: 49 programs per layer as 1),
-a COMPONENT-class kernel that serves by default on its component-gate proof against the CPU oracle (layer-0 probe, four
-p150: state error 0.0048 and gated output 0.0098 for the fused step, 0.0081 and 0.0234 for the composed chain) and
-runs where its input contract holds (the one-row step and, since 2026-09-25, the batched-decode lanes body on B rows,
-one item per (lane, value head) and one state slot per lane: 40.9 -> 35.0 ms per step at 4 lanes and 50.4 -> 43.3 ms at
-8 on the 200-replay lane sweep, 28.5 and 23.1 tok/s per user, 114 and 185 aggregate, the one-row step unchanged; the MTP
-draft body and verify rows keep the chain).  The composite lane body, kept as the fallback when the fused GDN step is
-not admitted, differs from the one-row fused body at one near-tie in the acceptance chain (219/225 at 4 and 8 lanes);
-the fused lanes form matches 225/225.  Opt-in
-through `QWEN38_FUSED=<name>`: `final_mixer`, `position_advance`.  The kernels cover rows 1..32 (decode, the MTP
-verify rows); the 128-row prefill chunk and the slab keep their chains.  `QWEN38_FUSED_OFF=<name>[,...]` (or `all`) in
-the server's environment falls back to the composed chains; an unknown name in either variable refuses to start;
-`QWEN38_FUSED_OFF=gr_fold` runs the GR read's merged three-program form with the stock collectives (5 programs per read);
-`QWEN38_FUSED_GR_READ_MERGED=0` runs the GR read's split form (7 programs per read); `QWEN38_ROUTER_TAIL_LANES=0` runs
-the router tail's top-k on one core per tile (the same program, the LLK's four passes on that core).
+program; its reader takes each routing tensor in one read from moe_compute's drain-core shard and seeds the score tiles
+with the NoC's zeros, so the program is 7.5 -> 5.9 us at one row and flat in the row count, bitwise; at several rows the
+routed dispatch untilizes the sharded hidden directly and takes the rows view of the result, 2026-09-25); the prologue's
+position derivation (40 programs as 1); the sparse-attention block's decode glue as six programs (index tail, main tail,
+post-attention, partial widen, selection row, score merge); the MoE router tail (softmax, top-10, sum, div, casts and
+layouts: 12 programs per layer as one, its top-k on one core per eight-token group: the LLK sort's four independent
+passes, so every token sees the chain's instructions, bitwise, 88 -> 52 us per layer at one row, 2026-09-18); the shared
+expert as three programs (one DRAM-sharded linear over the concatenated [gate | up | scalar] weight, one silu / product
+/ sigmoid program, the down linear); the layer-1 PLE (stats, group norm, gate, conv with the state shift and the layer's
+permute + add: 56 programs as 9, the SFPU `mac_tile` of `ttnn.mac`, the accurate fp32 reduce of the gate's sum); and,
+since 2026-09-25, `gdn_step`, the GDN decode step from the projection to the gated output as one program (the conv, the
+head split, the gates, the l2 norms, the fp32 delta-rule update, the read-out, the gated RMSNorm and the sigmoid gate:
+49 programs per layer as 1), a COMPONENT-class kernel that serves by default on its component-gate proof against the CPU
+oracle (layer-0 probe, four p150: state error 0.0048 and gated output 0.0098 for the fused step, 0.0081 and 0.0234 for
+the composed chain) and runs where its input contract holds (the one-row step and, since 2026-09-25, the batched-decode
+lanes body on B rows, one item per (lane, value head) and one state slot per lane: 40.9 -> 35.0 ms per step at 4 lanes
+and 50.4 -> 43.3 ms at 8 on the 200-replay lane sweep, 28.5 and 23.1 tok/s per user, 114 and 185 aggregate, the one-row
+step unchanged; the MTP draft body and verify rows keep the chain). The composite lane body, kept as the fallback when
+the fused GDN step is not admitted, differs from the one-row fused body at one near-tie in the acceptance chain (219/225
+at 4 and 8 lanes); the fused lanes form matches 225/225.  The lanes' greedy tail scans (row, tile-group) items since
+2026-09-25, one lane row per core on up to 128 cores (the scan program 164 -> 86 us at 4 lanes and 322 -> 173 at 8, the
+step 34.7 -> 34.6 and 42.8 -> 42.7 ms at 4 and 8 lanes on the 200-replay lane sweep), bitwise the per-core all-rows scan
+it replaces (`QWEN38_FUSED_GREEDY_TAIL_LANE_SPLIT=0`).  Opt-in through `QWEN38_FUSED=<name>`: `final_mixer`,
+`position_advance`. The kernels cover rows 1..32 (decode, the MTP verify rows); the 128-row prefill chunk and the slab
+keep their chains. `QWEN38_FUSED_OFF=<name>[,...]` (or `all`) in the server's environment falls back to the composed
+chains; an unknown name in either variable refuses to start; `QWEN38_FUSED_OFF=gr_fold` runs the GR read's merged
+three-program form with the stock collectives (5 programs per read); `QWEN38_FUSED_GR_READ_MERGED=0` runs the GR read's
+split form (7 programs per read); `QWEN38_ROUTER_TAIL_LANES=0` runs the router tail's top-k on one core per tile (the
+same program, the LLK's four passes on that core).
 
 The DRAM-sharded decode linears of the GDN input and output projections, the sparse attention's query-gate and output
 projections and the LM-head chunks read each DRAM bank with two worker cores (`num_workers_per_dram_bank=2`; the K/V and

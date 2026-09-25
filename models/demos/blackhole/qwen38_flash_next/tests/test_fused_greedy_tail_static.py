@@ -66,7 +66,7 @@ def test_registered_bitwise():
 @pytest.mark.parametrize(
     "kernel, runtime_args, tensors, named",
     [
-        ("scan", gt.SCAN_ARGS, 3, {"cb_stage", "lanes_per_tile", "rows", "candidates"}),
+        ("scan", gt.SCAN_ARGS, 3, {"cb_stage", "lanes_per_tile", "rows", "candidates", "lane_split"}),
         ("merge", gt.MERGE_ARGS, 8, {"cb_stage", "cores", "rows", "packed_lanes", "candidates"}),
         ("resolve", gt.RESOLVE_ARGS, 6, {"cb_stage", "devices", "copy_into", "rows", "stride"}),
     ],
@@ -83,7 +83,7 @@ def test_kernel_arg_contracts(kernel, runtime_args, tensors, named):
 def test_python_side_named_args_match_the_kernels():
     source = inspect.getsource(gt)
     for kernel, expected in (
-        ("scan", {"cb_stage", "lanes_per_tile", "rows", "candidates"}),
+        ("scan", {"cb_stage", "lanes_per_tile", "rows", "candidates", "lane_split"}),
         ("merge", {"cb_stage", "cores", "rows", "packed_lanes", "candidates"}),
         ("resolve", {"cb_stage", "devices", "copy_into", "rows", "stride"}),
     ):
@@ -140,8 +140,10 @@ def test_staging_layouts_fit_the_cbs():
     assert 2048 + pairs_bytes + 32 <= gt.MERGE_STAGE_PAGES * 2048
     assert 4096 + 3 * 64 <= gt.RESOLVE_STAGE_PAGES * 4096
     assert "PAIRS_BYTES = ((16 * CORES) + 63) & ~63u;" in SOURCES["merge"]
-    assert "pairs_lanes = -(-4 * len(work) // 16) * 16" in inspect.getsource(gt.greedy_candidates)
-    assert "{.page_id = 0, .offset_bytes = 16 * core}" in SOURCES["scan"]
+    assert "pairs_lanes = -(-4 * pairs_per_row // 16) * 16" in inspect.getsource(gt.greedy_candidates)
+    assert (
+        "{.page_id = row, .offset_bytes = 16 * core}" in SOURCES["scan"]
+    )  # row 0 of the one-row step, row r of a lane
 
 
 def test_composed_chains_follow_the_lm_head_op_order():
@@ -241,7 +243,13 @@ def test_lane_forms_keep_the_one_row_paths_and_the_kernel_layouts():
     (resolve), and the lanes' hooks gather the packed rows once."""
 
     scan, merge, resolve = SOURCES["scan"], SOURCES["merge"], SOURCES["resolve"]
-    assert "if constexpr (ROWS == 1) {" in scan and "constexpr uint32_t LO_ROWS = ROWS < 16 ? ROWS : 16;" in scan
+    assert (
+        "if constexpr (ROWS == 1 || LANE_SPLIT) {" in scan
+        and "constexpr uint32_t LO_ROWS = ROWS < 16 ? ROWS : 16;" in scan
+    )
+    assert (
+        "const uint32_t row = LANE_SPLIT ? get_arg_val<uint32_t>(6) : 0;" in scan
+    )  # one lane row per core (lane_split)
     assert "{.page_id = r, .offset_bytes = 16 * core}" in scan  # row r of the pairs rows
     assert "if constexpr (ROWS == 1 && PACKED_LANES == 2) {" in merge  # the decode step's two-lane row keeps its path
     assert "constexpr uint32_t PACKED_ROW_BYTES = PACKED_LANES * 4;" in merge

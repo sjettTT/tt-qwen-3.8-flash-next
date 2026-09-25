@@ -26,7 +26,11 @@ def test_constants_match_the_sampling_chain():
     assert gt.CANDIDATES == embedding.SAMPLING_CANDIDATES_PER_DEVICE == 32
     assert gt.LIST_BYTES == 8 * gt.CANDIDATES
     assert 2 * gt.CANDIDATES * embedding.TP_SIZE == embedding.SAMPLING_CANDIDATE_ROW_SHAPE[3]
-    assert gt.SCAN_ARGS[-1] == "lists_addr" and gt.MERGE_ARGS[-3:] == ("lists_addr", "vocab_start_addr", "row_addr")
+    assert gt.SCAN_ARGS[-2:] == ("lists_addr", "row") and gt.MERGE_ARGS[-3:] == (
+        "lists_addr",
+        "vocab_start_addr",
+        "row_addr",
+    )
 
 
 def _one_line(source: str) -> str:

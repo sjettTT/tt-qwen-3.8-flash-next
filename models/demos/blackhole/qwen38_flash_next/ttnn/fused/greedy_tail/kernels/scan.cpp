@@ -11,9 +11,13 @@
 // With candidates > 0 (the decode step of a sampling server) each core also keeps its top `candidates` pairs in key
 // order, lowest id first among equal keys, and writes them as one fp32 ROW_MAJOR page [values | ids] of the lists
 // tensor (page = core); the argmax pair is the list's first entry, so the greedy outputs are unchanged.
-// Named compile-time args: cb_stage, lanes_per_tile, rows, candidates.  Compile-time args: TensorAccessorArgs(logits),
+// LANE_SPLIT (rows > 1): one lane row per core, (row, tile range) work items over the grid: the core reads only row r
+// of its tiles (the two 64-byte grains that hold it, as the one-row path reads row 0) and writes its pair to pairs row
+// r, lane 4 g of its tile group g; the merge then compares the groups of each row in group order (increasing id
+// ranges), so every lane meets the one-row path's rule: bitwise the per-core all-rows scan below it. Named compile-time
+// args: cb_stage, lanes_per_tile, rows, candidates, lane_split.  Compile-time args: TensorAccessorArgs(logits),
 // (pairs), (lists when candidates > 0).  Runtime args: 0 logits addr, 1 pairs addr, 2 first tile, 3 tile count,
-// 4 core index, 5 lists addr (candidates > 0).
+// 4 core index (the tile group), 5 lists addr (candidates > 0), 6 row (lane_split).
 
 #include <cstdint>
 
@@ -27,6 +31,9 @@ constexpr uint32_t CB_STAGE = get_named_compile_time_arg_val("cb_stage");
 constexpr uint32_t LANES = get_named_compile_time_arg_val("lanes_per_tile");
 constexpr uint32_t ROWS = get_named_compile_time_arg_val("rows");
 constexpr uint32_t CANDIDATES = get_named_compile_time_arg_val("candidates");
+constexpr uint32_t LANE_SPLIT = get_named_compile_time_arg_val("lane_split");
+static_assert(
+    LANE_SPLIT == 0 || (ROWS > 1 && CANDIDATES == 0), "lane_split is the lanes' form (rows > 1, no candidate row)");
 static_assert(CANDIDATES == 0 || ROWS == 1, "the candidate row folds into the one-row scan");
 // GT_CANDIDATE_ROW (the host defines it with candidates > 0) compiles the list branch: a discarded `if constexpr`
 // branch is still checked in this non-template function, and its TensorAccessorArgs index is out of range without
@@ -37,7 +44,6 @@ static_assert(CANDIDATES > 0, "GT_CANDIDATE_ROW needs candidates > 0");
 static_assert(CANDIDATES == 0, "candidates > 0 needs GT_CANDIDATE_ROW");
 #endif
 constexpr uint32_t GRAIN = 64;
-constexpr uint32_t FACE1_OFFSET = 512;
 constexpr uint32_t TILE_BYTES = 2048, FACE_BYTES = 512, ROW_BYTES = 32;
 
 // -0.0 is canonicalized to +0.0 first: the chain compares as floats (the zeros tie, the first lane wins) and its max
@@ -61,11 +67,27 @@ void kernel_main() {
     stage.reserve_back(1);
     const uint32_t base = stage.get_write_ptr();
     volatile tt_l1_ptr uint16_t* halves = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(base);
-    if constexpr (ROWS == 1) {
-        // tile t of this core: its two 64-byte face-row reads land at 128 t (face 0) and 128 t + 64 (face 1)
+    if constexpr (ROWS == 1 || LANE_SPLIT) {
+        // tile t of this core: the two 64-byte grains holding row `row` of faces (row >> 4) * 2 and + 1 land at 128 t
+        // and 128 t + 64 (row 0 of faces 0 and 1 for the one-row step); an odd row sits 32 bytes into its grain
+        const uint32_t row = LANE_SPLIT ? get_arg_val<uint32_t>(6) : 0;
+        const uint32_t face_lo = ((row >> 4) << 1) * FACE_BYTES;
+        const uint32_t row_bytes = (row & 15) * ROW_BYTES;
+        const uint32_t grain_off = row_bytes & ~(GRAIN - 1);
+        const uint32_t in_grain = (row_bytes & (GRAIN - 1)) / 2;  // half-words into the grain: 0 or 16
         for (uint32_t t = 0; t < count; ++t) {
-            noc.async_read(logits, stage, GRAIN, {.page_id = first + t, .offset_bytes = 0}, {.offset_bytes = 128 * t});
-            noc.async_read(logits, stage, GRAIN, {.page_id = first + t, .offset_bytes = FACE1_OFFSET}, {.offset_bytes = 128 * t + 64});
+            noc.async_read(
+                logits,
+                stage,
+                GRAIN,
+                {.page_id = first + t, .offset_bytes = face_lo + grain_off},
+                {.offset_bytes = 128 * t});
+            noc.async_read(
+                logits,
+                stage,
+                GRAIN,
+                {.page_id = first + t, .offset_bytes = face_lo + FACE_BYTES + grain_off},
+                {.offset_bytes = 128 * t + 64});
         }
         noc.async_read_barrier();
 
@@ -78,7 +100,7 @@ void kernel_main() {
             for (uint32_t t = 0; t < count; ++t) {
                 for (uint32_t lane = 0; lane < LANES; ++lane) {
                     const uint32_t word =
-                        64 * t + (lane < 16 ? lane : 32 + (lane - 16));  // face 0 row 0, then face 1 row 0
+                        64 * t + in_grain + (lane < 16 ? lane : 32 + (lane - 16));  // face 0 row 0, then face 1 row 0
                     const uint16_t bits = canonical(halves[word]);
                     const uint32_t key = key_of(bits);
                     if (!any || key > best_key) {
@@ -93,7 +115,8 @@ void kernel_main() {
             out[1] = best_id;
             out[2] = 0;
             out[3] = 0;
-            noc.async_write(stage, pairs, 16, {.offset_bytes = out_offset}, {.page_id = 0, .offset_bytes = 16 * core});
+            noc.async_write(
+                stage, pairs, 16, {.offset_bytes = out_offset}, {.page_id = row, .offset_bytes = 16 * core});
         }
 #else
         {
@@ -108,7 +131,7 @@ void kernel_main() {
             uint32_t n = 0;
             for (uint32_t t = 0; t < count; ++t) {
                 for (uint32_t lane = 0; lane < LANES; ++lane) {
-                    const uint32_t word = 64 * t + (lane < 16 ? lane : 32 + (lane - 16));
+                    const uint32_t word = 64 * t + in_grain + (lane < 16 ? lane : 32 + (lane - 16));
                     const uint16_t bits = canonical(halves[word]);
                     const uint32_t key = key_of(bits);
                     if (n == CANDIDATES && key <= ckey[CANDIDATES - 1]) {
@@ -141,7 +164,8 @@ void kernel_main() {
                 list[CANDIDATES + i] =
                     i < n ? cid[i] : 0xFFFFFFFFu;  // no id: an unfilled slot (a core with under CANDIDATES lanes)
             }
-            noc.async_write(stage, pairs, 16, {.offset_bytes = out_offset}, {.page_id = 0, .offset_bytes = 16 * core});
+            noc.async_write(
+                stage, pairs, 16, {.offset_bytes = out_offset}, {.page_id = row, .offset_bytes = 16 * core});
             noc.async_write(
                 stage, lists, LIST_BYTES, {.offset_bytes = list_offset}, {.page_id = core, .offset_bytes = 0});
         }
