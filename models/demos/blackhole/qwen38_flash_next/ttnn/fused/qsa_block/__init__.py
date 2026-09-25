@@ -10,6 +10,10 @@ decide whether those programs are bitwise: ``ttnn.rms_norm`` (layernorm.cpp's RM
 ``rotary_embedding_hf`` (FPU multiplies and an add in the op's 16-bit dest).  ``rms_norm_rows`` and ``rope64`` below
 are their call-for-call mirrors on the foundation's stream reader/writer; the dev tool fused_qsa_llk_pins runs them
 against the ops on a chip.
+
+The served decode path computes the five K = 2560 projections as one linear (ttnn/qsa.py ``_project_merged``): the
+tail programs take the first tile of each projection's window in the tensor they are handed (``index_q_first``,
+``qg_first``, ...), 0 for a separate projection shard, the window's tile for the merged shard passed in every slot.
 """
 
 from __future__ import annotations
@@ -279,6 +283,26 @@ def _expect(tensor, shape, dtype, layout, label: str) -> None:
         )
 
 
+def _window(tensor, first_tile: int, width: int, label: str) -> None:
+    """``tensor`` [1, 1, rows, W] of whole tiles holds the ``width`` columns from tile ``first_tile``: the separate
+    projection shard at 0, or the projection's window of the merged shard."""
+
+    total = fp.tile_width_of(tensor)
+    if first_tile < 0 or first_tile * fp.TILE + width > total:
+        raise ValueError(f"{label} window of {width} columns from tile {first_tile} is outside [1, 1, rows, {total}]")
+
+
+def _io(*tensors) -> list:
+    """generic_op's io list, inputs first and the output last, each tensor once (the tails take the merged projection
+    shard in several projection slots)."""
+
+    kept = []
+    for tensor in tensors:
+        if not any(tensor is other for other in kept):
+            kept.append(tensor)
+    return kept
+
+
 def index_tail(
     index_q_ws,
     raw_key_ws,
@@ -293,18 +317,20 @@ def index_tail(
     compressed_cache,
     *,
     eps: float = EPS,
+    index_q_first: int = 0,
+    index_k_first: int = 0,
 ):
     """The fused index tail on ``rows`` lanes; returns the rotated index query [1, 1, rows, 128] bf16 TILE and
     updates ``ring`` [1, rows, 32, 128] and ``compressed_cache`` [rows, 1, H, 128] in place.  ``position`` carries the
-    chain's ``kv_block_start`` and ``kv_row_hit`` (see ``_position_inputs``)."""
+    chain's ``kv_block_start`` and ``kv_row_hit`` (see ``_position_inputs``).  ``index_q_ws`` / ``raw_key_ws`` hold
+    the index query / raw key from tile ``index_q_first`` / ``index_k_first``: the separate projection shards at 0,
+    or both the merged projection shard with its windows' first tiles."""
 
     rows = fp.rows_of(index_q_ws)
-    if (
-        fp.rows_of(raw_key_ws) != rows
-        or fp.tile_width_of(index_q_ws) != INDEX_HEAD_DIM
-        or fp.tile_width_of(raw_key_ws) != INDEX_HEAD_DIM
-    ):
-        raise ValueError("index_tail takes the index query and raw key as [1, 1, rows, 128] row tiles")
+    if fp.rows_of(raw_key_ws) != rows:
+        raise ValueError("index_tail takes the index query and raw key as row tiles of the same rows")
+    _window(index_q_ws, index_q_first, INDEX_HEAD_DIM, "index query")
+    _window(raw_key_ws, index_k_first, INDEX_HEAD_DIM, "raw key")
     block_start, row_hit = _position_inputs(position, rows)
     for label, weight in (("index_q_norm", index_q_norm), ("index_k_norm", index_k_norm)):
         _expect(weight, (1, 1, 1, INDEX_HEAD_DIM), BF16, ttnn.TILE_LAYOUT, label)
@@ -370,6 +396,8 @@ def index_tail(
                         ring.buffer_address(),
                         row_hit.buffer_address(),
                         rows,
+                        index_q_first,
+                        index_k_first,
                     ],
                 )
             ],
@@ -436,7 +464,7 @@ def index_tail(
         ),
     ]
     semaphores = [fp.semaphore_descriptor(i, both) for i in range(3)]
-    io = [
+    io = _io(
         index_q_ws,
         raw_key_ws,
         block_start,
@@ -450,7 +478,7 @@ def index_tail(
         ring,
         compressed_cache,
         out,
-    ]
+    )
     return fp.run_program(io, fp.program_descriptor(kernels, cbs=cbs, semaphores=semaphores))
 
 
@@ -580,21 +608,36 @@ def _rect(x0: int, y0: int, x1: int, y1: int) -> ttnn.CoreRangeSet:
 
 
 def main_tail(
-    qg_ws, k_ws, v_ws, position, q_norm, k_norm, cos, sin, staging, kv_cache, *, lane_rows: int = 0, eps: float = EPS
+    qg_ws,
+    k_ws,
+    v_ws,
+    position,
+    q_norm,
+    k_norm,
+    cos,
+    sin,
+    staging,
+    kv_cache,
+    *,
+    lane_rows: int = 0,
+    eps: float = EPS,
+    qg_first: int = 0,
+    k_first: int = 0,
+    v_first: int = 0,
 ):
     """The fused main tail on ``rows`` lanes; returns the sparse query [1, 32, rows, 512] bf16 ROW_MAJOR and updates
     ``staging`` [1, rows, 32, 512] (TILE) and ``kv_cache`` [1, 1, C, 512] (ROW_MAJOR, lane r's block at
-    r * lane_rows + (P_r & ~31)) in place.  The gate halves stay in ``qg_ws`` for the post-attention program."""
+    r * lane_rows + (P_r & ~31)) in place.  The gate halves stay in ``qg_ws`` for the post-attention program.
+    ``qg_ws`` / ``k_ws`` / ``v_ws`` hold their projections from tile ``qg_first`` / ``k_first`` / ``v_first``: the
+    separate projection shards at 0, or the merged projection shard in all three slots with its windows' first
+    tiles."""
 
     rows = fp.rows_of(qg_ws)
-    if (
-        fp.tile_width_of(qg_ws) != QG_WIDTH
-        or fp.rows_of(k_ws) != rows
-        or fp.rows_of(v_ws) != rows
-        or fp.tile_width_of(k_ws) != HEAD_DIM
-        or fp.tile_width_of(v_ws) != HEAD_DIM
-    ):
-        raise ValueError("main_tail takes qg [1, 1, rows, 3072] and k, v [1, 1, rows, 256] row tiles")
+    if fp.rows_of(k_ws) != rows or fp.rows_of(v_ws) != rows:
+        raise ValueError("main_tail takes qg, k and v as row tiles of the same rows")
+    _window(qg_ws, qg_first, QG_WIDTH, "qg")
+    _window(k_ws, k_first, HEAD_DIM, "k")
+    _window(v_ws, v_first, HEAD_DIM, "v")
     block_start, row_hit = _position_inputs(position, rows)
     for label, weight in (("q_norm", q_norm), ("k_norm", k_norm)):
         _expect(weight, (1, 1, 1, HEAD_DIM), BF16, ttnn.TILE_LAYOUT, label)
@@ -658,7 +701,7 @@ def main_tail(
             q_norm_set,
             [eps_bits, *acc(qg_ws), *acc(q_norm)],
             [
-                (c, [qg_ws.buffer_address(), q_norm.buffer_address(), 2 * HEAD_TILES * h])
+                (c, [qg_ws.buffer_address(), q_norm.buffer_address(), qg_first + 2 * HEAD_TILES * h])
                 for h, c in enumerate(q_norm_cores)
             ],
         ),
@@ -666,7 +709,7 @@ def main_tail(
             MAIN_TAIL["reader_norm"],
             k_norm_set,
             [eps_bits, *acc(k_ws), *acc(k_norm)],
-            [(k_norm_core, [k_ws.buffer_address(), k_norm.buffer_address(), 0])],
+            [(k_norm_core, [k_ws.buffer_address(), k_norm.buffer_address(), k_first])],
         ),
         fp.compute_kernel(
             MAIN_TAIL["compute_norm"], norm_set, [], [(c, []) for c in [*q_norm_cores, k_norm_core]], fp32_dest=True
@@ -720,6 +763,7 @@ def main_tail(
                         block_start.buffer_address(),
                         row_hit.buffer_address(),
                         rows,
+                        v_first,
                     ],
                 )
             ],
@@ -745,7 +789,7 @@ def main_tail(
         ),
     ]
     semaphores = [fp.semaphore_descriptor(i, all_set) for i in range(3)]
-    io = [qg_ws, k_ws, v_ws, block_start, row_hit, q_norm, k_norm, cos, sin, staging, kv_cache, query]
+    io = _io(qg_ws, k_ws, v_ws, block_start, row_hit, q_norm, k_norm, cos, sin, staging, kv_cache, query)
     return fp.run_program(io, fp.program_descriptor(kernels, cbs=cbs, semaphores=semaphores))
 
 
@@ -865,14 +909,14 @@ SELECTION_WIDTH, EXPANDED_WIDTH, BLOCK_IDS = 2080, 2048, 512
 SELECTION_SLICES = 8
 
 
-def post_attention(attention, qg_ws, *, memory_config=None):
+def post_attention(attention, qg_ws, *, memory_config=None, qg_first: int = 0):
     """sigmoid(gate) x attention for the 6 local heads -> the head-major [1, 1, rows, 1536] bf16 TILE row in
     ``memory_config`` (the out-projection's activation shard in the model).  ``attention`` is sparse_sdpa's
-    ROW_MAJOR [1, 32, rows, 256]; the gates are the second 256 columns of each head's 512 in ``qg_ws``."""
+    ROW_MAJOR [1, 32, rows, 256]; the gates are the second 256 columns of each head's 512 in ``qg_ws`` from tile
+    ``qg_first`` (0 for the separate qg shard, the qg window's first tile for the merged projection shard)."""
 
     rows = fp.rows_of(qg_ws)
-    if fp.tile_width_of(qg_ws) != QG_WIDTH:
-        raise ValueError(f"post_attention takes the qg row tile [1, 1, rows, {QG_WIDTH}]")
+    _window(qg_ws, qg_first, QG_WIDTH, "qg")
     if (
         tuple(attention.shape) != (1, SPARSE_HEADS, rows, HEAD_DIM)
         or attention.dtype != BF16
@@ -892,7 +936,10 @@ def post_attention(attention, qg_ws, *, memory_config=None):
         POST_ATTENTION_READER,
         cores,
         [*fp.accessor_args(attention), *fp.accessor_args(qg_ws)],
-        [(c, [attention.buffer_address(), qg_ws.buffer_address(), rows, h]) for h, c in enumerate(head_cores)],
+        [
+            (c, [attention.buffer_address(), qg_ws.buffer_address(), rows, h, qg_first])
+            for h, c in enumerate(head_cores)
+        ],
     )
     compute = fp.compute_kernel(POST_ATTENTION_COMPUTE, cores, [], [(c, []) for c in head_cores], fp32_dest=True)
     writer = _writer(
@@ -1065,11 +1112,21 @@ def score_merge(gathered, mask):
     ``[1, 1, rows, W]`` bf16 ROW_MAJOR for the top-k."""
 
     shape, mshape = tuple(gathered.shape), tuple(mask.shape)
-    if len(mshape) != 4 or mshape[:2] != (1, 1) or mshape[3] % SCORE_CHUNK or mask.dtype != BF16 or mask.layout != ttnn.ROW_MAJOR_LAYOUT:
+    if (
+        len(mshape) != 4
+        or mshape[:2] != (1, 1)
+        or mshape[3] % SCORE_CHUNK
+        or mask.dtype != BF16
+        or mask.layout != ttnn.ROW_MAJOR_LAYOUT
+    ):
         raise ValueError(f"mask must be ROW_MAJOR bf16 [1, 1, rows, k * {SCORE_CHUNK}], got {mask.layout} {mshape}")
     rows, width = mshape[2], mshape[3]
     chunks = width // SCORE_CHUNK
-    if shape != (1, 1, DEVICES * rows * chunks, SCORE_CHUNK) or gathered.dtype != BF16 or gathered.layout != ttnn.ROW_MAJOR_LAYOUT:
+    if (
+        shape != (1, 1, DEVICES * rows * chunks, SCORE_CHUNK)
+        or gathered.dtype != BF16
+        or gathered.layout != ttnn.ROW_MAJOR_LAYOUT
+    ):
         raise ValueError(
             f"gathered score pages must be ROW_MAJOR bf16 [1, 1, {DEVICES * rows * chunks}, {SCORE_CHUNK}], got {gathered.layout} {shape}"
         )
@@ -1087,7 +1144,9 @@ def score_merge(gathered, mask):
         [*fp.accessor_args(gathered), *fp.accessor_args(mask)],
         [(w.core, [gathered.buffer_address(), mask.buffer_address(), rows, w.start, w.count, chunks]) for w in work],
     )
-    compute = fp.compute_kernel(SCORE_MERGE["compute"], cores, [], [(w.core, [rows, w.count]) for w in work], fp32_dest=False)
+    compute = fp.compute_kernel(
+        SCORE_MERGE["compute"], cores, [], [(w.core, [rows, w.count]) for w in work], fp32_dest=False
+    )
     writer = fp.writer_kernel(
         SCORE_MERGE["writer"],
         cores,

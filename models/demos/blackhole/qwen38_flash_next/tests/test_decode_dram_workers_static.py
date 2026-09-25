@@ -10,7 +10,6 @@ import math
 from dataclasses import asdict
 from types import SimpleNamespace
 
-import pytest
 import ttnn
 from models.demos.blackhole.qwen38_flash_next.checkpoint import CHECKPOINT_FILE_MANIFEST_SHA256, INDEX_SHA256
 from models.demos.blackhole.qwen38_flash_next.config import CONFIG_SHA256
@@ -35,21 +34,21 @@ def _mesh(banks: int = BANKS):
     return SimpleNamespace(dram_grid_size=lambda: ttnn.CoreCoord(banks, 1))
 
 
-def test_two_readers_are_the_default_and_the_switch_admits_one_or_two() -> None:
+def test_two_readers_are_the_default_and_the_switch_admits_one_or_two(expect_error) -> None:
     assert dm.WORKERS_ENV == "QWEN38_DRAM_WORKERS" and dm.DEFAULT_WORKERS_PER_DRAM_BANK == 2
     assert dm.default_decode_dram_workers({}) == 2
     assert dm.default_decode_dram_workers({dm.WORKERS_ENV: "1"}) == 1
     assert dm.default_decode_dram_workers({dm.WORKERS_ENV: " 2 "}) == 2
     for bad in ("0", "3", "two", "1.0", "1,2"):
-        with pytest.raises(ValueError, match=dm.WORKERS_ENV):
+        with expect_error(ValueError, match=dm.WORKERS_ENV):
             dm.default_decode_dram_workers({dm.WORKERS_ENV: bad})
     for bad in (True, 0, 3, "2", 2.0, None):
-        with pytest.raises(ValueError):
+        with expect_error(ValueError):
             dm.validate_decode_dram_workers(bad)
     assert dm.validate_decode_dram_workers(1) == 1 and dm.validate_decode_dram_workers(2) == 2
 
 
-def test_the_two_reader_table_names_the_screened_projections() -> None:
+def test_the_two_reader_table_names_the_screened_projections(expect_error) -> None:
     assert dm.TWO_WORKER_PROJECTIONS == {
         (2560, 4160): 8,
         (1536, 2560): 16,
@@ -61,11 +60,12 @@ def test_the_two_reader_table_names_the_screened_projections() -> None:
     assert (qsa_module.HIDDEN_SIZE, 2 * qsa_module.LOCAL_QUERY_WIDTH) == (2560, 3072)
     assert (qsa_module.LOCAL_QUERY_WIDTH, qsa_module.HIDDEN_SIZE) == (1536, 2560)
     assert set(embedding_module.LM_HEAD_CHUNK_COLUMNS) == {8192, 7040}
-    # the K/V and index projections keep one reader: two are refused for their shapes and off the eight-bank grid
-    for k, n in ((2560, qsa_module.HEAD_DIM), (2560, qsa_module.INDEX_HEAD_DIM)):
-        with pytest.raises(ValueError, match="not qualified"):
+    # the K/V and index projections keep one reader, and so does the served path's merged QSA projection (3840
+    # columns): two are refused for their shapes and off the eight-bank grid
+    for k, n in ((2560, qsa_module.HEAD_DIM), (2560, qsa_module.INDEX_HEAD_DIM), (2560, qsa_module.PROJECTIONS_WIDTH)):
+        with expect_error(ValueError, match="not qualified"):
             dm.bank_tiles(_mesh(), k, n, 2)
-    with pytest.raises(ValueError, match="not qualified"):
+    with expect_error(ValueError, match="not qualified"):
         dm.bank_tiles(_mesh(7), *GDN_IN, 2)
     assert dm.bank_tiles(_mesh(7), *GDN_IN) == math.ceil(4160 / (TILE * 7))
 
@@ -91,7 +91,7 @@ def test_bank_layouts_pad_to_whole_tiles_per_reader_and_only_the_gdn_input_widen
     assert gdn_layers * BANKS * (576 - 544) * 2560 * 2 == 47_185_920
 
 
-def test_program_configs_keep_one_tile_row_and_the_qualified_storage_grids() -> None:
+def test_program_configs_keep_one_tile_row_and_the_qualified_storage_grids(expect_error) -> None:
     mesh = _mesh()
     for (k, n), cores in dm.TWO_WORKER_PROJECTIONS.items():
         act1, one = dm.dram_sharded_matmul_configs(mesh, k, n, num_cores=cores)
@@ -101,9 +101,16 @@ def test_program_configs_keep_one_tile_row_and_the_qualified_storage_grids() -> 
         assert one.num_workers_per_dram_bank == 1 and two.num_workers_per_dram_bank == 2
         assert one.per_core_N == math.ceil(n / (TILE * cores)) and two.per_core_N == dm.bank_tiles(mesh, k, n, 2)
         assert act1 == act2  # the activation shard is the storage grid's, unchanged
-    with pytest.raises(ValueError, match="storage cores"):
+    # the merged QSA projection of the served fused path (one reader): 15 output tiles per storage core, no padding,
+    # on the eight-core activation shard the separate K = 2560 linears run on
+    hidden, width = qsa_module.HIDDEN_SIZE, qsa_module.PROJECTIONS_WIDTH
+    act, merged = dm.dram_sharded_matmul_configs(mesh, hidden, width, num_cores=8)
+    assert (merged.per_core_M, merged.per_core_N, merged.in0_block_w, merged.num_workers_per_dram_bank) == (1, 15, 5, 1)
+    assert dm.bank_tiles(mesh, hidden, width) * BANKS * TILE == width == 3840
+    assert act == dm.dram_sharded_matmul_configs(mesh, hidden, 2 * qsa_module.LOCAL_QUERY_WIDTH, num_cores=8)[0]
+    with expect_error(ValueError, match="storage cores"):
         dm.dram_sharded_matmul_configs(mesh, *GDN_IN, num_cores=16, num_workers_per_dram_bank=2)
-    with pytest.raises(ValueError, match="not qualified"):
+    with expect_error(ValueError, match="not qualified"):
         dm.dram_sharded_matmul_configs(mesh, 2560, qsa_module.HEAD_DIM, num_cores=8, num_workers_per_dram_bank=2)
 
 
@@ -118,6 +125,12 @@ def test_the_modules_thread_the_reader_count_from_the_builder() -> None:
     qsa_init = inspect.getsource(qsa_module.Qwen38TTNNQSA.__init__)
     assert qsa_init.count("num_workers_per_dram_bank=workers") == 4
     assert "dram_sharded_matmul_configs(mesh_device, HIDDEN_SIZE, HEAD_DIM, num_cores=8)" in qsa_init
+    # the merged projection keeps one reader whatever the builder's count (3840 is not in the two-reader table)
+    assert (
+        "dram_sharded_matmul_configs(\n            mesh_device, HIDDEN_SIZE, PROJECTIONS_WIDTH, num_cores=8\n        )"
+        in qsa_init
+    )
+    assert qsa_init.count("num_workers_per_dram_bank=1") == 1
     head_init = inspect.getsource(embedding_module.Qwen38TTNNLMHead.__init__)
     assert head_init.count("num_workers_per_dram_bank=workers") == 2
     builder_source = inspect.getsource(builder_module.Qwen38TTNNBuilder)
@@ -132,7 +145,7 @@ def test_the_modules_thread_the_reader_count_from_the_builder() -> None:
     assert "default_decode_dram_workers()" in inspect.getsource(builder_module.Qwen38TTNNBuilder.__init__)
 
 
-def test_the_build_identity_keeps_the_one_reader_key() -> None:
+def test_the_build_identity_keeps_the_one_reader_key(expect_error) -> None:
     provenance = builder_module.Qwen38BuildProvenance(
         checkpoint_revision=PINNED_CHECKPOINT_REVISION,
         checkpoint_index_sha256=INDEX_SHA256,
@@ -159,7 +172,7 @@ def test_the_build_identity_keeps_the_one_reader_key() -> None:
         before_the_field
     )
     assert two.key != one.key and len(two.key) == 64 and two.key == builder_module._identity_key(two)
-    with pytest.raises(ValueError):
+    with expect_error(ValueError):
         builder_module.Qwen38LiveBuildIdentity(**common, decode_dram_workers_per_bank=3)
 
 

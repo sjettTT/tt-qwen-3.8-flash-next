@@ -5,7 +5,8 @@
 // rotated tiles 8, 9 and normalized tiles 10..15 arrive from the key cores); per lane the lane's KV staging tiles
 // with row (P % 32) replaced by the lane's packed row [v | k] (-0 -> +0 as the chain's SFPU one-hot select does).
 // Compile-time args: TensorAccessorArgs staging, v, kv_block_start, kv_row_hit.  Runtime args: 0 staging, 1 v, 2
-// kv_block_start, 3 kv_row_hit, 4 rows.
+// kv_block_start, 3 kv_row_hit, 4 rows, 5 first tile of the value in v (0 for the separate projection shard; the v
+// window's first tile in the merged projection shard).
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -22,6 +23,7 @@ void kernel_main() {
     const uint32_t pos_addr = get_arg_val<uint32_t>(2);
     const uint32_t hit_addr = get_arg_val<uint32_t>(3);
     const uint32_t rows = get_arg_val<uint32_t>(4);
+    const uint32_t v_first = get_arg_val<uint32_t>(5);
     constexpr auto stg_args = TensorAccessorArgs<0>();
     constexpr auto v_args = TensorAccessorArgs<stg_args.next_compile_time_args_offset()>();
     constexpr auto pos_args = TensorAccessorArgs<v_args.next_compile_time_args_offset()>();
@@ -42,7 +44,7 @@ void kernel_main() {
     tile_rows::read_positions(
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pos_l1), pos, hit, rows, get_write_ptr(CB_POSCR));
     for (uint32_t c = 0; c < HEAD_TILES; ++c) {
-        noc_async_read_page(c, v, pack_l1 + c * TILE_BYTES);
+        noc_async_read_page(v_first + c, v, pack_l1 + c * TILE_BYTES);
     }
     noc_async_read_barrier();
     invalidate_l1_cache();

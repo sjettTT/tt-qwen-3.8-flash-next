@@ -5,7 +5,8 @@
 // projection) and the head's attention rows placed into an otherwise zero tile row (the chain's slice + tilize with
 // zero padding).  CBs: 0 gate (bf16, 8), 1 attention (bf16, 8), 3 row scratch (bf16, 1).
 // Compile-time args: TensorAccessorArgs attention (ROW_MAJOR [1, 32, rows, 256]), qg.
-// Runtime args: 0 attention, 1 qg addresses, 2 rows, 3 head.
+// Runtime args: 0 attention, 1 qg addresses, 2 rows, 3 head, 4 first tile of the qg projection in qg (0 for the
+// separate qg shard; the qg window's first tile in the merged projection shard).
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/noc.h"
@@ -18,6 +19,7 @@ void kernel_main() {
     const uint32_t qg_addr = get_arg_val<uint32_t>(1);
     const uint32_t rows = get_arg_val<uint32_t>(2);
     const uint32_t head = get_arg_val<uint32_t>(3);
+    const uint32_t qg_first = get_arg_val<uint32_t>(4);
     constexpr uint32_t CB_GATE = 0, CB_ATT = 1, CB_ROW = 3, HEAD_TILES = 8, GATE_FIRST = 8;
     constexpr auto att_args = TensorAccessorArgs<0>();
     constexpr auto qg_args = TensorAccessorArgs<att_args.next_compile_time_args_offset()>();
@@ -36,7 +38,7 @@ void kernel_main() {
         noc.write_zeros_l1_barrier();
     }
     for (uint32_t t = 0; t < HEAD_TILES; ++t) {
-        noc_async_read_page(2 * HEAD_TILES * head + GATE_FIRST + t, qg, gate_l1 + t * TILE_BYTES);
+        noc_async_read_page(qg_first + 2 * HEAD_TILES * head + GATE_FIRST + t, qg, gate_l1 + t * TILE_BYTES);
     }
     // DRAM reads land whole (64-byte aligned) rows in the scratch; the RISC places the chunks into the tile faces
     cb_reserve_back(CB_ROW, 1);

@@ -6,7 +6,8 @@
 // the chain's SFPU one-hot select does).
 // Compile-time args: 0 eps bits, then TensorAccessorArgs: index_q, raw_key, kv_block_start, gamma_q, gamma_k, ring,
 // kv_row_hit. Runtime args: 0 index_q, 1 raw_key, 2 kv_block_start, 3 gamma_q, 4 gamma_k, 5 ring, 6 kv_row_hit
-// addresses, 7 rows.
+// addresses, 7 rows, 8 first tile of the index query in index_q, 9 first tile of the raw key in raw_key (0 for the
+// separate projection shards; the windows' first tiles when both are the merged projection shard).
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/circular_buffer.h"
@@ -27,6 +28,8 @@ void kernel_main() {
     const uint32_t ring_addr = get_arg_val<uint32_t>(5);
     const uint32_t hit_addr = get_arg_val<uint32_t>(6);
     const uint32_t rows = get_arg_val<uint32_t>(7);
+    const uint32_t q_first = get_arg_val<uint32_t>(8);
+    const uint32_t raw_first = get_arg_val<uint32_t>(9);
     constexpr uint32_t eps_bits = get_compile_time_arg_val(0);
     constexpr auto q_args = TensorAccessorArgs<1>();
     constexpr auto raw_args = TensorAccessorArgs<q_args.next_compile_time_args_offset()>();
@@ -62,8 +65,8 @@ void kernel_main() {
     for (uint32_t c = 0; c < HEAD_TILES; ++c) {
         noc_async_read_page(c, gq, gq_l1 + c * TILE_BYTES);
         noc_async_read_page(c, gk, gk_l1 + c * TILE_BYTES);
-        noc_async_read_page(c, q, x_l1 + c * TILE_BYTES);
-        noc_async_read_page(c, raw, raw_l1 + c * TILE_BYTES);
+        noc_async_read_page(q_first + c, q, x_l1 + c * TILE_BYTES);
+        noc_async_read_page(raw_first + c, raw, raw_l1 + c * TILE_BYTES);
     }
     noc_async_read_barrier();
     tile_rows::read_positions(

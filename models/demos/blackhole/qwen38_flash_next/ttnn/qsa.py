@@ -53,10 +53,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     Qwen38MeshContract,
     TensorPlacement,
     chunk_row_tiles,
+    is_slab_rows,
     replicate_tensor_2d_mesh_mapper,
     tensor_metadata,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dense_dtype_tag,
     dense_math_fidelity_name,
@@ -94,6 +94,23 @@ INDEX_HEAD_DIM = 128
 COMPRESS_RATIO = 4
 TOKEN_BUDGET = 2048
 BLOCK_TOPK = TOKEN_BUDGET // COMPRESS_RATIO
+
+# The served fused decode path runs one token's five K = 2560 projections as one DRAM-sharded linear against a merged
+# weight: device d's columns are [index_q_d | index_k | qg_d | k_pair_d | v_pair_d] (index_k is the same on every
+# device), and the fused tails read their windows of the one L1 output shard by first tile.  The five separate
+# weights stay for the composed chain and the prefill chunk path.
+PROJECTION_COLUMNS = (
+    ("index_q", INDEX_QUERY_HEADS_PER_DEVICE * INDEX_HEAD_DIM),
+    ("index_k", INDEX_HEAD_DIM),
+    ("qg", 2 * LOCAL_QUERY_WIDTH),
+    ("k", HEAD_DIM),
+    ("v", HEAD_DIM),
+)
+PROJECTIONS_WIDTH = sum(width for _, width in PROJECTION_COLUMNS)  # 3840
+PROJECTION_FIRST_TILE = {
+    name: sum(width for _, width in PROJECTION_COLUMNS[:index]) // ttnn.TILE_SIZE
+    for index, (name, _) in enumerate(PROJECTION_COLUMNS)
+}  # index_q 0, index_k 4, qg 8, k 104, v 112
 
 MAX_CONTEXT = 262144
 MAX_COMPRESSED_BLOCKS = MAX_CONTEXT // COMPRESS_RATIO
@@ -390,6 +407,34 @@ def _expanded_pair_kv(weight: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _merged_projections(
+    qg: torch.Tensor, k: torch.Tensor, v: torch.Tensor, index_q: torch.Tensor, index_k: torch.Tensor
+) -> torch.Tensor:
+    """The merged projection weight ``[1, 1, HIDDEN_SIZE, TP_SIZE * PROJECTIONS_WIDTH]`` from the checkpoint tensors
+    (``[out, in]`` rows).  Under the same dim-3 shard as the separate weights, device d's ``PROJECTIONS_WIDTH`` columns
+    are ``[index_q_d | index_k | qg_d | k_pair_d | v_pair_d]`` in ``PROJECTION_COLUMNS`` order, each block the device's
+    block of that separate weight (``index_k`` whole on every device), so the linear against it computes exactly the
+    five separate linears' columns side by side."""
+
+    per_device = {
+        "index_q": index_q.transpose(0, 1).reshape(HIDDEN_SIZE, TP_SIZE, -1),
+        "qg": qg.transpose(0, 1).reshape(HIDDEN_SIZE, TP_SIZE, -1),
+        "k": _expanded_pair_kv(k).transpose(0, 1).reshape(HIDDEN_SIZE, TP_SIZE, HEAD_DIM),
+        "v": _expanded_pair_kv(v).transpose(0, 1).reshape(HIDDEN_SIZE, TP_SIZE, HEAD_DIM),
+    }
+    replicated = {"index_k": index_k.transpose(0, 1)}
+    blocks = []
+    for device in range(TP_SIZE):
+        for name, width in PROJECTION_COLUMNS:
+            block = replicated[name] if name in replicated else per_device[name][:, device]
+            if tuple(block.shape) != (HIDDEN_SIZE, width):
+                raise ValueError(
+                    f"merged projection block {name} is {tuple(block.shape)}, expected ({HIDDEN_SIZE}, {width})"
+                )
+            blocks.append(block)
+    return torch.cat(blocks, dim=1).reshape(1, 1, HIDDEN_SIZE, TP_SIZE * PROJECTIONS_WIDTH)
+
+
 @dataclass(frozen=True)
 class Qwen38QSASelectionGeometry:
     context_length: int
@@ -435,6 +480,9 @@ class Qwen38TTNNQSAWeights:
     index_k_norm: Any
     # The six projection weights' dtype (QWEN38_DENSE_WEIGHT_DTYPE); the norms stay BF16.
     weight_dtype: Any = ttnn.bfloat16
+    # the served fused path's merged [index_q | index_k | qg | k | v] weight (None in a container built without it,
+    # which runs the five separate linears)
+    projections: Any = None
 
     @classmethod
     def from_checkpoint(
@@ -600,6 +648,14 @@ class Qwen38TTNNQSAWeights:
             dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, INDEX_HEAD_DIM),
             dtype=weight_dtype,
         )
+        # The served fused path's one-linear form of the five projections above: the same device blocks side by side.
+        projections_tt = upload(
+            _merged_projections(qg, k, v, index_q, index_k),
+            "qsa_proj_dram_sharded",
+            output_mapper,
+            dram_sharded_weight_memory_config(mesh_device, HIDDEN_SIZE, PROJECTIONS_WIDTH),
+            dtype=weight_dtype,
+        )
 
         # Qwen4Exp norms are zero-centred: the checkpoint stores delta-gamma.
         # Norm vectors are elementwise operands, not matmul weights: interleaved DRAM.
@@ -616,6 +672,7 @@ class Qwen38TTNNQSAWeights:
         mesh_contract.validate_tensor(v_tt, placement=TensorPlacement.KV_PAIR_GROUPED, shard_dim=3)
         mesh_contract.validate_tensor(out_tt, placement=TensorPlacement.HEAD_SHARDED, shard_dim=2)
         mesh_contract.validate_tensor(index_q_tt, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
+        mesh_contract.validate_tensor(projections_tt, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)
         for value in (index_k_tt, q_norm_tt, k_norm_tt, index_q_norm_tt, index_k_norm_tt):
             mesh_contract.validate_tensor(value, placement=TensorPlacement.REPLICATED)
         result = cls(
@@ -632,6 +689,7 @@ class Qwen38TTNNQSAWeights:
             index_q_norm=index_q_norm_tt,
             index_k_norm=index_k_norm_tt,
             weight_dtype=weight_dtype,
+            projections=projections_tt,
         )
         result.validate(mesh_contract)
         return result
@@ -673,6 +731,18 @@ class Qwen38TTNNQSAWeights:
             ("out", self.out, TensorPlacement.HEAD_SHARDED, 2, (1, 1, LOCAL_QUERY_WIDTH, HIDDEN_SIZE)),
             ("index_q", self.index_q, TensorPlacement.HEAD_SHARDED, 3, (1, 1, HIDDEN_SIZE, INDEX_HEAD_DIM)),
         )
+        if self.projections is not None:
+            # a dim-3 shard like qg is the topology the contract checks; the column windows inside keep their own
+            # placements (index_k replicated, k/v pair-grouped), which _merged_projections fixes at assembly
+            expected += (
+                (
+                    "projections",
+                    self.projections,
+                    TensorPlacement.HEAD_SHARDED,
+                    3,
+                    (1, 1, HIDDEN_SIZE, PROJECTIONS_WIDTH),
+                ),
+            )
         for name, tensor, placement, shard_dim, shape in expected:
             mesh_contract.validate_tensor(tensor, placement=placement, shard_dim=shard_dim)
             _require_shape(tensor, shape, f"QSA {name} weight")
@@ -706,6 +776,7 @@ class Qwen38TTNNQSAWeights:
             self.index_k,
             self.index_q_norm,
             self.index_k_norm,
+            self.projections,
         )
 
 
@@ -1249,7 +1320,9 @@ def _derive_slab_tile_inputs(position_scalar, chunk: Qwen38TTNNQSAChunkConstants
     dram = ttnn.DRAM_MEMORY_CONFIG
     tile_index = ttnn.bitwise_right_shift(position_scalar, 7, memory_config=dram)
     tile_indices = ttnn.add(chunk.page_offsets, tile_index, memory_config=dram)
-    compressed_tile_i32 = ttnn.reshape(ttnn.typecast(tile_indices, ttnn.int32, memory_config=dram), (1, chunk.block_tiles))
+    compressed_tile_i32 = ttnn.reshape(
+        ttnn.typecast(tile_indices, ttnn.int32, memory_config=dram), (1, chunk.block_tiles)
+    )
     _deallocate(tile_index, tile_indices)
     context_rows = ttnn.add(chunk.row_index_col, position_scalar, memory_config=dram)
     context_rows_plus = ttnn.add(context_rows, 1, memory_config=dram)
@@ -1384,7 +1457,15 @@ def derive_qsa_chunk_inputs(
     for name, tensor, shape, dtype, layout in (
         ("kv_block_start", kv_block_start, (1, 1, 1, 1), u32, ttnn.ROW_MAJOR_LAYOUT),
         *(
-            (("indexer_neg_mask", indexer_neg_mask, (1, 1, template_rows, blocks), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT),)
+            (
+                (
+                    "indexer_neg_mask",
+                    indexer_neg_mask,
+                    (1, 1, template_rows, blocks),
+                    ttnn.bfloat16,
+                    ttnn.ROW_MAJOR_LAYOUT,
+                ),
+            )
             if indexer_neg_mask is not None
             else (("complete_blocks_col", complete_blocks_col, (1, 1, template_rows, 1), u32, ttnn.TILE_LAYOUT),)
         ),
@@ -1447,9 +1528,9 @@ def emulate_qsa_chunk_inputs(
             torch.arange(block_tiles, dtype=torch.int32) + position // LONG_CHUNK_ROWS
         ).reshape(1, block_tiles)
         # (P + j + 1) // 4 per row: the slab's mask operand (its mask per row j is the 1-row mask at P + j).
-        inputs["complete_blocks_col"] = ((torch.arange(rows, dtype=torch.int64) + position + 1) // COMPRESS_RATIO).reshape(
-            1, 1, rows, 1
-        )
+        inputs["complete_blocks_col"] = (
+            (torch.arange(rows, dtype=torch.int64) + position + 1) // COMPRESS_RATIO
+        ).reshape(1, 1, rows, 1)
     elif long:
         inputs["compressed_tile_i32"] = torch.tensor([[position // LONG_CHUNK_ROWS]], dtype=torch.int32)
     return inputs
@@ -1989,6 +2070,15 @@ class Qwen38TTNNQSA:
         _, self.index_program_config = dram_sharded_matmul_configs(
             mesh_device, HIDDEN_SIZE, INDEX_HEAD_DIM, num_cores=8
         )
+        # the served fused path's merged projection (_project_merged): one reader per bank whatever the builder's
+        # count (3840 columns are not in the two-reader table), 15 output tiles per storage core, no padding
+        if weights.projections is not None:
+            validate_dram_sharded_weight(
+                weights.projections, mesh_device, HIDDEN_SIZE, PROJECTIONS_WIDTH, num_workers_per_dram_bank=1
+            )
+        _, self.proj_program_config = dram_sharded_matmul_configs(
+            mesh_device, HIDDEN_SIZE, PROJECTIONS_WIDTH, num_cores=8
+        )
         self.out_act_memory_config, self.out_program_config = dram_sharded_matmul_configs(
             mesh_device, LOCAL_QUERY_WIDTH, HIDDEN_SIZE, num_cores=16, num_workers_per_dram_bank=workers
         )
@@ -2033,16 +2123,30 @@ class Qwen38TTNNQSA:
             self._main_tail_fused = fused_kernels.kernel("qsa_main_tail").fused
             self._post_attention_fused = fused_kernels.kernel("qsa_post_attention").fused
         elif fused_kernels.enabled("qsa_post_attention"):
-            raise ValueError("qsa_post_attention reads the gates from the fused main tail's qg shard: enable qsa_main_tail too")
+            raise ValueError(
+                "qsa_post_attention reads the gates from the fused main tail's qg shard: enable qsa_main_tail too"
+            )
         if fused_kernels.enabled("qsa_widen_partial"):
             self._widen_partial_fused = fused_kernels.kernel("qsa_widen_partial").fused
         if fused_kernels.enabled("qsa_selection_row"):
             self._selection_row_fused = fused_kernels.kernel("qsa_selection_row").fused
         if fused_kernels.enabled("qsa_score_merge"):
             self._score_merge_fused = fused_kernels.kernel("qsa_score_merge").fused
+        # The served path's one linear for the five projections (_project_merged): both fused tails read their column
+        # windows of its shard, so it needs both on and the merged weight resident (a container built without it, the
+        # dev microtests' random weights, runs the separate linears).
+        self.merged_projections = (
+            self._index_tail_fused is not None and self._main_tail_fused is not None and weights.projections is not None
+        )
         if any(
             switch is not None
-            for switch in (self._index_tail_fused, self._main_tail_fused, self._widen_partial_fused, self._selection_row_fused, self._score_merge_fused)
+            for switch in (
+                self._index_tail_fused,
+                self._main_tail_fused,
+                self._widen_partial_fused,
+                self._selection_row_fused,
+                self._score_merge_fused,
+            )
         ):
             self.forward_decode_generic = functools.partial(type(self)._forward_decode_generic_fused, self)
 
@@ -3391,6 +3495,22 @@ class Qwen38TTNNQSA:
             raise RuntimeError("compressed QSA index update was not in place")
         _deallocate(rotated_sharded)
 
+    def _project_merged(self, full_hidden):
+        """The served fused path's five K = 2560 projections of one token as one DRAM-sharded linear against
+        ``weights.projections``: the [1, 1, 1, PROJECTIONS_WIDTH] L1 width shard (the eight storage cores of the
+        separate linears, 15 tiles each) whose column windows (PROJECTION_FIRST_TILE) the fused index tail, main tail
+        and post-attention read by first tile; :meth:`_sparse_value_attention_fused` releases it after the gates are
+        read.  The separate linears' program (in0_block_w 5, the same K accumulation per output column), one reader
+        per bank."""
+
+        return ttnn.linear(
+            full_hidden,
+            self.weights.projections,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.proj_program_config,
+            compute_kernel_config=self.projection_compute_config,
+        )
+
     def _index_tail_step(
         self,
         full_hidden,
@@ -3400,24 +3520,32 @@ class Qwen38TTNNQSA:
         block_start_sin,
         state: Qwen38TTNNQSAGenericState,
         position: Qwen38TTNNQSAPositionInputs,
+        projections=None,
     ):
         """The index linears, then the fused index tail (ttnn/fused/qsa_block.index_tail) in place of the chain after
-        them in :meth:`_index_projection` and :meth:`_write_compressed_index_generic`."""
+        them in :meth:`_index_projection` and :meth:`_write_compressed_index_generic`.  With ``projections`` (the
+        merged shard of :meth:`_project_merged`) the linears do not run: the tail reads the index query and raw key
+        windows of that shard, which its owner releases."""
 
-        index_q_ws = ttnn.linear(
-            full_hidden,
-            self.weights.index_q,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.index_program_config,
-            compute_kernel_config=self.projection_compute_config,
-        )
-        raw_key_ws = ttnn.linear(
-            full_hidden,
-            self.weights.index_k,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.index_program_config,
-            compute_kernel_config=self.projection_compute_config,
-        )
+        if projections is None:
+            index_q_ws = ttnn.linear(
+                full_hidden,
+                self.weights.index_q,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=self.index_program_config,
+                compute_kernel_config=self.projection_compute_config,
+            )
+            raw_key_ws = ttnn.linear(
+                full_hidden,
+                self.weights.index_k,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=self.index_program_config,
+                compute_kernel_config=self.projection_compute_config,
+            )
+            index_q_first = index_k_first = 0
+        else:
+            index_q_ws = raw_key_ws = projections
+            index_q_first, index_k_first = PROJECTION_FIRST_TILE["index_q"], PROJECTION_FIRST_TILE["index_k"]
         rotated = self._index_tail_fused(
             index_q_ws,
             raw_key_ws,
@@ -3430,8 +3558,11 @@ class Qwen38TTNNQSA:
             block_start_sin,
             state.raw_key_ring,
             state.compressed_index_cache,
+            index_q_first=index_q_first,
+            index_k_first=index_k_first,
         )
-        _deallocate(index_q_ws, raw_key_ws)
+        if projections is None:
+            _deallocate(index_q_ws, raw_key_ws)
         _require_shape(rotated, (1, 1, 1, INDEX_HEAD_DIM), "fused local index query")
         _retag_tensor(rotated, reference=full_hidden, shard_dim=1)
         self.mesh_contract.validate_tensor(rotated, placement=TensorPlacement.HEAD_SHARDED, shard_dim=1)
@@ -3501,33 +3632,47 @@ class Qwen38TTNNQSA:
         self.mesh_contract.validate_tensor(sparse_indices, placement=TensorPlacement.REPLICATED)
         return sparse_indices
 
-    def _main_tail_step(self, full_hidden, cos, sin, state: Qwen38TTNNQSAGenericState, position: Qwen38TTNNQSAPositionInputs):
+    def _main_tail_step(
+        self,
+        full_hidden,
+        cos,
+        sin,
+        state: Qwen38TTNNQSAGenericState,
+        position: Qwen38TTNNQSAPositionInputs,
+        projections=None,
+    ):
         """The three main linears, then the fused main tail (ttnn/fused/qsa_block.main_tail) in place of the chain after
         them in :meth:`_main_projection`, :meth:`_write_packed_kv_generic` and the query build of
         :meth:`_sparse_value_attention`.  Returns the sparse query and the qg shard (the gates for the post-attention
-        program, released there)."""
+        program, released there).  With ``projections`` (the merged shard of :meth:`_project_merged`) the linears do
+        not run: the tail reads the qg, k and v windows of that shard, which is returned as the qg shard."""
 
-        qg_ws = ttnn.linear(
-            full_hidden,
-            self.weights.qg,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.qg_program_config,
-            compute_kernel_config=self.projection_compute_config,
-        )
-        k_ws = ttnn.linear(
-            full_hidden,
-            self.weights.k_pair_grouped,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.kv_program_config,
-            compute_kernel_config=self.projection_compute_config,
-        )
-        v_ws = ttnn.linear(
-            full_hidden,
-            self.weights.v_pair_grouped,
-            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
-            program_config=self.kv_program_config,
-            compute_kernel_config=self.projection_compute_config,
-        )
+        if projections is None:
+            qg_ws = ttnn.linear(
+                full_hidden,
+                self.weights.qg,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=self.qg_program_config,
+                compute_kernel_config=self.projection_compute_config,
+            )
+            k_ws = ttnn.linear(
+                full_hidden,
+                self.weights.k_pair_grouped,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=self.kv_program_config,
+                compute_kernel_config=self.projection_compute_config,
+            )
+            v_ws = ttnn.linear(
+                full_hidden,
+                self.weights.v_pair_grouped,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                program_config=self.kv_program_config,
+                compute_kernel_config=self.projection_compute_config,
+            )
+            qg_first = k_first = v_first = 0
+        else:
+            qg_ws = k_ws = v_ws = projections
+            qg_first, k_first, v_first = (PROJECTION_FIRST_TILE[name] for name in ("qg", "k", "v"))
         sparse_query = self._main_tail_fused(
             qg_ws,
             k_ws,
@@ -3539,15 +3684,21 @@ class Qwen38TTNNQSA:
             sin,
             state.kv_staging,
             state.packed_kv_cache,
+            qg_first=qg_first,
+            k_first=k_first,
+            v_first=v_first,
         )
-        _deallocate(k_ws, v_ws)
+        if projections is None:
+            _deallocate(k_ws, v_ws)
         _require_shape(sparse_query, (1, 32, 1, 2 * HEAD_DIM), "fused padded sparse QSA query")
         _retag_tensor(sparse_query, reference=state.packed_kv_cache, shard_dim=1)
         return sparse_query, qg_ws
 
-    def _sparse_value_attention_fused(self, sparse_query, qg_ws, sparse_indices, state):
+    def _sparse_value_attention_fused(self, sparse_query, qg_ws, sparse_indices, state, *, qg_first: int = 0):
         """sparse_sdpa on the fused query, then the fused post-attention (ttnn/fused/qsa_block.post_attention) straight
-        into the out-projection's activation shard; the chain's tail of :meth:`_sparse_value_attention`."""
+        into the out-projection's activation shard; the chain's tail of :meth:`_sparse_value_attention`.  ``qg_first``
+        is the first tile of the qg projection in ``qg_ws`` (its window of the merged shard, which this releases as the
+        last consumer)."""
 
         sparse_output = ttnn.transformer.sparse_sdpa(
             sparse_query,
@@ -3560,7 +3711,9 @@ class Qwen38TTNNQSA:
             compute_kernel_config=self.compute_config,
         )
         _deallocate(sparse_query)
-        attention_ws = self._post_attention_fused(sparse_output, qg_ws, memory_config=self.out_act_memory_config)
+        attention_ws = self._post_attention_fused(
+            sparse_output, qg_ws, memory_config=self.out_act_memory_config, qg_first=qg_first
+        )
         _deallocate(sparse_output, qg_ws)
         _require_shape(attention_ws, (1, 1, 1, LOCAL_QUERY_WIDTH), "fused gated QSA attention")
         _retag_tensor(attention_ws, reference=state.packed_kv_cache, shard_dim=3)
@@ -3858,8 +4011,11 @@ class Qwen38TTNNQSA:
         self._validate_position_inputs(position)
 
         full_hidden = self._all_gather_hidden(hidden_sharded)
+        merged = self._project_merged(full_hidden) if self.merged_projections else None
         if self._index_tail_fused is not None:
-            index_query = self._index_tail_step(full_hidden, cos, sin, block_start_cos, block_start_sin, state, position)
+            index_query = self._index_tail_step(
+                full_hidden, cos, sin, block_start_cos, block_start_sin, state, position, projections=merged
+            )
         else:
             index_query, raw_key = self._index_projection(full_hidden, cos, sin)
             self._write_compressed_index_generic(state, raw_key, position, block_start_cos, block_start_sin)
@@ -3874,8 +4030,14 @@ class Qwen38TTNNQSA:
             sparse_indices = self._materialize_row_generic(masked_scores, position)
 
         if self._main_tail_fused is not None:
-            sparse_query, qg_ws = self._main_tail_step(full_hidden, cos, sin, state, position)
-            local_attention = self._sparse_value_attention_fused(sparse_query, qg_ws, sparse_indices, state)
+            sparse_query, qg_ws = self._main_tail_step(full_hidden, cos, sin, state, position, projections=merged)
+            local_attention = self._sparse_value_attention_fused(
+                sparse_query,
+                qg_ws,
+                sparse_indices,
+                state,
+                qg_first=0 if merged is None else PROJECTION_FIRST_TILE["qg"],
+            )
             _deallocate(sparse_indices)
             output = self._project_output_fused(local_attention, full_hidden)
         else:
@@ -4262,7 +4424,10 @@ class Qwen38TTNNQSA:
             score_tiles = []
             for tile_start in range(start, start + SLAB_SCORE_BLOCK_ROWS, CHUNK_ROWS):
                 query_tile = ttnn.slice(
-                    index_query, (0, 0, tile_start, 0), (1, 1, tile_start + CHUNK_ROWS, INDEX_HEAD_DIM), memory_config=dram
+                    index_query,
+                    (0, 0, tile_start, 0),
+                    (1, 1, tile_start + CHUNK_ROWS, INDEX_HEAD_DIM),
+                    memory_config=dram,
                 )
                 local_scores = ttnn.experimental.indexer_score_dsa(
                     query_tile,
@@ -4291,7 +4456,10 @@ class Qwen38TTNNQSA:
             # The mask: block b of row j is hidden when b >= complete(j); the comparison broadcasts the block index
             # row against the block's complete-block column (bitwise the row templates, measured 2026-09-09).
             complete_col = ttnn.slice(
-                chunk.complete_blocks_col, (0, 0, start, 0), (1, 1, start + SLAB_SCORE_BLOCK_ROWS, 1), memory_config=dram
+                chunk.complete_blocks_col,
+                (0, 0, start, 0),
+                (1, 1, start + SLAB_SCORE_BLOCK_ROWS, 1),
+                memory_config=dram,
             )
             invalid_bits = ttnn.ge(constants.arange_blocks_row, complete_col, dtype=ttnn.uint32, memory_config=dram)
             invalid = ttnn.typecast(invalid_bits, ttnn.bfloat16, memory_config=dram)
