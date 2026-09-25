@@ -10,6 +10,7 @@ import inspect
 import pytest
 import torch
 
+from models.demos.blackhole.qwen38_flash_next.tools import qwen38_sampling_step as step
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import THINK_END_ID
 from models.demos.blackhole.qwen38_flash_next.ttnn import device_sampler as ds
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import VOCAB_SIZE
@@ -19,7 +20,6 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.sampling import (
     Qwen38SamplingProfile,
     sample_full_vocabulary,
 )
-from models.demos.blackhole.qwen38_flash_next.tools import qwen38_sampling_step as step
 
 EOS = (248_046, 248_044)
 TOKENIZER_SIZE = 248_077
@@ -217,7 +217,7 @@ def test_should_stop_ends_the_loop_between_steps_without_a_sample() -> None:
     assert session.chain.log[-1].startswith("tail:") and len(session.committed) == 3
 
 
-def test_think_budget_forces_think_end_through_the_forced_step() -> None:
+def test_think_budget_forces_think_end_through_the_forced_step(expect_error) -> None:
     session, request = FakeSession([1]), _request()
     items = _run(session, request, 6, think_budget=2)
     tokens = [token for token, _ in items]
@@ -225,14 +225,14 @@ def test_think_budget_forces_think_end_through_the_forced_step() -> None:
     forced = session.chain.log.index(f"write:{THINK_END_ID}")
     assert session.chain.log[forced - 1].startswith("tail:") and session.chain.log[forced + 1] == "head:3"
     assert session.committed[3] == THINK_END_ID
-    with pytest.raises(TypeError, match="forced step"):
+    with expect_error(TypeError, match="forced step"):
         list(step.generate_sampled(FakeSession([1]), _request(), 2, stop_ids=EOS, tokenizer_size=1, think_budget=1))
 
 
-def test_temperature_zero_is_refused_by_the_request() -> None:
-    with pytest.raises(ValueError, match="temperature > 0"):
+def test_temperature_zero_is_refused_by_the_request(expect_error) -> None:
+    with expect_error(ValueError, match="temperature > 0"):
         step.Qwen38SamplingRequest(Qwen38SamplingParameters.greedy())
-    with pytest.raises(TypeError, match="Qwen38SamplingRequest"):
+    with expect_error(TypeError, match="Qwen38SamplingRequest"):
         list(step.generate_sampled(FakeSession([1]), THINKING, 4, stop_ids=EOS, tokenizer_size=TOKENIZER_SIZE))
 
 
@@ -330,17 +330,18 @@ def test_temperature_zero_and_greedy_take_the_greedy_loop() -> None:
         ({"greedy": True, "temperature": 0.7}, "greedy is true but temperature is 0.7"),
     ],
 )
-def test_bad_fields_are_request_errors_naming_the_field_first(document, message) -> None:
-    with pytest.raises(step.Qwen38SamplingRequestError, match=message) as info:
+def test_bad_fields_are_request_errors_naming_the_field_first(document, message, expect_error) -> None:
+    error_type = step.Qwen38SamplingRequestError
+    with pytest.raises(error_type, match=message) as info:  # allow-pytest.raises: reads the exception
         step.parameters_from_request(document, enable_thinking=True, seed=0)
     assert str(info.value).split(" ", 1)[0] in document
 
 
-def test_logprobs_fields_and_the_content_item_shape() -> None:
+def test_logprobs_fields_and_the_content_item_shape(expect_error) -> None:
     assert step.logprobs_from_request({}) == (False, 0)
     assert step.logprobs_from_request({"logprobs": True, "top_logprobs": 5}) == (True, 5)
     for document in ({"logprobs": "yes"}, {"logprobs": True, "top_logprobs": 21}, {"top_logprobs": 2}):
-        with pytest.raises(step.Qwen38SamplingRequestError):
+        with expect_error(step.Qwen38SamplingRequestError):
             step.logprobs_from_request(document)
     sample = sample_full_vocabulary(_logits_for([1]).to(torch.float32), THINKING, top_logprobs=2)
     item = step.logprobs_content_item(sample, sample.token_id, lambda token: f"<{token}>")
@@ -355,9 +356,9 @@ def test_logprobs_fields_and_the_content_item_shape() -> None:
 
 
 def test_chain_extension_runs_the_greedy_epilogue_unchanged_before_the_row() -> None:
-    body = inspect.getsource(step.Qwen38SamplingChainExtension.capture_epilogue)
+    body = inspect.getsource(step.Qwen38SamplingChainExtension._epilogue)  # eager in the warm, captured in TAIL
     greedy = (  # the resolve writes the persistent token row itself (into=): the greedy epilogue's last op
-        "greedy_candidates(trace_output.logits)",
+        "greedy_candidates(logits)",
         "resolve_greedy_on_device(candidates, into=token_row_io)",
     )
     positions = [body.index(fragment) for fragment in greedy]
@@ -371,7 +372,9 @@ def test_chain_extension_runs_the_greedy_epilogue_unchanged_before_the_row() -> 
     )
     assert "ttnn.deallocate(gathered)" in inspect.getsource(step.Qwen38SamplingChainExtension._gather)
     warm = inspect.getsource(step.Qwen38SamplingChainExtension.warm)
-    assert "sampling_candidates(logits, self.constants)" in warm and "self._gather(logits)" in warm
+    assert (
+        "self._epilogue(logits, token_row_io)" in warm and "self._gather(logits)" in warm
+    )  # the capture's own epilogue
     assert "ids_equal_up_to_boundary_ties" in warm and "raise RuntimeError" in warm
 
 
@@ -428,10 +431,18 @@ class FakeDeviceChain(FakeChain):
 
 
 class FakeDeviceSampling(FakeSampling):
+    presence_on_device = False  # the composite's constants: no device history
+
     def __init__(self, chain: FakeDeviceChain) -> None:
         super().__init__(chain)
         self.sampler = FakeDeviceSampler(chain)
         chain.sampler_holder["sampler"] = self.sampler
+
+    def device_policy_of(self, request):
+        return request.device_policy(presence_on_device=self.presence_on_device)
+
+    def rewrite_history(self, emitted) -> None:
+        return None
 
     def read_candidate_row(self) -> Qwen38CandidateRow:
         self.chain.log.append("read_row")
@@ -513,7 +524,7 @@ def test_device_loop_is_the_greedy_loop_plus_a_draw_write_and_replays_the_refere
     assert [t for t, _ in _run_device(other, other_request, 5)] != tokens
 
 
-def test_device_loop_verifies_each_step_when_asked_and_rewrites_a_stale_continuation() -> None:
+def test_device_loop_verifies_each_step_when_asked_and_rewrites_a_stale_continuation(expect_error) -> None:
     session, request = FakeDeviceSession([4]), _request()
     session.sampling.begin_request(request)
     session.prompt([5])
@@ -542,11 +553,11 @@ def test_device_loop_verifies_each_step_when_asked_and_rewrites_a_stale_continua
     session._forced_step(9)
     request = _request(Qwen38SamplingParameters.official_thinking(seed=6))
     session.sampling.begin_request(request)
-    with pytest.raises(RuntimeError, match="first token"):
+    with expect_error(RuntimeError, match="first token"):
         _run_device(session, request, 3, prefilled=True)
 
 
-def test_device_loop_finishes_like_the_greedy_loop() -> None:
+def test_device_loop_finishes_like_the_greedy_loop(expect_error) -> None:
     session, request = FakeDeviceSession([5, 6], eos_at=4), _request()
     session.sampling.begin_request(request)
     session.prompt([7])
@@ -567,7 +578,7 @@ def test_device_loop_finishes_like_the_greedy_loop() -> None:
         session, request, 8, should_stop=lambda: (polls.append(1), "halt" if len(polls) == 3 else None)[1]
     )
     assert items[-1] == (None, "halt") and len(items) == 3
-    with pytest.raises(RuntimeError, match="begin_request"):
+    with expect_error(RuntimeError, match="begin_request"):
         _run_device(FakeDeviceSession([1]), _request(), 2)
 
 
@@ -593,22 +604,29 @@ def test_device_policy_routing_and_begin_request_for_greedy_and_host_loop_reques
 
 
 def test_device_sampler_epilogue_runs_after_the_row_and_the_host_branch_is_unchanged() -> None:
-    body = inspect.getsource(step.Qwen38SamplingChainExtension.capture_epilogue)
-    host_branch, device_branch = body.split("if self.sampler is None:")[1].split(
-        "return candidates, trace_token_row", 1
-    )
-    assert "resolve_greedy_on_device(candidates, into=token_row_io)" in host_branch  # the greedy row lands in place
-    assert "sample_on_device" not in host_branch and "ttnn.copy(" not in host_branch
+    body = inspect.getsource(step.Qwen38SamplingChainExtension._epilogue)  # eager in the warm pass, captured in TAIL
+    host_branch, device_branch = body.split("if self.sampler is None:")
     order = [
-        device_branch.index(f)
+        host_branch.index(f)
         for f in (
-            "resolve_greedy_on_device(candidates)",
+            "greedy_candidates(logits)",
+            "resolve_greedy_on_device(candidates, into=token_row_io)",  # the greedy row lands in place, one greedy_tail program
             "sampling_candidates(",
-            "sample_on_device(row, greedy_row, self.sampler)",
-            "ttnn.copy(trace_token_row, token_row_io)",
         )
     ]
-    assert order == sorted(order)
+    assert order == sorted(order) and "self.sample(" not in host_branch and "ttnn.copy(" not in host_branch
+    assert (
+        "return candidates, row, greedy_row, greedy_row" in device_branch
+    )  # without the sampler the greedy row is the token row
+    assert device_branch.index("self.sample(row, greedy_row, self.sampler)") < device_branch.index(
+        "ttnn.copy(token_row, token_row_io)"
+    )  # the composite or the one-program kernel, by the registry, then its token into the resident row
+    capture = inspect.getsource(step.Qwen38SamplingChainExtension.capture_epilogue)
+    warm = inspect.getsource(step.Qwen38SamplingChainExtension.warm)
+    assert (
+        "self._epilogue(trace_output.logits, token_row_io)" in capture
+        and "self._epilogue(logits, token_row_io)" in warm
+    )
     loop = inspect.getsource(step.generate_sampled_on_device)
     assert "sampler.write_uniform(request.next_uniform())" in loop and loop.index(
         "chain.execute_head(residue)"

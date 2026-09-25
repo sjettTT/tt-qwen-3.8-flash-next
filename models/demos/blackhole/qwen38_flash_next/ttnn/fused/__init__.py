@@ -43,6 +43,7 @@ from . import (
     position_derive,
     qsa_block,
     router_tail,
+    sampler_tail,
     shared_expert,
     untilize_rows,
 )
@@ -77,6 +78,7 @@ __all__ = [
     "register",
     "resolve",
     "router_tail",
+    "sampler_tail",
     "shared_expert",
     "untilize_rows",
     "AdmittedStep",

@@ -107,6 +107,15 @@ read candidate row, not the vocabulary (`logprobs_normalizer` in `/health` and `
 decodes at a time; up to four wait in the queue (`queue_wait_seconds` in `usage`), the fifth gets HTTP 503.  A prompt
 over the context limit gets HTTP 400 `context_length_exceeded`.
 
+The sampled draw runs on the device by default: for `temperature` up to 4, `top_k` 1..32, `top_p`, `min_p` and a
+`presence_penalty` in [0, 2] the TAIL trace samples the token from the read candidate row (the request's emitted tokens
+are the device's own history), the same law as the host sampler (`docs/NUMERICS.md`, the law gate).  A request with
+`frequency_penalty`, `repetition_penalty`, a negative `presence_penalty`, `top_k` 0, a temperature above 4 or `logprobs`
+samples on the host over the same candidate row (`qwen38.sampling.sampler` in the response names the path);
+`--host-sampler` keeps every request on the host.  The composite device-sampler path (`--device-sampler` before the
+one-program sampler) never captured inside the chat server before 2026-09-25: its TAIL capture resolved the greedy row
+in a form the warm pass had not compiled; the same change fixes both paths.
+
 Sampled requests and MTP drafting: on an `--mtp` `--sampling` server the pass loop drafts for sampled requests by
 default (`QWEN38_MTP_SAMPLED` unset or `1`; `QWEN38_MTP_SAMPLED=0` in the server's environment restores the plain
 sampled path, the fused verify with sampled requests on the 1-row sampled loop; the launcher passes the variable

@@ -1965,7 +1965,7 @@ class Qwen38TracedChain:
                 token_row_io, resident_decode.host_token_row(resolved), label=f"warm position {position} row copy"
             )
             if chain.sampling is not None:
-                chain.sampling.warm(output.logits, resolved_row, label=f"warm position {position} candidate row")
+                chain.sampling.warm(output.logits, token_row_io, label=f"warm position {position} candidate row")
             ttnn.deallocate(candidates.local_indices)
             ttnn.deallocate(candidates.local_values)
             ttnn.deallocate(resolved_row)

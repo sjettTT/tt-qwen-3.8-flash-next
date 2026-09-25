@@ -12,7 +12,7 @@ request naming no sampling field, ``temperature 0`` or ``greedy`` is the bitwise
 greedy loop (the argmax the TAIL resolves; the candidate row is never read); a
 request with ``temperature > 0`` samples with it and one naming another sampling
 field without a temperature takes the model card's profile for its thinking
-mode.  Without ``--sampling`` (``--no-sampling``, the argparse default) TAIL
+mode; the draw runs on the device unless ``--host-sampler``.  Without ``--sampling`` (``--no-sampling``, the argparse default) TAIL
 captures no candidate row, the loop is the greedy one at its measured period and
 explicit sampling fields are refused; the launchers pass ``--sampling``.  The
 device prompt of every request is the reference render of the client's
@@ -69,14 +69,11 @@ from models.demos.blackhole.qwen38_flash_next.tools.evidence_records import (
     utc_now,
     write_result,
 )
-from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import Qwen38ChatRequestRejected
 from models.demos.blackhole.qwen38_flash_next.tools.live_decode_diagnostic import (
     construct_live_decode_diagnostic,
     missing_bf4_layers,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn import fused
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
-from models.demos.blackhole.qwen38_flash_next.ttnn.moe import moe_local_output_enabled
+from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import Qwen38ChatRequestRejected
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     DEFAULT_PREFILL_MODE,
     MAX_TOKENS_BOUND,
@@ -91,11 +88,14 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     resolve_route,
     template_decoder,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
     RESIDENT_MAX_QSA_CACHE_CAPACITY,
     RESIDENT_QSA_CACHE_CAPACITIES,
     Qwen38ResidentContext,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
+from models.demos.blackhole.qwen38_flash_next.ttnn.moe import moe_local_output_enabled
 
 MODEL_ID = "Qwen/Qwen3.8-Flash-Next"
 ACCEPTANCE_CONTINUATION = 96
@@ -1560,9 +1560,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--device-sampler",
+        dest="device_sampler",
         action="store_true",
-        help="with --sampling: the on-device sampler after the candidate row (TAIL writes the sampled token; "
-        "sampled requests without penalties or logprobs run the greedy loop plus one draw write per step)",
+        default=None,
+        help="the default with --sampling: the on-device sampler after the candidate row (TAIL writes the sampled "
+        "token; a sampled request the device policy admits runs the greedy loop plus one draw write per step)",
+    )
+    parser.add_argument(
+        "--host-sampler",
+        dest="device_sampler",
+        action="store_false",
+        default=None,
+        help="with --sampling: every sampled request draws on the host over the read candidate row",
     )
     parser.add_argument(
         "--sampling-discriminator",
@@ -1592,9 +1601,15 @@ def _parser() -> argparse.ArgumentParser:
         "by the prompt splice, removed with the committed-prefix rule): 0, the single-lane chain",
     )
     parser.add_argument("--lane-slots", type=int, default=None, help="host slots for parked lane images (--lanes)")
-    parser.add_argument("--lane-verify-policy", default="2/0", help="N/M tracker passes after lane lifecycle events (--lanes)")
-    parser.add_argument("--lane-prefill-chunk-budget", type=int, default=2, help="chunk replays per device tick (--lanes)")
-    parser.add_argument("--lane-prefill-import-check", action="store_true", help="re-read prefilled lane images (--lanes)")
+    parser.add_argument(
+        "--lane-verify-policy", default="2/0", help="N/M tracker passes after lane lifecycle events (--lanes)"
+    )
+    parser.add_argument(
+        "--lane-prefill-chunk-budget", type=int, default=2, help="chunk replays per device tick (--lanes)"
+    )
+    parser.add_argument(
+        "--lane-prefill-import-check", action="store_true", help="re-read prefilled lane images (--lanes)"
+    )
     return parser
 
 
@@ -1627,8 +1642,10 @@ def main() -> int:
         raise SystemExit(
             f"--stall-seconds must exceed --socket-timeout-seconds {args.socket_timeout_seconds}, got {args.stall_seconds}"
         )
+    if args.device_sampler is None:
+        args.device_sampler = bool(args.sampling)  # the device sampler is the --sampling default
     if args.device_sampler and not args.sampling:
-        raise SystemExit("--device-sampler needs --sampling (the composite reads the candidate row)")
+        raise SystemExit("--device-sampler needs --sampling (the sampler reads the candidate row)")
     if args.sampling_discriminator and (not args.sampling or args.acceptance_prompts is None):
         raise SystemExit("--sampling-discriminator needs --sampling and the acceptance prompt records")
     if args.lanes:

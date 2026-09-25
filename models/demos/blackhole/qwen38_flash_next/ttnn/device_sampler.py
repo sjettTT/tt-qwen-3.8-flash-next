@@ -57,7 +57,6 @@ prefixes to one rounded product; a token with ``p / p_max < 2**-19`` gets weight
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,16 +73,11 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import (
     SAMPLING_CANDIDATES_PER_DEVICE,
     TOKEN_ROW_SHAPE,
     TP_SIZE,
-    VOCAB_SIZE,
     _deallocate,
     _metadata,
     _shape,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.sampling import (
-    UNIFORM_BITS,
-    Qwen38SamplingParameters,
-    UniformStream,
-)
+from models.demos.blackhole.qwen38_flash_next.ttnn.sampling import UNIFORM_BITS, Qwen38SamplingParameters, UniformStream
 
 LANES = TP_SIZE * SAMPLING_CANDIDATES_PER_DEVICE  # 128 candidates per row
 LANE_SHAPE = (1, 1, 1, LANES)
@@ -125,10 +119,15 @@ class Qwen38DeviceSamplerPolicy:
     top_p: float
     min_p: float
     greedy: bool = False
+    # The OpenAI presence penalty over the request's output: the one-program sampler (``fused/sampler_tail``) keeps
+    # the emitted tokens on the device and applies it; the composite takes no penalty (``from_parameters`` refuses).
+    presence_penalty: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.greedy and not 0 < self.temperature <= MAX_TEMPERATURE:
             raise ValueError(f"temperature must be in (0, {MAX_TEMPERATURE}], got {self.temperature}")
+        if not 0 <= self.presence_penalty <= 2:
+            raise ValueError(f"presence_penalty must be in [0, 2], got {self.presence_penalty}")
         if isinstance(self.top_k, bool) or type(self.top_k) is not int or not 1 <= self.top_k <= MAX_TOP_K:
             raise ValueError(f"top_k must be an integer in [1, {MAX_TOP_K}], got {self.top_k!r}")
         if not 0 < self.top_p <= 1:
@@ -143,15 +142,45 @@ class Qwen38DeviceSamplerPolicy:
         return cls(temperature=1.0, top_k=MAX_TOP_K, top_p=1.0, min_p=0.0, greedy=True)
 
     @classmethod
-    def from_parameters(cls, p: Qwen38SamplingParameters) -> "Qwen38DeviceSamplerPolicy | None":
-        """The device policy of a request, or ``None`` when the request needs the host loop (temperature above
-        ``MAX_TEMPERATURE``, ``top_k`` 0, any penalty)."""
+    def from_parameters(
+        cls, p: Qwen38SamplingParameters, *, presence_on_device: bool = False
+    ) -> "Qwen38DeviceSamplerPolicy | None":
+        """The device policy of a request, or ``None`` when the request needs the host loop (``refusal`` says why)."""
 
         if p.temperature == 0:
             return cls.greedy_policy()
-        if not p.temperature <= MAX_TEMPERATURE or not 1 <= p.top_k <= MAX_TOP_K or p.penalizes:
+        if cls.refusal(p, presence_on_device=presence_on_device) is not None:
             return None
-        return cls(temperature=p.temperature, top_k=p.top_k, top_p=p.top_p, min_p=p.min_p)
+        return cls(
+            temperature=p.temperature,
+            top_k=p.top_k,
+            top_p=p.top_p,
+            min_p=p.min_p,
+            presence_penalty=p.presence_penalty if presence_on_device else 0.0,
+        )
+
+    @classmethod
+    def refusal(cls, p: Qwen38SamplingParameters, *, presence_on_device: bool = False) -> str | None:
+        """Why a sampled request keeps the host loop: a temperature above ``MAX_TEMPERATURE``, ``top_k`` 0 or above
+        the row's 32 per shard, a frequency penalty (counts, not bits), a repetition penalty (the multiplicative
+        transformers rule), a negative presence penalty (it can lift unread tokens: the host path's own fallback),
+        or any presence penalty when the sampler serving cannot apply one (the composite)."""
+
+        if p.temperature == 0:
+            return None
+        if not p.temperature <= MAX_TEMPERATURE:
+            return f"temperature {p.temperature} above the table's {MAX_TEMPERATURE}"
+        if not 1 <= p.top_k <= MAX_TOP_K:
+            return f"top_k {p.top_k} outside [1, {MAX_TOP_K}]"
+        if p.frequency_penalty != 0:
+            return "frequency penalty (counts, not presence bits)"
+        if p.repetition_penalty != 1:
+            return "repetition penalty (the multiplicative rule)"
+        if p.presence_penalty < 0:
+            return "negative presence penalty (can lift unread tokens)"
+        if p.presence_penalty != 0 and not presence_on_device:
+            return "presence penalty on a sampler without the device history"
+        return None
 
     @property
     def min_weight(self) -> float:
@@ -171,10 +200,18 @@ class Qwen38DeviceSample:
 
 
 def device_sampler_reference(
-    values: torch.Tensor, ids: torch.Tensor, policy: Qwen38DeviceSamplerPolicy, uniform: float, *, table=None
+    values: torch.Tensor,
+    ids: torch.Tensor,
+    policy: Qwen38DeviceSamplerPolicy,
+    uniform: float,
+    *,
+    table=None,
+    seen: torch.Tensor | None = None,
 ) -> Qwen38DeviceSample:
-    """The host reference of :func:`sample_on_device` for one row: ``values`` fp32 ``[128]`` and ``ids`` int64
-    ``[128]`` in lane order (shard d's 32 lanes at ``32 d``), the policy's temperature table, one draw ``u``."""
+    """The host reference of :func:`sample_on_device` (and of ``fused/sampler_tail``) for one row: ``values`` fp32
+    ``[128]`` and ``ids`` int64 ``[128]`` in lane order (shard d's 32 lanes at ``32 d``), the policy's temperature
+    table, one draw ``u``; ``seen`` (bool ``[128]``: the lanes whose id the request has emitted) takes the policy's
+    presence penalty off those values first (an fp32 subtract, the host sampler's), required when it is nonzero."""
 
     if tuple(values.shape) != (LANES,) or values.dtype != torch.float32:
         raise ValueError(f"values must be fp32 [{LANES}], got {values.dtype} {tuple(values.shape)}")
@@ -185,6 +222,11 @@ def device_sampler_reference(
     if table is None:
         table = weight_table(policy.temperature)
     table = table.reshape(-1)
+    if policy.presence_penalty != 0:
+        if seen is None or tuple(seen.shape) != (LANES,) or seen.dtype != torch.bool:
+            raise ValueError(f"a presence policy needs the row's seen mask (bool [{LANES}]), got {seen}")
+        values = values.clone()
+        values[seen] = values[seen] - torch.tensor(policy.presence_penalty, dtype=torch.float32)
     by_id = torch.argsort(ids)  # the ids of a row are distinct: ascending id first, then the stable sort by value
     order = by_id[torch.sort(values[by_id], descending=True, stable=True).indices]
     s_sorted = values[order]
