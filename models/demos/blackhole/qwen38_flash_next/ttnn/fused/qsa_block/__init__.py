@@ -1059,29 +1059,24 @@ DEVICES = 4
 
 
 def score_merge(gathered, mask):
-    """[1, 1, 4 * rows, W] gathered bf16 ROW_MAJOR score rows (device d's rows at d * rows) + mask [1, 1, rows, W] ->
-    the masked block scores [1, 1, rows, W] bf16 ROW_MAJOR for the top-k."""
+    """The gathered score rows as 2 KB pages, ``[1, 1, 4 * rows * chunks, 1024]`` bf16 ROW_MAJOR (device d's row r,
+    chunk c at page ``(d * rows + r) * chunks + c``: the all_gather of the row reshaped to ``[1, 1, chunks, 1024]``,
+    the page form ttnn.all_gather takes at every context), + mask ``[1, 1, rows, W]`` -> the masked block scores
+    ``[1, 1, rows, W]`` bf16 ROW_MAJOR for the top-k."""
 
-    shape = tuple(gathered.shape)
-    if (
-        len(shape) != 4
-        or shape[:2] != (1, 1)
-        or shape[2] % DEVICES
-        or shape[3] % SCORE_CHUNK
-        or gathered.dtype != BF16
-        or gathered.layout != ttnn.ROW_MAJOR_LAYOUT
-    ):
-        raise ValueError(
-            f"gathered scores must be ROW_MAJOR bf16 [1, 1, 4 * rows, k * {SCORE_CHUNK}], got {gathered.layout} {shape}"
-        )
-    rows, width = shape[2] // DEVICES, shape[3]
-    if tuple(mask.shape) != (1, 1, rows, width) or mask.dtype != BF16 or mask.layout != ttnn.ROW_MAJOR_LAYOUT:
-        raise ValueError(f"mask must be ROW_MAJOR bf16 [1, 1, {rows}, {width}], got {tuple(mask.shape)}")
+    shape, mshape = tuple(gathered.shape), tuple(mask.shape)
+    if len(mshape) != 4 or mshape[:2] != (1, 1) or mshape[3] % SCORE_CHUNK or mask.dtype != BF16 or mask.layout != ttnn.ROW_MAJOR_LAYOUT:
+        raise ValueError(f"mask must be ROW_MAJOR bf16 [1, 1, rows, k * {SCORE_CHUNK}], got {mask.layout} {mshape}")
+    rows, width = mshape[2], mshape[3]
     chunks = width // SCORE_CHUNK
+    if shape != (1, 1, DEVICES * rows * chunks, SCORE_CHUNK) or gathered.dtype != BF16 or gathered.layout != ttnn.ROW_MAJOR_LAYOUT:
+        raise ValueError(
+            f"gathered score pages must be ROW_MAJOR bf16 [1, 1, {DEVICES * rows * chunks}, {SCORE_CHUNK}], got {gathered.layout} {shape}"
+        )
     mesh = gathered.device()
     out = fp.allocate((1, 1, rows, width), BF16, ttnn.ROW_MAJOR_LAYOUT, mesh)
-    cores = _rect(0, 0, chunks - 1, 0)
-    core_list = [ttnn.CoreCoord(c, 0) for c in range(chunks)]
+    work = score_merge_work(width, mesh.compute_with_storage_grid_size())
+    cores = fp.core_rectangle(work, mesh)
     cbs = [
         fp.cb_descriptor(cb, BF16, TILE_BF16, pages, cores)
         for cb, pages in ((0, DEVICES), (1, 1), (2, 1), (3, 1), (16, 1))
@@ -1090,31 +1085,55 @@ def score_merge(gathered, mask):
         SCORE_MERGE["reader"],
         cores,
         [*fp.accessor_args(gathered), *fp.accessor_args(mask)],
-        [(c, [gathered.buffer_address(), mask.buffer_address(), rows, i]) for i, c in enumerate(core_list)],
+        [(w.core, [gathered.buffer_address(), mask.buffer_address(), rows, w.start, w.count, chunks]) for w in work],
     )
-    compute = fp.compute_kernel(SCORE_MERGE["compute"], cores, [], [(c, [rows]) for c in core_list], fp32_dest=False)
+    compute = fp.compute_kernel(SCORE_MERGE["compute"], cores, [], [(w.core, [rows, w.count]) for w in work], fp32_dest=False)
     writer = fp.writer_kernel(
         SCORE_MERGE["writer"],
         cores,
         fp.accessor_args(out),
-        [(c, [out.buffer_address(), rows, i]) for i, c in enumerate(core_list)],
+        [(w.core, [out.buffer_address(), rows, w.start, w.count]) for w in work],
     )
     return fp.run_program([gathered, mask, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
 
 
+def score_merge_work(width: int, grid) -> list[fp.CoreWork]:
+    """The merge's ``width // SCORE_CHUNK`` chunks (1024 columns each: one tile row of bf16 per row) over the compute
+    grid in ``fp.split_work``'s order, at most one core per chunk and never more cores than the grid has; a core with
+    several chunks runs them one after another.  Every output element is one chunk's row of the same four device
+    tiles summed in the same order plus its mask element, whatever core carries the chunk, so the placement does not
+    enter the bits.  (The first form put chunk c on core (c, 0): at 65536 tokens of context, 16 chunks, that row runs
+    past the 11- or 12-column compute grid of a p150 onto a dispatch core: "Illegal kernel placement".)"""
+
+    chunks = width // SCORE_CHUNK
+    if chunks < 1:
+        raise ValueError(f"the score width must hold at least one {SCORE_CHUNK}-column chunk, got {width}")
+    return fp.split_work(chunks, _Grid(grid))
+
+
+class _Grid:
+    """A ``compute_with_storage_grid_size()`` result as the mesh argument ``fp.split_work`` reads it from."""
+
+    def __init__(self, grid) -> None:
+        self._grid = grid
+
+    def compute_with_storage_grid_size(self):
+        return self._grid
+
+
 def score_merge_composed(gathered, mask):
     """The all_reduce composite's local reduce (all_reduce_async.cpp local_sum: to TILE, moreh_sum over the device
-    dim, back to ROW_MAJOR) and the chain's masked add, for one row."""
+    dim, back to ROW_MAJOR) and the chain's masked add, for one row; ``gathered`` in the merge's page form."""
 
-    shape = tuple(gathered.shape)
-    if shape[2] != DEVICES:
-        raise ValueError("the composed score merge is the one-row chain")
+    width = int(mask.shape[3])
+    if tuple(gathered.shape) != (1, 1, DEVICES * (width // SCORE_CHUNK), SCORE_CHUNK):
+        raise ValueError("the composed score merge is the one-row chain on the gathered pages")
     dram = ttnn.DRAM_MEMORY_CONFIG
-    stacked = ttnn.reshape(gathered, (DEVICES, 1, 1, shape[3]))
+    stacked = ttnn.reshape(gathered, (DEVICES, 1, 1, width))  # the pages are device-major, so this is the row order
     tiled = ttnn.to_layout(stacked, ttnn.TILE_LAYOUT, memory_config=dram)
     summed = ttnn.moreh_sum(tiled, dim=0, keepdim=True, memory_config=dram)
     row_major = ttnn.to_layout(summed, ttnn.ROW_MAJOR_LAYOUT, memory_config=dram)
-    row = ttnn.reshape(row_major, (1, 1, 1, shape[3]))
+    row = ttnn.reshape(row_major, (1, 1, 1, width))
     out = ttnn.add(row, mask, memory_config=dram, fast_and_approximate_mode=False)
     for t in (tiled, summed, row_major):
         ttnn.deallocate(t)

@@ -94,6 +94,9 @@ BLOCK_TOPK = TOKEN_BUDGET // COMPRESS_RATIO
 
 MAX_CONTEXT = 262144
 MAX_COMPRESSED_BLOCKS = MAX_CONTEXT // COMPRESS_RATIO
+# The fused block-score gather moves the score row as pages of this many bf16 columns (2 KB): ttnn.all_gather's
+# kernel headers refuse a page of 65,536 bytes or more (the whole row is 65,536 bytes at a 131072-token context).
+SCORE_GATHER_PAGE = 1024
 CACHE_WRITE_ROWS = 32
 QSA_CACHE_CAPACITY_ALIGNMENT = COMPRESS_RATIO * CACHE_WRITE_ROWS
 MIN_QSA_CACHE_CAPACITY = max(QSA_CACHE_CAPACITY_ALIGNMENT, BLOCK_TOPK * COMPRESS_RATIO)
@@ -3432,14 +3435,19 @@ class Qwen38TTNNQSA:
             replicated_reference=state.compressed_index_cache,
             expected_shape=(1, 1, 1, self.allocated_compressed_blocks),
         )
+        # the row as 2 KB pages: ttnn.all_gather's kernels refuse a page of 65,536 bytes or more (the whole row at a
+        # 131072-token context); device d's page c lands at gathered page d * pages + c, which the fused merge reads
+        pages = self.allocated_compressed_blocks // SCORE_GATHER_PAGE
+        paged = ttnn.reshape(score_row, (1, 1, pages, SCORE_GATHER_PAGE))
+        _deallocate(score_row)
         gathered = ttnn.all_gather(
-            score_row,
+            paged,
             dim=2,
             cluster_axis=TP_AXIS,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
-        _deallocate(score_row)
-        _require_shape(gathered, (1, 1, TP_SIZE, self.allocated_compressed_blocks), "gathered QSA block scores")
+        _deallocate(paged)
+        _require_shape(gathered, (1, 1, TP_SIZE * pages, SCORE_GATHER_PAGE), "gathered QSA block score pages")
         masked = self._score_merge_fused(gathered, position.indexer_neg_mask)
         _deallocate(gathered)
         # generic_op leaves the allocation's topology: stamp the placement the chain's add would have given it
