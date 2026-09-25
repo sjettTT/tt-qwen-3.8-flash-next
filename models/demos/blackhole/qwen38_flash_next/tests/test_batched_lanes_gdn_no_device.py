@@ -542,7 +542,8 @@ def test_gdn_fused_lanes_body_is_the_one_row_fused_walk_on_b_rows_and_binds_unde
     assert _calls(cls._out_project_lanes).count("ttnn.reduce_scatter") == 1
     assert "lanes" in fused.kernel("gdn_step").replaces and "_forward_decode_lanes_fused" in gdn_step_module.__doc__
     # The binding: the one ``if fused.enabled("gdn_step")`` of the constructor assigns the partial over the class
-    # attribute; the switch is off by default and on under QWEN38_FUSED; the class body still runs the lane chain.
+    # attribute; the kernel serves by default (since 2026-09-25) and QWEN38_FUSED_OFF=gdn_step unbinds it; the class
+    # body still runs the lane chain.
     init = ast.parse(textwrap.dedent(inspect.getsource(cls.__init__)))
     binds = [
         node
@@ -553,7 +554,8 @@ def test_gdn_fused_lanes_body_is_the_one_row_fused_walk_on_b_rows_and_binds_unde
     assert ast.unparse(binds[0].body[0]) == (
         "self.forward_decode_lanes = functools.partial(type(self)._forward_decode_lanes_fused, self)"
     )
-    assert not fused.enabled("gdn_step", {}) and fused.enabled("gdn_step", {"QWEN38_FUSED": "gdn_step"})
+    assert fused.enabled("gdn_step", {}) and not fused.enabled("gdn_step", {"QWEN38_FUSED_OFF": "gdn_step"})
+    assert "gdn_step" in fused.DEFAULT_ON and fused.kernel("gdn_step").default_on
     assert "_recurrent_decode_lanes" in _self_walk(cls.forward_decode_lanes)
     assert "fused" not in _self_walk(cls.forward_decode_lanes) and "gdn_step" not in composed
 
