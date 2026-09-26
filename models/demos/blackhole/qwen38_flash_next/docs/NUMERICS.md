@@ -433,6 +433,29 @@ rows measured with a fixed completion budget and no stop ids overstate short-ans
 after about 151 tokens and then repeats its answer, so a 600-token json row runs about 75 % in that loop; read the passes
 before the first end marker.
 
+### The PLE rows lookup after the reader trim (2026-09-26)
+
+The "PLE n-gram rows" term above is the host's lookup of the k + 1 tokens' rows plus their one upload.  One k = 4 pass reads
+80 rows of 320 B from about 62 of the 128 table parts (33 shard files); the lookup was 75 % syscalls: the row reader
+re-proved the checkpoint file guard's identity with three `fstat` per touched PART (185 per pass) around 79 WILLNEED and
+79 `pread` calls.  The identity is the shard FILE's, so the resident lookup now proves it once per touched file before and
+after each batch, advises every distinct row before any is read and reads each once: 344 -> about 130 syscalls per pass, the
+same bytes in the same order (`tests/test_ple_resident_lookup_no_device.py` pins fstat = 2 x files touched, fadvise = pread =
+distinct rows, every WILLNEED before the first pread, the per-file fail-closed, and the oracle bitwise).  The WILLNEED stays:
+a pass whose rows are all cold costs +0.24 ms with it, 3.8 ms without, 8.8 ms through mmap slices.
+
+Measured on the 4-chip p150 line (the fork runtime built at `5eac9c778edb`, the GDN rows fold on, greedy fused, pipelined
+p50, json / prose / chat560): the lookup 1.90 / 1.90 / 1.92 -> 1.41 / 1.41 / 1.41 ms per pass, the row write 0.70-0.78
+unchanged (the call's own host cost, the same with the device idle), the `ple_rows` segment 2.62 / 2.62 / 2.66 -> 2.20 /
+2.18 / 2.16, the pass wall 47.26 / 46.55 / 48.64 -> 46.87 / 46.17 / 48.11 ms, the exposed-host bucket (host work per pass
+minus the 0.9 ms commit replay it hides under: the device idle from the commit's end to the verify launch) 1.98 / 2.07 / 2.19
+-> 1.50 / 1.69 / 1.64 ms; the wrap arm's segment 2.75 -> 2.25.  The stream is unchanged: the A3 12-record table is identical
+to the fold's row with the fold on and passes its pins with it off, tokens per pass identical on every cell.  What remains of
+the segment scales with the main thread's core clock: in cells where the core ran at 3.70 GHz the lookup reads 0.70-0.72 and
+the write 0.42-0.43 ms (the standalone host numbers), at 1.48-2.6 GHz both about twice that -- the thread sleeps 44 of every
+47 ms on the readback and the frequency governor lowers its clock; neither the thread's NUMA node (both 2.15-2.20 ms) nor its
+SMT sibling moves it.  The remaining ~1.0 ms/pass is the host's cpufreq policy, a host setting.
+
 ## The device sampler's law (2026-09-25)
 
 The on-device sampler (`sampler_tail`, one program on one core after the top-32 candidate row) is gated on its law, not

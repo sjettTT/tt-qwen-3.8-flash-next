@@ -98,21 +98,20 @@ def _table_name(part: int) -> str:
     return f"table.shard_{part}.weight"
 
 
-def _synthetic_corpus(root: Path) -> dict[str, str]:
+def _synthetic_corpus(root: Path, *, parts_per_file: int = 1) -> dict[str, str]:
+    """``PARTS`` table parts over ``PARTS / parts_per_file`` shard files (the real table: 128 parts over 33 files)."""
+
     torch.manual_seed(1)
     weight_map = {}
-    for part in range(PARTS):
-        shard = f"part-{part}.safetensors"
+    for first in range(0, PARTS, parts_per_file):
+        shard = f"part-{first}.safetensors"
         # The leading tensor gives the table a nonzero data offset inside the file.
-        save_file(
-            {
-                f"leading_{part}.bias": torch.randn(37, dtype=torch.bfloat16),
-                _table_name(part): torch.randn(ROWS_PER_PART, HEAD_DIM, dtype=torch.bfloat16),
-            },
-            str(root / shard),
-        )
-        weight_map[f"leading_{part}.bias"] = shard
-        weight_map[_table_name(part)] = shard
+        tensors = {f"leading_{first}.bias": torch.randn(37, dtype=torch.bfloat16)}
+        weight_map[f"leading_{first}.bias"] = shard
+        for part in range(first, min(first + parts_per_file, PARTS)):
+            tensors[_table_name(part)] = torch.randn(ROWS_PER_PART, HEAD_DIM, dtype=torch.bfloat16)
+            weight_map[_table_name(part)] = shard
+        save_file(tensors, str(root / shard))
     return weight_map
 
 
@@ -437,3 +436,129 @@ def test_resident_lookup_matches_the_real_checkpoint_oracle_over_a_decode_chain(
         _assert_bitwise_equal(got, expected)
         assert torch.equal(context, oracle_context)
     resident.close()
+
+
+# --------------------------------------------------------------------------- the batch's syscall contract
+
+
+class _SyscallLog:
+    """Records every ``os.fstat`` / ``os.posix_fadvise`` / ``os.pread`` the reader issues, in order."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.calls: list[tuple[str, int]] = []
+        for name in ("fstat", "posix_fadvise", "pread"):
+            real = getattr(os, name)
+
+            def logged(*args, _name=name, _real=real):
+                self.calls.append((_name, args[0]))
+                return _real(*args)
+
+            monkeypatch.setattr(os, name, logged)
+
+    def count(self, name: str) -> int:
+        return sum(1 for call in self.calls if call[0] == name)
+
+
+def _hashed_rows(host, tokens, context=None) -> list[int]:
+    hashed = []
+    for token in tokens:
+        ids, context = _scalar_ids(token, context, eos=EOS, spec=host.spec)
+        hashed += ids
+    return hashed
+
+
+@pytest.mark.parametrize("parts_per_file", (1, 2))
+def test_resident_batch_proves_each_touched_file_once_and_reads_each_distinct_row_once(
+    tmp_path, monkeypatch, parts_per_file
+):
+    """One MTP pass's rows through ``_read_rows``: the file guard's identity is re-proved with one ``fstat`` per touched
+    shard FILE before and after the batch (the identity is the file's; the per-part ``advise`` / ``read_rows`` would
+    pay three per touched part), every distinct row gets one WILLNEED before any row is read (the page-ins of cold
+    rows overlap: the deterministic form of the cold-rows guarantee, its timing is not) and one ``pread``; the bytes
+    are the per-part checked reads' bytes in request order, duplicates included."""
+
+    weight_map = _synthetic_corpus(tmp_path, parts_per_file=parts_per_file)
+    checkpoint = _SyntheticCheckpoint(tmp_path, weight_map)
+    host = _synthetic_host_embedding(checkpoint)
+    resident = Qwen38ResidentPLELookup(host)
+    assert len({reader.shard for reader in resident.readers}) == PARTS // parts_per_file
+    tokens = [17, 29, 31, EOS, 43]  # a k = 4 pass: 5 tokens, 80 hashed rows
+    hashed = _hashed_rows(host, tokens)
+    distinct = list(dict.fromkeys(hashed))
+    parts = {index // ROWS_PER_PART for index in distinct}
+    files = {resident.readers[part].shard for part in parts}
+    assert len(hashed) == 16 * len(tokens) and len(distinct) < len(hashed) or len(distinct) == len(hashed)
+
+    # The reference bytes: the per-part checked calls, the same rows in the same order.
+    expected = bytearray()
+    checked = {}
+    for part in sorted(parts):
+        rows = [index % ROWS_PER_PART for index in distinct if index // ROWS_PER_PART == part]
+        for row, payload in zip(rows, resident.readers[part].read_rows(rows)):
+            checked[part * ROWS_PER_PART + row] = payload
+    for index in hashed:
+        expected += checked[index]
+
+    log = _SyscallLog(monkeypatch)
+    payload, contexts = resident.lookup_tokens(tokens, None)
+    assert bytes(payload) == bytes(expected)
+    assert len(contexts) == len(tokens) + 1 and contexts[0] is None
+    assert log.count("fstat") == 2 * len(files), log.calls
+    assert log.count("posix_fadvise") == len(distinct) and log.count("pread") == len(distinct)
+    kinds = [name for name, _ in log.calls]
+    first_pread, last_fadvise = kinds.index("pread"), len(kinds) - 1 - kinds[::-1].index("posix_fadvise")
+    assert last_fadvise < first_pread, "every WILLNEED is issued before the first pread"
+    assert kinds[: len(files)] == ["fstat"] * len(files) and kinds[-len(files) :] == ["fstat"] * len(files)
+    # The proof is per file: every touched file's descriptor is proved, none twice per side.
+    proved = [descriptor for name, descriptor in log.calls if name == "fstat"]
+    assert len(set(proved[: len(files)])) == len(files) and proved[: len(files)] == proved[len(files) :]
+    resident.close()
+
+
+def test_resident_batch_fails_closed_when_a_touched_file_drifts_and_reads_the_others(tmp_path) -> None:
+    """The per-file proof keeps the fail-closed contract: a batch touching a rewritten file is refused before any
+    read (and a rewrite between the proofs would be refused after); a batch over the untouched files still reads."""
+
+    weight_map = _synthetic_corpus(tmp_path, parts_per_file=2)
+    checkpoint = _SyntheticCheckpoint(tmp_path, weight_map)
+    host = _synthetic_host_embedding(checkpoint)
+    resident = Qwen38ResidentPLELookup(host)
+    rows_file_0 = [1, 5, ROWS_PER_PART + 7]  # parts 0 and 1 live in part-0.safetensors
+    rows_file_1 = [2 * ROWS_PER_PART + 3, 3 * ROWS_PER_PART + 9]  # parts 2 and 3 in part-2.safetensors
+    before_0, before_1 = bytes(resident._read_rows(rows_file_0)), bytes(resident._read_rows(rows_file_1))
+    time.sleep(0.05)
+    with open(tmp_path / "part-0.safetensors", "r+b") as stream:
+        stream.seek(8)
+        stream.write(b"!")
+    with pytest.raises(RuntimeError, match="identity drifted before"):
+        resident._read_rows(rows_file_0)
+    with pytest.raises(RuntimeError, match="identity drifted before"):
+        resident._read_rows(rows_file_0 + rows_file_1)  # one drifted file refuses the whole batch
+    assert bytes(resident._read_rows(rows_file_1)) == before_1  # the other file's identity stands
+    assert before_0 != before_1
+    resident.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        resident._read_rows(rows_file_1)
+
+
+def test_row_reader_proven_forms_are_the_checked_forms_without_the_fstat(tmp_path, monkeypatch) -> None:
+    weight_map = _synthetic_corpus(tmp_path)
+    checkpoint = _SyntheticCheckpoint(tmp_path, weight_map)
+    reader = Qwen38CheckpointRowReader(checkpoint, _table_name(1))
+    assert reader.shard == "part-1.safetensors"
+    rows = [3, 3, 8, 0]
+    log = _SyscallLog(monkeypatch)
+    checked = reader.read_rows(rows)
+    assert (log.count("fstat"), log.count("pread")) == (2, 3)
+    log.calls.clear()
+    assert reader.read_rows_proven(rows) == checked
+    assert (log.count("fstat"), log.count("pread")) == (0, 3)
+    log.calls.clear()
+    reader.prove_identity("before")
+    reader.advise_proven(rows)
+    assert (log.count("fstat"), log.count("posix_fadvise"), log.count("pread")) == (1, 3, 0)
+    reader.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        reader.read_rows_proven([0])
+    with pytest.raises(RuntimeError, match="closed"):
+        reader.prove_identity("before")

@@ -333,7 +333,12 @@ class Qwen38CheckpointRowReader:
     The file guard brackets exactly one open per part.  Bytes read through an
     open descriptor can only change if the inode itself changes, so every later
     batch re-proves the identity captured at that open with ``fstat`` before
-    and after its ``pread`` calls instead of re-resolving the path.
+    and after its ``pread`` calls instead of re-resolving the path.  The
+    identity is the shard FILE's (``shard``): a caller reading several parts
+    of one file in a batch proves it once per touched file around the batch
+    (:meth:`prove_identity`) and reads the parts with :meth:`advise_proven` /
+    :meth:`read_rows_proven`; :meth:`advise` and :meth:`read_rows` prove it
+    themselves.
     """
 
     def __init__(self, checkpoint: Qwen38Checkpoint, name: str) -> None:
@@ -342,6 +347,7 @@ class Qwen38CheckpointRowReader:
             raise ValueError(f"sparse row reads require a rank>=2 BF16 tensor, got {metadata.dtype} {metadata.shape}")
         header_length, _ = checkpoint._header(metadata.shard)
         self.name = name
+        self.shard = metadata.shard
         self.rows = metadata.shape[0]
         self.row_shape = metadata.shape[1:]
         self.row_bytes = math.prod(self.row_shape) * _DTYPE_BYTES[metadata.dtype]
@@ -364,12 +370,22 @@ class Qwen38CheckpointRowReader:
             raise
         self._descriptor: int | None = descriptor
 
-    def _checked_descriptor(self, when: str) -> int:
+    def _open_descriptor(self) -> int:
         if self._descriptor is None:
             raise RuntimeError(f"sparse row reader for {self.name} is closed")
-        if _file_identity(os.fstat(self._descriptor)) != self._identity:
-            raise RuntimeError(f"checkpoint part identity drifted {when} sparse row read of {self.name}")
         return self._descriptor
+
+    def _checked_descriptor(self, when: str) -> int:
+        descriptor = self._open_descriptor()
+        if _file_identity(os.fstat(descriptor)) != self._identity:
+            raise RuntimeError(f"checkpoint part identity drifted {when} sparse row read of {self.name}")
+        return descriptor
+
+    def prove_identity(self, when: str) -> None:
+        """One ``fstat`` re-proof of the admitted inode (the identity of the whole shard file): a batch over several
+        parts of one file proves it before and after the batch through any one of their readers."""
+
+        self._checked_descriptor(when)
 
     def _offset(self, row_index: int) -> int:
         if not 0 <= row_index < self.rows:
@@ -379,17 +395,34 @@ class Qwen38CheckpointRowReader:
     def advise(self, row_indices: Sequence[int]) -> None:
         """Start the page-ins for a batch so the following preads overlap one disk latency."""
 
+        if getattr(os, "posix_fadvise", None) is None:
+            return
+        self._checked_descriptor("before advising")
+        self.advise_proven(row_indices)
+
+    def advise_proven(self, row_indices: Sequence[int]) -> None:
+        """:meth:`advise` for a caller that proved the file's identity itself: one WILLNEED per distinct row."""
+
         fadvise = getattr(os, "posix_fadvise", None)
         if fadvise is None:
             return
-        descriptor = self._checked_descriptor("before advising")
+        descriptor = self._open_descriptor()
         for row_index in set(row_indices):
             fadvise(descriptor, self._offset(row_index), self.row_bytes, os.POSIX_FADV_WILLNEED)
 
     def read_rows(self, row_indices: Sequence[int]) -> list[bytes]:
         """Return each row's raw BF16 bytes in request order, identity-checked around the batch."""
 
-        descriptor = self._checked_descriptor("before")
+        self._checked_descriptor("before")
+        payloads = self.read_rows_proven(row_indices)
+        self._checked_descriptor("after")
+        return payloads
+
+    def read_rows_proven(self, row_indices: Sequence[int]) -> list[bytes]:
+        """:meth:`read_rows` for a caller that proved the file's identity around its batch: one ``pread`` per
+        distinct row, no ``fstat``."""
+
+        descriptor = self._open_descriptor()
         payloads: dict[int, bytes] = {}
         for row_index in row_indices:
             if row_index not in payloads:
@@ -397,7 +430,6 @@ class Qwen38CheckpointRowReader:
                 if len(payload) != self.row_bytes:
                     raise ValueError(f"truncated sparse row {row_index} for {self.name}")
                 payloads[row_index] = payload
-        self._checked_descriptor("after")
         return [payloads[row_index] for row_index in row_indices]
 
     def read(self, indices: torch.Tensor) -> torch.Tensor:
