@@ -18,7 +18,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.fused import program as fp
 FUSED = Path(fp.__file__).parent
 MODULES = sorted(FUSED.glob("*/__init__.py"))
 KERNELS = 22  # sub-packages under ttnn/fused
-LAUNCHES = 60  # run_program call sites over them (every one passes its meta)
+LAUNCHES = 62  # run_program call sites over them (every one passes its meta)
 # a program's ``kernel`` is a registered name; the QSA block's mirrors and probes that are not a kernel of their own say
 # ``qsa_block``; the names bound in the modules that hold a kernel name
 KERNEL_NAMES = set(fused.kernels()) | {"qsa_block"}
@@ -68,7 +68,9 @@ def test_every_meta_names_a_kernel_and_a_distinct_variant():
     for path in MODULES:
         tree = ast.parse(path.read_text())
         metas = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and _dotted(n.func) == "fp.program_meta"]
-        if not _launches(tree):  # a family of ttnn ops and another package's programs (qsa_rows) launches nothing itself
+        if not _launches(
+            tree
+        ):  # a family of ttnn ops and another package's programs (qsa_rows) launches nothing itself
             assert not metas, f"{path.parent.name} builds a program_meta without a launch"
             continue
         assert metas, f"{path.parent.name} builds no program_meta"
@@ -105,6 +107,7 @@ def test_every_meta_names_a_kernel_and_a_distinct_variant():
     assert seen["gdn_post_rows"] == {"cast", "cast_verify", "norm", "norm_verify"}
     # the verify rows' fold (opt-in): the scan and its commit pick
     assert seen["gdn_rows_scan"] == {"verify_rows", "commit_pick"}
+    assert seen["qsa_rows"] == {"score_pages", "post_attention_rows"}  # programs 1-3 launch through qsa_block
 
 
 def _fake(shape, dtype, *, l1=False, padded=None):

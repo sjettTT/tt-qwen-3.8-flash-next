@@ -83,6 +83,14 @@ code 82.79 vs 73.33 (+12.9 %), prose 40.99 vs 36.10 (+13.5 %), tokens per pass i
 pinned divergence index identical (chat 43, code 32, list 56, math 63, ...), json 96/96 at 85.3 tok/s, the hand-offs
 matched in both orders.  `QWEN38_FUSED_OFF=gdn_rows_wrap` restores the chain, and the prefill slab keeps its own form
 (`gdn_prefill_rows`, on by default after its line gate).
+The verify tile's attention-layer glue serves as two bitwise data-movement programs by default since 2026-09-26:
+`qsa_score_pages` (the indexer's score slice to the resident blocks and the row-major reshape into the all-gather's
+pages, one program) and `qsa_rows_post_attention` (the gate's copy, slices and concat, the local heads' slice, tilize,
+sigmoid, multiply, slices, concat and the move into the out-projection shard, one 48-core program), bitwise the chain
+on the 1x4 p150 line and on the served stream (the 12-record acceptance table identical to the verify-rows fold's
+row on divergence index and token sha256); the pass pair measured -0.51 ms of verify replay and -0.7 ms of pass wall
+per pass with tokens per pass unchanged.  `QWEN38_FUSED_OFF=qsa_score_pages,qsa_rows_post_attention` restores the
+chain.  A third fold, the out-projection's widen at 32 rows, measured zero at the replay floor and was not kept.
 Opt-in through `QWEN38_FUSED=<name>`: `final_mixer`, `position_advance`, `gdn_rows_prims_direct` (the MTP
 verify rows' chunk recurrence as the composite's two phase prims called directly with the composite's own relayout ops
 in its order, bitwise by construction and on the line 2026-09-25: the seam the wrap's programs were proven against, a

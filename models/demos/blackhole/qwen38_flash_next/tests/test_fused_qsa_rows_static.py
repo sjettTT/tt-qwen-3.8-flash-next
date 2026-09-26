@@ -6,10 +6,13 @@ merge over the rows) and program 2 (the main tail with the verify rows' KV stage
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import importlib
 import inspect
 from pathlib import Path
+
+import ttnn
 
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn import qsa as qsa_module
@@ -40,8 +43,10 @@ def test_score_blocks_rows_composes_the_proven_merge() -> None:
     assert qsa_rows.PAGE == qsa_block.SCORE_CHUNK == qsa_module.SCORE_GATHER_PAGE == 1024
     assert qsa_rows.DEVICES == qsa_block.DEVICES == qsa_module.TP_SIZE == 4
     source = inspect.getsource(qsa_rows.score_blocks_rows)
-    assert "ttnn.all_gather(paged, dim=2, cluster_axis=cluster_axis" in source
-    assert "qsa_block.score_merge(gathered, mask)" in source
+    assert "paged = ttnn.reshape(score_rows, (1, 1, rows * pages, PAGE))" in source
+    merge = inspect.getsource(qsa_rows._gather_and_merge)  # the gather + merge both program 1 forms share
+    assert "ttnn.all_gather(paged, dim=2, cluster_axis=cluster_axis" in merge
+    assert "qsa_block.score_merge(gathered, mask)" in merge
     composed = inspect.getsource(qsa_rows.score_blocks_rows_composed)
     assert "ttnn.all_reduce(score_rows, cluster_axis=cluster_axis" in composed
     assert "fast_and_approximate_mode=False" in composed
@@ -129,3 +134,225 @@ def test_the_manifest_lists_the_family() -> None:
         "tests/test_fused_qsa_rows_static.py",
     ):
         assert f'"{path}"' in manifest, path
+
+
+def test_score_pages_is_a_default_bitwise_data_movement_program() -> None:
+    """Program 4 (qsa_score_pages): the indexer's rows repaged into the gather's pages as one program, in place of the
+    chain's slice to the resident blocks and the row-major reshape; default since its pass pair (2026-09-26)."""
+
+    kernel = fused.kernel(qsa_rows.PAGES_NAME)
+    assert qsa_rows.PAGES_NAME == "qsa_score_pages" and kernel.tolerance == fused.BITWISE
+    assert kernel.default_on is True and qsa_rows.PAGES_NAME in fused.DEFAULT_ON
+    assert kernel.fused is qsa_rows.score_pages and kernel.composed is qsa_rows.score_pages_composed
+    source = inspect.getsource(qsa_rows.score_pages)
+    assert "fp.allocate((1, 1, rows * chunks, PAGE), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, mesh)" in source
+    assert (
+        'fp.program_meta(\n        NAME,\n        "score_pages",' in source
+        and "outputs=((out, local_scores),)," in source
+    )
+    composed = inspect.getsource(qsa_rows.score_pages_composed)
+    assert "ttnn.slice(local_scores, (0, 0, 0, 0), (1, 1, rows, blocks), memory_config=dram)" in composed
+    assert "ttnn.reshape(sliced, (1, 1, rows * (blocks // PAGE), PAGE))" in composed
+    fed = inspect.getsource(qsa_rows.score_blocks_rows_from_scores)
+    assert (
+        "paged = pages(local_scores, blocks)" in fed
+        and "_gather_and_merge(paged, rows, blocks // PAGE, mask, cluster_axis)" in fed
+    )
+    assert "_gather_and_merge(paged, rows, pages, mask, cluster_axis)" in inspect.getsource(qsa_rows.score_blocks_rows)
+    kernel_source = (MODEL_DIR / "ttnn/fused/qsa_rows/kernels/score_pages.cpp").read_text(encoding="utf-8")
+    assert (
+        kernel_source.count("FUSED_ZONE(") == 2
+        and "noc_async_read(src.get_noc_addr(row, chunk * PAGE_BYTES)" in kernel_source
+    )
+    assert "constexpr uint32_t PAGE_BYTES = 2048;" in kernel_source
+
+
+def test_the_verify_path_takes_program_four_before_the_slice_when_switched_on() -> None:
+    source = inspect.getsource(qsa_module.Qwen38TTNNQSA._score_blocks_chunk)
+    hook = (
+        "if (\n"
+        "                self._score_pages is not None\n"
+        "                and rows == CHUNK_ROWS\n"
+        "                and chunk.indexer_neg_mask is not None\n"
+        "                and self._score_pages_admits(local_scores, self.allocated_compressed_blocks)\n"
+        "            ):"
+    )
+    assert hook in source
+    assert (
+        "self._rows_fused.score_blocks_rows_from_scores(\n"
+        "                    local_scores, chunk.indexer_neg_mask, cluster_axis=TP_AXIS, pages=self._score_pages\n"
+        "                )" in source
+    )
+    assert (
+        source.index("indexer_score_dsa(") < source.index(hook) < source.index("score_tiles.append(")
+    )  # before the slice
+    init = inspect.getsource(qsa_module.Qwen38TTNNQSA.__init__)
+    assert "if fused_kernels.enabled(fused_kernels.qsa_rows.PAGES_NAME):" in init
+    assert "self._score_pages = fused_kernels.kernel(fused_kernels.qsa_rows.PAGES_NAME).fused" in init
+    assert init.index('if fused_kernels.enabled("qsa_rows"):') < init.index("self._score_pages = ")  # inside the family
+    assert qsa_module.Qwen38TTNNQSA._score_pages is None
+    manifest = (MODEL_DIR / "tools/release/manifest.json").read_text()
+    assert '"ttnn/fused/qsa_rows/kernels/score_pages.cpp"' in manifest
+
+
+def test_post_attention_rows_is_a_default_bitwise_program_on_48_cores() -> None:
+    """Program 5 (qsa_rows_post_attention): the tile's post-attention glue (12 programs) as one program, one core per
+    (head, tile column); the decode kernel's two ops per tile; default since its pass pair (2026-09-26)."""
+
+    import importlib
+
+    pa = importlib.import_module("models.demos.blackhole.qwen38_flash_next.ttnn.fused.qsa_rows.post_attention_rows")
+
+    kernel = fused.kernel(qsa_rows.PA_NAME)
+    assert qsa_rows.PA_NAME == "qsa_rows_post_attention" and kernel.tolerance == fused.BITWISE
+    assert kernel.default_on is True and qsa_rows.PA_NAME in fused.DEFAULT_ON
+    assert kernel.fused is qsa_rows.post_attention_rows  # the launch is the family's (its __init__)
+    assert kernel.composed is qsa_rows.post_attention_rows_composed is pa.post_attention_rows_composed
+    assert len(pa.ITEMS) == 48 == qsa_block.LOCAL_HEADS * qsa_block.HEAD_TILES
+    source = inspect.getsource(qsa_rows.post_attention_rows)
+    assert "if any(w.count != 1 for w in work):" in source  # one output tile per core
+    assert "outputs=((out, 3),)," in source and '"post_attention_rows",' in source
+    composed = inspect.getsource(pa.post_attention_rows_composed)
+    for op in (
+        "ttnn.to_memory_config(qg_ws, dram)",
+        "ttnn.concat(gate_heads, dim=1",
+        "ttnn.to_layout(local, ttnn.TILE_LAYOUT",
+        "ttnn.sigmoid(gate, memory_config=dram)",
+        "ttnn.mul(local_tiled, activated_gate",
+        "ttnn.concat(heads, dim=3",
+    ):
+        assert op in composed, op
+    kernels = MODEL_DIR / "ttnn/fused/qsa_rows/kernels"
+    compute = (kernels / "pa_rows_compute.cpp").read_text(encoding="utf-8")
+    decode = (MODEL_DIR / "ttnn/fused/qsa_block/kernels/post_attention_compute.cpp").read_text(encoding="utf-8")
+    for op in (
+        "sigmoid_tile<VectorMode::RC, false, false>(",
+        "mul_binary_tile<false>(",
+        "pack_reconfig_data_format(CB_SIG)",
+    ):
+        assert op in compute and op in decode, op  # the decode kernel's ops, one tile per core
+    reader = (kernels / "pa_rows_reader.cpp").read_text(encoding="utf-8")
+    assert "qg_first + 2 * HEAD_TILES * head + GATE_FIRST + column" in reader
+    assert "tile_rows::chunk_offset(lane, half)" in reader
+    writer = (kernels / "pa_rows_writer.cpp").read_text(encoding="utf-8")
+    assert sum(k.count("FUSED_ZONE(") for k in (reader, compute, writer)) == 5
+
+
+def test_the_verify_path_takes_program_five_around_sparse_sdpa_when_switched_on() -> None:
+    tail = inspect.getsource(qsa_module.Qwen38TTNNQSA._main_tail_rows_step)
+    assert "if self._post_attention_rows is not None:" in tail
+    assert tail.index("return sparse_query, None, qg_ws") < tail.index(
+        "gate = self._gate_from_qg(qg_ws, rows, full_hidden)"
+    )
+    attention = inspect.getsource(qsa_module.Qwen38TTNNQSA._sparse_value_attention_rows)
+    hook = "if qg_ws is not None:"
+    assert hook in attention
+    assert (
+        attention.index("ttnn.transformer.sparse_sdpa(")
+        < attention.index(hook)
+        < attention.index("local = ttnn.slice(")
+    )
+    assert "self._post_attention_rows(sparse_output, qg_ws, memory_config=self.out_act_memory_config)" in attention
+    project = inspect.getsource(qsa_module.Qwen38TTNNQSA._project_output_rows)
+    assert "in_shard = rows == CHUNK_ROWS and local_attention.memory_config() == self.out_act_memory_config" in project
+    assert "if not in_shard:" in project and project.index("if not in_shard:") < project.index(
+        "_deallocate(local_attention)"
+    )
+    init = inspect.getsource(qsa_module.Qwen38TTNNQSA.__init__)
+    assert "self._post_attention_rows = fused_kernels.kernel(fused_kernels.qsa_rows.PA_NAME).fused" in init
+    assert qsa_module.Qwen38TTNNQSA._post_attention_rows is None
+    manifest = (MODEL_DIR / "tools/release/manifest.json").read_text()
+    for path in (
+        "ttnn/fused/qsa_rows/post_attention_rows.py",
+        "ttnn/fused/qsa_rows/kernels/pa_rows_reader.cpp",
+        "ttnn/fused/qsa_rows/kernels/pa_rows_compute.cpp",
+        "ttnn/fused/qsa_rows/kernels/pa_rows_writer.cpp",
+    ):
+        assert f'"{path}"' in manifest, path
+
+
+class _Stub:
+    """A host stand-in with the fields the admission predicates read (shape, padded shape, dtype, layout)."""
+
+    def __init__(self, shape, padded=None, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT):
+        self.shape, self.padded_shape, self.dtype, self.layout = tuple(shape), tuple(padded or shape), dtype, layout
+
+
+def test_admission_of_programs_four_and_five_serves_the_row_tile_forms_and_leaves_the_rest_to_the_chain() -> None:
+    """The standing gate rule (2026-09-26): every fused row program's admission is exercised with the verify-tile
+    shapes AND the prefill chunk shapes (32-row, 128-row, slab) AND the one-row draft shape, asserting which form takes
+    the program and which the chain.  The 32-row chunk body's six-branch gate (1, 6, 32, 256) is the shape that
+    poisoned the warm pass when program 5 was keyed on the shared attention step instead of its own argument."""
+
+    TILE_L = ttnn.TILE_LAYOUT
+    qg_tile = _Stub((1, 1, 32, qsa_block.QG_WIDTH), layout=TILE_L)
+    qg_one_row = _Stub((1, 1, 1, qsa_block.QG_WIDTH), padded=(1, 1, 32, qsa_block.QG_WIDTH), layout=TILE_L)
+    att = lambda rows: _Stub((1, qsa_block.SPARSE_HEADS, rows, qsa_block.HEAD_DIM))  # noqa: E731
+    admits = qsa_rows.post_attention_rows_admits
+    assert admits(att(32), qg_tile) and admits(att(1), qg_one_row)  # the verify tile and the one-row draft
+    chunk_gate = _Stub((1, 6, 32, qsa_block.HEAD_DIM), layout=TILE_L)  # the 32-row chunk body's gate
+    assert not admits(att(32), chunk_gate)
+    assert not admits(att(128), _Stub((1, 1, 128, qsa_block.QG_WIDTH), layout=TILE_L))  # the 128-row chunk
+    assert not admits(att(2048), _Stub((1, 1, 2048, qsa_block.QG_WIDTH), layout=TILE_L))  # the slab
+    assert not admits(_Stub((1, 6, 32, qsa_block.HEAD_DIM)), qg_tile)  # a wrong attention form
+    assert not admits(att(32), _Stub((1, 1, 32, qsa_block.QG_WIDTH)))  # a ROW_MAJOR qg is not the linear's tile shard
+    pages = qsa_rows.score_pages_admits
+    assert pages(_Stub((1, 1, 32, 8192 + 32)), 8192) and pages(_Stub((1, 1, 1, 8224)), 8192)
+    assert not pages(_Stub((1, 1, 128, 8224)), 8192)  # four tiles at once: the chain
+    assert not pages(_Stub((1, 1, 32, 8224), layout=TILE_L), 8192) and not pages(_Stub((1, 1, 32, 8224)), 8000)
+    assert not pages(_Stub((1, 1, 32, 8192)), 8224)  # blocks past the rows' width
+    for name, predicate in (
+        (qsa_rows.PAGES_NAME, qsa_rows.score_pages_admits),
+        (qsa_rows.PA_NAME, qsa_rows.post_attention_rows_admits),
+    ):
+        assert fused.kernel(name).admits is predicate, name
+
+
+def test_the_qg_shard_travels_as_its_own_argument_and_every_hook_asks_its_predicate() -> None:
+    attention = inspect.getsource(qsa_module.Qwen38TTNNQSA._sparse_value_attention_rows)
+    assert "qg_ws=None," in attention and "if qg_ws is not None:" in attention
+    assert "self._post_attention_rows_admits(sparse_output, qg_ws)" in attention
+    assert "gate = self._gate_from_qg(qg_ws, rows, state.packed_kv_cache)" in attention  # the chain's gate otherwise
+    tail = inspect.getsource(qsa_module.Qwen38TTNNQSA._main_tail_rows_step)
+    assert "return sparse_query, None, qg_ws" in tail and "return sparse_query, gate, None" in tail
+    assert "gate = self._gate_from_qg(qg_ws, rows, full_hidden)" in tail
+    helper = inspect.getsource(qsa_module.Qwen38TTNNQSA._gate_from_qg)
+    assert "_retag_tensor(gate, reference=reference, shard_dim=1)" in helper  # the helper reads no caller's local
+    assert "full_hidden" not in helper.split('"""')[-1]  # (the docstring may name it; the body may not)
+    verify = inspect.getsource(qsa_module.Qwen38TTNNQSA.forward_verify_generic)
+    assert "sparse_query, gate, qg_ws = self._main_tail_rows_step(" in verify
+    assert "sparse_query=sparse_query, qg_ws=qg_ws" in verify
+    # the chunk body, the lanes and the lane verify never hand a qg shard: their gate stays the chain's
+    for method in ("forward_chunk_generic", "forward_decode_lanes", "forward_verify_lanes"):
+        source = inspect.getsource(getattr(qsa_module.Qwen38TTNNQSA, method))
+        assert "self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)" in source, method
+        assert "qg_ws=" not in source, method
+    score = inspect.getsource(qsa_module.Qwen38TTNNQSA._score_blocks_chunk)
+    assert "self._score_pages_admits(local_scores, self.allocated_compressed_blocks)" in score
+
+
+def test_every_fused_kernels_name_in_qsa_is_bound_in_its_scope_and_the_predicates_ride_on_self() -> None:
+    """The lever-5 re-fire hold: the hooks named ``fused_kernels`` (a local import of ``__init__``) from other methods
+    and raised NameError inside the layer at the first served verify pass.  Every reference to that name must sit in a
+    function that imports it; the hooks read the predicates bound on ``self`` in ``__init__``."""
+
+    source = Path(qsa_module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for fn in (n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
+        refs = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == "fused_kernels"]
+        binds = any(
+            isinstance(n, ast.ImportFrom) and any((a.asname or a.name) == "fused_kernels" for a in n.names)
+            for n in ast.walk(fn)
+        )
+        assert not refs or binds, f"{fn.name} reads fused_kernels without importing it (lines {refs[:3]})"
+    init = inspect.getsource(qsa_module.Qwen38TTNNQSA.__init__)
+    for name in ("_score_pages_admits", "_post_attention_rows_admits"):
+        assert getattr(qsa_module.Qwen38TTNNQSA, name) is None
+        assert f"self.{name} = fused_kernels.qsa_rows." in init, name
+    # the switched hooks never call a predicate with the switch off: the handle check comes first
+    score = inspect.getsource(qsa_module.Qwen38TTNNQSA._score_blocks_chunk)
+    assert score.index("self._score_pages is not None") < score.index("self._score_pages_admits(")
+    attention = inspect.getsource(qsa_module.Qwen38TTNNQSA._sparse_value_attention_rows)
+    assert attention.index("self._post_attention_rows is not None") < attention.index(
+        "self._post_attention_rows_admits("
+    )

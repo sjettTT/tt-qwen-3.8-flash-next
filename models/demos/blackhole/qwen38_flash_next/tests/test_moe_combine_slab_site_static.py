@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import moe_combine as mc
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import program as fp
@@ -78,7 +80,9 @@ def test_fused_branch_marks_the_program_partial_and_slices_nothing(monkeypatch):
     out = moe_module.Qwen38TTNNMoE._weighted_reduce_slab_blocks(self, "combine", "full_hidden", routing, phases.append)
     assert out == "program-partial"
     assert calls == [(("combine", "scores", "indices", "owner"), {"memory_config": moe_module.ttnn.DRAM_MEMORY_CONFIG})]
-    assert marked == [("program-partial", {"replicated_reference": "full_hidden", "expected_shape": (1, 1, 2048, 2560)})]
+    assert marked == [
+        ("program-partial", {"replicated_reference": "full_hidden", "expected_shape": (1, 1, 2048, 2560)})
+    ]
     assert phases == ["before-selective-reduce", "after-selective-reduce"]
     # a bare namespace without the flag (the landing's aliasing test) takes the blocks path
     bare = SimpleNamespace(rows=512)
