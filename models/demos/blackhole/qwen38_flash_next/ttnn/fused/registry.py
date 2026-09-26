@@ -48,6 +48,7 @@ DEFAULT_ON: frozenset[str] = frozenset(
         "position_derive",
         "qsa_index_tail",
         "qsa_main_tail",
+        "qsa_rows",
         "qsa_post_attention",
         "qsa_score_merge",
         "qsa_selection_row",

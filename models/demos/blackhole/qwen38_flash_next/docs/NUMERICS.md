@@ -27,7 +27,7 @@ Decode chains run as fused programs (`ttnn/fused/`, built on `ttnn.generic_op`) 
 chain it replaces on device, leaves every pinned table above unchanged and beats the previous step time in its own
 timing slot. On by default: `gr_read` with `gr_fold`, `gr_write`, `greedy_tail`, `moe_combine` (the prefill slab's
 MoE combine as one program), `moe_post`, `ple`, `position_derive`,
-`qsa_block`, `router_tail`, `shared_expert`: the gated-residual read as two programs with its two all-gathers inside
+`qsa_block`, `qsa_rows`, `router_tail`, `shared_expert`: the gated-residual read as two programs with its two all-gathers inside
 them (the stats, their gather, normalize + down-project and the partial gather as one program whose transport cores send
 the tiles over the 1D fabric line into the pages the stock collectives write, then low-rank + gate: 18 programs per read
 as 2, the chain's LLK sequences call for call, its reduce scaler and spill/reload rounding included; a gather is data
@@ -88,6 +88,25 @@ verify rows' chunk recurrence as the composite's two phase prims called directly
 in its order, bitwise by construction and on the line 2026-09-25: the seam the wrap's programs were proven against, a
 diagnostic beside the default). The kernels cover rows 1..32 (decode, the MTP verify rows); the 128-row prefill chunk
 and the slab keep their chains.
+`qsa_rows` (2026-09-26, on by default; `QWEN38_FUSED_OFF=qsa_rows` restores the composed glue) runs the QSA verify
+tile's glue as fused programs: program 1, the indexer scores' all-reduce composite and mask add as one all-gather plus the fused
+score merge over the 32 rows (6 programs per layer as 2; bitwise on the four dies at three positions; the MTP lead's pass
+pair on the line: -0.50 / -0.60 / -0.51 ms per pass on json / prose / the 560-token chat, the committed streams bitwise,
+the A3-mtp4-32k pins 12/12, D1 25.904 against 25.889 ms); program 2, the main tail with the verify rows' KV stage -- the
+decode `qsa_main_tail` program's norm, RoPE, head-split and query kernels on the tile's 32 rows with its staging cores
+replaced by one KV core that reads the position P and the row count R from device scalars (the verify form's k + 1, the
+commit form's accepted count: one program), reads the current cache block back, scatters rows j < R of the packed [v | k]
+row into slot (P + j) & 31 of that block or of the next block's zero rows, zeroes the block's rows past the pass as the
+chain's kept-0 rows are, and writes both blocks (the head split, two norms, two RoPEs, the concat, the block lookup, the
+keep multiply, two one-hot placements, the add, two cache writes and the sparse-query concat / untilize / pad as one
+program); bitwise the chain's on the four dies at rows 5 and 6 at the block's first row, inside, crossing the edge and at
+its last row, in the single-row form and with the row count 0..5 read from the device, the untouched cache rows
+byte-identical, 0.094 against the chain's 0.143 ms per traced call at five rows.  The family's gate on the line
+(programs 1 + 2 against the composed glue, the `--mtp 4` server): the pass wall json 51.03 -> 49.65, prose 49.82 -> 48.56,
+560-token chat 51.51 -> 50.25 ms (-1.38 / -1.26 / -1.26 ms per pass; the verify replay -1.0, the draft replay -0.33 --
+the MTP layer's draft row runs the same main tail at one row), acceptance histograms and tokens per pass identical,
+the A3-mtp4-32k pins 12/12 at the default and under `QWEN38_MTP_SAMPLED=0` (the json stream's sha equal to the composed
+glue's), the plain-decode D1 band untouched (25.602 against 25.610 ms per step median over 200 steps).
 Since 2026-09-26 the slab has a fused form of its own, `gdn_prefill_rows` (on by default: bitwise the chain on the 4x p150
 line in two independent runs -- pins 12/12, records 12/12, 3,232 agreement columns, 4/4 probes -- with the time to the first
 token at 32k -13.1 %; a four-die device test guards the mesh-topology seam the one-die tests cannot see;

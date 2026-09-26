@@ -1030,6 +1030,10 @@ def test_qsa_verify_methods_are_the_chunk_ops_plus_two_block_writes_without_host
         "_write_compressed_index_verify",
         "_score_blocks_chunk",
         "_materialize_rows_chunk",
+        # the qsa_rows family (on by default since 2026-09-26): the fused main tail of the verify rows, then the
+        # attention on its query; the chain's projection + KV write + attention stay as the fallback branch
+        "_main_tail_rows_step",
+        "_sparse_value_attention_rows",
         "_main_projection_rows",
         "_write_packed_kv_verify",
         "_sparse_value_attention_rows",

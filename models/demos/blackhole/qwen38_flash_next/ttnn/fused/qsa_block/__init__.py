@@ -700,6 +700,28 @@ def _rect(x0: int, y0: int, x1: int, y1: int) -> ttnn.CoreRangeSet:
     return ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x0, y0), ttnn.CoreCoord(x1, y1))])
 
 
+class KVStage:
+    """A replacement for main_tail's staging cores (the verify rows form, ttnn/fused/qsa_rows): the key cores hand the
+    rotated and normalized key tiles to ``cores`` (CB_PACK slots 8..15, SEM_KROT / SEM_KNORM as for the staging cores);
+    the stage brings its own CBs (``cb_descriptors(all_set)``), kernels (``kernels(ctx)`` with ``ctx`` the builder's
+    accessor helper, the core sets and the noc coordinates), io tensors and program-meta parts."""
+
+    def __init__(
+        self, *, cores, cb_descriptors, kernels, io, reads=(), writes=(), partial=(), flops=0, name="main_tail"
+    ):
+        self.cores = list(cores)
+        self.cb_descriptors = cb_descriptors
+        self.kernels = kernels
+        self.io = list(io)
+        self.reads, self.writes, self.partial, self.flops, self.name = (
+            tuple(reads),
+            tuple(writes),
+            tuple(partial),
+            flops,
+            name,
+        )
+
+
 def main_tail(
     qg_ws,
     k_ws,
@@ -717,6 +739,7 @@ def main_tail(
     qg_first: int = 0,
     k_first: int = 0,
     v_first: int = 0,
+    kv_stage: KVStage | None = None,
 ):
     """The fused main tail on ``rows`` lanes; returns the sparse query [1, 32, rows, 512] bf16 ROW_MAJOR and updates
     ``staging`` [1, rows, 32, 512] (TILE) and ``kv_cache`` [1, 1, C, 512] (ROW_MAJOR, lane r's block at
@@ -731,14 +754,15 @@ def main_tail(
     _window(qg_ws, qg_first, QG_WIDTH, "qg")
     _window(k_ws, k_first, HEAD_DIM, "k")
     _window(v_ws, v_first, HEAD_DIM, "v")
-    block_start, row_hit = _position_inputs(position, rows)
+    block_start, row_hit = _position_inputs(position, rows) if kv_stage is None else (None, None)
     for label, weight in (("q_norm", q_norm), ("k_norm", k_norm)):
         _expect(weight, (1, 1, 1, HEAD_DIM), BF16, ttnn.TILE_LAYOUT, label)
     for label, table in (("cos", cos), ("sin", sin)):
         _expect(table, (1, 1, rows, ROPE_DIM), BF16, ttnn.TILE_LAYOUT, label)
-    _expect(staging, (1, rows, fp.TILE, KV_WIDTH), BF16, ttnn.TILE_LAYOUT, "KV staging")
-    cache_shape = tuple(kv_cache.shape)
-    if (
+    if kv_stage is None:
+        _expect(staging, (1, rows, fp.TILE, KV_WIDTH), BF16, ttnn.TILE_LAYOUT, "KV staging")
+    cache_shape = tuple(kv_cache.shape) if kv_stage is None else (1, 1, 0, KV_WIDTH)
+    if kv_stage is None and (
         len(cache_shape) != 4
         or cache_shape[:2] != (1, 1)
         or cache_shape[3] != KV_WIDTH
@@ -746,7 +770,7 @@ def main_tail(
         or kv_cache.layout != ttnn.ROW_MAJOR_LAYOUT
     ):
         raise ValueError(f"KV cache must be ROW_MAJOR bf16 [1, 1, C, 512], got {kv_cache.layout} {cache_shape}")
-    if rows > 1 and (lane_rows % fp.TILE or cache_shape[2] < rows * lane_rows):
+    if kv_stage is None and rows > 1 and (lane_rows % fp.TILE or cache_shape[2] < rows * lane_rows):
         raise ValueError(
             f"{rows} lanes need lane_rows a multiple of 32 with {rows} * lane_rows <= {cache_shape[2]}, got {lane_rows}"
         )
@@ -756,9 +780,9 @@ def main_tail(
     q_rope_cores = [ttnn.CoreCoord(h, 1) for h in range(LOCAL_HEADS)]
     k_norm_core, k_rope_core = ttnn.CoreCoord(LOCAL_HEADS, 0), ttnn.CoreCoord(LOCAL_HEADS, 1)
     # one staging core per lane on the core rows below the head and key cores; the key cores hand their tiles to each
-    staging_rows = -(-rows // LANE_COLUMNS)
+    staging_cores = _lane_cores(rows, 2) if kv_stage is None else kv_stage.cores
+    staging_rows = -(-rows // LANE_COLUMNS) if kv_stage is None else max(c.y for c in staging_cores) - 1
     _require_grid(mesh, LOCAL_HEADS + 2, 2 + staging_rows, "main_tail lanes")
-    staging_cores = _lane_cores(rows, 2)
     every = [*q_norm_cores, *q_rope_cores, k_norm_core, k_rope_core, *staging_cores]
     coords = noc_coords(mesh, every)
     xy = lambda c: coords[(c.x, c.y)]
@@ -767,6 +791,8 @@ def main_tail(
     cbs = [
         fp.cb_descriptor(index, dtype, fp.TILE_BYTES[dtype], pages, all_set) for index, dtype, pages in _MAIN_TAIL_CBS
     ]
+    if kv_stage is not None:
+        cbs += kv_stage.cb_descriptors(all_set)
     cbs.append(
         ttnn.CBDescriptor(  # the canonical staging: the compute's untilize input and the writer's drain, one allocation
             total_size=KV_TILES * TILE_BF16,
@@ -837,72 +863,94 @@ def main_tail(
             [1, *acc(query)],
             [(k_rope_core, [query.buffer_address(), rows, 0, *staging_xy])],
         ),
-        fp.reader_kernel(
-            MAIN_TAIL["reader_staging"],
-            staging_set,
-            [*acc(staging), *acc(v_ws), *acc(block_start), *acc(row_hit)],
-            [
-                (
-                    core,
-                    [
-                        staging.buffer_address(),
-                        v_ws.buffer_address(),
-                        block_start.buffer_address(),
-                        row_hit.buffer_address(),
-                        rows,
-                        v_first,
-                        u,
-                        1,
-                    ],
-                )
-                for u, core in enumerate(staging_cores)
-            ],
-        ),
-        fp.compute_kernel(
-            MAIN_TAIL["compute_staging"], staging_set, [], [(core, [1]) for core in staging_cores], fp32_dest=True
-        ),
-        fp.writer_kernel(
-            MAIN_TAIL["writer_staging"],
-            staging_set,
-            [*acc(staging), *acc(kv_cache), *acc(block_start), *acc(row_hit)],
-            [
-                (
-                    core,
-                    [
-                        staging.buffer_address(),
-                        kv_cache.buffer_address(),
-                        block_start.buffer_address(),
-                        row_hit.buffer_address(),
-                        rows,
-                        lane_rows,
-                        u,
-                        1,
-                    ],
-                )
-                for u, core in enumerate(staging_cores)
-            ],
-        ),
     ]
+
+    def staging_kernels():  # the decode stage's three kernels; their tensors are None under a KV stage
+        return [
+            fp.reader_kernel(
+                MAIN_TAIL["reader_staging"],
+                staging_set,
+                [*acc(staging), *acc(v_ws), *acc(block_start), *acc(row_hit)],
+                [
+                    (
+                        core,
+                        [
+                            staging.buffer_address(),
+                            v_ws.buffer_address(),
+                            block_start.buffer_address(),
+                            row_hit.buffer_address(),
+                            rows,
+                            v_first,
+                            u,
+                            1,
+                        ],
+                    )
+                    for u, core in enumerate(staging_cores)
+                ],
+            ),
+            fp.compute_kernel(
+                MAIN_TAIL["compute_staging"], staging_set, [], [(core, [1]) for core in staging_cores], fp32_dest=True
+            ),
+            fp.writer_kernel(
+                MAIN_TAIL["writer_staging"],
+                staging_set,
+                [*acc(staging), *acc(kv_cache), *acc(block_start), *acc(row_hit)],
+                [
+                    (
+                        core,
+                        [
+                            staging.buffer_address(),
+                            kv_cache.buffer_address(),
+                            block_start.buffer_address(),
+                            row_hit.buffer_address(),
+                            rows,
+                            lane_rows,
+                            u,
+                            1,
+                        ],
+                    )
+                    for u, core in enumerate(staging_cores)
+                ],
+            ),
+        ]
+
+    if kv_stage is None:
+        kernels += staging_kernels()
+        io = _io(qg_ws, k_ws, v_ws, block_start, row_hit, q_norm, k_norm, cos, sin, staging, kv_cache, query)
+    else:
+        kernels += kv_stage.kernels({"acc": acc, "staging_set": staging_set, "xy": xy, "rows": rows})
+        io = _io(qg_ws, k_ws, v_ws, q_norm, k_norm, cos, sin, *kv_stage.io, query)  # the query last: run_program returns it
     semaphores = [fp.semaphore_descriptor(i, all_set) for i in range(3)]
-    io = _io(qg_ws, k_ws, v_ws, block_start, row_hit, q_norm, k_norm, cos, sin, staging, kv_cache, query)
     # the qg, k and v windows (from the projection shards), the position inputs, the two norm weights and the RoPE
     # tiles in, the staging read and written, one 32-row KV block per lane written, the sparse query out; the seven
     # rms_norms and partial RoPEs, the staging one-hot update
-    meta = fp.program_meta(
-        "qsa_main_tail",
-        "main_tail",
-        rows,
-        reads=(block_start, row_hit, q_norm, k_norm, cos, sin, staging),
-        writes=(staging, query),
-        partial=(
-            (qg_ws, 2 * LOCAL_HEADS * HEAD_TILES * TILE_BF16),
-            (k_ws, HEAD_TILES * TILE_BF16),
-            (v_ws, HEAD_TILES * TILE_BF16),
-            (kv_cache, rows * fp.TILE * KV_WIDTH * 2),
-        ),
-        flops=rows * ((LOCAL_HEADS + 1) * (4 * HEAD_DIM + 6 * ROPE_DIM) + 3 * fp.TILE * KV_WIDTH),
-        cores=2 * (LOCAL_HEADS + 1) + rows,
+    windows = (
+        (qg_ws, 2 * LOCAL_HEADS * HEAD_TILES * TILE_BF16),
+        (k_ws, HEAD_TILES * TILE_BF16),
+        (v_ws, HEAD_TILES * TILE_BF16),
     )
+    if kv_stage is None:
+        meta = fp.program_meta(
+            "qsa_main_tail",
+            "main_tail",
+            rows,
+            reads=(block_start, row_hit, q_norm, k_norm, cos, sin, staging),
+            writes=(staging, query),
+            partial=(*windows, (kv_cache, rows * fp.TILE * KV_WIDTH * 2)),
+            flops=rows * ((LOCAL_HEADS + 1) * (4 * HEAD_DIM + 6 * ROPE_DIM) + 3 * fp.TILE * KV_WIDTH),
+            cores=2 * (LOCAL_HEADS + 1) + rows,
+        )
+    else:
+        meta = fp.program_meta(  # the verify rows form (ttnn/fused/qsa_rows main_tail_rows), the family's one KV stage
+            "qsa_rows",
+            "main_tail_rows",
+            rows,
+            reads=(q_norm, k_norm, cos, sin, *kv_stage.reads),
+            writes=(query, *kv_stage.writes),
+            partial=(*windows, *kv_stage.partial),
+            flops=rows * (LOCAL_HEADS + 1) * (4 * HEAD_DIM + 6 * ROPE_DIM) + kv_stage.flops,
+            cores=2 * (LOCAL_HEADS + 1) + len(staging_cores),
+        )
     return fp.run_program(io, fp.program_descriptor(kernels, cbs=cbs, semaphores=semaphores), meta=meta)
 
 

@@ -145,7 +145,9 @@ def test_qsa_projection_linears_run_the_weight_fidelity() -> None:
         "self.weights.index_q",
         "self.weights.index_k",
     )
-    _check_module(qsa_module, weights, "projection_compute_config", 15)
+    # 15 chain / slab / decode-fused sites + the verify rows step's three (qg, k, v at the projection fidelity, the
+    # decode _main_tail_step's blocks over the 32-row tile; qsa_rows program 2, 2026-09-26)
+    _check_module(qsa_module, weights, "projection_compute_config", 18)
     rows = inspect.getsource(qsa_module.Qwen38TTNNQSA._linear_rows)
     assert rows.count("compute_kernel_config=self.projection_compute_config") == 3
     assert "compute_kernel_config=self.compute_config" not in rows

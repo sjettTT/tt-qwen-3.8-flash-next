@@ -1,0 +1,113 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Tenstorrent AI ULC
+# SPDX-License-Identifier: Apache-2.0
+
+"""``qsa_rows``: the QSA verify-form glue on the 32-row tile at R real rows, as fused programs.
+
+``Qwen38TTNNQSA.forward_verify_generic`` runs the R rows P .. P + R - 1 of one pass on one 32-row tile (R = k + 1 the
+MTP verify rows of the twelve backbone layers, R = 1 the MTP layer's draft row padded in place); its glue around the
+kept kernels (the all-gather of the hidden rows, the six linears, the indexer, the top-k, sparse_sdpa, the out linear
+and its reduce-scatter) is ~62 small programs per layer.  This family replaces them program by program, each bitwise
+against the chain it stands for on the rows the tile carries (rows past R are not zero on the verify tile: every
+program masks or ignores them exactly as its chain does).  Opt-in as one name, ``QWEN38_FUSED=qsa_rows``.
+
+Program 1, ``score_blocks_rows``: the indexer scores' all-reduce and mask add.  The chain is ``ttnn.all_reduce`` (its
+composite: the all-broadcast, a concat, tilize, ``moreh_sum`` over the device dim, untilize) and ``ttnn.add`` of the
+per-row block mask, six programs and ~130 us per layer at 32 rows.  Here, as the decode chain's ``qsa_score_merge``
+does for one row: the local rows as 2 KB pages, one ``all_gather`` (device d's page c of row r lands at page
+``(d * rows + r) * chunks + c``), then ``qsa_block.score_merge`` (the composite's moreh_sum order, then the mask add)
+over all 32 rows of the tile at once -- that program's device test holds it bitwise against the chain per row at 1, 2,
+5 and 32 rows; the mask is the chunk's ``[1, 1, 32, blocks]`` row mask, so the rows past R are masked as the chain
+masks them.
+"""
+
+from __future__ import annotations
+
+import ttnn
+
+from .. import qsa_block
+from ..registry import BITWISE, FusedKernel, register
+
+NAME = "qsa_rows"
+PAGE = qsa_block.SCORE_CHUNK  # the all-gather page: 1024 bf16 block scores
+DEVICES = qsa_block.DEVICES
+
+
+def _score_rows_shape(score_rows, mask):
+    shape, mshape = tuple(score_rows.shape), tuple(mask.shape)
+    if (
+        len(shape) != 4
+        or shape[:2] != (1, 1)
+        or not 1 <= shape[2] <= ttnn.TILE_SIZE
+        or shape[3] % PAGE
+        or score_rows.dtype != ttnn.bfloat16
+        or score_rows.layout != ttnn.ROW_MAJOR_LAYOUT
+    ):
+        raise ValueError(
+            f"score rows must be ROW_MAJOR bf16 [1, 1, 1..32, k * {PAGE}], got {score_rows.layout} {shape}"
+        )
+    if mshape != shape or mask.dtype != ttnn.bfloat16 or mask.layout != ttnn.ROW_MAJOR_LAYOUT:
+        raise ValueError(
+            f"the block mask must be ROW_MAJOR bf16 of the rows' shape {shape}, got {mask.layout} {mshape}"
+        )
+    return shape[2], shape[3]
+
+
+def score_blocks_rows(score_rows, mask, *, cluster_axis: int):
+    """The local partial block scores ``[1, 1, rows, blocks]`` bf16 ROW_MAJOR of the tile's rows, summed over the
+    ``cluster_axis`` devices and masked with ``mask`` (the same shape): the pages all-gathered, the fused merge over
+    the rows.  Returns the masked scores ``[1, 1, rows, blocks]`` bf16 ROW_MAJOR (the top-k's input)."""
+
+    rows, blocks = _score_rows_shape(score_rows, mask)
+    pages = blocks // PAGE
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    # row r's chunk c at page r * pages + c; the gather stacks the devices' page runs, device-major
+    paged = ttnn.reshape(score_rows, (1, 1, rows * pages, PAGE))
+    gathered = ttnn.all_gather(paged, dim=2, cluster_axis=cluster_axis, memory_config=dram)
+    ttnn.deallocate(paged)
+    if tuple(gathered.shape) != (1, 1, DEVICES * rows * pages, PAGE):
+        raise RuntimeError(
+            f"gathered score pages have shape {tuple(gathered.shape)}, expected [1, 1, {DEVICES * rows * pages}, {PAGE}]"
+        )
+    masked = qsa_block.score_merge(gathered, mask)
+    ttnn.deallocate(gathered)
+    return masked
+
+
+def score_blocks_rows_composed(score_rows, mask, *, cluster_axis: int, topology=None):
+    """The chain: ``ttnn.all_reduce`` over the devices, then the mask add (``fast_and_approximate_mode=False``)."""
+
+    _score_rows_shape(score_rows, mask)
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    kwargs = {} if topology is None else {"topology": topology}
+    scores = ttnn.all_reduce(score_rows, cluster_axis=cluster_axis, memory_config=dram, **kwargs)
+    masked = ttnn.add(scores, mask, memory_config=dram, fast_and_approximate_mode=False)
+    ttnn.deallocate(scores)
+    return masked
+
+
+register(
+    FusedKernel(
+        name=NAME,
+        replaces=(
+            "the QSA verify-form glue on the 32-row tile: program 1 the indexer scores' all-reduce composite + mask add "
+            "(6 programs/layer) as one all-gather + the fused score merge over the rows"
+        ),
+        tolerance=BITWISE,
+        fused=score_blocks_rows,
+        composed=score_blocks_rows_composed,
+        gate=None,  # the rows micro-test and the pass pair (the MTP lead's gate) stand for the family
+    )
+)
+
+# program 2: the main tail with the verify rows' KV stage (the family's attribute is the function; the module stays
+# importable as ttnn.fused.qsa_rows.main_tail_rows through sys.modules)
+from .main_tail_rows import kv_stage, main_tail_rows, main_tail_rows_composed  # noqa: E402
+
+__all__ = [
+    "NAME",
+    "kv_stage",
+    "main_tail_rows",
+    "main_tail_rows_composed",
+    "score_blocks_rows",
+    "score_blocks_rows_composed",
+]

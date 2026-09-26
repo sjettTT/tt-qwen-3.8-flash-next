@@ -1842,6 +1842,7 @@ def qsa_verify_constant_rows(rows: int, allocated_compressed_blocks: int) -> dic
         ),
         "arange32_row": lane.reshape(1, 1, 1, CHUNK_ROWS),
         "pool_select_stack": stack.reshape(1, 1, CHUNK_ROWS, CHUNK_ROWS * RAW_WINDOW_TILE_ROWS),
+        "rows_u32": torch.tensor([[[[rows]]]], dtype=torch.int64),
     }
 
 
@@ -2283,6 +2284,7 @@ class Qwen38TTNNQSAVerifyConstants:
     arange32_row: Any
     pool_select_stack: Any
     select_compute_config: Any
+    rows_u32: Any = None  # R as a UINT32 ROW_MAJOR [1,1,1,1] scalar: the fused verify rows form reads it on the core
 
     @property
     def allocated_compressed_blocks(self) -> int:
@@ -2334,6 +2336,7 @@ class Qwen38TTNNQSAVerifyConstants:
                 stage_b_lanes=upload_uint32("stage_b_lanes", ttnn.TILE_LAYOUT),
                 arange32_row=upload_uint32("arange32_row", ttnn.TILE_LAYOUT),
                 pool_select_stack=stack,
+                rows_u32=upload_uint32("rows_u32", ttnn.ROW_MAJOR_LAYOUT),
                 select_compute_config=ttnn.WormholeComputeKernelConfig(
                     math_fidelity=ttnn.MathFidelity.HiFi4,
                     math_approx_mode=False,
@@ -2353,6 +2356,7 @@ class Qwen38TTNNQSAVerifyConstants:
             self.stage_b_lanes,
             self.arange32_row,
             self.pool_select_stack,
+            self.rows_u32,
         )
 
 
@@ -2372,6 +2376,10 @@ class Qwen38TTNNQSAVerifyInputs:
     ``single_row`` (a one-row pass, the draft rows): the row never reaches the next KV block or the next compressed
     block, so ``kv_block_start_next`` and ``stage_b_select`` are None and ``chunk.block_index_i32`` holds P // 4 alone;
     the layer skips those two writes (they wrote rows and a block no pass reads before rewriting them).
+
+    ``position`` (the caller's P scalar) and ``rows_u32`` (the verify constants' R scalar), UINT32 ROW_MAJOR
+    ``[1,1,1,1]``, are the fused verify rows form's inputs (ttnn/fused/qsa_rows main_tail_rows reads P and R on the
+    core); references, not released here.
     """
 
     chunk: Qwen38TTNNQSAChunkInputs
@@ -2383,6 +2391,8 @@ class Qwen38TTNNQSAVerifyInputs:
     stage_b_select: Any
     pool_select: Any
     single_row: bool = False
+    position: Any = None
+    rows_u32: Any = None
 
     def deallocate(self) -> None:
         self.chunk.deallocate()
@@ -2479,6 +2489,8 @@ def derive_qsa_verify_inputs(
         stage_b_select=stage_b_select,
         pool_select=pool_select,
         single_row=single_row,
+        position=position_scalar,
+        rows_u32=verify.rows_u32,
     )
     for name, tensor, shape, dtype, layout in (
         ("kv_block_start_next", kv_block_start_next, (1, 1, 1, 1), u32, ttnn.ROW_MAJOR_LAYOUT),
@@ -3201,6 +3213,7 @@ class Qwen38TTNNQSA:
     _widen_partial_fused = None
     _selection_row_fused = None
     _score_merge_fused = None
+    _rows_fused = None  # ttnn/fused/qsa_rows: the verify-form glue on the 32-row tile (QWEN38_FUSED=qsa_rows)
     _lane_score_rows_fused = None
     # QWEN38_FUSED=sparse_sdpa_tiled: the slab's attention as the block-shared kernel (ttnn/fused/sparse_sdpa_tiled)
     # in place of the block-id expansion + zero half + head pad + sparse_sdpa + slice; tolerance class against the
@@ -3383,6 +3396,9 @@ class Qwen38TTNNQSA:
             self._selection_row_fused = fused_kernels.kernel("qsa_selection_row").fused
         if fused_kernels.enabled("qsa_score_merge"):
             self._score_merge_fused = fused_kernels.kernel("qsa_score_merge").fused
+        if fused_kernels.enabled("qsa_rows"):
+            # the verify-form rows family (forward_verify_generic's glue on the 32-row tile), program by program
+            self._rows_fused = fused_kernels.qsa_rows
         if fused_kernels.enabled("sparse_sdpa_tiled"):
             self._slab_attention_fused = fused_kernels.kernel("sparse_sdpa_tiled").fused
             # the compute config (HiFi4 / fp32 DEST, or the HiFi2 arm under QWEN38_SPARSE_SDPA_TILED_FIDELITY),
@@ -5685,6 +5701,15 @@ class Qwen38TTNNQSA:
             replicated_reference=state.compressed_index_cache,
             expected_shape=(1, 1, rows, self.allocated_compressed_blocks),
         )
+        if self._rows_fused is not None and rows == CHUNK_ROWS and chunk.indexer_neg_mask is not None:
+            # qsa_rows program 1: the all-reduce composite + mask add as one all-gather + the fused merge over the
+            # tile's 32 rows at once (the rows past R take the chunk's mask as the chain gives it to them)
+            masked = self._rows_fused.score_blocks_rows(score_rows, chunk.indexer_neg_mask, cluster_axis=TP_AXIS)
+            _deallocate(score_rows)
+            _retag_tensor(masked, reference=state.compressed_index_cache, shard_dim=None)
+            self.mesh_contract.validate_tensor(masked, placement=TensorPlacement.REPLICATED)
+            _require_shape(masked, (1, 1, rows, self.allocated_compressed_blocks), "masked QSA chunk block scores")
+            return masked
         scores = ttnn.all_reduce(
             score_rows,
             cluster_axis=TP_AXIS,
@@ -6062,29 +6087,33 @@ class Qwen38TTNNQSA:
         _require_shape(local_flat, (1, 1, rows, LOCAL_QUERY_WIDTH), "flat QSA attention rows")
         return local_flat
 
-    def _sparse_value_attention_rows(self, query, gate, sparse_indices, state, constants: Qwen38TTNNQSAChunkConstants):
-        # q = [zeros(256) | Q(256)] per local head over the rows, untilized, 26 zero heads appended.
+    def _sparse_value_attention_rows(
+        self, query, gate, sparse_indices, state, constants: Qwen38TTNNQSAChunkConstants, *, sparse_query=None
+    ):
+        # q = [zeros(256) | Q(256)] per local head over the rows, untilized, 26 zero heads appended -- unless the fused
+        # main tail of the verify rows built it (``sparse_query``; ``query`` is None then).
         rows = constants.rows
-        sparse_query_tiled = ttnn.concat(
-            [constants.zero_value_half_rows, query], dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG
-        )
-        _deallocate(query)
-        _retag_tensor(sparse_query_tiled, reference=state.packed_kv_cache, shard_dim=1)
-        _require_shape(
-            sparse_query_tiled, (1, QUERY_HEADS_PER_DEVICE, rows, 2 * HEAD_DIM), "local sparse QSA query rows"
-        )
-        sparse_query_row_major = ttnn.to_layout(
-            sparse_query_tiled, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
-        )
-        _deallocate(sparse_query_tiled)
-        sparse_query = ttnn.pad(
-            sparse_query_row_major,
-            [(0, 0), (0, 32 - QUERY_HEADS_PER_DEVICE), (0, 0), (0, 0)],
-            0.0,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        )
-        _deallocate(sparse_query_row_major)
-        _retag_tensor(sparse_query, reference=state.packed_kv_cache, shard_dim=1)
+        if sparse_query is None:
+            sparse_query_tiled = ttnn.concat(
+                [constants.zero_value_half_rows, query], dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+            _deallocate(query)
+            _retag_tensor(sparse_query_tiled, reference=state.packed_kv_cache, shard_dim=1)
+            _require_shape(
+                sparse_query_tiled, (1, QUERY_HEADS_PER_DEVICE, rows, 2 * HEAD_DIM), "local sparse QSA query rows"
+            )
+            sparse_query_row_major = ttnn.to_layout(
+                sparse_query_tiled, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+            _deallocate(sparse_query_tiled)
+            sparse_query = ttnn.pad(
+                sparse_query_row_major,
+                [(0, 0), (0, 32 - QUERY_HEADS_PER_DEVICE), (0, 0), (0, 0)],
+                0.0,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            _deallocate(sparse_query_row_major)
+            _retag_tensor(sparse_query, reference=state.packed_kv_cache, shard_dim=1)
         _require_shape(sparse_query, (1, 32, rows, 2 * HEAD_DIM), "padded sparse QSA query rows")
         if sparse_query.layout != ttnn.ROW_MAJOR_LAYOUT:
             raise RuntimeError(f"padded sparse QSA query rows must be ROW_MAJOR, got {tensor_metadata(sparse_query)}")
@@ -6135,9 +6164,7 @@ class Qwen38TTNNQSA:
         attention_tiles = (
             [ttnn.to_memory_config(local_attention, self.out_act_memory_config)]
             if rows == CHUNK_ROWS
-            else []
-            if slab
-            else dram_sharded_row_tiles(local_attention, self.out_act_memory_config)
+            else [] if slab else dram_sharded_row_tiles(local_attention, self.out_act_memory_config)
         )
         partial_tiles = []
         for attention_ws in attention_tiles:
@@ -6374,6 +6401,8 @@ class Qwen38TTNNQSA:
             )
         for name, tensor, shape, dtype, layout in (
             ("kv_block_start_next", verify.kv_block_start_next, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
+            ("position", verify.position, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
+            ("rows_u32", verify.rows_u32, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
             ("kv_read_indices", verify.kv_read_indices, (1, 1, CACHE_WRITE_ROWS), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
             ("stage_keep", verify.stage_keep, (1, 1, CACHE_WRITE_ROWS, 1), ttnn.bfloat16, ttnn.TILE_LAYOUT),
             (
@@ -6399,7 +6428,7 @@ class Qwen38TTNNQSA:
             ),
         ):
             if tensor is None:
-                continue  # the single-row form's next-block index and select (their absence is checked above)
+                continue  # the single-row form's next-block index and select (checked above); P / R before program 2
             _require_shape(tensor, shape, f"QSA verify input {name}")
             if tensor.dtype != dtype or tensor.layout != layout:
                 raise RuntimeError(
@@ -6603,6 +6632,74 @@ class Qwen38TTNNQSA:
             _deallocate(row_sharded)
         _deallocate(rotated)
 
+    def _main_tail_rows_step(self, full_hidden, cos, sin, state, verify: Qwen38TTNNQSAVerifyInputs, constants):
+        """The three main linears on the gathered tile (L1 width-sharded, as the decode step's), then the fused main
+        tail of the verify rows (ttnn/fused/qsa_rows main_tail_rows) in place of the chain after them in
+        :meth:`_main_projection_rows`, :meth:`_write_packed_kv_verify` and the query build of
+        :meth:`_sparse_value_attention_rows`: the norm / RoPE / head-split / query kernels of the decode program on the
+        tile's 32 rows, the KV write of rows P .. P + R - 1 (P and R read on the core from ``verify.position`` and
+        ``verify.rows_u32``; the current block's rows past them zeroed, the next block written unless ``single_row``,
+        as the chain does).  The gate keeps the chain's head slices of qg (program 5 folds them).  Returns the sparse
+        query ``[1,32,32,512]`` ROW_MAJOR and the gate ``[1,6,32,256]`` TILE."""
+
+        rows = constants.rows
+        qg_ws = ttnn.linear(
+            full_hidden,
+            self.weights.qg,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.qg_program_config,
+            compute_kernel_config=self.projection_compute_config,
+        )
+        k_ws = ttnn.linear(
+            full_hidden,
+            self.weights.k_pair_grouped,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.kv_program_config,
+            compute_kernel_config=self.projection_compute_config,
+        )
+        v_ws = ttnn.linear(
+            full_hidden,
+            self.weights.v_pair_grouped,
+            memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+            program_config=self.kv_program_config,
+            compute_kernel_config=self.projection_compute_config,
+        )
+        sparse_query = self._rows_fused.main_tail_rows(
+            qg_ws,
+            k_ws,
+            v_ws,
+            verify.position,
+            self.weights.q_norm,
+            self.weights.k_norm,
+            cos,
+            sin,
+            state.packed_kv_cache,
+            rows=verify.rows_u32,
+            single_row=verify.single_row,
+            eps=self.rms_norm_eps,
+        )
+        _deallocate(k_ws, v_ws)
+        _require_shape(sparse_query, (1, 32, rows, 2 * HEAD_DIM), "fused padded sparse QSA query rows")
+        _retag_tensor(sparse_query, reference=state.packed_kv_cache, shard_dim=1)
+        # the gate: head h's second 256 columns of qg, the chain's slices (the interleaved copy, as _linear_rows makes)
+        qg = ttnn.to_memory_config(qg_ws, ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(qg_ws)
+        gate_heads = [
+            ttnn.slice(
+                qg,
+                (0, 0, 0, head * 2 * HEAD_DIM + HEAD_DIM),
+                (1, 1, rows, (head + 1) * 2 * HEAD_DIM),
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            for head in range(QUERY_HEADS_PER_DEVICE)
+        ]
+        _deallocate(qg)
+        gate = ttnn.concat(gate_heads, dim=1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _deallocate(*gate_heads)
+        _retag_tensor(gate, reference=full_hidden, shard_dim=1)
+        _require_shape(gate, (1, QUERY_HEADS_PER_DEVICE, rows, HEAD_DIM), "local QSA gate head rows")
+        return sparse_query, gate
+
     def _write_packed_kv_verify(
         self,
         state: Qwen38TTNNQSAGenericState,
@@ -6727,9 +6824,15 @@ class Qwen38TTNNQSA:
         _deallocate(index_query)
         sparse_indices = self._materialize_rows_chunk(masked_scores, verify.chunk, constants)
 
-        query, gate, key, value = self._main_projection_rows(full_hidden, None, cos, sin, constants)
-        self._write_packed_kv_verify(state, key, value, verify)
-        local_attention = self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)
+        if self._rows_fused is not None and verify.position is not None:
+            sparse_query, gate = self._main_tail_rows_step(full_hidden, cos, sin, state, verify, constants)
+            local_attention = self._sparse_value_attention_rows(
+                None, gate, sparse_indices, state, constants, sparse_query=sparse_query
+            )
+        else:
+            query, gate, key, value = self._main_projection_rows(full_hidden, None, cos, sin, constants)
+            self._write_packed_kv_verify(state, key, value, verify)
+            local_attention = self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)
         _deallocate(sparse_indices)
         output = self._project_output_rows(local_attention, full_hidden, constants)
         _deallocate(full_hidden)
