@@ -1595,14 +1595,25 @@ def _draft_world(fake, monkeypatch, *, drafts: int, positions, accepted):
     return world, model, verify, seen
 
 
-@pytest.mark.parametrize("drafts", (3, 4))
 @pytest.mark.parametrize(
-    "positions,accepted", (((5, 31, 32, 100), (0, 2, 1, 3)), ((29, 30, 63, 60), (3, 0, 2, 1)), ((0, 3, 61, 127), (1, 1, 0, 0)))
+    "drafts,positions,accepted",
+    (
+        (3, (5, 31, 32, 100), (0, 2, 1, 3)),
+        (4, (5, 31, 32, 100), (0, 2, 1, 3)),
+        (3, (29, 30, 63, 60), (3, 0, 2, 1)),
+        (4, (29, 30, 63, 60), (3, 0, 2, 1)),
+        (3, (0, 3, 61, 127), (1, 1, 0, 0)),
+        (4, (0, 3, 61, 127), (1, 1, 0, 0)),
+        # eight lanes at k = 3 fill the verify tile (8 x 4 = 32 rows): the constants carry no sentinel tail and the
+        # assembly concatenates the lane blocks alone (the 2026-09-26 64K B=8 k=3 row poisoned the model here)
+        (3, (5, 31, 32, 100, 29, 63, 60, 127), (0, 2, 1, 3, 3, 0, 2, 1)),
+    ),
 )
 def test_forward_draft_lanes_is_the_eager_row_chain_per_lane_and_assembles_the_next_pass(fake, monkeypatch, drafts, positions, accepted):
     lanes, rows = len(positions), drafts + 1
     accepted = [min(a, drafts) for a in accepted]
     world, model, verify, seen = _draft_world(fake, monkeypatch, drafts=drafts, positions=positions, accepted=accepted)
+    assert (verify.constants.sentinel_tail is None) == (lanes * rows == 32)
     draft = mtp_lanes.allocate_lane_draft_state(model, verify)
     assert draft.rows == 1 and draft.qsa_verify_constants.rows == 1 and draft.qsa_lane_verify_constants.rows == 1
     assert draft.layer_state.moe.rows == lanes and draft.layer_state.moe_input.shape == (1, 1, lanes, step6.WIDTH)

@@ -186,6 +186,65 @@ pass, 70.7 ms per pass); `--mtp 3` 38.0 median, 55.6 on `json`.  Sampled draftin
 | plain decode, 2026-09-06 | none (96/96) | 43 | 32 | 15 | 56 | 61 | 9 | 13 | 24 | 19 | 6 | 75 |
 | `--mtp 4`, 2026-09-06 | none (96/96) | 56 | 32 | 15 | 46 | 56 | 9 | 13 | 24 | 19 | 6 | 1 |
 
+## The MTP pass decomposition (2026-09-25)
+
+Measured on the 4-chip p150 line (a shared host) at the landed head with the chain opened as the server opens it,
+`--mtp 4`, the `json` and `prose` acceptance prompts, 120-280 pipelined passes per cell and 20-40 all-blocking probe passes
+(every trace replayed blocking on its own: its raw device wall), the device profiler for the per-family split (its per-program
+markers inflate a trace by 3-4 %; the raw replay walls are the timing numbers).  The pass wall does not depend on what is
+accepted: with the host decision stubbed to accept-all / reject-all the json pass is 62.20 / 62.00 ms against 62.14 normal.
+
+| term of one k = 4 pass (json greedy, ms) | fused verify (`QWEN38_MTP_SAMPLED=0`) | split verify (the default, greedy) | split verify, sampled |
+|---|---|---|---|
+| commit trace (the previous pass's a*+1 rows; hides the host's PLE lookup) | 4.07 raw, ~1.3 exposed | 4.06 | 4.06 |
+| PLE n-gram rows of the k+1 tokens (host; the table is host memory) | 2.8, hidden | 2.7 | 2.7 |
+| verify body (48 layers on the 5-row tile, LM head, rows argmax, accept, alignment) | 47.35 raw | head 45.25 + tail 2.79 | same |
+| host between head and tail | - | read 0.67, decision 0.02, writes 0.86 | read 0.67, decision 0.6 + 0.8 per row evaluated (4.6 at a* = 4; 0.7 batched), writes 0.84 |
+| draft trace (k - 1 rows: embed, mixer, MTP layer, rows-1 MoE, final mixer, LM head, the fused greedy tail) | 7.38 raw = 3 x 2.46 | 7.33 = 3 x 2.44 | 7.33 |
+| pass-row readback (268 B, the one host read) | 0.72 | 0.54 | 0.52 |
+| pipelined pass wall, p50 [p90] | **60.28** [61.54] | **62.14** [63.40] | **66.92** [68.07] |
+| tokens per pass / tok/s over the passes | 4.657 / 76.9 | 4.657 / 74.6 | 4.677 / 70.0 |
+
+Prose: fused 58.92, split greedy 60.86 (2.529 tokens per pass, 41.3 tok/s), split sampled 63.28 (2.583, 40.5).  The verify
+body is flat in k inside the rows-5 MoE form (raw head 44.2 / 45.2 / 46.0 / 45.3 ms for 2 / 3 / 4 / 5 rows) and 1.6x the
+27.7 ms one-row decode step even at two rows: the rows forms are the cost, not the row count.  Each draft row adds 2.4 ms of
+device time (draft trace 0.14 / 2.51 / 4.89 / 7.33 ms for 0 / 1 / 2 / 3 rows); k = 1 / 2 / 3 / 4 give json 1.98 / 2.92 / 3.18 /
+4.66 tokens per pass at 53.3 / 56.2 / 60.6 / 62.1 ms (37.0 / 51.5 / 52.4 / 74.6 tok/s).  k = 5 is refused by the MTP DRAM
+admission on this head (the 32-row MoE verify form's states).
+
+The verify head by family (device profiler, chip 0 kernel ms of 43.0 over 4,479 programs; 36 GDN layers at 833 us, 12 QSA
+layers at 986 us, head epilogue 1.2):
+
+| family | GDN layers | QSA layers | total |
+|---|---|---|---|
+| MoE compute (156 us per layer at 5 rows against ~65 at 1 row) + the combine collective (58 us) | 7.73 | 2.58 | 10.30 |
+| fused programs (gated-residual read/write, router top-k, dispatch, MoE post) | 7.75 | 2.48 | 10.23 |
+| dense matmuls (projections, shared expert, router) | 3.95 | 1.63 | 5.57 |
+| Chunk-GDN prep + scan (the recurrence over the rows) | 1.87 | - | 1.87 |
+| composed glue (binary / unary / reshape / transpose / slice / concat / norms / rope / tilize / KV update / indexer / SDPA) | 8.70 | 5.15 | 13.85 |
+
+One draft row (254 programs, 2.30 ms kernel, 0.18 ms dispatch): LM head 0.54 (eight weight-bound chunk matmuls), the MTP QSA
+layer ~0.7, the input mixer / norm chain ~0.6, the rows-1 MoE ~0.33, the final mixer ~0.12, the resolve 0.055 (the fused greedy
+tail).  Ceiling at five tokens per pass = 5 / pass wall: fused greedy 82.9 (json) / 84.9 (prose) tok/s, split greedy 80.5 / 82.2,
+split sampled 74.7 / 79.0; accept-all realizes 80.0 on json.
+
+k = 5 (`--mtp 5`, admissible since the k-aware DRAM estimate) against k = 4 on the same runtime (2026-09-26, the 4-chip p150
+line, 32k): the pass costs 65.4-67.4 ms in the split form (k = 4: 62.1-63.3) and about 68.5 ms served on the fused greedy
+form (k = 4: 60.2, from tokens per pass and tok/s), +4 to +8 ms per pass for one more draft row (+2.4 ms of draft trace):
+the 6-row verify tile and the 32-row MoE verify form pay the rest.  Served 256-token greedy rows, k = 5 against k = 4: json
+75.6 against 75.6 tok/s (5.18 against 4.55 tokens per pass), code 77.1 against 75.7 (5.24 / 4.57), the 177-token multi-turn
+chat 45.6 against 47.5 (3.10 / 2.83), the 560-token chat 42.1 against 50.6 (2.88 / 3.12), prose 26.8 against 37.3 (1.76 /
+2.20).  k = 4 stays the default; k = 5 is opt-in.  The k = 5 stream is not bitwise with k = 4's (the pass partition moves the
+commit chunks and the verify MoE runs the 32-row instance): `json` stays 96/96, `code` holds the reference to 96 (k = 4
+leaves at 32), `chat` leaves at 39 (43), `list` 46 (56), `math` 61 (63), `multilingual` 9 (9, a different tail): the
+divergence tokens are the reference's #2 or #3 at fp32-oracle margins of 0.09-0.36 logits (chat 39: 0.27, list 46: 0.09,
+math 61: 0.36, multilingual 9: 0.11; the k = 4 positions: chat 43 0.04, list 56 0.42, math 63 0.04, code 32 0.42), the
+near-tie class above (the "0.4-1.0 logits apart" wording of the 2026-09-25 table holds for list and code; chat and math sit
+at 0.04).  Per-depth acceptance
+rows measured with a fixed completion budget and no stop ids overstate short-answer classes: `json` reaches `<|im_end|>`
+after about 151 tokens and then repeats its answer, so a 600-token json row runs about 75 % in that loop; read the passes
+before the first end marker.
+
 ## The device sampler's law (2026-09-25)
 
 The on-device sampler (`sampler_tail`, one program on one core after the top-32 candidate row) is gated on its law, not

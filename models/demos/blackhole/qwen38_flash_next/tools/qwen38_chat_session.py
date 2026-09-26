@@ -32,7 +32,7 @@ TAIL's epilogue also writes a candidate row, and a request with ``temperature > 
 runs the sampled loop (read the row after TAIL, sample on the host, write the token
 into the row before HEAD).  Greedy requests take the loop above untouched.
 
-MTP drafting is opt-in (``mtp=K``, K in 3 or 4; ``ttnn/mtp_v2.py``): the chain also
+MTP drafting is opt-in (``mtp=K``, K in 3, 4 or 5; ``ttnn/mtp_v2.py``): the chain also
 holds the verify / draft / commit traces and, in every TAIL and in the chunk body, the
 MTP layer's rows, so the MTP layer follows the target through prefill.  A greedy
 request on such a chain runs its prefill as above, reads the first token, switches
@@ -42,13 +42,14 @@ per pass streamed as they commit.  At the end of the request (or before a forced
 token) the last pass's rows are committed as far as the request consumed them and
 the 1-row buffers are rebuilt (``mtp_leave``), so 1-row, sampled and MTP requests
 alternate on one server.  Sampled requests and ``prefill_mode`` ``teacher_forced``
-requests take the loops above, unless the chain captured the split verify
-(``mtp_sampled``: an ``--mtp --sampling`` server's default, off with the server's
-``QWEN38_MTP_SAMPLED=0``): then a sampled request the pass loop can bound
-(``sampling_step.drafting_admission``) drafts too, the host deciding every pass
-by exact speculative sampling (``ttnn/speculative_sampling.py``) on the rows'
-candidate distributions, and a greedy request runs the same split form with the
-device's own verdict written back.
+requests take the loops above, unless the chain captured the split verify beside
+the fused one (``mtp_sampled``: an ``--mtp --sampling`` server's default, off with
+the server's ``QWEN38_MTP_SAMPLED=0``): then a sampled request the pass loop can
+bound (``sampling_step.drafting_admission``) drafts too, through the split form,
+the host deciding every pass by exact speculative sampling
+(``ttnn/speculative_sampling.py``) on the rows' candidate distributions, while a
+greedy request keeps the fused verify (the pinned greedy stream: the traces a
+``QWEN38_MTP_SAMPLED=0`` server runs; ``mtp_enter`` routes by ``decide``).
 
 ``Qwen38ChatSession`` speaks to the device only through a chain object with the
 per-step primitives; ``Qwen38TracedChain`` is the hardware one, the no-device
@@ -57,6 +58,7 @@ test drives the session with a scripted chain.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -79,7 +81,7 @@ from models.demos.blackhole.qwen38_flash_next.tools import hardware_profiles, ph
 from models.demos.blackhole.qwen38_flash_next.tools import qwen38_chat_protocol as protocol
 from models.demos.blackhole.qwen38_flash_next.tools import qwen38_sampling_step as sampling_step
 from models.demos.blackhole.qwen38_flash_next.tools import resident_decode
-from models.demos.blackhole.qwen38_flash_next.tools.evidence_records import Marker
+from models.demos.blackhole.qwen38_flash_next.tools.evidence_records import Marker, utc_now
 from models.demos.blackhole.qwen38_flash_next.tools.hardware_profiles import ResidentHardwareProfile
 from models.demos.blackhole.qwen38_flash_next.tools.live_decode_diagnostic import (
     Qwen38LiveDecodeConstruction,
@@ -145,22 +147,64 @@ REASONING_EFFORT = "low"
 RESIDUE_CLASSES = resident_decode.SINGLE_TRACE_RESIDUE_CLASS_TRACES
 SEED_TOKEN_ID = IM_START_ID
 THINK_END_ID = protocol.THINK_END_ID
-# MTP drafting: the draft counts a server may be opened with (the chain timing tool's measured arms), the GDN state
-# re-anchor settings (off = every GDN layer commits through the chunk kernel; layer0 = layer 0's commits run the
-# 1-row fp32 step recurrence over the committed rows), the bootstrap pass's placeholder drafts, the resident expert
-# pairs with the MTP layer's.
-MTP_DRAFTS = (3, 4)
+# MTP drafting: the draft counts a server may be opened with (the chain timing tool's measured arms; k = 3 and 4
+# run the 5-row verify MoE form, k = 5 the 32-row form, and the QSA verify path admits no more than k + 1 = 6 rows),
+# the GDN state re-anchor settings (off = every GDN layer commits through the chunk kernel; layer0 = layer 0's
+# commits run the 1-row fp32 step recurrence over the committed rows), the bootstrap pass's placeholder drafts, the
+# resident expert pairs with the MTP layer's.
+MTP_DRAFTS = (3, 4, 5)
 MTP_GDN_ANCHORS = ("off", "layer0")
 MTP_GDN_ANCHOR_LAYERS = {"off": (), "layer0": (0,)}
 MTP_BOOTSTRAP_DRAFT_TOKEN = 0
 MTP_EXPECTED_CACHE_LOADS = resident_decode.EXPECTED_CACHE_LOADS + 1
-# The MTP chain's DRAM per bank beyond the 49th BF4 pair and the MTP layer's QSA state: the layer's non-expert weights,
-# the verify / draft states, the step inputs, the chunk extension and the three traces (8.2 MB of states and traces
-# measured at 32,768; the open checks the measured growth against this bound).  The free bytes per bank a resident build
-# leaves after its captures without MTP (measured 2026-09-04, head 4149197252, 8 banks of 4,272,341,376 bytes; free and
-# largest contiguous) are the admission table --mtp is refused against.  A resident BF4 payload is interleaved over
-# the banks one 576-byte tile page at a time, and the resident loader needs 128 MB contiguous per bank.
-MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND = 24 << 20
+# The verify forms a chain captures per switch value (Qwen38TracedChain.open): the fused verify alone, or the fused
+# verify and the split head + tail beside it.  The admission's traces term counts them; the server's pre-mesh refusal
+# and the open's gate both read this one table, so the two records cannot drift.
+MTP_VERIFY_FORMS_BY_SWITCH = {False: ("fused",), True: ("fused", "split")}
+
+
+def mtp_verify_forms(mtp_sampled: bool) -> tuple[str, ...]:
+    """The verify forms an MTP chain captures with the switch ``mtp_sampled`` (``MTP_VERIFY_FORMS_BY_SWITCH``)."""
+
+    if type(mtp_sampled) is not bool:
+        raise ValueError(f"mtp_sampled must be a bool, got {mtp_sampled!r}")
+    return MTP_VERIFY_FORMS_BY_SWITCH[mtp_sampled]
+
+
+# The MTP chain's DRAM growth per bank beyond the resident build, by the part the open measures it in.  `components`
+# is the MTP layer's weights: its 49th BF4 pair (interleaved over the banks) and its non-expert weights beyond the pair
+# (k-independent).  `states` is the layer's QSA state at the allocated context, then the verify / draft / split states,
+# the step inputs and the chunk extension, sized by the verify MoE form ``moe_rows_for(k + 1)`` (5 rows for k = 3 and
+# 4, 32 rows for k >= 5).  `traces` is the captured MTP traces, sized by the number of verify forms captured: one (the
+# fused verify or the split head + tail, with the draft and the commit: three or four traces), each further form adding
+# its verify trace and its draft trace (two forms: six traces; up to three: the fused greedy verify, a fused sampled
+# verify and the split head + tail).  Measured on the 4x p150
+# line (ring 8, allocated context 32,768) 2026-09-25: k = 4 with both verify forms {'components': 50468032, 'states':
+# 12938112, 'traces': 11107904}; k = 5 with the split verify alone {'components': 50468032, 'states': 20920192,
+# 'traces': 6390144}; the ring-8 pair per bank is 44,236,800 and the QSA state per bank 4,462,592 at 32,768.  The
+# admission's estimate (its required side) is the exact pair and QSA state plus these measured remainders, each with
+# the margin (the 24 MiB flat bound before it admitted k = 4 with one form only: 73,865,216 against the 74,514,048
+# and 77,778,368 measured); the open checks the measured growth against the estimate.  Its free side decides on the
+# live allocator (mtp_capacity_admission with ``live``: the mesh's DRAM view read after the resident weights are
+# built, the chain's open), from which the resident build's own remaining allocations are taken: the context state
+# (Qwen38ResidentContext.context_state_bytes_per_device) and RESIDENT_POST_BUILD_BYTES_PER_BANK_UPPER_BOUND, the
+# context-independent rest (the GDN states, the decode and chunk traces, the sampling chain: 47.5 MB per bank at
+# 32,768 and 49.9 MB at 262,144, measured 2026-09-25 on the compact expert layout with bf8 dense weights).  Without a
+# device (the no-device tests) the table RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES stands in: the free bytes per
+# bank a resident build left after its captures without MTP, measured 2026-09-04 (head 4149197252, 8 banks of
+# 4,272,341,376 bytes; free and largest contiguous) on the layout of that date -- today's build leaves about 1.24 GB
+# more per bank, so the table refuses 262,144 where the live read admits it.  A resident BF4 payload is interleaved
+# over the banks one 576-byte tile page at a time, and the resident loader needs 128 MB contiguous per bank.
+# components 50,468,032 - the pair 44,236,800; states 12,938,112 (5 rows) / 20,920,192 (32 rows) - the QSA state
+# 4,462,592; traces 6,390,144 with one verify form and 11,107,904 with two, so 4,717,760 per further form (its verify
+# trace and its draft trace; the third form's figure is that line continued, not a measurement).
+MTP_COMPONENTS_BEYOND_PAIR_BYTES_PER_BANK = 6_231_232
+MTP_STATES_BEYOND_QSA_STATE_BYTES_PER_BANK_BY_MOE_ROWS = {5: 8_475_520, 32: 16_457_600}
+MTP_TRACES_BYTES_PER_BANK_ONE_VERIFY_FORM = 6_390_144
+MTP_TRACES_BYTES_PER_BANK_PER_ADDITIONAL_VERIFY_FORM = 4_717_760
+MTP_VERIFY_FORMS_MAX = 3
+MTP_GROWTH_ESTIMATE_MARGIN_PERCENT = 10
+RESIDENT_POST_BUILD_BYTES_PER_BANK_UPPER_BOUND = 64 << 20
 RESIDENT_DRAM_BANKS = 8
 RESIDENT_MIN_CONTIGUOUS_BYTES_PER_BANK = 128 << 20
 RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES = {
@@ -171,39 +215,137 @@ RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES = {
 }
 
 
-def mtp_capacity_admission(allocated_context: int, *, ring_size: int = max(BLACKHOLE_RING_SIZES)) -> dict[str, Any]:
-    """Whether the MTP chain fits beside the resident build at ``allocated_context``: the 49th BF4 pair (its two
-    payloads interleaved over the banks, needing their contiguous room), the MTP layer's QSA state at that context and
-    :data:`MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND`, against the free bytes per bank the build leaves after its captures
-    (:data:`RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES`).  Every byte count is in the record; ``fits`` decides."""
+def resident_post_build_bytes_per_bank(allocated_context: int) -> int:
+    """What the resident build allocates per bank after its weights, before the MTP chain can be measured: the
+    context-scaled state (the QSA caches and the RoPE tables) and the context-independent rest under
+    :data:`RESIDENT_POST_BUILD_BYTES_PER_BANK_UPPER_BOUND`."""
 
+    context_state = Qwen38ResidentContext(allocated_context).context_state_bytes_per_device
+    return -(-context_state // RESIDENT_DRAM_BANKS) + RESIDENT_POST_BUILD_BYTES_PER_BANK_UPPER_BOUND
+
+
+def mtp_capacity_admission(
+    allocated_context: int,
+    *,
+    drafts: int = mtp_v2.DEFAULT_DRAFTS,
+    verify_forms: int = 1,
+    ring_size: int = max(BLACKHOLE_RING_SIZES),
+    live: Mapping[str, Any] | None = None,
+    live_point: str = "after_build",
+) -> dict[str, Any]:
+    """Whether the MTP chain fits beside the resident build at ``allocated_context`` with ``drafts`` drafts per pass
+    and ``verify_forms`` captured verify forms (1..:data:`MTP_VERIFY_FORMS_MAX`).  The required side is the estimate
+    of the growth the open measures per bank: the components with the 49th BF4 pair (its two payloads interleaved
+    over the banks and needing their contiguous room), the states of the verify MoE form ``moe_rows_for(drafts + 1)``
+    with the MTP layer's QSA state at that context, the traces of one form plus one verify and one draft trace per
+    further form, :data:`MTP_GROWTH_ESTIMATE_MARGIN_PERCENT` over every remainder.  The free side is the free bytes
+    per bank the build leaves after its captures, live or from the table.
+    ``drafts`` is any count whose verify MoE form exists (rows up to 32); which counts the verify path runs is
+    ``mtp_v2.SUPPORTED_DRAFTS``, which a server may open with :data:`MTP_DRAFTS`.
+
+    ``live`` is the mesh allocator's DRAM view (``free_bytes_per_bank``, ``largest_contiguous_bytes_free_per_bank``:
+    the record ``hardware_profiles.symmetric_mesh_dram_memory`` returns) read at ``live_point``: ``after_build``
+    (the chain's open, once the resident weights are built and before the MTP layer's) takes the resident build's
+    remaining allocations (:func:`resident_post_build_bytes_per_bank`) off both readings; ``after_captures`` reads
+    them as they are.  Without ``live`` the 2026-09-04 table :data:`RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES`
+    stands in (no device: the no-device tests).  Every byte count is in the record, the estimate by part beside the
+    measured remainders it adds and ``decided_by`` naming the free side read and the required side's parts, with
+    the shortfalls of a refusal; ``fits`` decides."""
+
+    if isinstance(drafts, bool) or type(drafts) is not int or not 1 <= drafts < CHUNK_ROWS:
+        raise ValueError(f"MTP drafts must be an int in [1, {CHUNK_ROWS - 1}], got {drafts!r}")
+    if isinstance(verify_forms, bool) or type(verify_forms) is not int or not 1 <= verify_forms <= MTP_VERIFY_FORMS_MAX:
+        raise ValueError(f"verify forms must be an int in [1, {MTP_VERIFY_FORMS_MAX}], got {verify_forms!r}")
+    moe_rows = mtp_v2.moe_rows_for(drafts + 1)
     context = Qwen38ResidentContext(allocated_context).allocated_context
-    # A context below the smallest measured one (8,192: the batched lanes' small context) is admitted against the
-    # smallest measured context's readings: its resident build leaves more room, so the admission is conservative.
-    measured_at = [c for c in sorted(RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES) if c >= context]
-    if not measured_at:
-        raise ValueError(f"no free-bytes-after-captures measurement at or above {context} tokens")
-    free, largest = RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES[measured_at[0]]
+    if live_point not in ("after_build", "after_captures"):
+        raise ValueError(f"live_point must be after_build or after_captures, got {live_point!r}")
+    if live is None:
+        # A context below the smallest measured one (8,192: the batched lanes' small context) is admitted against the
+        # smallest measured context's readings: its resident build leaves more room, so the admission is conservative.
+        measured_at = [c for c in sorted(RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES) if c >= context]
+        if not measured_at:
+            raise ValueError(f"no free-bytes-after-captures measurement at or above {context} tokens")
+        free, largest = RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES[measured_at[0]]
+        source: dict[str, Any] = {
+            "free_bytes_source": "table_2026-09-04",
+            "free_bytes_measured_at_context": measured_at[0],
+        }
+    else:
+        banks = int(live.get("num_banks", RESIDENT_DRAM_BANKS))
+        if banks != RESIDENT_DRAM_BANKS:
+            raise ValueError(
+                f"the live DRAM view has {banks} banks, the admission is written for {RESIDENT_DRAM_BANKS}"
+            )
+        live_free = int(live["free_bytes_per_bank"])
+        live_largest = int(live["largest_contiguous_bytes_free_per_bank"])
+        if live_free < 0 or live_largest < 0 or live_largest > live_free:
+            raise ValueError(f"inconsistent live DRAM view: free {live_free}, largest contiguous {live_largest}")
+        remaining = resident_post_build_bytes_per_bank(context) if live_point == "after_build" else 0
+        free, largest = live_free - remaining, max(live_largest - remaining, 0)
+        source = {
+            "free_bytes_source": f"measured_{live_point}",
+            "free_bytes_measured_at_context": context,
+            "live_free_bytes_per_bank": live_free,
+            "live_largest_contiguous_bytes_free_per_bank": live_largest,
+            "resident_post_build_bytes_per_bank": remaining,
+        }
     w01_bytes, w2_bytes = packed_bf4_bytes_per_device(ring_size=ring_size)
     w01_per_bank = -(-(w01_bytes // BF4_TILE_BYTES) // RESIDENT_DRAM_BANKS) * BF4_TILE_BYTES
     w2_per_bank = -(-(w2_bytes // BF4_TILE_BYTES) // RESIDENT_DRAM_BANKS) * BF4_TILE_BYTES
     qsa_state = -(-Qwen38ResidentContext(allocated_context).qsa_generic_state_bytes // RESIDENT_DRAM_BANKS)
-    required = w01_per_bank + w2_per_bank + qsa_state + MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND
+    remainders = {
+        "components_beyond_pair": MTP_COMPONENTS_BEYOND_PAIR_BYTES_PER_BANK,
+        "states_beyond_qsa_state": MTP_STATES_BEYOND_QSA_STATE_BYTES_PER_BANK_BY_MOE_ROWS[moe_rows],
+        "traces": MTP_TRACES_BYTES_PER_BANK_ONE_VERIFY_FORM
+        + (verify_forms - 1) * MTP_TRACES_BYTES_PER_BANK_PER_ADDITIONAL_VERIFY_FORM,
+        "traces_per_additional_verify_form": MTP_TRACES_BYTES_PER_BANK_PER_ADDITIONAL_VERIFY_FORM,
+    }
+
+    def with_margin(remainder: int) -> int:
+        return -(-remainder * (100 + MTP_GROWTH_ESTIMATE_MARGIN_PERCENT) // 100)
+
+    estimate = {
+        "components": w01_per_bank + w2_per_bank + with_margin(remainders["components_beyond_pair"]),
+        "states": qsa_state + with_margin(remainders["states_beyond_qsa_state"]),
+        "traces": with_margin(remainders["traces"]),
+    }
+    required = sum(estimate.values())
     contiguous = max(w01_per_bank, w2_per_bank, RESIDENT_MIN_CONTIGUOUS_BYTES_PER_BANK)
+    shortfalls = [
+        name
+        for name, short in (
+            ("free_bytes_below_estimate", free < required),
+            ("largest_contiguous_below_pair_room", largest < contiguous),
+        )
+        if short
+    ]
     return {
         "allocated_context": allocated_context,
+        "drafts": drafts,
+        "mtp_moe_rows": moe_rows,
+        "verify_forms": verify_forms,
         "ring_size": ring_size,
         "num_banks": RESIDENT_DRAM_BANKS,
-        "free_bytes_measured_at_context": measured_at[0],
+        **source,
         "free_bytes_per_bank_after_captures": free,
         "largest_contiguous_bytes_free_per_bank_after_captures": largest,
         "resident_pair_bytes_per_bank": w01_per_bank + w2_per_bank,
         "mtp_qsa_state_bytes_per_bank": qsa_state,
-        "mtp_chain_bytes_per_bank_upper_bound": MTP_CHAIN_BYTES_PER_BANK_UPPER_BOUND,
+        "mtp_growth_remainders_bytes_per_bank": remainders,
+        "mtp_growth_estimate_margin_percent": MTP_GROWTH_ESTIMATE_MARGIN_PERCENT,
+        "mtp_growth_estimate_bytes_per_bank": estimate,
         "required_free_bytes_per_bank": required,
         "required_largest_contiguous_bytes_per_bank": contiguous,
         "headroom_bytes_per_bank": free - required,
-        "fits": free >= required and largest >= contiguous,
+        # which side decided: the free side as read (live after build / after captures, or the table) against the
+        # required side's estimate by part for this k and these forms; the shortfalls name a refusal's reason(s)
+        "decided_by": {
+            "free_side": source["free_bytes_source"],
+            "required_side": f"estimate k={drafts} moe_rows={moe_rows} verify_forms={verify_forms}",
+            "shortfalls": shortfalls,
+        },
+        "fits": not shortfalls,
     }
 
 
@@ -1356,8 +1498,10 @@ def open_partition_b_mesh(marker: Marker, hardware_profile: ResidentHardwareProf
 
 @dataclass
 class Qwen38ChainMTP:
-    """What an MTP-drafting chain adds (``mtp_v2``): the MTP components, the verify / draft states and their three
-    traces, the TAIL rows' step inputs, the chunk extension, the live pass loop and the cumulative counters.
+    """What an MTP-drafting chain adds (``mtp_v2``): the MTP components, the verify / draft states and their traces
+    (``traces``: the fused verify, the commit and the draft; with ``sampled`` also ``split_traces``: the verify head
+    and tail with a draft of their own, the commit shared), the TAIL rows' step inputs, the chunk extension, the live
+    pass loop and the cumulative counters.
 
     ``step_written`` tracks the TAIL contract: every TAIL reads the step inputs written for its step (a forced step
     writes the next prompt token; a device-token step selects the resolved argmax).
@@ -1378,13 +1522,19 @@ class Qwen38ChainMTP:
     accepted_drafts: int = 0
     capture_ms: dict[str, float] = field(default_factory=dict)
     trace_dram_bytes_per_bank: dict[str, int] = field(default_factory=dict)
-    admission: dict[str, Any] = field(default_factory=dict)  # mtp_capacity_admission at the build's context
+    admission: dict[str, Any] = field(default_factory=dict)  # mtp_capacity_admission at the build's context and k
     dram_bytes_per_bank: dict[str, int] = field(default_factory=dict)  # measured growth: components, states, traces
-    # The split verify (an --mtp --sampling server's default; QWEN38_MTP_SAMPLED=0 turns it off): the host decides
-    # every pass; sampled requests draft too.
+    # The split verify (an --mtp --sampling server's default; QWEN38_MTP_SAMPLED=0 turns it off), captured beside
+    # the fused one: sampled requests draft through it, the host deciding every pass; greedy requests keep the fused
+    # traces (``Qwen38TracedChain.mtp_enter`` routes by ``decide``).
     sampled: bool = False
+    split_traces: mtp_v2.Qwen38TTNNMTPTraces | None = None  # verify_head, verify_tail, their draft; commit = traces'
+    split_verify_output: mtp_v2.Qwen38TTNNVerifyOutput | None = None  # the tail's readback row (the split draft's)
     head_output: mtp_v2.Qwen38TTNNVerifyHeadOutput | None = None
-    accept_checks: int = 0  # greedy split passes whose host decision was checked against the device lanes
+    # Greedy split passes whose host decision (decide_greedy) was checked against the device lanes.  The served path
+    # routes greedy requests to the fused traces, so it stays 0 there; a caller running the split form with
+    # decide_greedy (a diagnostic) counts here.
+    accept_checks: int = 0
     sampled_passes: int = 0
     sampled_accepted_drafts: int = 0
     sampled_draws: int = 0
@@ -1395,7 +1545,13 @@ class Qwen38ChainMTP:
         return self.verify.alignment
 
     def captured_trace_ids(self) -> list[int]:
-        return [] if self.traces is None else self.traces.ids()
+        """Every captured trace once (the commit is shared by both forms), the fused form's first."""
+
+        ids: list[int] = []
+        for traces in (self.traces, self.split_traces):
+            if traces is not None:
+                ids.extend(trace_id for trace_id in traces.ids() if trace_id not in ids)
+        return ids
 
     def record(self, pass_record: mtp_v2.Qwen38TTNNMTPPassRecord) -> mtp_v2.Qwen38TTNNMTPPassRecord:
         self.passes += 1
@@ -1426,10 +1582,11 @@ class Qwen38ChainMTP:
 
     def summary(self, *, since: Mapping[str, int] | None = None) -> dict[str, Any]:
         """The ``qwen38.mtp`` object: k, anchor, the switch, passes, accepted drafts and tokens per pass (``a + 1``
-        per pass); with the switch on also the split form's counters (the greedy passes whose host decision was
-        checked against the device lanes, the sampled passes with their accepted drafts, tokens per pass, draws and
-        fallbacks).  Cumulative since the chain opened, or, with ``since`` a ``counters()`` snapshot, the counts added
-        after it: a request's response reports every field over that request alone."""
+        per pass); with the switch on also the split form's counters (``accept_checks``, the greedy split passes
+        decided on the host: 0 on the served path, which runs greedy requests through the fused verify; the sampled
+        passes with their accepted drafts, tokens per pass, draws and fallbacks).  Cumulative since the chain opened,
+        or, with ``since`` a ``counters()`` snapshot, the counts added after it: a request's response reports every
+        field over that request alone."""
 
         counts = self.counters()
         if since is not None:
@@ -1661,30 +1818,38 @@ class Qwen38TracedChain:
         self, first_token: int, ple_context: tuple[int, int] | None, *, decide: Callable[..., Any] | None = None
     ) -> mtp_v2.Qwen38TTNNMTPPassRecord:
         """Eager switch into verify mode at the device position (the host's committed count), then the bootstrap
-        pass whose row 0 is ``first_token`` (placeholder drafts).  Returns the pass record.  ``decide`` (the split
-        verify only) is the host's verdict per pass; None is the greedy one, the device's verdict written back."""
+        pass whose row 0 is ``first_token`` (placeholder drafts).  Returns the pass record.  ``decide`` routes the
+        pass loop: None (a greedy request) runs the fused verify traces, the device's verdict inside the body (no
+        head readback, no host decision: the pinned greedy stream); a callable (a sampled request's acceptance) runs
+        the split traces, the host deciding between the head and the tail (``mtp_sampled`` chains only)."""
 
         mtp = self.mtp
         model = self.built_target.model
         if mtp.chain is not None:
             raise Qwen38ChatChainError("the MTP pass loop is already active")
-        if decide is not None and not mtp.sampled:
+        if decide is not None and (not mtp.sampled or mtp.split_traces is None):
             raise Qwen38ChatChainError(
                 "a host decision needs the split verify (the chain was opened without mtp_sampled)"
             )
         position = self.state.position.read()
         mtp_v2.enter_verify_mode(model, self.state, mtp.verify, position=position, ple_context=ple_context)
+        if decide is None:
+            # The fused form: no head output; decide_greedy is the chain's default, never called on this form.
+            traces, verify_output, head_output, decision = mtp.traces, mtp.verify_output, None, mtp_v2.decide_greedy
+        else:
+            traces, verify_output = mtp.split_traces, mtp.split_verify_output
+            head_output, decision = mtp.head_output, decide
         mtp.chain = mtp_v2.Qwen38TTNNMTPChain(
             model,
             mtp.verify,
             mtp.draft,
-            mtp.traces,
-            mtp.verify_output,
+            traces,
+            verify_output,
             replay=self._replay,
             position=position,
             enqueue=self._enqueue,
-            head_output=mtp.head_output,
-            decide=mtp_v2.decide_greedy if decide is None else decide,
+            head_output=head_output,
+            decide=decision,
         )
         return mtp.record(mtp.chain.bootstrap([first_token] + [MTP_BOOTSTRAP_DRAFT_TOKEN] * mtp.drafts))
 
@@ -1756,8 +1921,11 @@ class Qwen38TracedChain:
         every TAIL and its rows to the chunk body, warms the pass loop and both mode switches at every position
         residue, and captures the verify, commit and draft traces after the chunk trace.  ``mtp_sampled`` (needs
         ``mtp`` and ``sampling``) allocates the split verify's buffers beside the verify state, warms the split
-        form (the head, the greedy decision checked against the device lanes, the rows candidates against the eager
-        rows gather, the tail) and captures the verify head and tail in place of the fused verify.
+        form in every round (the head, the greedy decision checked against the device lanes, the rows candidates
+        against the eager rows gather, the tail; every op of the fused body runs in the head or the tail on tensors
+        of the same specs, so the fused capture needs no round of its own) and captures the verify head and tail,
+        with a draft of their own, after the fused verify, commit and draft (the commit is shared): greedy requests
+        run the fused traces, sampled requests the split ones (``mtp_enter``).
         """
 
         if type(chunk_gdn_step_anchor) is not bool:
@@ -1808,6 +1976,15 @@ class Qwen38TracedChain:
         def dram_allocated_per_bank() -> int:
             return int(ttnn.get_memory_view(mesh, ttnn.BufferType.DRAM).total_bytes_allocated_per_bank)
 
+        def dram_free_view() -> dict[str, int]:
+            # the mesh allocator's DRAM view (one virtual allocator, every card alike): what the admission reads
+            view = ttnn.get_memory_view(mesh, ttnn.BufferType.DRAM)
+            return {
+                "num_banks": int(view.num_banks),
+                "free_bytes_per_bank": int(view.total_bytes_free_per_bank),
+                "largest_contiguous_bytes_free_per_bank": int(view.largest_contiguous_bytes_free_per_bank),
+            }
+
         if slab_rows is not None:
             builder.enable_prefill_slab(slab_rows)  # the slab's dense-linear residents, behind the DRAM admission
         marker("before-chat-target-build")
@@ -1827,9 +2004,26 @@ class Qwen38TracedChain:
         mtp_components = None
         mtp_dram_bytes_per_bank: dict[str, int] = {}
         if mtp is not None:
-            # The admission's table row for this context (the server refused an unfit --mtp before the mesh opened);
-            # the measured growth of the MTP build, its states and its traces is checked against its estimate.
-            mtp_admission = mtp_capacity_admission(model.allocated_context, ring_size=builder.identity.ring_size)
+            # The admission on the live allocator: the free bytes per bank after the resident weights, less what the
+            # resident build still allocates (its context state, its traces), against the MTP pair, state and the
+            # growth estimate for this k and the verify forms; the measured growth of the MTP build, its states and
+            # its traces is checked against that estimate.  The verify forms the open captures (one table, the switch)
+            # are counted in the estimate and named in the record.
+            forms = mtp_verify_forms(mtp_sampled)
+            mtp_admission = mtp_capacity_admission(
+                model.allocated_context,
+                drafts=mtp,
+                ring_size=builder.identity.ring_size,
+                live=dram_free_view(),
+                verify_forms=len(forms),
+            )
+            mtp_admission["verify_forms_captured"] = list(forms)
+            # the record at the decision, admitted or not (READY carries it again; a refused or crashed open has only
+            # this line): the live view, what the resident build still takes, what the MTP chain needs, the verdict
+            print(
+                json.dumps({"utc": utc_now(), "event": "mtp_admission_live", **mtp_admission}, sort_keys=True),
+                flush=True,
+            )
             if not mtp_admission["fits"]:
                 raise Qwen38ChatChainError(
                     f"MTP drafting does not fit at allocated context {model.allocated_context}: {mtp_admission}"
@@ -2021,7 +2215,12 @@ class Qwen38TracedChain:
             # The pass loop's programs and both eager mode switches at every position residue: the seed's ring
             # slot slices are position-dependent programs and the server switches at any P.  Each round: the
             # switch in, one verify pass (its MoE rows / alignment / accept programs), the draft rows, the switch
-            # out through the commit (the request's settle form), then 1-row steps to the next residue.
+            # out through the commit (the request's settle form), then 1-row steps to the next residue.  With the
+            # split verify captured beside the fused one the rounds run the head / tail form: every op of the fused
+            # body (the prologue, the embed, the 48 layers, the final mixer, the rows resolve and the accept in the
+            # head; the alignment, the readback concat, the accept-tile copy and the position adds in the tail) runs
+            # there on tensors of the same dtype, layout and memory config (the split's host-written scalars and
+            # lanes are allocated as the fused body's), so the fused capture's programs are all compiled here.
             marker("before-chat-mtp-warm-pass")
             warm_fed = resident_decode.SINGLE_TRACE_WARM_POSITIONS  # positions the warm pass consumed so far
             for residue in range(RESIDUE_CLASSES):
@@ -2343,32 +2542,23 @@ class Qwen38TracedChain:
             synchronize()
             marker("after-chat-slab-capture")
         if chain_mtp is not None:
-            # The verify (first pass), commit and draft traces after the chunk trace; the draft body reads the
-            # verify output's readback address, so the verify capture comes first.  Capture records without
-            # executing: the device state is unchanged.
+            # The verify (first pass), commit and draft traces after the chunk trace, the fused form under both
+            # switch values (a greedy request's traces: the QWEN38_MTP_SAMPLED=0 server's exactly); the draft body
+            # reads the verify output's readback address, so the verify capture comes first.  With the split verify
+            # the head, the tail and a second draft follow: each verify body allocates its readback row inside its
+            # own capture, so the tail lands a row of its own and the split form needs a draft captured on that row;
+            # the commit reads neither row and is shared.  Capture records without executing: the device state is
+            # unchanged.
             marker("before-chat-mtp-captures")
 
             def guard(label: str):
                 return resident_decode.forbid_trace_body_host_io_and_sync(phase=f"chat {label}")
 
             capture_started_ns = clock_ns()
-            verify_first = verify_head = verify_tail = head_output = None
-            if chain_mtp.sampled:
-                # The split verify: the head, then the tail that reads its roots (the draft reads the tail's row).
-                verify_head, head_output = mtp_v2.capture_verify_head(
-                    model, chain_mtp.verify, state, catch_up=False, guard=guard, cq_id=0
-                )
-                chain_mtp.capture_ms["verify_head"] = (clock_ns() - capture_started_ns) / 1e6
-                capture_started_ns = clock_ns()
-                verify_tail, verify_output = mtp_v2.capture_verify_tail(
-                    model, chain_mtp.verify, state, head_output, catch_up=False, guard=guard, cq_id=0
-                )
-                chain_mtp.capture_ms["verify_tail"] = (clock_ns() - capture_started_ns) / 1e6
-            else:
-                verify_first, verify_output = mtp_v2.capture_verify(
-                    model, chain_mtp.verify, state, catch_up=False, guard=guard, cq_id=0
-                )
-                chain_mtp.capture_ms["verify_first"] = (clock_ns() - capture_started_ns) / 1e6
+            verify_first, verify_output = mtp_v2.capture_verify(
+                model, chain_mtp.verify, state, catch_up=False, guard=guard, cq_id=0
+            )
+            chain_mtp.capture_ms["verify_first"] = (clock_ns() - capture_started_ns) / 1e6
             capture_started_ns = clock_ns()
             commit = mtp_v2.capture_commit(model, chain_mtp.verify, state, guard=guard, cq_id=0)
             chain_mtp.capture_ms["commit"] = (clock_ns() - capture_started_ns) / 1e6
@@ -2377,29 +2567,71 @@ class Qwen38TracedChain:
                 model, chain_mtp.verify, chain_mtp.draft, state, verify_output, guard=guard, cq_id=0
             )
             chain_mtp.capture_ms["draft"] = (clock_ns() - capture_started_ns) / 1e6
-            chain_mtp.traces = mtp_v2.Qwen38TTNNMTPTraces(
-                verify_first=verify_first, draft=draft, commit=commit, verify_head=verify_head, verify_tail=verify_tail
-            )
+            chain_mtp.traces = mtp_v2.Qwen38TTNNMTPTraces(verify_first=verify_first, draft=draft, commit=commit)
             chain_mtp.verify_output = verify_output
-            chain_mtp.head_output = head_output
             ttnn.mark_corruptible(verify_output.readback)
-            if head_output is not None:
-                for tensor in (head_output.readback, head_output.roots, head_output.logits.tensor):
-                    ttnn.mark_corruptible(tensor)
             synchronize()
+            dram_after_fused = dram_allocated_per_bank()
+            if chain_mtp.sampled:
+                # The split verify: the head, the tail that reads its roots, the draft that reads the tail's row.
+                capture_started_ns = clock_ns()
+                verify_head, head_output = mtp_v2.capture_verify_head(
+                    model, chain_mtp.verify, state, catch_up=False, guard=guard, cq_id=0
+                )
+                chain_mtp.capture_ms["verify_head"] = (clock_ns() - capture_started_ns) / 1e6
+                capture_started_ns = clock_ns()
+                verify_tail, split_verify_output = mtp_v2.capture_verify_tail(
+                    model, chain_mtp.verify, state, head_output, catch_up=False, guard=guard, cq_id=0
+                )
+                chain_mtp.capture_ms["verify_tail"] = (clock_ns() - capture_started_ns) / 1e6
+                capture_started_ns = clock_ns()
+                split_draft = mtp_v2.capture_draft(
+                    model, chain_mtp.verify, chain_mtp.draft, state, split_verify_output, guard=guard, cq_id=0
+                )
+                chain_mtp.capture_ms["split_draft"] = (clock_ns() - capture_started_ns) / 1e6
+                chain_mtp.split_traces = mtp_v2.Qwen38TTNNMTPTraces(
+                    verify_first=None,
+                    draft=split_draft,
+                    commit=commit,
+                    verify_head=verify_head,
+                    verify_tail=verify_tail,
+                )
+                chain_mtp.split_verify_output = split_verify_output
+                chain_mtp.head_output = head_output
+                for tensor in (
+                    split_verify_output.readback,
+                    head_output.readback,
+                    head_output.roots,
+                    head_output.logits.tensor,
+                ):
+                    ttnn.mark_corruptible(tensor)
+                synchronize()
             marker("after-chat-mtp-captures")
+            dram_after_mtp = dram_allocated_per_bank()
             chain_mtp.trace_dram_bytes_per_bank = {
                 "decode_traces": dram_after_decode - dram_before_captures,
                 "chunk_trace": dram_after_chunk - dram_after_decode,
-                "mtp_traces": dram_allocated_per_bank() - dram_after_chunk,
+                "mtp_fused_traces": dram_after_fused - dram_after_chunk,
+                "mtp_traces": dram_after_mtp - dram_after_chunk,
             }
+            if chain_mtp.sampled:
+                chain_mtp.trace_dram_bytes_per_bank["mtp_split_traces"] = dram_after_mtp - dram_after_fused
             chain_mtp.dram_bytes_per_bank["traces"] = chain_mtp.trace_dram_bytes_per_bank["mtp_traces"]
+            chain_mtp.admission["measured_after_captures"] = dram_free_view()  # the allocator with the MTP chain in
+            captured_forms = ["fused"] + (["split"] if chain_mtp.split_traces is not None else [])
+            if captured_forms != chain_mtp.admission["verify_forms_captured"]:
+                raise Qwen38ChatChainError(
+                    f"captured verify forms {captured_forms} vs the admission's {chain_mtp.admission['verify_forms_captured']}"
+                )
             mtp_growth = sum(chain_mtp.dram_bytes_per_bank.values())
             if mtp_growth > chain_mtp.admission["required_free_bytes_per_bank"]:
                 raise Qwen38ChatChainError(
                     f"MTP DRAM growth {mtp_growth} bytes per bank {chain_mtp.dram_bytes_per_bank} exceeds the admission's "
-                    f"estimate {chain_mtp.admission['required_free_bytes_per_bank']} at allocated context "
-                    f"{model.allocated_context}"
+                    f"estimate {chain_mtp.admission['required_free_bytes_per_bank']} "
+                    f"{chain_mtp.admission['mtp_growth_estimate_bytes_per_bank']} for k={chain_mtp.drafts} "
+                    f"(verify MoE rows {chain_mtp.admission['mtp_moe_rows']}, "
+                    f"{chain_mtp.admission['verify_forms']} verify form(s); the required side decided, the free side "
+                    f"read {chain_mtp.admission['free_bytes_source']}) at allocated context {model.allocated_context}"
                 )
         phases, position = conv_phases(), state.position.read()
         if set(phases.values()) != {0} or position != 0:
@@ -2449,12 +2681,12 @@ class Qwen38TracedChain:
         self.slab_trace_id = None
         if self.mtp is not None:
             self.mtp.traces = None
-            if self.mtp.verify_output is not None:
-                self.mtp.verify_output.release_tensors()
-                self.mtp.verify_output = None
-            if self.mtp.head_output is not None:
-                self.mtp.head_output.release_tensors()
-                self.mtp.head_output = None
+            self.mtp.split_traces = None
+            for name in ("verify_output", "split_verify_output", "head_output"):
+                output = getattr(self.mtp, name)
+                if output is not None:
+                    output.release_tensors()
+                    setattr(self.mtp, name, None)
         for candidates in self.trace_candidates:
             ttnn.deallocate(candidates.local_indices)
             ttnn.deallocate(candidates.local_values)

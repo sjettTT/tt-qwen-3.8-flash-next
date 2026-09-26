@@ -52,7 +52,8 @@ MTP drafting for sampled requests (the default on an ``--mtp --sampling`` server
 off): the pass loop of ``tools/qwen38_chat_session.py`` runs the split verify and asks :func:`accept_pass` for the
 verdict on every pass, the point-mass acceptance (``ttnn/speculative_sampling.py``) over the k + 1 rows' candidate
 distributions (the same processors as :func:`choose_token`, the row's history the committed stream plus the pass's
-earlier rows); a row the candidate guard cannot bound is sampled over the eagerly gathered verify logits.
+earlier rows; built for every row at once by ``sampling.candidate_distributions``, bitwise the per-row function); a
+row the candidate guard cannot bound is sampled over the eagerly gathered verify logits.
 :func:`drafting_admission` names the requests the pass loop does not serve (``top_k`` 0, a boosting penalty, logprobs,
 the device-sampler loop): they take the 1-row loop above with the reason in ``qwen38.sampling.mtp_drafting``.
 """
@@ -92,11 +93,12 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.sampling import (
     MAX_TOP_LOGPROBS,
     Qwen38CandidateFallback,
     Qwen38CandidateRow,
+    Qwen38CandidateRows,
     Qwen38CandidateSample,
     Qwen38RowDistribution,
     Qwen38SamplingParameters,
     UniformStream,
-    candidate_distribution,
+    candidate_distributions,
     full_distribution,
     sample_candidates,
     sample_full_vocabulary,
@@ -704,34 +706,45 @@ def accept_pass(
     ``session.committed + tokens[:j + 1]`` (the drafts accepted earlier in the pass count, as plain decode's output
     would; ``prompt_tokens`` exempts the prompt from the additive penalties), or over the eagerly gathered verify
     logits when the guard fails (``session.chain.mtp_read_full_logits_rows``); the point-mass acceptance draws
-    from ``request.draw``.  The alignment tokens are ``[d_1 .. d_a*, x*]`` then the zero-embedding sentinel."""
+    from ``request.draw``.  The alignment tokens are ``[d_1 .. d_a*, x*]`` then the zero-embedding sentinel.
+
+    The k + 1 candidate distributions come from one batched pass (``candidate_distributions``, bitwise the per-row
+    ``candidate_distribution``); the acceptance still asks for them row by row, so a fallback is counted, and the
+    verify logits read, only for a row the acceptance reaches."""
 
     rows = len(tokens)
     if tuple(head.candidate_rows.shape) != (rows, SAMPLING_CANDIDATE_ROW_SHAPE[3]):
         raise ValueError(f"{tuple(head.candidate_rows.shape)} candidate rows for a {rows}-row pass")
-    committed = list(session.committed)
+    pass_tokens = [int(token) for token in tokens]
+    committed = session.committed
+    distributions = candidate_distributions(
+        Qwen38CandidateRows.from_host_rows(head.candidate_rows),
+        request.parameters,
+        token_history=committed,
+        row_tokens=pass_tokens,
+        prompt_tokens=prompt_tokens,
+    )
     fallbacks = 0
     full_rows: torch.Tensor | None = None
 
     def distribution(row: int) -> Qwen38RowDistribution:
         nonlocal fallbacks, full_rows
-        history = committed + [int(token) for token in tokens[: row + 1]]
-        candidate_row = Qwen38CandidateRow.from_host_row(head.candidate_rows[row].reshape(SAMPLING_CANDIDATE_ROW_SHAPE))
         try:
-            return candidate_distribution(
-                candidate_row, request.parameters, token_history=history, prompt_tokens=prompt_tokens
-            )
+            return distributions.row(row)
         except Qwen38CandidateFallback:
             fallbacks += 1
             if full_rows is None:
                 full_rows = session.chain.mtp_read_full_logits_rows()
             return full_distribution(
-                full_rows[row], request.parameters, token_history=history, prompt_tokens=prompt_tokens
+                full_rows[row],
+                request.parameters,
+                token_history=[*committed, *pass_tokens[: row + 1]],
+                prompt_tokens=prompt_tokens,
             )
 
-    acceptance = accept_point_mass(distribution, tokens[1:], request.draw)
+    acceptance = accept_point_mass(distribution, pass_tokens[1:], request.draw)
     request.mtp.record(acceptance, fallbacks)
-    alignment = [int(token) for token in tokens[1 : acceptance.accepted + 1]] + [acceptance.token]
+    alignment = pass_tokens[1 : acceptance.accepted + 1] + [acceptance.token]
     alignment += [ZERO_EMBEDDING_TOKEN] * (rows - len(alignment))
     return mtp_v2.Qwen38TTNNVerifyDecision(
         acceptance.accepted,

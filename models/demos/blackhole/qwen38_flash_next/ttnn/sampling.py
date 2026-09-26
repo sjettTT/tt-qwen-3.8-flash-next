@@ -57,16 +57,21 @@ among candidates at the k-th value while reporting how many such ties there are.
 stopped before their draw: the kept tokens and their probabilities as one
 :class:`Qwen38RowDistribution`, the object the speculative acceptance of the MTP
 verify rows (``ttnn/speculative_sampling.py``) reads and conditions.  The same
-``_penalize`` and ``_filter`` run in all four functions.
+``_penalize`` and ``_filter`` run in all four functions.  :func:`candidate_distributions`
+is :func:`candidate_distribution` over the k + 1 rows of one MTP pass in one batched
+pass (:class:`Qwen38CandidateRows` parses them at once): the same operations along the
+last dimension of ``[rows, candidates]`` tensors, bitwise per row, so the pass loop's
+decision costs a few dozen tensor operations instead of a few dozen per row.
 """
 
 from __future__ import annotations
 
+import array
 import math
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from enum import Enum
 from numbers import Real
 from typing import Any, Literal
@@ -565,12 +570,16 @@ class Qwen38RowDistribution:
     scaled score, ties by the lowest id) and their probabilities (zero where the nucleus or min-p cut removed a
     token).  Both samplers draw from exactly this (``tokens[_inverse_cdf(probabilities, u)]``); the speculative
     acceptance reads ``probability`` and conditions with ``without``.  The dtype is the caller's (fp32 from the
-    samplers; the algebra tests use float64)."""
+    samplers; the algebra tests use float64).  ``checked=False`` skips the validation: for
+    :func:`candidate_distributions`, which verified the invariants over every row of a pass at once."""
 
     tokens: torch.Tensor  # int64 [n]
     probabilities: torch.Tensor  # floating [n], summing to 1
+    checked: InitVar[bool] = True
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, checked: bool) -> None:
+        if not checked:
+            return
         tokens, probabilities = self.tokens, self.probabilities
         if (
             not isinstance(tokens, torch.Tensor)
@@ -611,7 +620,7 @@ class Qwen38RowDistribution:
         total = remaining.sum()
         if not bool(total > 0):
             raise ValueError(f"no probability mass remains without token {token}")
-        return Qwen38RowDistribution(self.tokens, remaining / total)
+        return Qwen38RowDistribution(self.tokens, remaining / total, False)  # the same tokens, a scaled sub-vector
 
 
 @dataclass(frozen=True)
@@ -967,6 +976,269 @@ def candidate_distribution(
     return Qwen38RowDistribution(ids[positions], probabilities)
 
 
+# --- the verify rows of one MTP pass: the candidate sampler's distributions in one batched pass -----------------
+#
+# ``candidate_distributions`` is ``candidate_distribution`` for the k + 1 rows of a pass, computed together: every
+# operation of ``_penalize`` and ``_filter`` runs along the last dimension of a ``[rows, candidates]`` tensor.  On the
+# CPU each of those kernels (the stable sort, softmax, the cumulative sum, the elementwise updates) works one row at a
+# time, so the rows come out bitwise as the per-row function computes them; the one reduction whose 1-D and last-dim
+# kernels differ (``sum``) is taken row by row.  The history is counted in C once for every row instead of walked
+# in Python once per row.  ``tests/test_candidate_distributions_no_device.py`` holds the bitwise proof.
+
+
+@dataclass(frozen=True)
+class Qwen38CandidateRows:
+    """The candidate rows of one verify pass parsed at once: row j is ``Qwen38CandidateRow(values[j], ids[j])`` (fp32
+    ``[rows, TP_SIZE, k]``, int64 ``[rows, TP_SIZE, k]``); :meth:`from_host_rows` runs
+    :meth:`Qwen38CandidateRow.from_host_row`'s checks over every row in a few tensor operations."""
+
+    values: torch.Tensor
+    ids: torch.Tensor
+
+    @classmethod
+    def from_host_rows(cls, rows: torch.Tensor) -> "Qwen38CandidateRows":
+        """``rows`` fp32 ``[rows, 2 * TP_SIZE * k]``, row j flattened as :meth:`Qwen38CandidateRow.from_host_row` reads it."""
+
+        width = SAMPLING_CANDIDATE_ROW_SHAPE[-1]
+        if (
+            not isinstance(rows, torch.Tensor)
+            or rows.ndim != 2
+            or rows.shape[0] == 0
+            or rows.shape[1] != width
+            or rows.dtype != torch.float32
+        ):
+            raise ValueError(
+                f"candidate rows must be fp32 [rows, {width}], got "
+                f"{getattr(rows, 'dtype', None)} {tuple(getattr(rows, 'shape', ()))}"
+            )
+        if not bool(torch.all(torch.isfinite(rows))):
+            raise ValueError("candidate rows contain NaN or infinity")
+        k = SAMPLING_CANDIDATES_PER_DEVICE
+        packs = rows.reshape(rows.shape[0], TP_SIZE, 2, k)
+        values = packs[:, :, 0].contiguous()
+        ids_fp32 = packs[:, :, 1]
+        ids = ids_fp32.to(torch.int64).contiguous()
+        if not torch.equal(ids.to(torch.float32), ids_fp32):
+            raise ValueError("candidate ids are not integers")
+        starts = torch.tensor([start for start, _ in EXPECTED_VOCAB_RANGES], dtype=torch.int64).reshape(1, TP_SIZE, 1)
+        if bool(torch.any(ids < starts)) or bool(torch.any(ids >= starts + LOCAL_VOCAB_SIZE)):
+            raise ValueError("candidate ids leave their shards")
+        ordered = torch.sort(ids, dim=-1).values
+        if bool(torch.any(ordered[..., 1:] == ordered[..., :-1])):
+            raise ValueError("a shard's candidate ids repeat")
+        if bool(torch.any(values[..., 1:] > values[..., :-1])):
+            raise ValueError("candidate values are not descending per shard")
+        return cls(values, ids)
+
+    @property
+    def rows(self) -> int:
+        return int(self.values.shape[0])
+
+    def row(self, index: int) -> Qwen38CandidateRow:
+        return Qwen38CandidateRow(self.values[index], self.ids[index])
+
+    @property
+    def shard_floors(self) -> torch.Tensor:
+        """Every row's :attr:`Qwen38CandidateRow.shard_floor`: ``[rows]``."""
+
+        return self.values[:, :, -1].max(dim=-1).values
+
+
+@dataclass(frozen=True)
+class Qwen38CandidateDistributions:
+    """The rows of one pass after the processors: row j's kept tokens ``tokens[j]`` (descending scaled score, ties by
+    the lowest id) and probabilities ``probabilities[j]``, or in ``outcomes[j]`` what :func:`candidate_distribution`
+    raises for it (the :class:`Qwen38CandidateFallback` of a row the guard cannot bound, a ``ValueError`` or
+    ``RuntimeError`` of the filters).  :meth:`row` answers like the per-row function, so a caller that asks row by row
+    (the acceptance never asks past its first rejection) sees the fallbacks the per-row function would have raised."""
+
+    tokens: torch.Tensor  # int64 [rows, kept]
+    probabilities: torch.Tensor  # floating [rows, kept]
+    outcomes: tuple[Exception | None, ...]
+
+    @property
+    def rows(self) -> int:
+        return len(self.outcomes)
+
+    def row(self, index: int) -> Qwen38RowDistribution:
+        """Row ``index``'s distribution, or the exception :func:`candidate_distribution` raises for that row."""
+
+        error = self.outcomes[index]
+        if error is not None:
+            raise error
+        return Qwen38RowDistribution(self.tokens[index], self.probabilities[index], False)
+
+
+def _history_tensor(values: Sequence[int], *, label: str) -> torch.Tensor:
+    """:func:`_normalize_one_history` for the long committed stream, in C: ``array.array`` refuses a non-integer element
+    and the range check runs vectorised; int64 ``[len]``.  The relaxation against the per-row check: any ``__index__``
+    object (a bool, a numpy int, a 0-dim tensor) passes as its integer value, and an int past 64 bits is a
+    ``TypeError`` rather than the range ``ValueError``; the session's committed stream holds Python ints."""
+
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise TypeError(f"{label} must be a sequence of token IDs")
+    try:
+        packed = array.array("q", values)
+    except (TypeError, OverflowError) as error:
+        raise TypeError(f"{label} must contain only integer token IDs") from error
+    if not packed:
+        return torch.empty(0, dtype=torch.int64)
+    history = torch.frombuffer(packed, dtype=torch.int64)
+    low, high = torch.aminmax(history)
+    if int(low) < 0 or int(high) >= VOCAB_SIZE:
+        raise ValueError(f"{label} contains a token outside [0,{VOCAB_SIZE})")
+    return history
+
+
+def _occurrences(unique: torch.Tensor, inverse: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+    """How often each candidate (``unique[inverse]``: every row's ids) occurs in ``tokens``; int64 of ``inverse``'s
+    shape.  Each token finds its slot among the sorted unique ids, the slots are counted."""
+
+    if not tokens.numel():
+        return torch.zeros_like(inverse)
+    slots = torch.searchsorted(unique, tokens)
+    matched = unique[slots.clamp(max=unique.numel() - 1)] == tokens
+    buckets = torch.where(matched, slots, unique.numel())
+    return torch.bincount(buckets, minlength=unique.numel() + 1)[: unique.numel()][inverse]
+
+
+def _penalize_rows(
+    scores: torch.Tensor,
+    ids: torch.Tensor,
+    committed: torch.Tensor,
+    pass_tokens: tuple[int, ...],
+    p: Qwen38SamplingParameters,
+    *,
+    prompt_tokens: int,
+) -> torch.Tensor:
+    """:func:`_penalize` over every row at once, row j's history ``committed`` then ``pass_tokens[:j + 1]``: the
+    per-row function's operations on the whole tensor, kept where the row's history holds the candidate.  The
+    frequency count is fp32 whatever the scores' dtype, as ``_seen`` builds it."""
+
+    rows = scores.shape[0]
+    unique, inverse = torch.unique(ids, return_inverse=True)
+    split = min(prompt_tokens, committed.numel())  # the committed stream's prompt part ends here
+    index = torch.arange(rows)
+    counted = index.reshape(-1, 1) >= index.reshape(1, -1)  # row j's history holds pass token i <= j
+    in_output = (
+        index >= prompt_tokens - committed.numel()
+    )  # pass token i lies in the output unless the prompt covers it
+    hits = ids.unsqueeze(-1) == torch.tensor(pass_tokens, dtype=torch.int64).reshape(1, 1, rows)  # [rows, n, rows]
+    output_counts = _occurrences(unique, inverse, committed[split:]) + (hits & (counted & in_output).unsqueeze(1)).sum(
+        -1
+    )
+    if p.presence_penalty != 0 or p.frequency_penalty != 0:
+        seen = output_counts > 0
+        if p.presence_penalty != 0:
+            scores = torch.where(seen, scores - p.presence_penalty, scores)
+        if p.frequency_penalty != 0:
+            scores = torch.where(seen, scores - output_counts.to(torch.float32) * p.frequency_penalty, scores)
+    if p.repetition_penalty != 1:
+        prompt_counts = _occurrences(unique, inverse, committed[:split]) + (
+            hits & (counted & ~in_output).unsqueeze(1)
+        ).sum(-1)
+        seen = (prompt_counts + output_counts) > 0
+        scores = torch.where(
+            seen, torch.where(scores < 0, scores * p.repetition_penalty, scores / p.repetition_penalty), scores
+        )
+    return scores
+
+
+def _row_sums(values: torch.Tensor) -> torch.Tensor:
+    """Each row's ``.sum()`` as :func:`_filter` takes it (the full reduction of one vector; its kernel and the
+    last-dimension reduction's need not agree bitwise), ``[rows, 1]``."""
+
+    return torch.stack([row.sum() for row in values]).reshape(-1, 1)
+
+
+def _every_row(rows: Qwen38CandidateRows, error: type[Exception], message: str) -> Qwen38CandidateDistributions:
+    """Every row of the pass raises ``error(message)`` (one instance per row) and holds no tokens."""
+
+    empty = torch.empty((rows.rows, 0), dtype=torch.int64)
+    return Qwen38CandidateDistributions(
+        empty, empty.to(rows.values.dtype), tuple(error(message) for _ in range(rows.rows))
+    )
+
+
+def candidate_distributions(
+    rows: Qwen38CandidateRows,
+    parameters: Qwen38SamplingParameters,
+    *,
+    token_history: Sequence[int] = (),
+    row_tokens: Sequence[int],
+    prompt_tokens: int = 0,
+) -> Qwen38CandidateDistributions:
+    """:func:`candidate_distribution` over the ``rows`` of one MTP pass in one batched pass, bitwise: row j's history is
+    ``token_history + row_tokens[:j + 1]`` (the committed stream, then the pass's ``[t_P, d_1 .. d_j]``), its first
+    ``prompt_tokens`` exempt from the additive penalties.  The checks and fallbacks are the per-row function's: the
+    refusals (``top_k`` above the row's k, temperature 0) are raised here, ``top_k`` 0 and a boosting penalty make
+    every row fall back, the guard and the filters' errors are recorded per row
+    (:attr:`Qwen38CandidateDistributions.outcomes`)."""
+
+    if not isinstance(rows, Qwen38CandidateRows):
+        raise TypeError("rows must be Qwen38CandidateRows")
+    if not isinstance(parameters, Qwen38SamplingParameters):
+        raise TypeError("parameters must be Qwen38SamplingParameters")
+    if parameters.temperature == 0:
+        raise ValueError("a distribution needs temperature > 0 (temperature 0 is the argmax)")
+    count = rows.rows
+    pass_tokens = _normalize_one_history(row_tokens, label="row tokens")
+    if len(pass_tokens) != count:
+        raise ValueError(f"expected one token per row ({count}), got {len(pass_tokens)}")
+    committed = _history_tensor(token_history, label="token history")
+    if parameters.top_k > CANDIDATE_TOP_K_LIMIT:
+        raise Qwen38SamplingError(f"top_k {parameters.top_k} exceeds the candidate limit {CANDIDATE_TOP_K_LIMIT}")
+    if parameters.top_k == 0:
+        return _every_row(rows, Qwen38CandidateFallback, "top_k 0: the nucleus may extend past the candidate row")
+    if parameters.raises_logits:  # every row's history holds at least its own token
+        return _every_row(rows, Qwen38CandidateFallback, "a penalty raises logits: unread tokens are unbounded")
+    shortest = committed.numel() + 1  # row 0's history, the shortest
+    if isinstance(prompt_tokens, bool) or type(prompt_tokens) is not int or not 0 <= prompt_tokens <= shortest:
+        raise ValueError(f"prompt_tokens must be an integer in [0, {shortest}], got {prompt_tokens!r}")
+
+    ids, order = torch.sort(rows.ids.reshape(count, -1), dim=-1)
+    scores = torch.gather(rows.values.reshape(count, -1), 1, order)
+    if parameters.penalizes:
+        scores = _penalize_rows(scores, ids, committed, pass_tokens, parameters, prompt_tokens=prompt_tokens)
+    # _filter along the last dimension
+    scaled = scores / parameters.temperature
+    finite = torch.isfinite(scaled).all(dim=-1)
+    positions = torch.argsort(scaled, dim=-1, descending=True, stable=True)[:, : parameters.top_k]
+    ordered = torch.gather(scaled, 1, positions)
+    probabilities = torch.softmax(ordered, dim=-1)
+    if parameters.top_p < 1:
+        remove = torch.cumsum(probabilities, dim=-1) > parameters.top_p
+        # keep the token that crosses the boundary: the mask shifts one column right
+        remove = torch.cat([torch.zeros((count, 1), dtype=torch.bool), remove[:, :-1]], dim=1)
+        probabilities = probabilities.masked_fill(remove, 0.0)
+        probabilities = probabilities / _row_sums(probabilities)
+    if parameters.min_p > 0:
+        remove = probabilities < parameters.min_p * probabilities[:, :1]  # column 0 holds each row's maximum
+        remove[:, 0] = False
+        probabilities = probabilities.masked_fill(remove, 0.0)
+        probabilities = probabilities / _row_sums(probabilities)
+    positive = torch.isfinite(probabilities).all(dim=-1) & (probabilities.sum(dim=-1) > 0)
+    # _kept_candidates' guard per row
+    floors = rows.shard_floors / parameters.temperature
+    kept_minimum = ordered[:, -1]
+    exact = kept_minimum > floors
+    outcomes: list[Exception | None] = []
+    for row, (is_finite, is_positive, is_exact) in enumerate(zip(finite.tolist(), positive.tolist(), exact.tolist())):
+        if not is_finite:
+            outcomes.append(ValueError("temperature scaling produced non-finite logits"))
+        elif not is_positive:
+            outcomes.append(RuntimeError("the filters removed every finite candidate"))
+        elif not is_exact:
+            outcomes.append(
+                Qwen38CandidateFallback(
+                    f"kept minimum {float(kept_minimum[row])} does not exceed the scaled shard floor {float(floors[row])}"
+                )
+            )
+        else:
+            outcomes.append(None)
+    return Qwen38CandidateDistributions(torch.gather(ids, 1, positions), probabilities, tuple(outcomes))
+
+
 class Qwen38TTNNHostSampler:
     """Provenance-bound TP4 sampler for one already-open, qualified mesh.
 
@@ -1244,8 +1516,10 @@ __all__ = [
     "CANDIDATE_TOP_K_LIMIT",
     "EXPECTED_VOCAB_RANGES",
     "MAX_TOP_LOGPROBS",
+    "Qwen38CandidateDistributions",
     "Qwen38CandidateFallback",
     "Qwen38CandidateRow",
+    "Qwen38CandidateRows",
     "Qwen38CandidateSample",
     "Qwen38RowDistribution",
     "Qwen38SampledTokens",
@@ -1258,6 +1532,7 @@ __all__ = [
     "UNIFORM_BITS",
     "UniformStream",
     "candidate_distribution",
+    "candidate_distributions",
     "full_distribution",
     "sample_candidates",
     "sample_full_vocabulary",

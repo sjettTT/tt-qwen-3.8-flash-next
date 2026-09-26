@@ -1996,8 +1996,10 @@ def forward_draft_lanes(
             ids = [_lane(first_draft, lane), *(_lane(row, lane) for row in step_rows)]
             token_pieces += [_lane(next_token, lane), *ids]
             draft_pieces += [*ids, draft.sentinel_lane]
-        token_lanes = ttnn.concat([*token_pieces, verify.constants.sentinel_tail], dim=3, memory_config=dram)
-        draft_lanes = ttnn.concat([*draft_pieces, verify.constants.sentinel_tail], dim=3, memory_config=dram)
+        # the tail past B*R is absent when the lanes fill the tile (B * R == 32: 8 lanes at k = 3)
+        tail = [] if verify.constants.sentinel_tail is None else [verify.constants.sentinel_tail]
+        token_lanes = ttnn.concat([*token_pieces, *tail], dim=3, memory_config=dram)
+        draft_lanes = ttnn.concat([*draft_pieces, *tail], dim=3, memory_config=dram)
         pass_row = ttnn.concat([readback, token_lanes], dim=3, memory_config=dram)
         for name, row, shape in (
             ("assembled lane verify token lanes", token_lanes, TOKEN_ROW_SHAPE),

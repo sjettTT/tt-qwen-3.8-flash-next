@@ -120,7 +120,7 @@ in a form the warm pass had not compiled; the same change fixes both paths.
 
 Sampled requests and MTP drafting: on an `--mtp` `--sampling` server the pass loop drafts for sampled requests by
 default (`QWEN38_MTP_SAMPLED` unset or `1`; `QWEN38_MTP_SAMPLED=0` in the server's environment restores the plain
-sampled path, the fused verify with sampled requests on the 1-row sampled loop; the launcher passes the variable
+sampled path, the fused verify alone with sampled requests on the 1-row sampled loop; the launcher passes the variable
 through; a server without `--mtp` or without `--sampling` has no drafting for sampled requests and refuses an
 explicit `1` at start), by exact speculative sampling: the device drafts by argmax as for a greedy request, and the
 host accepts draft `d` at a verify row with probability `p(d)` under the request's own
@@ -134,14 +134,31 @@ vocabulary, counted in
 `qwen38.sampling.mtp.fallbacks`).  Requests the rows cannot bound every step (`top_k` 0, a penalty that raises logits)
 and `logprobs` requests stay on the 1-row loop; `qwen38.sampling.mtp_drafting` says which loop served the request and
 why, `qwen38.sampling.mtp` carries its passes, accepted drafts, draws and fallbacks, and every field of `qwen38.mtp`
-(passes, accepted drafts, tokens per pass; with the split verify the greedy passes checked against the device lanes
-and the sampled passes with their draws and fallbacks) counts that request alone; `/health.mtp` carries the same
-counters cumulative since the server started, `/health.mtp.sampled` the switch.
+(passes, accepted drafts, tokens per pass; with the split verify captured also the sampled passes with their draws
+and fallbacks, and `accept_checks`, the greedy passes decided on the host: 0 on the served path) counts that request
+alone; `/health.mtp` carries the same
+counters cumulative since the server started, `/health.mtp.sampled` the switch.  `/health.mtp.admission` is the DRAM
+admission the server opened under: the free bytes per bank the resident build leaves after its captures, the estimate
+of the MTP chain's growth per bank by part (`components`: the 49th BF4 pair and the layer's weights beyond it;
+`states`: the layer's QSA state at the context and the states of `k`'s verify MoE form, 5 rows for k = 3 and 4, 32 rows
+for k = 5; `traces`: one verify form's, plus a verify and a draft trace per further form, up to three; `verify_forms` counts
+the forms the chain captures and `verify_forms_captured` names them, `["fused"]` or, with drafting for sampled
+requests on, `["fused", "split"]`), every remainder
+carrying a 10 % margin (4x p150
+line, 2026-09-25: k = 4 with both verify forms 50,468,032 + 12,938,112 + 11,107,904, k = 5 with the split verify
+50,468,032 + 20,920,192 + 6,390,144), and `fits`; `/health.mtp.dram_bytes_per_bank` is the growth the open measured,
+refused above the estimate.
 A `seed` reproduces a stream against the same `system_fingerprint`, which carries the switch and `k`: with drafting
 on, the pass loop consumes the request's draws in the pass's order, so the seed reproduces the drafting stream, not
-the 1-row loop's stream (the 1-row stream is the `QWEN38_MTP_SAMPLED=0` server's).  With drafting on a greedy request
-runs the same split pass with the device's own verdict written back and is bitwise the fused pass's stream.
+the 1-row loop's stream (the 1-row stream is the `QWEN38_MTP_SAMPLED=0` server's).  With drafting on the chain holds
+both verify forms: a greedy request runs the fused verify, the pinned greedy stream (the traces the
+`QWEN38_MTP_SAMPLED=0` server runs, bitwise), and a sampled request the split form, the host deciding between its head
+and its tail.
 `--mtp-gdn-anchor layer0` (a server flag) re-anchors the layer-0 GDN state from the 1-row recurrence.
+Since 2026-09-25 the `--mtp` admission reads the mesh allocator's free bytes per DRAM bank after the resident weights
+are built (less the build's own remaining state and traces) and refuses only when the MTP pair, state and growth
+estimate for k and the verify forms do not fit there; the 2026-09-04 free-after-captures table is the no-device fallback and is logged, not enforced,
+before the mesh opens.
 
 ## The prompt, follow-up turns and the prompt-end snapshot
 

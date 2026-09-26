@@ -84,6 +84,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     Qwen38ChatSession,
     construct_chain,
     mtp_capacity_admission,
+    mtp_verify_forms,
     open_partition_b_mesh,
     resolve_route,
     template_decoder,
@@ -164,11 +165,11 @@ def _log(event: str, **fields: Any) -> None:
     print(json.dumps({"utc": utc_now(), "event": event, **fields}, sort_keys=True), flush=True)
 
 
-# MTP drafting for sampled requests: on by default on an --mtp --sampling server (the split verify is captured and the
-# pass loop drafts for sampled requests by exact speculative sampling); QWEN38_MTP_SAMPLED=0 restores the plain sampled
-# path (the fused verify, sampled requests on the 1-row loop).  A server without --mtp or without --sampling has no
-# drafting for sampled requests: unset resolves to off there and an explicit 1 is refused at start.  Any other value is
-# refused.
+# MTP drafting for sampled requests: on by default on an --mtp --sampling server (the split verify is captured beside
+# the fused one: greedy requests run the fused verify, the pass loop drafts for sampled requests through the split form
+# by exact speculative sampling); QWEN38_MTP_SAMPLED=0 restores the plain sampled path (the fused verify alone, sampled
+# requests on the 1-row loop).  A server without --mtp or without --sampling has no drafting for sampled requests: unset
+# resolves to off there and an explicit 1 is refused at start.  Any other value is refused.
 MTP_SAMPLED_VARIABLE = "QWEN38_MTP_SAMPLED"
 
 
@@ -1729,16 +1730,19 @@ def main() -> int:
     template = Qwen38OfficialChatTemplate(prepared.checkpoint.root)
     records = load_acceptance_records(args.acceptance_prompts) if args.acceptance_prompts is not None else []
     resident_context = Qwen38ResidentContext(args.allocated_context)
-    # MTP is refused where the resident build's admission table says its pair, state and chain do not fit.
-    mtp_admission = None if args.mtp is None else mtp_capacity_admission(resident_context.allocated_context)
-    if mtp_admission is not None and not mtp_admission["fits"]:
-        raise SystemExit(
-            f"--mtp {args.mtp} does not fit at --allocated-context {resident_context.allocated_context}: the resident "
-            f"build leaves {mtp_admission['free_bytes_per_bank_after_captures']} free bytes per DRAM bank "
-            f"({mtp_admission['largest_contiguous_bytes_free_per_bank_after_captures']} contiguous) after its captures, "
-            f"the MTP chain needs {mtp_admission['required_free_bytes_per_bank']} "
-            f"({mtp_admission['required_largest_contiguous_bytes_per_bank']} contiguous): {mtp_admission}"
-        )
+    # The MTP admission decides on the live allocator once the resident weights are built (the chain's open,
+    # Qwen38TracedChain.open); the 2026-09-04 table is the no-device fallback, logged here for the record, never a
+    # refusal before the mesh opens.  The table row counts the verify forms the open will capture (one table, the
+    # switch), so its record and the live decision's agree on them.
+    forms = mtp_verify_forms(mtp_sampled)
+    mtp_admission_table = (
+        None
+        if args.mtp is None
+        else mtp_capacity_admission(resident_context.allocated_context, drafts=args.mtp, verify_forms=len(forms))
+    )
+    if mtp_admission_table is not None:
+        mtp_admission_table["verify_forms_captured"] = list(forms)
+        _log("mtp_admission_table_fallback", **mtp_admission_table)
     summary = {
         "mode": "chat_server_single_trace_chain",
         "model": MODEL_ID,
@@ -1794,7 +1798,8 @@ def main() -> int:
         "mtp": {
             "k": args.mtp,
             "anchor": args.mtp_gdn_anchor if args.mtp is not None else None,
-            "admission": mtp_admission,
+            "admission": None,  # the chain's live admission once it opens (report["mtp"]["admission"])
+            "admission_table_fallback": mtp_admission_table,
             "sampled": mtp_sampled,
         },
         # What a seed reproduces against: the source head and the runtime; with the pass loop drafting for sampled
@@ -1905,6 +1910,17 @@ def main() -> int:
             raise Qwen38ChatChainError(f"session mtp {session.mtp is not None} vs requested {args.mtp}")
         if session.mtp is not None and session.mtp.sampled != mtp_sampled:
             raise Qwen38ChatChainError(f"session mtp sampled {session.mtp.sampled} vs requested {mtp_sampled}")
+        if chain.mtp is not None:
+            report["mtp"]["admission"] = chain.mtp.admission
+        if session.mtp is not None and (
+            session.mtp.admission["verify_forms"] != mtp_admission_table["verify_forms"]
+            or session.mtp.admission["verify_forms_captured"] != mtp_admission_table["verify_forms_captured"]
+        ):
+            raise Qwen38ChatChainError(
+                f"the chain's live admission counts {session.mtp.admission['verify_forms']} verify form(s) "
+                f"{session.mtp.admission['verify_forms_captured']}, the table fallback evaluated "
+                f"{mtp_admission_table['verify_forms']} {mtp_admission_table['verify_forms_captured']}"
+            )
         if session.context_limit != resident_context.context_limit:
             raise Qwen38ChatChainError(
                 f"session context limit {session.context_limit} vs the build's {resident_context.context_limit}"

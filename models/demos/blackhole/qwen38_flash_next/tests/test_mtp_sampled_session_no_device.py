@@ -4,8 +4,10 @@
 """The sampled MTP pass loop of the chat session on a scripted chain (no device).
 
 A fake device model (deterministic logits per history) and a fake drafter (the model's argmax, wrong every third
-draft) stand behind the chain primitives the session calls; the chain runs the split verify's contract: the head's
-readback (argmaxes, the device's greedy verdict, the per-row candidate rows) goes to the host's ``decide``, the
+draft) stand behind the chain primitives the session calls; the chain runs both verify forms' contracts as the served
+chain routes them (``mtp_enter``): a greedy request's passes run the fused form (the device's verdict inside the body,
+no head readback, no host decision), a sampled request's the split form (the head's readback: argmaxes, the device's
+greedy verdict, the per-row candidate rows, goes to the host's ``decide``, whose verdict the tail lands); either way the
 decision's rows are committed at the next pass or at the leave.  What is pinned: the greedy pass loop still gives
 the greedy stream; the sampled pass loop gives the stream the design's algorithm produces from the same rows and
 draws (the host re-derivation), every emitted token has positive probability under the target's conditional at its
@@ -17,6 +19,7 @@ the admission refuses what the rows cannot bound.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -67,7 +70,8 @@ def _draft_for(history: list[int], *, eos_at: int | None = None) -> int:
 
 
 class FakeMTPChain:
-    """The traced chain's primitives over the fake model: the 1-row steps, the pass loop with the split verify."""
+    """The traced chain's primitives over the fake model: the 1-row steps, the pass loop in both verify forms
+    (``decide`` None: the fused one; a callable: the split one), logged as ``pass:<form>:<accepted>``."""
 
     allocated_context = 32_768
     chunk_trace_id = 1  # the chunked mode is available; prompts below CHUNK_PREFILL_MIN_ROWS take the forced path
@@ -158,24 +162,33 @@ class FakeMTPChain:
             [Qwen38CandidateRow.emulate(logits).to_host_row().reshape(-1) for logits in rows_logits]
         )
         self.head_full_rows = torch.stack([logits.to(torch.float32) for logits in rows_logits])
-        head = mtp_v2.Qwen38TTNNVerifyHeadReadback(accepted, argmaxes[accepted], tuple(argmaxes), candidate_rows)
-        decision = self.decide(tokens, head)
-        self.pending_rows = tokens[: decision.accepted + 1]  # committed at the next pass or at the leave
-        chain_history = history + self.pending_rows + [decision.next_token]
+        if self.decide is None:
+            # The fused verify: the device's (a, t') and its argmax lanes land in the body; no head readback.
+            decision = None
+            accepted_star, next_token, alignment = accepted, argmaxes[accepted], tuple(argmaxes)
+            self.head_full_rows = None
+        else:
+            # The split verify: the head's readback to the host's decide, its verdict written back before the tail.
+            head = mtp_v2.Qwen38TTNNVerifyHeadReadback(accepted, argmaxes[accepted], tuple(argmaxes), candidate_rows)
+            decision = self.decide(tokens, head)
+            accepted_star, next_token = decision.accepted, decision.next_token
+            alignment = tuple(decision.alignment_tokens)
+        self.pending_rows = tokens[: accepted_star + 1]  # committed at the next pass or at the leave
+        chain_history = history + self.pending_rows + [next_token]
         drafts: list[int] = []
         for _ in range(K):
             drafts.append(_draft_for(chain_history + drafts, eos_at=self.eos_at))
-        self.next_tokens = [decision.next_token, *drafts]
+        self.next_tokens = [next_token, *drafts]
         self.passes += 1
-        self.log.append(f"pass:{decision.accepted}")
+        self.log.append(f"pass:{'fused' if decision is None else 'split'}:{accepted_star}")
         return mtp_v2.Qwen38TTNNMTPPassRecord(
             index=self.passes - 1,
             position=len(history),
             tokens=tuple(tokens),
-            accepted=decision.accepted,
-            committed=(*tokens[1 : decision.accepted + 1], decision.next_token),
-            argmaxes=tuple(decision.alignment_tokens),
-            next_token=decision.next_token,
+            accepted=accepted_star,
+            committed=(*tokens[1 : accepted_star + 1], next_token),
+            argmaxes=alignment,
+            next_token=next_token,
             first_draft=drafts[0],
             finished=False,
             segments_ns={},
@@ -187,7 +200,7 @@ class FakeMTPChain:
             raise session_module.Qwen38ChatChainError("the MTP pass loop is already active")
         if decide is not None and not self.mtp.sampled:
             raise session_module.Qwen38ChatChainError("a host decision needs the split verify")
-        self.decide = mtp_v2.decide_greedy if decide is None else decide
+        self.decide = decide  # None: the fused traces (no host decision); a callable: the split traces
         self.mtp.chain = self
         self.log.append("enter")
         return self.mtp.record(self._pass([first_token] + [session_module.MTP_BOOTSTRAP_DRAFT_TOKEN] * K))
@@ -277,15 +290,22 @@ def _expected_sampled_stream(prompt: list[int], parameters: Qwen38SamplingParame
     return emitted[:count]
 
 
-# --- the greedy pass loop is unchanged on the split chain ---------------------------------------------------------------
+# --- the greedy pass loop runs the fused verify on the sampled-capable chain --------------------------------------------
 
 
-def test_greedy_request_on_the_split_chain_gives_the_greedy_stream() -> None:
+def _pass_forms(chain: FakeMTPChain) -> set[str]:
+    return {entry.split(":")[1] for entry in chain.log if entry.startswith("pass:")}
+
+
+def test_greedy_request_on_the_sampled_capable_chain_runs_the_fused_verify_and_gives_the_greedy_stream() -> None:
     session, chain = _session()
     completion = session.complete(PROMPT, 14, stop_ids=())
     assert completion.token_ids == _greedy_stream(PROMPT, 14)
     assert completion.finish_reason == "length" and completion.mtp["passes"] >= 2
-    assert completion.mtp["sampled"] is True and completion.mtp["accept_checks"] == chain.passes
+    # Every pass ran the fused form: no host decision, so no greedy split pass was checked (accept_checks 0; the
+    # field stays in the response of a sampled-capable chain).
+    assert _pass_forms(chain) == {"fused"} and chain.decide is None and chain.head_full_rows is None
+    assert completion.mtp["sampled"] is True and completion.mtp["accept_checks"] == 0
     assert session.committed == PROMPT + completion.token_ids[:-1] and chain.inputs == session.committed
     assert chain.row == completion.token_ids[-1]  # length: the last token unconsumed in the row
     assert not any(entry == "read_row" for entry in chain.log)  # the greedy loop never reads the candidate row
@@ -326,6 +346,7 @@ def test_sampled_request_drafts_and_gives_the_host_re_derived_stream() -> None:
         completion = session.complete(PROMPT, 16, stop_ids=(), sampling=request)
         assert request.mtp_drafting == "drafted" and completion.finish_reason == "length"
         assert completion.token_ids == _expected_sampled_stream(PROMPT, parameters, 16), seed
+        assert _pass_forms(chain) == {"split"}  # every pass of a sampled request through the split form
         _law_holds(PROMPT, completion.token_ids, parameters)
         assert completion.mtp["passes"] == request.mtp.passes == chain.passes >= 2
         assert completion.mtp["sampled_passes"] == chain.passes and completion.mtp["accept_checks"] == 0
@@ -484,6 +505,8 @@ def test_chain_mtp_summary_carries_the_split_counters() -> None:
     )
     assert set(mtp.summary()) == {"k", "anchor", "sampled", "passes", "accepted_drafts", "tokens_per_pass"}
     mtp.sampled = True
+    # A greedy split pass decided on the host (decide_greedy's record): a diagnostic's, not the served path's, whose
+    # greedy requests run the fused traces; the counter still counts it.
     greedy = mtp_v2.Qwen38TTNNVerifyDecision(2, 9, (7, 8, 9, 1, 2), {"accept_checks": 1})
     sampled = mtp_v2.Qwen38TTNNVerifyDecision(
         1,
@@ -514,6 +537,103 @@ def test_chain_mtp_summary_carries_the_split_counters() -> None:
     assert since["sampled_fallbacks"] == 1 and since["tokens_per_pass"] == since["sampled_tokens_per_pass"] == 2.0
     assert set(snapshot) == set(session_module.Qwen38ChainMTP.COUNTERS) and snapshot["passes"] == 1
     assert mtp.captured_trace_ids() == []
+
+
+def test_chain_mtp_captured_trace_ids_cover_both_forms_and_the_shared_commit_once() -> None:
+    mtp = session_module.Qwen38ChainMTP(
+        drafts=4, anchor="off", components=None, verify=None, draft=None, step_inputs=None, chunk_extension=None
+    )
+    assert mtp.captured_trace_ids() == []
+    mtp.traces = mtp_v2.Qwen38TTNNMTPTraces(verify_first=1, draft=2, commit=3)
+    assert mtp.captured_trace_ids() == [1, 3, 2]  # the switch off: the fused form alone
+    mtp.sampled = True
+    mtp.split_traces = mtp_v2.Qwen38TTNNMTPTraces(verify_first=None, draft=6, commit=3, verify_head=4, verify_tail=5)
+    # The switch on: the fused form's traces first, then the split form's, the shared commit once (close() releases
+    # every id of this list exactly once).
+    assert mtp.captured_trace_ids() == [1, 3, 2, 4, 5, 6]
+    assert len(set(mtp.captured_trace_ids())) == 6
+
+
+def test_traced_chain_mtp_enter_routes_greedy_to_the_fused_traces_and_sampled_to_the_split_ones(monkeypatch) -> None:
+    """The routing point of the hardware chain (its device calls replaced): a greedy request's pass loop is built on
+    the fused traces with no head output and no host decision, a sampled request's on the split traces with the
+    head output and its ``decide``; the eager switch in happens either way."""
+
+    built: list[dict] = []
+    entered: list[dict] = []
+
+    class RecordingChain:
+        def __init__(
+            self, model, verify, draft, traces, verify_output, *, replay, position, enqueue, head_output, decide
+        ):
+            built.append(
+                dict(
+                    model=model,
+                    verify=verify,
+                    draft=draft,
+                    traces=traces,
+                    verify_output=verify_output,
+                    replay=replay,
+                    position=position,
+                    enqueue=enqueue,
+                    head_output=head_output,
+                    decide=decide,
+                )
+            )
+
+        def bootstrap(self, tokens):
+            return SimpleNamespace(accepted=0, decision=None, tokens=tuple(tokens))
+
+    monkeypatch.setattr(mtp_v2, "Qwen38TTNNMTPChain", RecordingChain)
+    monkeypatch.setattr(mtp_v2, "enter_verify_mode", lambda *args, **kwargs: entered.append(kwargs))
+    fused = mtp_v2.Qwen38TTNNMTPTraces(verify_first=1, draft=2, commit=3)
+    split = mtp_v2.Qwen38TTNNMTPTraces(verify_first=None, draft=6, commit=3, verify_head=4, verify_tail=5)
+    mtp = session_module.Qwen38ChainMTP(
+        drafts=K,
+        anchor="off",
+        components=None,
+        verify="verify",
+        draft="draft",
+        step_inputs=None,
+        chunk_extension=None,
+        traces=fused,
+        verify_output="fused-row",
+        sampled=True,
+        split_traces=split,
+        split_verify_output="tail-row",
+        head_output="head",
+    )
+    chain = object.__new__(session_module.Qwen38TracedChain)
+    chain.mtp = mtp
+    chain.built_target = SimpleNamespace(model="model")
+    chain.state = SimpleNamespace(position=SimpleNamespace(read=lambda: 7))
+    record = chain.mtp_enter(11, (3, 4))
+    assert record.tokens == (11, *[session_module.MTP_BOOTSTRAP_DRAFT_TOKEN] * K) and mtp.passes == 1
+    assert entered == [{"position": 7, "ple_context": (3, 4)}] and isinstance(mtp.chain, RecordingChain)
+    greedy = built[-1]
+    assert greedy["traces"] is fused and greedy["verify_output"] == "fused-row" and greedy["head_output"] is None
+    assert greedy["decide"] is mtp_v2.decide_greedy and greedy["position"] == 7
+    assert (greedy["model"], greedy["verify"], greedy["draft"]) == ("model", "verify", "draft")
+    assert greedy["replay"] == chain._replay and greedy["enqueue"] == chain._enqueue
+    with pytest.raises(session_module.Qwen38ChatChainError, match="already active"):
+        chain.mtp_enter(11, None)
+    mtp.chain = None
+    decide = lambda tokens, head: None  # noqa: E731
+    chain.mtp_enter(11, None, decide=decide)
+    sampled = built[-1]
+    assert sampled["traces"] is split and sampled["verify_output"] == "tail-row" and sampled["head_output"] == "head"
+    assert sampled["decide"] is decide and mtp.passes == 2 and len(entered) == 2
+    # A host decision needs the split form: refused with the switch off, and without the split traces.
+    mtp.chain = None
+    mtp.sampled = False
+    with pytest.raises(session_module.Qwen38ChatChainError, match="host decision"):
+        chain.mtp_enter(11, None, decide=decide)
+    mtp.sampled, mtp.split_traces = True, None
+    with pytest.raises(session_module.Qwen38ChatChainError, match="host decision"):
+        chain.mtp_enter(11, None, decide=decide)
+    assert len(built) == 2 and len(entered) == 2  # neither refusal reached the switch or built a chain
+    chain.mtp_enter(11, None)  # the greedy route needs no split traces
+    assert built[-1]["traces"] is fused and built[-1]["head_output"] is None
 
 
 PROMPT_B = [12, 23, 34, 45, 56, 67]
@@ -548,9 +668,9 @@ def test_consecutive_requests_report_their_own_counters_and_the_chain_summary_th
     assert set(greedy.mtp) == set(sampled.mtp) == set(again.mtp) == MTP_RESPONSE_KEYS
     assert greedy.mtp["passes"] >= 2 and sampled.mtp["passes"] >= 2 and again.mtp["passes"] >= 1
     assert greedy.mtp["passes"] + sampled.mtp["passes"] + again.mtp["passes"] == chain.passes
-    # The greedy requests: every pass of the request checked against the device lanes, nothing sampled.
+    # The greedy requests: every pass through the fused form (no host decision to check), nothing sampled.
     for completion in (greedy, again):
-        assert completion.mtp["accept_checks"] == completion.mtp["passes"]
+        assert completion.mtp["accept_checks"] == 0 and completion.mtp["passes"] >= 1
         assert completion.mtp["sampled_passes"] == completion.mtp["sampled_accepted_drafts"] == 0
         assert completion.mtp["sampled_draws"] == completion.mtp["sampled_fallbacks"] == 0
         assert completion.mtp["sampled_tokens_per_pass"] is None
@@ -565,6 +685,7 @@ def test_consecutive_requests_report_their_own_counters_and_the_chain_summary_th
         == request.mtp.as_dict()["tokens_per_pass"]
         == round((request.mtp.passes + request.mtp.accepted_drafts) / request.mtp.passes, 4)
     )
+    assert _pass_forms(chain) == {"fused", "split"}  # both forms served on one chain
     # The chain's summary: the totals, field by field.
     health = chain.mtp.summary()
     assert set(health) == MTP_RESPONSE_KEYS and health["sampled"] is True and health["passes"] == chain.passes

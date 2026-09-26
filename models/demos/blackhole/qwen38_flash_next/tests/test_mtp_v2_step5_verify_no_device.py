@@ -884,6 +884,10 @@ def test_moe_row_admission_and_flags_are_untouched() -> None:
     assert moe_module.ROWS5_HARDWARE_PROVEN is True and moe_module.ROWS32_HARDWARE_PROVEN is True
     assert [mtp_v2.moe_rows_for(k + 1) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, 32]
     assert mtp_v2.SUPPORTED_DRAFTS == (3, 4, 5) and mtp_v2.DEFAULT_DRAFTS == 4
+    # The 32-row form holds every k up to 31 (the DRAM admission's estimate keys k = 5..8 by it); the QSA verify path
+    # caps a pass at VERIFY_MAX_ROWS = 6 rows, so k = 5 is the largest draft count the verify runs.
+    assert [mtp_v2.moe_rows_for(k + 1) for k in range(5, 9)] == [32, 32, 32, 32] and mtp_v2.moe_rows_for(32) == 32
+    assert max(mtp_v2.SUPPORTED_DRAFTS) + 1 == qsa_module.VERIFY_MAX_ROWS
     with pytest.raises(ValueError):  # allow-pytest.raises: the row bound is a contract
         mtp_v2.moe_rows_for(33)
     # An explicit override (the runner's argument) is admitted for the instance it constructs, nothing else.

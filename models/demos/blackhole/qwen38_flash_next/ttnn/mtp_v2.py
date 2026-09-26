@@ -88,6 +88,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.ple import (
     Qwen38TTNNPLERowsState,
 )
 
+# k = 3 and 4 run the 5-row verify MoE form, k = 5 the 32-row form (``moe_rows_for``, which holds every k up to 31);
+# the QSA verify path admits k + 1 <= qsa.VERIFY_MAX_ROWS = 6 rows per pass (two compressed blocks completed, two KV
+# blocks spanned, so the op sequence never depends on P), so k = 5 is the largest draft count until that path is
+# proven wider on silicon.
 SUPPORTED_DRAFTS = (3, 4, 5)
 DEFAULT_DRAFTS = 4
 RESIDUAL_ROWS_SHAPE = (1, RESIDUAL_BRANCHES, CHUNK_ROWS, LOCAL_HIDDEN_SIZE)
@@ -495,8 +499,9 @@ class Qwen38TTNNVerifyReadback:
 
 
 def moe_rows_for(rows: int) -> int:
-    """The smallest admitted MoE row count that holds ``rows`` (5 for k = 3 and 4; 32 for k = 5: the two verify
-    forms proven on silicon); a verify pass is one 32-row tile, so the 128-row prefill form is not a candidate."""
+    """The smallest admitted MoE row count that holds ``rows`` (5 for k = 3 and 4; 32 for rows 6..32, k = 5 today:
+    the two verify forms proven on silicon); a verify pass is one 32-row tile, so the 128-row prefill form is not a
+    candidate."""
 
     # The verify forms proven on silicon: 5 and 32 rows.  SUPPORTED_ROWS also admits the batched lanes' 1..32, which
     # are not verify candidates (the choice is pinned by the MTP tables).
