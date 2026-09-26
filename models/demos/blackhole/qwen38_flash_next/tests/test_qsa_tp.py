@@ -13,6 +13,8 @@ Run:  pytest models/demos/blackhole/qwen38_flash_next/tests/test_qsa_tp.py -v -s
 Env:  MODEL_WEIGHTS_DIR, MESH_DEVICE="(1, 4)"; QWEN38_CACHE_ROOT optional (component cache reuse)
 """
 
+import os
+
 import pytest
 import torch
 from loguru import logger
@@ -25,6 +27,11 @@ from models.demos.blackhole.qwen38_flash_next.tt.qsa import Qwen38QSA, Qwen38QSA
 from models.demos.blackhole.qwen38_flash_next.ttnn.builder import RESIDENT_DEFAULT_QSA_CACHE_CAPACITY
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE
 from models.demos.blackhole.qwen38_flash_next.ttnn.qsa import COMPRESS_RATIO, Qwen38TTNNQSA, Qwen38TTNNQSAWeights
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("QWEN38_FUSED_DEVICE_TEST") != "1",
+    reason="a device test: set QWEN38_FUSED_DEVICE_TEST=1 on a held four-die line (the no-device sets are masked)",
+)
 
 POSITIONS = 6
 

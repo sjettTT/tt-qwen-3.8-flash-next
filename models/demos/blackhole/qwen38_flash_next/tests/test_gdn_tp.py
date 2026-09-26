@@ -10,6 +10,8 @@ Run:  pytest models/demos/blackhole/qwen38_flash_next/tests/test_gdn_tp.py -v -s
 Env:  MODEL_WEIGHTS_DIR, MESH_DEVICE="(1, 4)"; QWEN38_CACHE_ROOT optional (component cache reuse)
 """
 
+import os
+
 import pytest
 import torch
 from loguru import logger
@@ -20,6 +22,11 @@ from models.demos.blackhole.qwen38_flash_next.tests.tp_harness import DEVICE_PAR
 from models.demos.blackhole.qwen38_flash_next.tt.gdn import Qwen38GDN, Qwen38GDNWeights
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE
 from models.demos.blackhole.qwen38_flash_next.ttnn.gdn import Qwen38TTNNGDN, Qwen38TTNNGDNWeights
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("QWEN38_FUSED_DEVICE_TEST") != "1",
+    reason="a device test: set QWEN38_FUSED_DEVICE_TEST=1 on a held four-die line (the no-device sets are masked)",
+)
 
 POSITIONS = 4
 

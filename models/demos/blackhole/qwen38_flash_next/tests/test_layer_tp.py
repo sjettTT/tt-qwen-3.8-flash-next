@@ -13,6 +13,8 @@ Env:  MODEL_WEIGHTS_DIR, MESH_DEVICE="(1, 4)", QWEN38_CACHE_ROOT (skipped withou
       QWEN38_BF4_CORPUS_VERIFICATION when the experts come from the CPU-staged corpus
 """
 
+import os
+
 import pytest
 import torch
 from loguru import logger
@@ -24,6 +26,11 @@ from models.demos.blackhole.qwen38_flash_next.tt.layer import Qwen38DecoderLayer
 from models.demos.blackhole.qwen38_flash_next.tt.model import text_rope
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE
 from models.demos.blackhole.qwen38_flash_next.ttnn.layer import Qwen38TTNNLayerType
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("QWEN38_FUSED_DEVICE_TEST") != "1",
+    reason="a device test: set QWEN38_FUSED_DEVICE_TEST=1 on a held four-die line (the no-device sets are masked)",
+)
 
 POSITIONS = 3
 RESIDUAL_WIDTH = RESIDUAL_BRANCHES * HIDDEN_SIZE
