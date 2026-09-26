@@ -1648,9 +1648,12 @@ def resolve_route(hardware_profile: ResidentHardwareProfile) -> tuple[ResidentHa
     return hardware_profile, derivation
 
 
-def open_partition_b_mesh(marker: Marker, hardware_profile: ResidentHardwareProfile) -> tuple[Any, dict]:
+def open_partition_b_mesh(
+    marker: Marker, hardware_profile: ResidentHardwareProfile, *, command_queues: int = 1
+) -> tuple[Any, dict]:
     """The runner's mesh open for one lane: the profile's route derivation, FABRIC_1D, one 1D four-device mesh as
-    the logical 1x4.
+    the logical 1x4.  ``command_queues`` (1 by default: the open call as it always was) opens a second queue for the
+    MTP pass's early rows read (``QWEN38_MTP_PLE_EARLY``); nothing but buffer reads may ever run on it.
 
     Same calls and checks as ``run()`` of the timing runner on a larger
     host (its partition-B values are the profile's defaults, hence the
@@ -1662,6 +1665,8 @@ def open_partition_b_mesh(marker: Marker, hardware_profile: ResidentHardwareProf
     before re-raising, so the caller owns the fabric only once this returns.
     """
 
+    if isinstance(command_queues, bool) or type(command_queues) is not int or command_queues not in (1, 2):
+        raise Qwen38ChatChainError(f"the mesh opens with 1 or 2 command queues, got {command_queues!r}")
     lane = f"{hardware_profile.host} partition-{hardware_profile.partition.upper()}"
     discovered = (int(ttnn.GetNumAvailableDevices()), int(ttnn.get_num_pcie_devices()), int(ttnn.get_num_devices()))
     if discovered != (4, 4, 4):
@@ -1692,6 +1697,7 @@ def open_partition_b_mesh(marker: Marker, hardware_profile: ResidentHardwareProf
             physical_device_ids=list(route),
             l1_small_size=24576,
             trace_region_size=0,
+            **({"num_command_queues": command_queues} if command_queues != 1 else {}),
         )
         if tuple(int(value) for value in mesh.shape) != MESH_SHAPE:
             mesh.reshape(ttnn.MeshShape(*MESH_SHAPE))
@@ -1705,6 +1711,7 @@ def open_partition_b_mesh(marker: Marker, hardware_profile: ResidentHardwareProf
         raise
     return mesh, {
         "partition": hardware_profile.partition,
+        "command_queues": command_queues,
         "device_nodes": list(hardware_profile.device_nodes),
         "physical_open_shape": list(physical_shape),
         "logical_mesh_shape": list(MESH_SHAPE),
@@ -1764,6 +1771,11 @@ class Qwen38ChainMTP:
     device_accept: bool = False
     sampled_traces: mtp_v2.Qwen38TTNNMTPTraces | None = None  # verify_sampled, its draft; commit = traces'
     sampled_verify_output: mtp_v2.Qwen38TTNNVerifyOutput | None = None
+    # The early rows read (QWEN38_MTP_PLE_EARLY, the server's default with --mtp since 2026-09-26; the mesh opened with
+    # two command queues): the fused and the device-decided pass loops read the verify lanes on the second queue and
+    # look the next pass's PLE rows 0-1 up under the draft (mtp_v2.Qwen38TTNNEarlyRowsReader); the host-decided split
+    # keeps its order.  False here = the one-queue form (a caller that did not ask; QWEN38_MTP_PLE_EARLY=0).
+    ple_early: bool = False
     # Greedy split passes whose host decision (decide_greedy) was checked against the device lanes.  The served path
     # routes greedy requests to the fused traces, so it stays 0 there; a caller running the split form with
     # decide_greedy (a diagnostic) counts here.
@@ -2121,6 +2133,11 @@ class Qwen38TracedChain:
         else:
             traces, verify_output = mtp.split_traces, mtp.split_verify_output
             head_output, decision = mtp.head_output, decide
+        early_reader = None
+        if mtp.ple_early and decide is None:
+            # The fused and the device-decided forms: the verify lanes read on the second queue under the draft.
+            # The host-decided split keeps today's order (its head readback blocks the host before the tail).
+            early_reader = mtp_v2.Qwen38TTNNEarlyRowsReader(self.mesh, verify_output.readback, cq_id=1, main_cq_id=0)
         mtp.chain = mtp_v2.Qwen38TTNNMTPChain(
             model,
             mtp.verify,
@@ -2134,6 +2151,7 @@ class Qwen38TracedChain:
             decide=decision,
             before_verify_sampled=before_verify_sampled,
             record_candidate_rows=record_candidate_rows,
+            early_reader=early_reader,
         )
         return mtp.record(mtp.chain.bootstrap([first_token] + [MTP_BOOTSTRAP_DRAFT_TOKEN] * mtp.drafts))
 
@@ -2189,6 +2207,7 @@ class Qwen38TracedChain:
         mtp_device_accept: bool = False,
         mtp_moe_rows: int | None = None,
         mtp_alternates: Sequence[int] = (),
+        mtp_ple_early: bool = False,
     ) -> Qwen38TracedChain:
         """Target build, generic state (+ chunk state), warm pass (+ one eager chunk and both hand-off forms), miss
         guard, 8 decode captures (+ the chunk capture): the runner's chain prologue and the full-model gate's order.
@@ -2218,6 +2237,9 @@ class Qwen38TracedChain:
         from ``QWEN38_MTP_DEVICE_ACCEPT``) warms and captures the device-decided sampled form beside them (the head,
         the accept program and the tail in one trace, with a draft of its own): the warm round runs that very
         sequence under the extension's warm policy and checks the program's statistics row against the host reference.
+        ``mtp_ple_early`` (``QWEN38_MTP_PLE_EARLY``; the mesh opened with two command queues) makes the fused and the
+        device-decided pass loops read the verify lanes on the second queue and look the next pass's PLE rows 0-1 up
+        under the draft (``mtp_enter`` builds the reader; the host-decided split keeps its order).
         """
 
         if type(chunk_gdn_step_anchor) is not bool:
@@ -2248,6 +2270,10 @@ class Qwen38TracedChain:
             raise ValueError(f"mtp_device_accept must be a bool, got {mtp_device_accept!r}")
         if mtp_device_accept and not mtp_sampled:
             raise ValueError("mtp_device_accept needs mtp_sampled: the device decides the split verify's pass")
+        if type(mtp_ple_early) is not bool:
+            raise ValueError(f"mtp_ple_early must be a bool, got {mtp_ple_early!r}")
+        if mtp_ple_early and mtp is None:
+            raise ValueError("mtp_ple_early needs mtp: the early rows are the MTP pass loop's")
         started_ns = clock_ns()
         runtime_surface = resident_decode.b5b_runtime_surface()
         if runtime_surface["nonblocking_read"] != "ttnn.from_device(local, blocking=False)":
@@ -2392,6 +2418,7 @@ class Qwen38TracedChain:
                 dram_bytes_per_bank=mtp_dram_bytes_per_bank,
                 sampled=mtp_sampled,
                 device_accept=mtp_device_accept,
+                ple_early=mtp_ple_early,
             )
             if long_chunk_state is not None:
                 # The 128-row twin runs the MTP layer's rows inside the 128-row chunk body (base= the 32-row extension,
@@ -2485,6 +2512,7 @@ class Qwen38TracedChain:
                     admission=alternate_admission,
                     dram_bytes_per_bank=alternate_dram,
                     sampled=mtp_sampled,
+                    ple_early=mtp_ple_early,
                 )
                 synchronize()
                 alternate_dram["states"] = dram_allocated_per_bank() - allocated_before_alternate
@@ -2518,9 +2546,11 @@ class Qwen38TracedChain:
             sampling=(
                 sampling_extension
                 if sampling_extension is not None
-                else sampling_step.Qwen38SamplingChainExtension(lm_head, mesh, device_sampler=device_sampler)
-                if sampling
-                else None
+                else (
+                    sampling_step.Qwen38SamplingChainExtension(lm_head, mesh, device_sampler=device_sampler)
+                    if sampling
+                    else None
+                )
             ),
             chunk_gdn_step_anchor=chunk_gdn_step_anchor,
             mtp=chain_mtp,
@@ -3255,6 +3285,7 @@ def construct_chain(
     mtp_device_accept: bool = False,
     mtp_moe_rows: int | None = None,
     mtp_alternates: Sequence[int] = (),
+    mtp_ple_early: bool = False,
 ) -> Qwen38TracedChain:
     """Live construction on the open mesh (missing BF4 layers converted first), then the chain prologue."""
 
@@ -3279,4 +3310,5 @@ def construct_chain(
         mtp_device_accept=mtp_device_accept,
         mtp_moe_rows=mtp_moe_rows,
         mtp_alternates=mtp_alternates,
+        mtp_ple_early=mtp_ple_early,
     )

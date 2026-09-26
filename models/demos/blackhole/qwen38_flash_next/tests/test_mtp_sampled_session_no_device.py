@@ -612,6 +612,7 @@ def test_traced_chain_mtp_enter_routes_greedy_to_the_fused_traces_and_sampled_to
             decide,
             before_verify_sampled=None,
             record_candidate_rows=False,
+            early_reader=None,
         ):
             built.append(
                 dict(
@@ -627,6 +628,7 @@ def test_traced_chain_mtp_enter_routes_greedy_to_the_fused_traces_and_sampled_to
                     decide=decide,
                     before_verify_sampled=before_verify_sampled,
                     record_candidate_rows=record_candidate_rows,
+                    early_reader=early_reader,
                 )
             )
 

@@ -1041,12 +1041,52 @@ def write_verify_inputs(
     return write_verify_ple_rows(model, verify, tokens)
 
 
+@dataclass(frozen=True)
+class Qwen38TTNNPLEEarlyRows:
+    """The NEXT pass's first two PLE rows, looked up under the draft: ``tokens`` = ``(t', d_1)`` from the verify
+    readback row's fixed lanes (:class:`Qwen38TTNNEarlyRowsReader`), ``rows`` BF16 ``[1,1,2,2560]``, ``contexts`` the
+    three n-gram contexts (``contexts[0]`` = the context the pass commits to, ``contexts[2]`` = the one rows 2..k
+    continue from).  :func:`write_verify_ple_rows` takes them beside the pass's tokens."""
+
+    tokens: tuple[int, int]
+    rows: torch.Tensor
+    contexts: tuple[tuple[int, int] | None, ...]
+
+
+def lookup_verify_ple_rows_early(
+    model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState, *, accepted: int, next_token: int, first_draft: int
+) -> Qwen38TTNNPLEEarlyRows | None:
+    """Rows 0-1 of the next pass from this pass's verify lanes ``(a, t', d_1)``, before its pass row: the context
+    they chain from is ``verify.ple_rows.contexts[a + 1]`` (what :func:`commit_verify_host` sets after the row).
+    None when the lanes carry no first draft (the chain refuses such a pass at the row)."""
+
+    if first_draft == ZERO_EMBEDDING_TOKEN or next_token == ZERO_EMBEDDING_TOKEN:
+        return None
+    contexts = verify.ple_rows.contexts
+    if isinstance(accepted, bool) or type(accepted) is not int or not 0 <= accepted < verify.rows:
+        raise RuntimeError(f"early rows need 0 <= accepted < {verify.rows}, got {accepted!r}")
+    if len(contexts) != verify.rows + 1:
+        raise RuntimeError(f"early rows need this pass's {verify.rows + 1} PLE contexts, got {len(contexts)}")
+    ple = model.layers[PLE_CHECKPOINT_LAYER].ple
+    if ple is None:
+        raise RuntimeError("checkpoint layer 1 PLE owner is unavailable")
+    tokens = (int(next_token), int(first_draft))
+    rows, early_contexts = ple.host_rows(list(tokens), contexts[accepted + 1])
+    return Qwen38TTNNPLEEarlyRows(tokens, rows, early_contexts)
+
+
 def write_verify_ple_rows(
-    model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState, tokens: Sequence[int]
+    model: Qwen38TTNNTextModel,
+    verify: Qwen38TTNNVerifyState,
+    tokens: Sequence[int],
+    *,
+    early: Qwen38TTNNPLEEarlyRows | None = None,
 ) -> tuple[tuple[int, int] | None, ...]:
     """The per-pass host segment of a traced chain: only the PLE n-gram rows of the R tokens (the token row and
     the draft lanes were assembled on device by the draft body).  Looked up sequentially from the PLE rows state's
-    committed context; returns the R + 1 contexts."""
+    committed context; returns the R + 1 contexts.  With ``early`` (rows 0-1 looked up under the previous draft,
+    :func:`lookup_verify_ple_rows_early`) only rows 2..k are looked up, from ``early.contexts[2]``: the same rows,
+    the same contexts, row for row, as the whole lookup."""
 
     _validate_verify_state(model, verify)
     tokens = [int(token) for token in tokens]
@@ -1056,7 +1096,16 @@ def write_verify_ple_rows(
     ple_state = verify.layers[PLE_CHECKPOINT_LAYER].ple
     if ple is None or ple_state is None:
         raise RuntimeError("checkpoint layer 1 PLE owner/rows state is unavailable")
-    rows, contexts = ple.host_rows(tokens, ple_state.token_context)
+    if early is None:
+        rows, contexts = ple.host_rows(tokens, ple_state.token_context)
+    else:
+        if early.tokens != tuple(tokens[:2]) or early.contexts[0] != ple_state.token_context:
+            raise RuntimeError(
+                f"early PLE rows were looked up for {early.tokens} from {early.contexts[0]}, the pass takes "
+                f"{tuple(tokens[:2])} from {ple_state.token_context}"
+            )
+        tail_rows, tail_contexts = ple.host_rows(tokens[2:], early.contexts[2])
+        rows, contexts = torch.cat([early.rows, tail_rows], dim=2), early.contexts + tail_contexts[1:]
     ttnn.copy_host_to_device_tensor(
         ttnn.from_torch(
             rows.contiguous(),
@@ -2563,12 +2612,56 @@ class Qwen38TTNNCommitQueue:
             self._committed_event = None
 
 
+class Qwen38TTNNEarlyRowsReader:
+    """The verify readback row's fixed lanes read on a second command queue as soon as the verify is done, while the
+    main queue runs the draft.
+
+    ``verify_launched`` records an event on the main queue right after the verify launch; ``read_fixed_lanes``
+    makes the second queue wait for it and reads the row there (one blocking buffer read of coordinate 0, the read
+    :func:`read_pass_row` makes on the main queue), so the host holds ``(a, t', d_1)`` a draft's length before the
+    pass row and looks the next pass's PLE rows 0-1 up meanwhile (:func:`lookup_verify_ple_rows_early`); rows 2..k
+    follow the pass row.  The second queue carries nothing but this read: a program or a trace there takes the
+    sub-device's workers and the main queue's programs are refused (one queue owns the workers), a buffer read
+    takes no ownership.  The draft trace reads the readback row and never writes it, and the next verify overwrites
+    it only after this pass's row was read, so the read sees this pass's lanes.
+    """
+
+    def __init__(self, mesh_device, readback, *, cq_id: int = 1, main_cq_id: int = 0) -> None:
+        if not (isinstance(cq_id, int) and isinstance(main_cq_id, int)) or cq_id == main_cq_id:
+            raise ValueError(
+                f"the early rows reader needs two distinct command queue ids, got {cq_id} and {main_cq_id}"
+            )
+        if _shape(readback) != (1, 1, 1, READBACK_WIDTH) or readback.dtype != ttnn.float32:
+            raise RuntimeError(
+                f"verify readback must be FP32 [1,1,1,{READBACK_WIDTH}], got {tensor_metadata(readback)}"
+            )
+        self.mesh_device, self.readback, self.cq_id, self.main_cq_id = mesh_device, readback, cq_id, main_cq_id
+        self._event = None
+
+    def verify_launched(self) -> None:
+        self._event = ttnn.record_event(self.mesh_device, cq_id=self.main_cq_id)
+
+    def read_fixed_lanes(self) -> tuple[int, int, int]:
+        if self._event is None:
+            raise RuntimeError("the verify must be launched (its event recorded) before the early read")
+        ttnn.wait_for_event(self.cq_id, self._event)
+        self._event = None
+        values = ttnn.to_torch(ttnn.get_device_tensors(self.readback)[0], cq_id=self.cq_id).reshape(-1)
+        if values.numel() != READBACK_WIDTH:
+            raise RuntimeError(f"verify readback has {values.numel()} lanes, expected {READBACK_WIDTH}")
+        accepted, next_token, first_draft = (int(values[lane].item()) for lane in range(len(READBACK_FIXED_LANES)))
+        return accepted, next_token, first_draft
+
+
 @dataclass(frozen=True)
 class Qwen38TTNNMTPPassRecord:
     """One pass: its host-mirrored start position, the R verify tokens, the accept count, the a + 1 committed ids
     (cut at the first EOS), the 32 argmaxes, and the wall of every segment in ns (``commit_enqueue`` or
     ``commit_replay``, ``ple_rows`` = lookup + upload, ``verify_enqueue`` / ``draft_enqueue`` or ``verify_replay`` /
-    ``draft_replay``, ``readback``; the bootstrap pass has ``host_inputs`` instead of the first two)."""
+    ``draft_replay``, ``readback``; the bootstrap pass has ``host_inputs`` instead of the first two; with the early
+    rows reader ``early_readback`` = the second queue's read of the verify lanes, ``ple_rows_early`` = the lookup of
+    the next pass's rows 0-1 under the draft and ``ple_rows_late`` = its rows 2..k plus the upload replace
+    ``ple_rows``)."""
 
     index: int
     position: int
@@ -2624,6 +2717,12 @@ class Qwen38TTNNMTPChain:
     statistics row (:func:`read_accept_statistics`; the pass row's ``(a, t')`` must be the program's) and, with
     ``record_candidate_rows``, one read of the rows the device decided on.  No head readback, no host decision, no
     decision writes: the other two forms' behaviour is untouched.
+
+    With ``early_reader`` (:class:`Qwen38TTNNEarlyRowsReader`; the fused and the device-decided forms) the verify
+    lanes ``(a, t', d_1)`` are read on the second queue right after the draft launch, the next pass's PLE rows 0-1
+    are looked up while the draft runs, and the next ``step`` looks up only rows 2..k before the one upload: the
+    same rows from the same contexts, row for row.  The host-decided split form keeps today's order: its head
+    readback already blocks the host before the tail, so its lanes arrive with the pass row anyway.
     """
 
     def __init__(
@@ -2645,6 +2744,7 @@ class Qwen38TTNNMTPChain:
         decide: Callable[[Sequence[int], Qwen38TTNNVerifyHeadReadback], Qwen38TTNNVerifyDecision] = decide_greedy,
         before_verify_sampled: Callable[[list[int]], Any] | None = None,
         record_candidate_rows: bool = False,
+        early_reader: Qwen38TTNNEarlyRowsReader | None = None,
     ) -> None:
         _validate_draft_state(model, verify, draft)
         if not isinstance(traces, Qwen38TTNNMTPTraces) or not callable(replay):
@@ -2667,6 +2767,15 @@ class Qwen38TTNNMTPChain:
             raise ValueError("before_verify_sampled is the device-decided sampled form's hook, a callable")
         if type(record_candidate_rows) is not bool or (record_candidate_rows and not traces.device_sampled):
             raise ValueError("record_candidate_rows is the device-decided sampled form's option")
+        if early_reader is not None:
+            if not isinstance(early_reader, Qwen38TTNNEarlyRowsReader):
+                raise TypeError("early_reader must be a Qwen38TTNNEarlyRowsReader")
+            if traces.split:
+                # The host-decided split form keeps today's order: its head readback already blocks the host before
+                # the tail, so (a, t') are known before the draft anyway and d_1 only lands with the tail.
+                raise ValueError("the early rows reader serves the fused and the device-decided forms, not the split")
+        self.early_reader = early_reader
+        self._early_rows: Qwen38TTNNPLEEarlyRows | None = None
         self.before_verify_sampled, self.record_candidate_rows = before_verify_sampled, record_candidate_rows
         self.model, self.verify, self.draft, self.traces = model, verify, draft, traces
         self.verify_output, self.replay, self.clock_ns = verify_output, replay, clock_ns
@@ -2699,17 +2808,22 @@ class Qwen38TTNNMTPChain:
     def _finish_pass(self, tokens: Sequence[int], segments: dict[str, int]) -> Qwen38TTNNMTPPassRecord:
         launch, form = (self.replay, "replay") if self.enqueue is None else (self.enqueue, "enqueue")
         decision = None
+        early_reader = self.early_reader
         if self.traces.device_sampled:
             # The device decides: the hook writes the pass's uniforms, one launch runs the head, the accept program
             # and the tail; no host stop, no decision writes (the program wrote the split's buffers).
             if self.before_verify_sampled is not None:
                 self._timed(segments, "uniforms", lambda: self.before_verify_sampled(list(tokens)))
             self._timed(segments, f"verify_sampled_{form}", lambda: launch(self.traces.verify_sampled))
+            if early_reader is not None:
+                early_reader.verify_launched()  # the main queue's event the second queue's read waits for
         elif not self.traces.split:
             verify_trace = (
                 self.traces.verify_catch_up if self.records and self.traces.commit is None else self.traces.verify_first
             )
             self._timed(segments, f"verify_{form}", lambda: launch(verify_trace))
+            if early_reader is not None:
+                early_reader.verify_launched()
         else:
             # The head, the one blocking read of its row, the host's verdict, its four writes, the tail.
             self._timed(segments, f"verify_head_{form}", lambda: launch(self.traces.verify_head))
@@ -2724,7 +2838,24 @@ class Qwen38TTNNMTPChain:
             if self.commit_queue is not None:
                 self.commit_queue.history_derived()  # the commit of this pass may start here, on its own queue
         self._timed(segments, f"draft_{form}", lambda: launch(self.traces.draft))
+        early_rows = lanes = None
+        if early_reader is not None:
+            # The verify lanes on the second queue while the draft runs, then the next pass's rows 0-1.
+            lanes = self._timed(segments, "early_readback", early_reader.read_fixed_lanes)
+            early_rows = self._timed(
+                segments,
+                "ple_rows_early",
+                lambda: lookup_verify_ple_rows_early(
+                    self.model, self.verify, accepted=lanes[0], next_token=lanes[1], first_draft=lanes[2]
+                ),
+            )
         readback, self.next_tokens = self._timed(segments, "readback", lambda: read_pass_row(self.verify, self.draft))
+        if lanes is not None and lanes != (
+            readback.accepted,
+            readback.next_token,
+            ZERO_EMBEDDING_TOKEN if readback.first_draft is None else readback.first_draft,
+        ):
+            raise RuntimeError(f"the early verify lanes {lanes} are not the pass row's verify lanes")
         if readback.first_draft is None:
             raise RuntimeError("the verify readback carries no first draft; the chain needs the alignment rows")
         if decision is not None and (readback.accepted, readback.next_token) != (
@@ -2773,6 +2904,7 @@ class Qwen38TTNNMTPChain:
         self.records.append(record)
         self.position += readback.accepted + 1
         self.next_token, self.first_draft = readback.next_token, readback.first_draft
+        self._early_rows = early_rows  # the next step's rows 0-1 (None: it looks every row up)
         return record
 
     def bootstrap(self, tokens: Sequence[int]) -> Qwen38TTNNMTPPassRecord:
@@ -2787,13 +2919,15 @@ class Qwen38TTNNMTPChain:
         return self._finish_pass(tokens, segments)
 
     def step(self) -> Qwen38TTNNMTPPassRecord:
-        """One traced pass on the tokens the previous pass read: [commit], PLE rows, verify, draft, readback."""
+        """One traced pass on the tokens the previous pass read: [commit], PLE rows, verify, draft, readback (with
+        the early rows reader: [commit], PLE rows 2..k + upload, verify, draft, the lanes, PLE rows 0-1, readback)."""
 
         if not self.records:
             raise RuntimeError("bootstrap the chain first")
         self._require_room()
         segments: dict[str, int] = {}
         tokens = self.next_tokens
+        early_rows, self._early_rows = self._early_rows, None
         if self.traces.commit is not None and self.commit_queue is not None and self.enqueue is not None:
             self._timed(segments, "commit_enqueue", lambda: self.commit_queue.enqueue_commit(self.traces.commit))
         elif self.traces.commit is not None and self.commit_queue is not None:
@@ -2802,7 +2936,14 @@ class Qwen38TTNNMTPChain:
             self._timed(segments, "commit_enqueue", lambda: self.enqueue(self.traces.commit))
         elif self.traces.commit is not None:
             self._timed(segments, "commit_replay", lambda: self.replay(self.traces.commit))
-        self._timed(segments, "ple_rows", lambda: write_verify_ple_rows(self.model, self.verify, tokens))
+        if early_rows is not None:
+            self._timed(
+                segments,
+                "ple_rows_late",
+                lambda: write_verify_ple_rows(self.model, self.verify, tokens, early=early_rows),
+            )
+        else:
+            self._timed(segments, "ple_rows", lambda: write_verify_ple_rows(self.model, self.verify, tokens))
         if self.commit_queue is not None:
             self._timed(segments, "commit_wait", self.commit_queue.wait_committed)  # the verify's fence
         return self._finish_pass(tokens, segments)
@@ -3182,11 +3323,13 @@ __all__ = [
     "head_readback_width",
     "HEAD_READBACK_FIXED_LANES",
     "leave_verify_mode",
+    "lookup_verify_ple_rows_early",
     "moe_rows_for",
     "Qwen38TTNNAcceptConstants",
     "Qwen38TTNNAcceptResult",
     "Qwen38TTNNCommitQueue",
     "Qwen38TTNNDraftState",
+    "Qwen38TTNNEarlyRowsReader",
     "parse_accept_statistics",
     "Qwen38TTNNAcceptStatistics",
     "Qwen38TTNNMTPChain",
@@ -3194,6 +3337,7 @@ __all__ = [
     "Qwen38TTNNMTPPassRecord",
     "Qwen38TTNNMTPStepInputs",
     "Qwen38TTNNMTPTraces",
+    "Qwen38TTNNPLEEarlyRows",
     "Qwen38TTNNVerifyAlignment",
     "Qwen38TTNNVerifyDecision",
     "Qwen38TTNNVerifyHeadOutput",

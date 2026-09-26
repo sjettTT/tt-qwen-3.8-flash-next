@@ -844,6 +844,132 @@ def test_pass_loop_on_two_command_queues_fences_the_commit_behind_the_draft_hist
         mtp_v2.Qwen38TTNNCommitQueue("mesh").enqueue_commit(3)
 
 
+class _FakeEarlyReader(mtp_v2.Qwen38TTNNEarlyRowsReader):
+    """The second queue's read as a log: the fake device is serial, so the verify's lanes are in the readback row the
+    moment the verify replayed; the event and the read are recorded beside the device's replays."""
+
+    def __init__(self, device: _FakeDevice) -> None:
+        super().__init__("mesh", device.output.readback, cq_id=1, main_cq_id=0)
+        self.device, self.ops = device, []
+
+    def verify_launched(self) -> None:
+        self.ops.append("verify_launched")
+        self.device.replays.append("event-cq0")
+
+    def read_fixed_lanes(self) -> tuple[int, int, int]:
+        assert self.ops and self.ops[-1] == "verify_launched", "the read waits for the verify's event"
+        self.ops.append("read")
+        self.device.replays.append("lanes-cq1")
+        row = self.device.output.readback.torch_shards()[0].reshape(-1)
+        return int(row[0]), int(row[1]), int(row[2])
+
+
+@pytest.mark.parametrize("enqueue", (True, False))
+def test_pass_loop_with_the_early_rows_reader_splits_the_lookup_and_keeps_the_stream(fake, monkeypatch, enqueue):
+    """The early rows reader: after the draft launch the verify lanes are read (the fake: right after the verify
+    replay's event), the next pass's rows 0-1 looked up from the context the pass commits to, and the next step looks
+    up rows 2..k from their chain and uploads once; the committed stream, the PLE tokens and the contexts are the plain
+    loop's, row for row."""
+
+    k = 4
+    pattern = (2, 4, 0, 1, 3)
+    target, drafter = _oracles(pattern, k)
+    prompt = [5, 9, 2]
+    segments_seen: list[str] = []
+    chain, device, ple = _chain(
+        fake,
+        monkeypatch,
+        k=k,
+        target=target,
+        drafter=drafter,
+        prompt=prompt,
+        split=True,
+        enqueue=enqueue,
+        observer=segments_seen.append,
+    )
+    reader = _FakeEarlyReader(device)
+    chain.early_reader = reader
+    plain_chain, _plain_device, plain_ple = _chain(
+        fake, monkeypatch, k=k, target=target, drafter=drafter, prompt=prompt, split=True, enqueue=enqueue
+    )
+    first_drafts = []
+    for _ in range(k):
+        first_drafts.append(drafter(prompt + first_drafts))
+    emitted = list(chain.bootstrap([prompt[-1], *first_drafts]).committed)
+    plain = list(plain_chain.bootstrap([prompt[-1], *first_drafts]).committed)
+    for _ in range(len(pattern) - 1):
+        emitted.extend(chain.step().committed)
+        plain.extend(plain_chain.step().committed)
+    assert emitted == plain == _fixed_five_stream(target, drafter, prompt, k=k, passes=len(pattern))
+    assert [record.accepted for record in chain.records] == list(pattern)
+    # The PLE lookups: the bootstrap's whole row, then per pass rows 0-1 (early, from the committed context) and rows
+    # 2..k (from the early chain's context[2]); tokens and contexts equal the plain loop's whole-row lookups.
+    assert ple.calls[0] == plain_ple.calls[0]
+    # Every pass (the last one too) looks the next rows 0-1 up; the steady steps consume all but the last.
+    early_calls, late_calls = ple.calls[1::2], ple.calls[2::2]
+    assert len(early_calls) == len(pattern) and len(late_calls) == len(pattern) - 1
+    for (early_tokens, early_context), (late_tokens, late_context), (tokens, context) in zip(
+        early_calls, late_calls, plain_ple.calls[1:]
+    ):
+        assert early_tokens + late_tokens == tokens and early_context == context
+        chained = context
+        for token in early_tokens:
+            chained = (chained[1] if chained else -1, token)
+        assert late_context == chained  # rows 2..k continue where rows 0-1 left the chain
+    assert chain.verify.ple_rows.contexts == plain_chain.verify.ple_rows.contexts
+    assert chain.verify.ple_rows.tokens == plain_chain.verify.ple_rows.tokens
+    # Device order per pass: verify, its event, the draft, the lanes read on the second queue; the commit first.
+    suffix = "-enqueued" if enqueue else ""
+    pass_replays = ["verify" + suffix, "event-cq0", "draft" + suffix, "lanes-cq1"]
+    assert device.replays == pass_replays + ["commit" + suffix, *pass_replays] * (len(pattern) - 1)
+    assert reader.ops == ["verify_launched", "read"] * len(pattern)
+    launch = "enqueue" if enqueue else "replay"
+    commit = "commit_enqueue" if enqueue else "commit_replay"
+    first = ["host_inputs", f"verify_{launch}", f"draft_{launch}", "early_readback", "ple_rows_early", "readback"]
+    steady = [
+        commit,
+        "ple_rows_late",
+        f"verify_{launch}",
+        f"draft_{launch}",
+        "early_readback",
+        "ple_rows_early",
+        "readback",
+    ]
+    assert segments_seen == first + steady * (len(pattern) - 1)
+    assert "ple_rows" not in chain.records[-1].segments_ns and "ple_rows_late" in chain.records[-1].segments_ns
+    # The reader serves the fused and the device-decided forms only; the split form keeps its order.
+    chain.verify.split = SimpleNamespace()  # the split form's buffers, as far as the chain's checks look
+    with pytest.raises(ValueError, match="not the split"):  # allow-pytest.raises: the form rule
+        mtp_v2.Qwen38TTNNMTPChain(
+            chain.model,
+            chain.verify,
+            chain.draft,
+            mtp_v2.Qwen38TTNNMTPTraces(verify_first=None, verify_head=1, verify_tail=5, draft=2, commit=3),
+            chain.verify_output,
+            replay=device.replay,
+            position=3,
+            head_output=SimpleNamespace(),
+            early_reader=reader,
+        )
+    with pytest.raises(TypeError):  # allow-pytest.raises: the reader's type
+        mtp_v2.Qwen38TTNNMTPChain(
+            chain.model,
+            chain.verify,
+            chain.draft,
+            chain.traces,
+            chain.verify_output,
+            replay=device.replay,
+            position=3,
+            early_reader=object(),
+        )
+    with pytest.raises(ValueError):  # allow-pytest.raises: two distinct queues
+        mtp_v2.Qwen38TTNNEarlyRowsReader("mesh", device.output.readback, cq_id=0, main_cq_id=0)
+    with pytest.raises(RuntimeError, match="must be launched"):  # allow-pytest.raises: the event comes first
+        mtp_v2.Qwen38TTNNEarlyRowsReader.read_fixed_lanes(
+            mtp_v2.Qwen38TTNNEarlyRowsReader("mesh", device.output.readback)
+        )
+
+
 # --------------------------------------------------------------------------- source pins
 
 

@@ -179,6 +179,14 @@ realisation, `device-theta` or `host-fp32`); `/health.mtp.device_accept` is the 
 `device_accept_guard_deviations` its counters, and `QWEN38_MTP_DEVICE_ACCEPT_DUMP=<dir>` (dev) writes one JSON per
 request with every device-decided pass's rows, tokens, statistics and uniforms for the
 development-side law gate that re-derives each decision on the host.
+`QWEN38_MTP_PLE_EARLY` (on by default with `--mtp` since 2026-09-26; `=0` restores the one-queue open and the whole-row
+lookup after the pass row) opens the mesh with a second command queue on which the fused and the device-decided pass
+loops read the verify row's `(a, t', d_1)` lanes as soon as the verify is done, while the draft runs, and look the next
+pass's first two PLE n-gram rows up meanwhile (rows 2..k after the pass row; the same rows from the same contexts, so the
+stream is unchanged: the A3 table is identical with the switch on and off); nothing but that buffer read ever runs on the
+second queue, the host-decided split form keeps its order, and `/health.mtp.ple_early` reports the switch.  Measured on
+the 4-chip p150 line (2026-09-26): the greedy fused pass 0.3-0.6 ms shorter, the device-decided sampled pass 0.7 ms
+shorter, the second queue free on the device side (`docs/NUMERICS.md`).
 `QWEN38_MTP_MOE_ROWS=5|6|32` (diagnostic, default unset) forces the verify MoE row count the chain runs (`moe_rows_for(k + 1)` otherwise: 5 for k = 3 and 4, 6 for k = 5 since the 6-row form's silicon proof of 2026-09-26, its states term provisional until the first served 6-row open re-seeds it), keyed into the admission's states term and reported under `/health` `mtp.moe_rows`; the 6-row form is under proof for k = 5.
 When `QWEN38_FUSED` names `gdn_rows_scan` (the verify-rows fold, opt-in) the `states` estimate also carries the fold's persistent prefix states, (k + 1) x 786,432 bytes per GDN layer per device spread over the banks (17,694,720 bytes per bank at k = 4), the figure the line measured the fold's growth against (docs/NUMERICS.md); with `QWEN38_MTP_DRAFTS_PER_REQUEST` every drafting chain allocates its own GDN rows states, so each chain's admission charges its own k + 1.
 

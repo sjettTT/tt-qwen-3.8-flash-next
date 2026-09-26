@@ -240,6 +240,25 @@ def mtp_sampled_switch(environment: Mapping[str, str], *, applicable: bool = Tru
 # pass's candidate rows and write one JSON per request for the acceptance's gate tool (dev).
 DEVICE_ACCEPT_DUMP_VARIABLE = "QWEN38_MTP_DEVICE_ACCEPT_DUMP"
 
+# The MTP pass's early PLE rows (QWEN38_MTP_PLE_EARLY; on by default with --mtp since 2026-09-26, =0 restores the
+# one-queue open and the whole-row lookup after the pass row): the mesh opens with a second command queue and the fused /
+# device-decided pass loops read the verify lanes there while the draft runs, looking the next pass's PLE rows 0-1 up
+# under the draft (mtp_v2.Qwen38TTNNEarlyRowsReader); the second queue carries nothing but that buffer read.  The
+# host-decided split form keeps its order either way.  An explicit 1 without --mtp is refused at start.
+PLE_EARLY_VARIABLE = "QWEN38_MTP_PLE_EARLY"
+
+
+def ple_early_switch(environment: Mapping[str, str], *, applicable: bool = True) -> bool:
+    """``QWEN38_MTP_PLE_EARLY``: ``1`` on, ``0`` off, unset = ``applicable`` (the server runs with ``--mtp``); anything
+    else refused."""
+
+    value = environment.get(PLE_EARLY_VARIABLE)
+    if value is None:
+        return applicable
+    if value not in ("0", "1"):
+        raise SystemExit(f"{PLE_EARLY_VARIABLE} must be 0 or 1, got {value!r}")
+    return value == "1"
+
 
 # -- requests and responses ----------------------------------------------------------------------
 
@@ -791,9 +810,11 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                     "sampling": (
                         "greedy"
                         if session.sampling is None
-                        else "candidate_row_device_sampler"
-                        if getattr(session.sampling, "sampler", None) is not None
-                        else "candidate_row_host_sampler"
+                        else (
+                            "candidate_row_device_sampler"
+                            if getattr(session.sampling, "sampler", None) is not None
+                            else "candidate_row_host_sampler"
+                        )
                     ),
                     # logprobs are relative to the read candidates (above the vocabulary's by -log of the row's mass).
                     "logprobs_normalizer": None if session.sampling is None else "candidate_row",
@@ -1806,6 +1827,10 @@ def main() -> int:
         raise SystemExit(
             f"{DEVICE_ACCEPT_SWITCH}=1 needs the split verify ({MTP_SAMPLED_VARIABLE} on: --mtp and --sampling)"
         )
+    # The second command queue's early rows read: on with --mtp unless QWEN38_MTP_PLE_EARLY=0; an explicit 1 needs --mtp.
+    mtp_ple_early = ple_early_switch(os.environ, applicable=args.mtp is not None)
+    if mtp_ple_early and args.mtp is None:
+        raise SystemExit(f"{PLE_EARLY_VARIABLE}=1 needs --mtp (the early rows are the MTP pass loop's)")
     # The open captures these forms; its gate evaluates the same configuration.
     forms = mtp_verify_forms(mtp_sampled, mtp_device_accept)
     # QWEN38_MTP_MOE_ROWS (diagnostic, default unset): the verify MoE row count forced on the chain (5, 6 or 32);
@@ -1865,9 +1890,7 @@ def main() -> int:
         "sampling": (
             "candidate_row_device_sampler"
             if args.device_sampler
-            else "candidate_row_host_sampler"
-            if args.sampling
-            else "greedy"
+            else "candidate_row_host_sampler" if args.sampling else "greedy"
         ),
         "sampling_discriminator": bool(args.sampling_discriminator),
         "agreement": (
@@ -1887,6 +1910,7 @@ def main() -> int:
             "admission_table_fallback": mtp_admission_table,
             "sampled": mtp_sampled,
             "device_accept": mtp_device_accept,
+            "ple_early": mtp_ple_early,
             "moe_rows": mtp_moe_rows,  # the switch's forced verify MoE rows, None = moe_rows_for(k + 1)
             # QWEN38_MTP_DRAFTS_PER_REQUEST=1: the chains captured at open, the default first; a request picks one
             # with extra_body.mtp_drafts (the fingerprint and the acceptance baselines are the default chain's)
@@ -1944,7 +1968,9 @@ def main() -> int:
     uncertain = False
     cleanup_errors: list[str] = []
     try:
-        mesh, report["topology"] = open_partition_b_mesh(marker, hardware_profile)
+        mesh, report["topology"] = open_partition_b_mesh(
+            marker, hardware_profile, command_queues=2 if mtp_ple_early else 1
+        )
         fabric_enabled = True
         if args.prepare_only:
             # The caches only: the builder converts the missing BF4 layers (bounded by --bf4-stage-limit) and the
@@ -1989,6 +2015,7 @@ def main() -> int:
             mtp_device_accept=mtp_device_accept,
             mtp_moe_rows=mtp_moe_rows,
             mtp_alternates=mtp_drafts_admitted[1:],
+            mtp_ple_early=mtp_ple_early,
         )
         if chain.allocated_context != resident_context.allocated_context:
             raise Qwen38ChatChainError(

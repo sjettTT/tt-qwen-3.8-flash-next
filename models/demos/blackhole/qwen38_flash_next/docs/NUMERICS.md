@@ -464,6 +464,35 @@ the write 0.42-0.43 ms (the standalone host numbers), at 1.48-2.6 GHz both about
 47 ms on the readback and the frequency governor lowers its clock; neither the thread's NUMA node (both 2.15-2.20 ms) nor its
 SMT sibling moves it.  The remaining ~1.0 ms/pass is the host's cpufreq policy, a host setting.
 
+### The verify lanes read on a second command queue (2026-09-26)
+
+The fused and the device-decided pass loops know `(a, t', d_1)` when the verify body ends, a draft's length (about 7 ms)
+before the pass row the draft lands, but looked every PLE row of the next pass up after that row while the device idled
+from the commit's end to the verify launch.  With `QWEN38_MTP_PLE_EARLY` (the server's default with `--mtp`; `=0` opts
+out) the chain records an event on the main queue right after the verify launch; right after the draft launch the second
+queue waits for it and reads the verify readback row (one buffer read of coordinate 0, 35 fp32 lanes -- nothing else ever
+runs on that queue: a program or a trace there takes the sub-device's workers and the main queue's programs are refused,
+a buffer read takes no ownership); the host looks the next pass's rows 0-1 up from the context this pass commits to while
+the draft runs, and the next step looks rows 2..k up and uploads the R rows once under the commit.  The same rows from the
+same contexts (the two-call lookup is the whole lookup row for row, pinned); the lanes are checked against the pass row
+every pass.  The host-decided split form keeps its order (its head readback already blocks the host before the tail; a
+reader given with it is refused).
+
+Measured on the 4-chip p150 line (the fork runtime built at `5eac9c778edb`, the GDN rows fold on, pipelined p50 over
+json / prose / chat560, mode-matched cells): the greedy fused pass 46.83 / 46.24 / 48.22 -> 46.52 / 45.60 / 47.71 ms
+(-0.31 / -0.64 / -0.51); with the reader the segments read `early_readback` 37.3 / 36.4 / 38.2 (the second queue's wait for
+the verify), `ple_rows_early` 0.83 (rows 0-1, hidden under the draft), `readback` 6.0-6.3, `ple_rows_late` 1.81-1.89 (rows
+2..k plus the upload, on the critical path) against `ple_rows` 2.22 without it: the two calls cost 2.64-2.72 together,
++0.45 ms of their own in this clock mode (+0.12 standalone).  The device-decided sampled pass -0.71 / -0.72 ms (json /
+prose).  The probe replays (verify, draft, commit) are identical with and without the second queue: the two-queue open costs
+nothing on the device.  Bitwise: the A3 12-record table identical to the fold's row with the fold on and passing the pins
+with it off, the server recording the switch; a 2,179-pass soak with the lanes asserted every pass, no hang, a clean
+close.  The plain decode step (no pass loop) 25.43 against 25.61 ms, untouched.  Clock caveat: these are mode-matched
+cells; a cell whose main thread runs in the boosted clock mode reads 1.5-2 ms lower on both arms (the section above), and a
+process confined to the core pair of the busiest completion-queue reader thread kept its main thread at 3.70 GHz on every
+cell, the pass 45.44 / 44.56 / 46.57 ms (-1.4 / -1.6 / -1.5 against unpinned): a launch-time placement under study, not
+code.
+
 ## The device sampler's law (2026-09-25)
 
 The on-device sampler (`sampler_tail`, one program on one core after the top-32 candidate row) is gated on its law, not
