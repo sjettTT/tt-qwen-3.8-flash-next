@@ -100,6 +100,9 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_prefill_driver import
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import ZERO_EMBEDDING_TOKEN
+from models.demos.blackhole.qwen38_flash_next.config import LAYER_PATTERN
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_module
+from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_rows_scan as gdn_rows_scan_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import mtp_accept as mtp_accept_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import (
     BF4_TILE_BYTES,
@@ -254,6 +257,32 @@ RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES = {
     131072: (313_694_272, 313_040_128),
     262144: (94_378_048, 93_723_904),
 }
+# The verify-rows fold (``QWEN38_FUSED=gdn_rows_scan``, opt-in; ttnn/fused/gdn_rows_scan) keeps every GDN layer's k + 1
+# prefix states in DRAM for the pass: ``[k + 1, 12, 128, 128]`` fp32 per layer = (k + 1) x 786,432 bytes per layer per
+# device (3,932,160 at k = 4; 141,557,760 over the 36 GDN layers), interleaved one 4 KiB tile page at a time over the
+# banks, so the states term grows by GDN layers x ceil((k + 1) x 192 pages / banks) x 4,096 bytes per bank (17,694,720 at
+# k = 4).  Measured on the 4x p150 line 2026-09-26 (k = 4, two verify forms, 32,768, head e31a751e483, run
+# q38-chat-server-p150-line-20260926T130417Z-3556384): {'components': 50468032, 'states': 31093824, 'traces': 5832256}
+# = 87,394,112 bytes per bank, refused by the estimate without this term (77,095,515, of which states 13,785,664:
+# +17,308,160 measured over the estimate; the 2026-09-25 record without the fold measured states 12,938,112, so the
+# growth beyond the prefix states themselves is 461,000 bytes per bank, inside the margin).  The traces fell 11,107,904
+# -> 5,832,256 (one program per GDN layer where the wrap runs six, one pick where the commit re-ran the two prims); the
+# estimate keeps the wrap's traces figure as an over-estimate.  The fold attaches only where its admission holds (rows
+# k + 1 <= gdn_rows_scan.MAX_ROWS), so beyond that the term is zero.
+GDN_LAYERS = LAYER_PATTERN.count("linear_attention")
+GDN_STATE_TILE_PAGES = gdn_rows_scan_module.HEADS * (gdn_rows_scan_module.HEAD_DIM // gdn_rows_scan_module.TILE) ** 2
+GDN_STATE_PAGE_BYTES = gdn_rows_scan_module.TILE * gdn_rows_scan_module.TILE * 4  # one fp32 tile
+
+
+def fold_prefix_states_bytes_per_bank(drafts: int, banks: int = RESIDENT_DRAM_BANKS) -> int:
+    """The verify-rows fold's prefix states per bank at ``drafts`` drafts: every GDN layer's ``[drafts + 1, 12, 128, 128]``
+    fp32 tensor, its 4 KiB tile pages spread over the ``banks``; 0 where the fold does not attach (rows past its
+    admission, :data:`ttnn.fused.gdn_rows_scan.MAX_ROWS`)."""
+
+    rows = drafts + 1
+    if rows > gdn_rows_scan_module.MAX_ROWS:
+        return 0
+    return GDN_LAYERS * -(-(rows * GDN_STATE_TILE_PAGES) // banks) * GDN_STATE_PAGE_BYTES
 
 
 def resident_post_build_bytes_per_bank(allocated_context: int) -> int:
@@ -276,6 +305,7 @@ def mtp_capacity_admission(
     long_chunks: bool = False,
     moe_rows: int | None = None,
     components_shared: bool = False,
+    gdn_rows_scan: bool = False,
 ) -> dict[str, Any]:
     """Whether the MTP chain fits beside the resident build at ``allocated_context`` with ``drafts`` drafts per pass
     and ``verify_forms`` captured verify forms (1..:data:`MTP_VERIFY_FORMS_MAX`).  The required side is the estimate
@@ -299,7 +329,13 @@ def mtp_capacity_admission(
     ``long_chunks`` (an ``--mtp --long-chunks`` chain) takes the 128-row chunk state and trace
     (:data:`LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES`) off the free side where they are not yet in the reading (the
     table, the live ``after_build`` read) and adds the MTP layer's 128-row extension
-    (:data:`MTP_LONG_CHUNK_EXTENSION_BYTES_PER_BANK`) to the states remainder."""
+    (:data:`MTP_LONG_CHUNK_EXTENSION_BYTES_PER_BANK`) to the states remainder.
+
+    ``gdn_rows_scan`` (the verify-rows fold on: ``QWEN38_FUSED`` names it) adds the fold's persistent prefix states to
+    the states remainder, derived from ``drafts`` and the GDN layer count (:func:`fold_prefix_states_bytes_per_bank`),
+    with the same margin; the traces remainder stays the wrap's (an over-estimate under the fold).  The term is per
+    chain: a second drafting chain (``components_shared``) allocates its own GDN rows states, so its admission
+    charges its own ``drafts + 1`` rows."""
 
     if isinstance(drafts, bool) or type(drafts) is not int or not 1 <= drafts < CHUNK_ROWS:
         raise ValueError(f"MTP drafts must be an int in [1, {CHUNK_ROWS - 1}], got {drafts!r}")
@@ -313,6 +349,8 @@ def mtp_capacity_admission(
         raise ValueError(f"live_point must be after_build or after_captures, got {live_point!r}")
     if type(long_chunks) is not bool:
         raise ValueError(f"long_chunks must be a bool, got {long_chunks!r}")
+    if type(gdn_rows_scan) is not bool:
+        raise ValueError(f"gdn_rows_scan must be a bool, got {gdn_rows_scan!r}")
     long_chunks_bytes = LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES if long_chunks else 0
     if live is None:
         # A context below the smallest measured one (8,192: the batched lanes' small context) is admitted against the
@@ -356,10 +394,12 @@ def mtp_capacity_admission(
     w2_per_bank = -(-(w2_bytes // BF4_TILE_BYTES) // RESIDENT_DRAM_BANKS) * BF4_TILE_BYTES
     qsa_state = -(-Qwen38ResidentContext(allocated_context).qsa_generic_state_bytes // RESIDENT_DRAM_BANKS)
     extension = MTP_LONG_CHUNK_EXTENSION_BYTES_PER_BANK if long_chunks else 0
+    prefix_states = fold_prefix_states_bytes_per_bank(drafts) if gdn_rows_scan else 0
     remainders = {
         "components_beyond_pair": MTP_COMPONENTS_BEYOND_PAIR_BYTES_PER_BANK,
         "states_beyond_qsa_state": MTP_STATES_BEYOND_QSA_STATE_BYTES_PER_BANK_BY_MOE_ROWS[moe_rows],
         "long_chunk_extension": extension,
+        "gdn_prefix_states": prefix_states,
         "traces": MTP_TRACES_BYTES_PER_BANK_ONE_VERIFY_FORM
         + (verify_forms - 1) * MTP_TRACES_BYTES_PER_BANK_PER_ADDITIONAL_VERIFY_FORM,
         "traces_per_additional_verify_form": MTP_TRACES_BYTES_PER_BANK_PER_ADDITIONAL_VERIFY_FORM,
@@ -377,7 +417,10 @@ def mtp_capacity_admission(
     )
     estimate = {
         "components": components,
-        "states": qsa_state + with_margin(remainders["states_beyond_qsa_state"] + remainders["long_chunk_extension"]),
+        "states": qsa_state
+        + with_margin(
+            remainders["states_beyond_qsa_state"] + remainders["long_chunk_extension"] + remainders["gdn_prefix_states"]
+        ),
         "traces": with_margin(remainders["traces"]),
     }
     required = sum(estimate.values())
@@ -405,10 +448,12 @@ def mtp_capacity_admission(
         "components_shared": components_shared,
         "ring_size": ring_size,
         "long_chunks": long_chunks,
+        "gdn_rows_scan": gdn_rows_scan,
         "num_banks": RESIDENT_DRAM_BANKS,
         **source,
         "long_chunks_bytes_per_bank_after_captures": long_chunks_bytes,
         "mtp_long_chunk_extension_bytes_per_bank": extension,
+        "mtp_gdn_prefix_states_bytes_per_bank": prefix_states,
         "free_bytes_per_bank_after_captures": free,
         "largest_contiguous_bytes_free_per_bank_after_captures": largest,
         "resident_pair_bytes_per_bank": w01_per_bank + w2_per_bank,
@@ -423,7 +468,8 @@ def mtp_capacity_admission(
         # required side's estimate by part for this k and these forms; the shortfalls name a refusal's reason(s)
         "decided_by": {
             "free_side": source["free_bytes_source"],
-            "required_side": f"estimate k={drafts} moe_rows={moe_rows} verify_forms={verify_forms}",
+            "required_side": f"estimate k={drafts} moe_rows={moe_rows} verify_forms={verify_forms}"
+            + (" gdn_rows_scan" if gdn_rows_scan else ""),
             "shortfalls": shortfalls,
         },
         "fits": not shortfalls,
@@ -2267,6 +2313,7 @@ class Qwen38TracedChain:
                 live=dram_free_view(),
                 verify_forms=len(forms),
                 long_chunks=long_chunks,
+                gdn_rows_scan=fused_module.enabled(gdn_rows_scan_module.NAME),
                 moe_rows=mtp_moe_rows,
             )
             mtp_admission["verify_forms_captured"] = list(forms)
@@ -2396,6 +2443,8 @@ class Qwen38TracedChain:
                     verify_forms=len(forms),
                     long_chunks=False,  # the 128-row twin is the default chain's (shared): counted once, by its owner
                     components_shared=True,
+                    # the fold's prefix states are per chain (every chain allocates its own GDN rows states): its k + 1
+                    gdn_rows_scan=fused_module.enabled(gdn_rows_scan_module.NAME),
                 )
                 alternate_admission["verify_forms_captured"] = list(forms)
                 print(

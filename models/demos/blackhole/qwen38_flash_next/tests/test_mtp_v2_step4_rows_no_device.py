@@ -1224,6 +1224,7 @@ def test_rows_bodies_are_the_pinned_walk() -> None:
     assert walk("commit_rows") == [
         "_validate_state",
         "_validate_rows_state",
+        "_advance_history_rows",  # the verify-rows fold's form: the prefix-state pick (a fused call), then the history
         "_step_committed_rows_state",  # the state re-anchor form: no chunk rerun
         "_advance_history_rows",
         "_chunk_rows",

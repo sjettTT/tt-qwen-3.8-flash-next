@@ -581,6 +581,7 @@ def test_server_admits_long_chunks_with_mtp_and_reports_the_twin() -> None:
         "            verify_forms=len(forms),\n"
         "            long_chunks=bool(args.long_chunks),\n"
         "            moe_rows=mtp_moe_rows,\n"  # the verify MoE row count knob (QWEN38_MTP_MOE_ROWS) sits beside it
+        "            gdn_rows_scan=fused_module.enabled(gdn_rows_scan_module.NAME),\n"
         "        )"
     ) in server
     assert '"long_chunk_extension": chain.mtp.long_chunk_extension is not None,' in server

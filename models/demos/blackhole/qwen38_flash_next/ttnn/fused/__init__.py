@@ -58,6 +58,7 @@ from . import gr_fold  # after gr_read: it composes gr_read's programs
 from . import moe_dense  # after router_tail, shared_expert, untilize_rows and gr_read: it hosts their kernels
 from . import gdn_prefill_rows  # after the two rows programs: it wires them together for the prefill slab
 from . import qsa_rows  # after qsa_block: it composes its score merge over the verify tile's rows
+from . import gdn_rows_scan  # after gdn_rows_wrap and gdn_step: the verify rows' fold composes both
 
 __all__ = [
     "ALL",
@@ -78,6 +79,7 @@ __all__ = [
     "gdn_pre_rows",
     "gdn_prefill_rows",
     "gdn_rows_prims_direct",
+    "gdn_rows_scan",
     "gdn_rows_wrap",
     "gdn_step",
     "gr_read",

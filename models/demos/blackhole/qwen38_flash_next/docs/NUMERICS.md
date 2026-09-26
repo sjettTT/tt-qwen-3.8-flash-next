@@ -86,8 +86,27 @@ matched in both orders.  `QWEN38_FUSED_OFF=gdn_rows_wrap` restores the chain, an
 Opt-in through `QWEN38_FUSED=<name>`: `final_mixer`, `position_advance`, `gdn_rows_prims_direct` (the MTP
 verify rows' chunk recurrence as the composite's two phase prims called directly with the composite's own relayout ops
 in its order, bitwise by construction and on the line 2026-09-25: the seam the wrap's programs were proven against, a
-diagnostic beside the default). The kernels cover rows 1..32 (decode, the MTP verify rows); the 128-row prefill chunk
-and the slab keep their chains.
+diagnostic beside the default), and `gdn_rows_scan` (2026-09-26, class COMPONENT against the served stream): the same
+verify-rows body as ONE program per GDN layer that runs the fused `gdn_step`'s serial fp32 recurrence row after row
+over the k + 1 rows and keeps every prefix state, so the commit is one pick of the prefix state after the accepted rows
+instead of the masked re-run of the two chunk prims.  Measured on the 4x p150 line at k = 4 on real layers 1 and 33
+(the rows micro-test's scan arm): every prefix state and every committed state bitwise the state after the same rows
+of the served 1-row fused step, and the GDN layer's output rows bitwise plain decode's 1-row outputs (max abs 0.0),
+where the wrap / chain form (the chunk / WY recurrence at TF32 operand precision) deviates from those outputs by 1.2e-3
+on the state at a scale of 0.185 (layer 1; 9.2e-4 at 0.066 on layer 33) and up to 1.2e-2 on the bf16 output rows;
+device operations per GDN layer 10 for the forward against the wrap's 12 (the chain's 58) and 3 for the commit against
+5 (12); on one die the program runs in 113 us at k = 4 on 48 cores against 382 us for five sequential fused steps, the
+pick in 11 us.  The fold's persistent DRAM: (k + 1) x 786,432 bytes per GDN layer per device (3.9 MB at k = 4;
+141.6 MB over the 36 GDN layers); on the line at k = 4 with two verify forms the MTP chain's states term measured
+31,093,824 bytes per bank against the admission's 13,785,664 estimated without the fold (+17,308,160, of which the
+prefix states are 17,694,720 by construction and the rest sits inside the margin), its traces 5,832,256 against
+12,218,695 estimated (one program per GDN layer where the wrap runs six), 87,394,112 per bank in all, so the admission's
+estimate carries the prefix states -- derived from k + 1 and the GDN layer count -- whenever `QWEN38_FUSED` names the
+kernel; the term is per drafting chain (a second chain of `QWEN38_MTP_DRAFTS_PER_REQUEST` allocates its own GDN
+rows states and is charged its own k + 1).  The whole verify stream with the kernel on is measured in the MTP
+section's opt-in row below (the served line, 2026-09-26); the QSA and MoE rows forms are unchanged by this kernel, and
+the MTP table's pins move only at the kernel's default flip.  The kernels cover rows 1..32
+(decode, the MTP verify rows); the 128-row prefill chunk and the slab keep their chains.
 `qsa_rows` (2026-09-26, on by default; `QWEN38_FUSED_OFF=qsa_rows` restores the composed glue) runs the QSA verify
 tile's glue as fused programs: program 1, the indexer scores' all-reduce composite and mask add as one all-gather plus the fused
 score merge over the 32 rows (6 programs per layer as 2; bitwise on the four dies at three positions; the MTP lead's pass
@@ -106,8 +125,7 @@ byte-identical, 0.094 against the chain's 0.143 ms per traced call at five rows.
 560-token chat 51.51 -> 50.25 ms (-1.38 / -1.26 / -1.26 ms per pass; the verify replay -1.0, the draft replay -0.33 --
 the MTP layer's draft row runs the same main tail at one row), acceptance histograms and tokens per pass identical,
 the A3-mtp4-32k pins 12/12 at the default and under `QWEN38_MTP_SAMPLED=0` (the json stream's sha equal to the composed
-glue's), the plain-decode D1 band untouched (25.602 against 25.610 ms per step median over 200 steps).
-Since 2026-09-26 the slab has a fused form of its own, `gdn_prefill_rows` (on by default: bitwise the chain on the 4x p150
+glue's), the plain-decode D1 band untouched (25.602 against 25.610 ms per step median over 200 steps).Since 2026-09-26 the slab has a fused form of its own, `gdn_prefill_rows` (on by default: bitwise the chain on the 4x p150
 line in two independent runs -- pins 12/12, records 12/12, 3,232 agreement columns, 4/4 probes -- with the time to the first
 token at 32k -13.1 %; a four-die device test guards the mesh-topology seam the one-die tests cannot see;
 `QWEN38_FUSED_OFF=gdn_prefill_rows` restores the chain): the GDN body from the projection to the gated output as two rows-form programs around the unchanged chunk prims (called directly through
@@ -262,6 +280,99 @@ pass, 70.7 ms per pass); `--mtp 3` 38.0 median, 55.6 on `json`.  Sampled draftin
 | `--mtp 4`, 2026-09-25 | none (96/96) | 43 | 32 | 15 | 56 | 63 | 9 | 13 | 24 | 19 | 6 | 1 |
 | plain decode, 2026-09-06 | none (96/96) | 43 | 32 | 15 | 56 | 61 | 9 | 13 | 24 | 19 | 6 | 75 |
 | `--mtp 4`, 2026-09-06 | none (96/96) | 56 | 32 | 15 | 46 | 56 | 9 | 13 | 24 | 19 | 6 | 1 |
+
+Opt-in row, `QWEN38_FUSED=gdn_rows_scan` (2026-09-26, the served `--mtp 4` line; the pins above stay the wrap's until
+the kernel's default flip, the user's decision).  Every number of this row was measured on the sealed fork runtime built at `e74d3b864ff`,
+at head `93b9e857bd2` (the 2026-09-26 unified `5307c930416` plus the fold); the runtime kit of record is
+now the fork runtime built at `5eac9c778edb` (the MoE a2a pipeline lives in the runtime C++), the fold-against-wrap comparison
+stands as measured on the sealed kit; the kit of record's numbers (the fork runtime built at `5eac9c778edb`, `_ttnncpp.so`
+`211530d77b2b`, the same line, 2026-09-26, the tree = unified `5eac9c778ed` plus the fold) are the numbers of record
+and the sealed kit's the original measurement, both given below.  The committed stream leaves the CPU
+reference at plain decode's token on 12/12 prompts (`chat` 2, `math` 61, `summary` 75 where the served row above reads
+43 / 63 / 1), and its device token stream is bitwise plain decode's pinned stream on 8/12 (`json`, `chat`, `code`, `fact`,
+`math`, `sky`, `story`, `summary`; the served row's pinned streams equal plain decode's on 5/12).  The greedy server
+(`QWEN38_MTP_SAMPLED=0`) with the kernel on reads the same twelve rows.  On `list`, `multilingual`, `prose` and `refactor`
+the stream leaves the reference at plain decode's token but its later tokens differ from both pinned streams (on
+`refactor` the served row's stream equals plain decode's where the fold's does not): under the fold the GDN rows are
+measured bitwise the 1-row fused step, and no other verify-rows form is measured against its 1-row counterpart row for
+row -- the linears are the same tile programs at 1 and 32 rows, the residual read / write, RoPE and norms the same
+per-row kernels, the QSA glue the decode's own kernels over the rows (bitwise the chain at rows 5 and 6), the MoE rows
+form measured bitwise the 1-row path (rows 5, 2026-09-03/04; the down linear at rows 1 / 5 / 32, 2026-09-25), the
+candidates' argmax exact -- so the forms bitwise by construction only, the attention over the R query rows, the PLE rows
+body and the compressed-index block mean, are where a rounding difference can still sit: by elimination, not by
+measurement; the near-tie check (the device's own 1-row logits at the first differing token) is the test that settles it.
+Plain decode's own step is untouched: 25.612 against 25.619 ms per token over 200 traced steps with the kernel on / off.
+
+| | json | chat | code | fact | list | math | multilingual | prose | refactor | sky | story | summary |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `--mtp 4` + `QWEN38_FUSED=gdn_rows_scan`, 2026-09-26 | none (96/96) | 2 | 32 | 15 | 56 | 61 | 9 | 13 | 24 | 19 | 6 | 75 |
+| stream bitwise plain decode's pin | yes | yes | yes | yes | no | yes | no | no | no | yes | yes | yes |
+| stream bitwise the `--mtp 4` pin | yes | no | yes | yes | no | no | no | no | no | yes | no | no |
+| fold stream sha256 (first 12) | a5b4defa72fa | 34686e9146e7 | 0234032be259 | 9afd57cc0303 | ea554701b6f5 | 19f55ccb4bb2 | e83d74f6b8bd | 129b10287cbd | 8a812a8ea01b | de86bbc09c48 | d1897b72f57d | d9d024681580 |
+
+The pass (measured by the MTP lead on a second 1x4 p150 line at the landing head, 120 + 20 passes per cell,
+`--stop-at-end`): the fold removes 2.9-3.1 ms of program time from a k = 4 pass (the commit's masked re-run of the two
+chunk prims becomes one pick, 0.91 against 3.13 ms; the verify's six GDN programs per layer become one, -0.55..-0.62;
+the draft replay equal) and 0.8-1.3 ms of the pipelined wall on every prompt, since the commit replay already overlapped
+the host's PLE lookup: fused verify, greedy, p50 json 47.84 against 49.17 ms, prose 47.23 against 48.24, 560-token chat
+49.23 against 50.38 (the all-blocking probe 49.15 / 48.21 / 50.07 against 52.03 / 51.07 / 53.19) on the sealed kit, and
+on the kit of record (runs re5-decomp-on / re5-decomp-off) json 47.42 against 48.63, prose 46.69 against 47.78, 560-token
+chat 48.76 against 49.73 with the same tokens per pass; split verify, sampled,
+json 51.61 against 51.81, prose 50.59 against 51.55, 560-token chat 52.71 against 53.88 (probe -3.01 / -2.91 / -2.89,
+the sampled tail unchanged; json's stream identical at 4.750 tokens per pass, prose 2.033 against 2.000 and the chat
+2.951 against 2.527 a different sampled continuation of one seeded request).  Served tokens/s move with the stream, not
+with the pass: the fold's stream is plain decode's, so a request's first ~96-150 tokens are identical under the fold and
+the wrap and then a different continuation with its own draftability follows; no systematic acceptance loss is
+attributed (the fold's drafter is not less accurate on its own committed stream than the wrap's on its: `fact`, an
+identical 67-token answer, 2.58 against 2.48 tokens per pass, depth-1 acceptance 0.808 against 0.741, one acceptance
+apart; `summary`, 3.31 against 2.67 tokens per pass over its own 86- / 64-token answer).  Served rows, EOS honoured
+(the lmx-like client, one warm-up and the median of 3, greedy, at most 256 tokens): the kit of record's columns are the
+numbers of record (runs re5-rows-on / re5-rows-off, servers `20260926T162840Z-3851428` fold and `20260926T162159Z-3842121`
+wrap; the wrap's rows are the README's), the sealed kit's the original measurement:
+
+| served greedy, tokens/s over the answer to its end marker | fold, kit of record | wrap, kit of record | fold, sealed kit | wrap, sealed kit | tokens per pass, fold / wrap |
+|---|---|---|---|---|---|
+| 560-token chat (256 tokens, finish length: the answer exceeds 256) | 62.52 | 61.30 | 61.70 | 60.55 | 3.08 / 3.12 |
+| 177-token multi-turn chat (256, length; all answer) | 57.60 | 57.62 | 56.89 | 57.00 | 2.80 / 2.83 |
+| code (256, length; the answer is 283 tokens) | 95.51 | 91.93 | 94.16 | 90.99 | 4.65 / 4.57 |
+| json (153 tokens, stop) | 97.27 | 95.25 | 95.74 | 94.02 | 4.75 / 4.75 |
+| prose (stop; the fold's answer 203 tokens, the wrap's 196) | 43.42 | 44.73 | 42.87 | 44.28 | 2.09 / 2.17 |
+| sampled, ms per token (non-thinking / thinking) | 19.67 / 20.93 | 19.75 / 19.90 | 19.91 / 20.56 | 19.90 / 20.20 | |
+
+The wrap's kit-of-record rows sit 0.7-1.3 tokens/s above the sealed kit's (the MoE exchange pipelining), lengths and
+tokens per pass identical; at 256 forced tokens the kit of record reads fold 62.54 / 76.87 / 57.62 / 37.13 / 95.49
+against wrap 61.29 / 92.03 / 57.68 / 45.49 / 91.92 (560-token chat / json / chat / prose / code).
+
+At 256 forced tokens (`ignore_eos`, the previous form) the same requests read mixed by stream -- 560-token chat +1.9 %,
+code +3.8 %, json -16.7 %, prose -18.4 %; the 12 acceptance records net -2.1 % at 256 tokens and +1.2 % on the 96-token
+replay; `summary` -47.5 % where the wrap's post-marker text repeats and drafts at depth-1 0.864 and the fold's does not
+(0.370), which never enters a verdict.  The 43-prompt pair in that form is contaminated the same way (sum +3.2 %, paired
+mean +1.94 +- 1.49 tokens/s, n = 43); the flip-decision sample is its EOS-honoured re-run: Over 43 distinct prompts -- the 12 acceptance records, the reference corpus's 16 served renders (12 with
+thinking on and 4 requests with tools), its 4 evaluation items, the two books' first 256 / 512 / 1024 tokens as raw user
+text, and the synthetic chat prompt at 128 / 256 / 560 / 1024 / 2048 rendered tokens -- one greedy request each with EOS
+honoured (max 256; 21 of the 43 stop before 256), tokens per pass from the server's pass counters: the fold reads 3005.8
+against the wrap's 2947.4 tokens per second summed (+2.0 %), 30 prompts up and 13 down; the paired mean delta is +1.36
++- 0.61 tokens per second (standard error, n 43) and the mean relative delta +2.44 % +- 1.09 %; no part of the set is
+negative on average (acceptance records +2.6 %, served renders +1.1 %, evaluation items +1.1 %, synthetic chat +5.9 %,
+book prefixes +3.9 %).  Where the two arms' answers are identical the fold's tokens per pass is equal or one acceptance
+higher.  The
+lmx-like client's `ignore_eos` form matched the localmaxxing reference's 256 output tokens; the reference record does
+not say whether EOS was forced.
+
+The sampled law gate under the kernel (the host-fp32 derivation; json / chat / code / story at offsets 0 / 16 / 48,
+4,096 seeds, 32 loop requests of 10 tokens) passes on both cards, 12 positions each, loop mismatches / fallbacks /
+guard deviations 0 / 0 / 0; the rows-against-plain total variation is 0.0 at the median on both cards, max 0.0253
+(thinking) and 0.2227 (non-thinking) where the wrap-era rows of record read 0.0083 / 0.0438.  The non-thinking maximum
+is one position, read from the gate's position dump: at `chat` offset 48 the fold's verify row puts the top logit one
+bf16 step below the 1-row tail's (20.625 against 20.75, the runner-up equal), 0.029 of probability before truncation;
+the non-thinking nucleus cut at 0.8 sits between the two (0.8066 against 0.7772), so the runner-up survives under the
+fold and not under plain decode -- the 0.2227 total variation is that one token's mass; the argmax is unchanged, and
+the wrap's row equals plain decode's at this position.  The layer that moves the logit is not attributed (the fold's
+identity with the 1-row step was measured on GDN layers 01 and 33).
+
+Per GDN layer on the 1x4 line (30 traced replays, quiet host): the verify forward 0.459 -> 0.271 ms and the commit
+0.136 -> 0.051-0.058 against the chain (the wrap's 0.306 / 0.110), device operations 58 -> 10 and 12 -> 3.  The fold's
+DRAM stays the clause's (k + 1) x 786,432 bytes per GDN layer per device, 141.6 MB per device at k = 4, per drafting chain.
 
 ## The MTP pass decomposition (2026-09-25)
 

@@ -72,7 +72,7 @@ def test_the_layer_resolves_the_body_once_and_forward_rows_dispatches_through_it
     methods = {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
     init = ast.get_source_segment(source, methods["__init__"])
     assert f'self._rows_body_call = fused.resolve_admitted("{NAME}")' in init
-    getter = ast.get_source_segment(source, methods["_rows_body"])
+    getter = ast.get_source_segment(source, methods["_rows_body_wrap"])  # the fold's composed callable
     assert 'self.__dict__.get("_rows_body_call")' in getter and f'fused.resolve_admitted("{NAME}")' in getter
     forward = ast.get_source_segment(source, methods["forward_rows"])
     assert "body = self._rows_body()" in forward

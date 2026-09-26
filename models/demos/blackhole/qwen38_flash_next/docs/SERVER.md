@@ -180,6 +180,7 @@ realisation, `device-theta` or `host-fp32`); `/health.mtp.device_accept` is the 
 request with every device-decided pass's rows, tokens, statistics and uniforms for the
 development-side law gate that re-derives each decision on the host.
 `QWEN38_MTP_MOE_ROWS=5|6|32` (diagnostic, default unset) forces the verify MoE row count the chain runs (`moe_rows_for(k + 1)` otherwise: 5 for k = 3 and 4, 6 for k = 5 since the 6-row form's silicon proof of 2026-09-26, its states term provisional until the first served 6-row open re-seeds it), keyed into the admission's states term and reported under `/health` `mtp.moe_rows`; the 6-row form is under proof for k = 5.
+When `QWEN38_FUSED` names `gdn_rows_scan` (the verify-rows fold, opt-in) the `states` estimate also carries the fold's persistent prefix states, (k + 1) x 786,432 bytes per GDN layer per device spread over the banks (17,694,720 bytes per bank at k = 4), the figure the line measured the fold's growth against (docs/NUMERICS.md); with `QWEN38_MTP_DRAFTS_PER_REQUEST` every drafting chain allocates its own GDN rows states, so each chain's admission charges its own k + 1.
 
 ## The prompt, follow-up turns and the prompt-end snapshot
 

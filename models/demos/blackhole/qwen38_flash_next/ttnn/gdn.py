@@ -1019,6 +1019,9 @@ class Qwen38TTNNRowsSelectors:
     # The same mask in the chunk prims' layout, built only when the constants carry ``arange_c`` (the verify-rows
     # wrap): its commit multiplies ``beta_c`` / ``g_c`` ``[12, 1, 32, 1]`` element for element.
     committed_mask_c: Any = None
+    # The pass's device accept count itself (fp32 ``[1, 1, 1, 1]``, the caller's tensor: not deallocated here); the
+    # verify-rows fold's commit reads it to pick the committed prefix state.
+    accepted: Any = None
 
     def validate(self, rows: int) -> None:
         if self.rows != rows or len(self.onehot_bf16) != rows:
@@ -1079,7 +1082,9 @@ def build_rows_selectors(accepted, constants: Qwen38TTNNGDNRowsConstants) -> Qwe
     )
     # One more tiny op per pass (not per layer) when the wrap runs: the same comparison in the prims' layout.
     committed_mask_c = None if constants.arange_c is None else ttnn.le(constants.arange_c, accepted, memory_config=dram)
-    selectors = Qwen38TTNNRowsSelectors(constants.rows, committed_mask, onehot_bf16, history_select, committed_mask_c)
+    selectors = Qwen38TTNNRowsSelectors(
+        constants.rows, committed_mask, onehot_bf16, history_select, committed_mask_c, accepted=accepted
+    )
     selectors.validate(constants.rows)
     return selectors
 
@@ -1148,6 +1153,9 @@ class Qwen38TTNNGDNRowsState:
     # and this is the 32-row form), freed with the state.  While they are here the wrap owns the recurrence: the
     # prim layouts live in them and ``q`` / ``k`` / ``beta`` / ``g`` are not written.
     wrap_buffers: Any = None
+    # The verify-rows fold's per-layer buffers (``fused.gdn_rows_scan.attach``: the prefix states), freed with the
+    # state; while they are here the fold owns the recurrence and the commit, and the wrap is not attached.
+    scan_buffers: Any = None
 
     @classmethod
     def allocate(
@@ -1309,6 +1317,9 @@ class Qwen38TTNNGDNRowsState:
         if self.wrap_buffers is not None:
             self.wrap_buffers.deallocate()
             self.wrap_buffers = None
+        if self.scan_buffers is not None:
+            self.scan_buffers.deallocate()
+            self.scan_buffers = None
 
 
 # --------------------------------------------------------------------------- lane rows path (the MTP lanes verify)
@@ -1662,7 +1673,9 @@ class Qwen38TTNNGDNRowsResult:
     """``hidden_rows`` is ``rows_state.output`` (``[1,1,rows,640]``, persistent: read it before the next pass,
     never deallocate it) or, for ``forward_rows(full_tile=True)``, the whole ``[1,1,32,640]`` output tile in a new
     buffer the caller deallocates; ``final_state`` is the chunk kernel's state after all ``rows`` rows in a new FP32
-    buffer (the committed state is untouched until ``commit_rows``); the caller owns and deallocates it."""
+    buffer (the committed state is untouched until ``commit_rows``); the caller owns and deallocates it -- or ``None``
+    under the verify-rows fold (``QWEN38_FUSED=gdn_rows_scan``), whose state after all rows is the last of the prefix
+    states the rows state owns (``commit_rows_full`` reads it from there)."""
 
     hidden_rows: Any
     final_state: Any
@@ -1768,6 +1781,9 @@ class Qwen38TTNNGDN:
         # the rows body between the projection and the out-projection: the wrap's two programs around the two prims
         # (a default) where the rows state carries its buffers, the chain elsewhere and under QWEN38_FUSED_OFF=gdn_rows_wrap
         self._rows_body_call = fused.resolve_admitted("gdn_rows_wrap")
+        # the verify rows' fold (opt-in QWEN38_FUSED=gdn_rows_scan): one serial-recurrence program where the rows state
+        # carries its prefix states, today's stream (the wrap or the chain, through _rows_body_wrap) elsewhere
+        self._rows_scan_call = fused.resolve_admitted("gdn_rows_scan")
         # The prefill glue policy (QWEN38_PREFILL_GLUE), resolved once; read when a slab rows state is allocated.
         self.glue = prefill_glue.policy()
         # The lane body runs the same program on its B rows (one item per (lane, value head), one state slot per
@@ -1822,15 +1838,25 @@ class Qwen38TTNNGDN:
             kernel = self._rows_chunk = fused.resolve_admitted("gdn_rows_prims_direct")
         return kernel
 
-    def _rows_body(self):
-        """The rows body from the projection to the out-projection: on a rows state that carries the wrap's buffers
-        (the 32-row verify tile, by default) ``gdn_pre_rows`` + the two chunk prims + ``gdn_post_rows``
+    def _rows_body_wrap(self):
+        """Today's rows body from the projection to the out-projection: on a rows state that carries the wrap's
+        buffers (the 32-row verify tile, by default) ``gdn_pre_rows`` + the two chunk prims + ``gdn_post_rows``
         (ttnn/fused/gdn_rows_wrap), the chain elsewhere and under QWEN38_FUSED_OFF=gdn_rows_wrap; resolved once (fakes
-        that skip ``__init__`` resolve here)."""
+        that skip ``__init__`` resolve here).  The verify-rows fold's composed callable."""
 
         body = self.__dict__.get("_rows_body_call")
         if body is None:
             body = self._rows_body_call = fused.resolve_admitted("gdn_rows_wrap")
+        return body
+
+    def _rows_body(self):
+        """The rows body ``forward_rows`` dispatches to: on a rows state that carries the verify-rows fold's buffers
+        (opt-in QWEN38_FUSED=gdn_rows_scan) the one-program serial recurrence (ttnn/fused/gdn_rows_scan), else today's
+        stream through ``_rows_body_wrap``; resolved once (fakes that skip ``__init__`` resolve here)."""
+
+        body = self.__dict__.get("_rows_scan_call")
+        if body is None:
+            body = self._rows_scan_call = fused.resolve_admitted("gdn_rows_scan")
         return body
 
     def _validate_state(self, state: Qwen38TTNNGDNState) -> None:
@@ -2510,7 +2536,9 @@ class Qwen38TTNNGDN:
         )
         # Whether this state runs the verify-rows wrap is decided here, before the warm pass: its buffers are the
         # admission, so the warm rounds, the capture and the commit that reads them cannot disagree.
-        fused.gdn_rows_wrap.attach(self, rows_state)
+        # The fold first (its prefix states are the admission); the wrap only where the fold did not attach.
+        if fused.gdn_rows_scan.attach(self, rows_state) is None:
+            fused.gdn_rows_wrap.attach(self, rows_state)
         return rows_state
 
     def _validate_rows_state(self, rows_state: Qwen38TTNNGDNRowsState) -> int:
@@ -3352,6 +3380,19 @@ class Qwen38TTNNGDN:
                 "verify-rows wrap (a default), which keeps the chunk prims' layouts instead: set "
                 "QWEN38_FUSED_OFF=gdn_rows_wrap to use the anchors"
             )
+        scan = fused.gdn_rows_scan.buffers_of(rows_state)
+        if scan is not None:
+            if step_committed_rows or step_on_full_rejection:
+                raise ValueError(
+                    "the 1-row step anchors of commit_rows need the chain's rows buffers; this layer runs the "
+                    "verify-rows fold (QWEN38_FUSED=gdn_rows_scan), whose committed state is the forward pass's own "
+                    "prefix state"
+                )
+            # The state after accepted + 1 rows is the forward pass's prefix slot `accepted`: one pick, no re-run.
+            fused.gdn_rows_scan.commit(self, rows_state, scan, state, selectors)
+            self._advance_history_rows(rows_state, selectors)
+            state.validate()
+            return
         if step_committed_rows:
             stepped = self._step_committed_rows_state(rows_state, state.recurrent, selectors)
             _copy_inplace(stepped, state.recurrent, label="GDN rows committed rows step state")
@@ -3392,9 +3433,14 @@ class Qwen38TTNNGDN:
 
         self._validate_state(state)
         self._validate_rows_state(rows_state)
-        _require_shape(final_state, (1, VALUE_HEADS_PER_DEVICE, HEAD_DIM, HEAD_DIM), label="GDN rows final state")
-        _copy_inplace(final_state, state.recurrent, label="GDN rows committed state")
-        _deallocate(final_state)
+        scan = fused.gdn_rows_scan.buffers_of(rows_state)
+        if final_state is None and scan is not None:
+            # the fold keeps the state after all rows in its last prefix slot
+            fused.gdn_rows_scan.commit_all_rows(scan, state)
+        else:
+            _require_shape(final_state, (1, VALUE_HEADS_PER_DEVICE, HEAD_DIM, HEAD_DIM), label="GDN rows final state")
+            _copy_inplace(final_state, state.recurrent, label="GDN rows committed state")
+            _deallocate(final_state)
         if rows_state.fused_prefill:
             # The fused slab body's gated epilogue already built the next pass's history tile from the projection's
             # last three rows (gdn_post_rows), in place of the seven programs of the branch below; the commit is the

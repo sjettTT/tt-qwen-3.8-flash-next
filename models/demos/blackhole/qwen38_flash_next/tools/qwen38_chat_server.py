@@ -74,6 +74,8 @@ from models.demos.blackhole.qwen38_flash_next.tools.live_decode_diagnostic impor
     missing_bf4_layers,
 )
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import Qwen38ChatRequestRejected
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_module
+from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_rows_scan as gdn_rows_scan_module
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     DEFAULT_PREFILL_MODE,
     MAX_TOKENS_BOUND,
@@ -1820,6 +1822,7 @@ def main() -> int:
             verify_forms=len(forms),
             long_chunks=bool(args.long_chunks),
             moe_rows=mtp_moe_rows,
+            gdn_rows_scan=fused_module.enabled(gdn_rows_scan_module.NAME),
         )
     )
     if mtp_admission_table is not None:
