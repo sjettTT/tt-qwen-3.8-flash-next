@@ -89,6 +89,8 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     resolve_route,
     template_decoder,
 )
+from models.demos.blackhole.qwen38_flash_next.tools.qwen38_mtp_device_accept import SWITCH as DEVICE_ACCEPT_SWITCH
+from models.demos.blackhole.qwen38_flash_next.tools.qwen38_mtp_device_accept import device_accept_switch
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
     RESIDENT_MAX_QSA_CACHE_CAPACITY,
@@ -201,6 +203,14 @@ def mtp_sampled_switch(environment: Mapping[str, str], *, applicable: bool = Tru
     if value not in ("0", "1"):
         raise SystemExit(f"{MTP_SAMPLED_VARIABLE} must be 0 or 1, got {value!r}")
     return value == "1"
+
+
+# The device acceptance (qwen38_mtp_device_accept.SWITCH, QWEN38_MTP_DEVICE_ACCEPT, default off): with it on beside the
+# split verify the chain warms and captures the device-decided sampled form too (the head, fused.mtp_accept and the
+# tail in one trace); which sampled requests run it is the acceptance's admission.  An explicit 1 without the split
+# verify is refused at start.  QWEN38_MTP_DEVICE_ACCEPT_DUMP=<dir> (dev) makes the session record every device-decided
+# pass's candidate rows and write one JSON per request for the acceptance's gate tool (dev).
+DEVICE_ACCEPT_DUMP_VARIABLE = "QWEN38_MTP_DEVICE_ACCEPT_DUMP"
 
 
 # -- requests and responses ----------------------------------------------------------------------
@@ -1734,7 +1744,13 @@ def main() -> int:
     # Qwen38TracedChain.open); the 2026-09-04 table is the no-device fallback, logged here for the record, never a
     # refusal before the mesh opens.  The table row counts the verify forms the open will capture (one table, the
     # switch), so its record and the live decision's agree on them.
-    forms = mtp_verify_forms(mtp_sampled)
+    mtp_device_accept = device_accept_switch()  # the acceptance module's switch; the extension builds from it at open
+    if mtp_device_accept and not mtp_sampled:
+        raise SystemExit(
+            f"{DEVICE_ACCEPT_SWITCH}=1 needs the split verify ({MTP_SAMPLED_VARIABLE} on: --mtp and --sampling)"
+        )
+    # The open captures these forms; its gate evaluates the same configuration.
+    forms = mtp_verify_forms(mtp_sampled, mtp_device_accept)
     mtp_admission_table = (
         None
         if args.mtp is None
@@ -1806,11 +1822,13 @@ def main() -> int:
             "admission": None,  # the chain's live admission once it opens (report["mtp"]["admission"])
             "admission_table_fallback": mtp_admission_table,
             "sampled": mtp_sampled,
+            "device_accept": mtp_device_accept,
         },
         # What a seed reproduces against: the source head and the runtime; with the pass loop drafting for sampled
         # requests the draw order is the pass's, so the switch and k are part of the identity.
         "system_fingerprint": f"{runtime['head'][:12]}-{runtime['extension_sha256'][:12]}"
-        + (f"-mtp{args.mtp}-sampled" if mtp_sampled else ""),
+        + (f"-mtp{args.mtp}-sampled" if mtp_sampled else "")
+        + ("-device-accept" if mtp_sampled and device_accept_switch() else ""),
     }
     if args.validate_only:
         print(json.dumps({"status": "pass", "mesh_open_requested": False, **summary}, sort_keys=True))
@@ -1899,12 +1917,16 @@ def main() -> int:
             mtp_gdn_anchor=args.mtp_gdn_anchor,
             device_sampler=bool(args.device_sampler),
             mtp_sampled=mtp_sampled,
+            mtp_device_accept=mtp_device_accept,
         )
         if chain.allocated_context != resident_context.allocated_context:
             raise Qwen38ChatChainError(
                 f"chain allocated context {chain.allocated_context} vs requested {resident_context.allocated_context}"
             )
         session = Qwen38ChatSession(chain, template, prefill_mode=args.prefill_mode)
+        if os.environ.get(DEVICE_ACCEPT_DUMP_VARIABLE):
+            session.device_accept_dump = Path(os.environ[DEVICE_ACCEPT_DUMP_VARIABLE])
+            session.device_accept_dump.mkdir(parents=True, exist_ok=True)
         if session.prefill_mode != args.prefill_mode:
             raise Qwen38ChatChainError(f"session prefill mode {session.prefill_mode} vs requested {args.prefill_mode}")
         if (session.sampling is not None) != bool(args.sampling):
@@ -1915,6 +1937,10 @@ def main() -> int:
             raise Qwen38ChatChainError(f"session mtp {session.mtp is not None} vs requested {args.mtp}")
         if session.mtp is not None and session.mtp.sampled != mtp_sampled:
             raise Qwen38ChatChainError(f"session mtp sampled {session.mtp.sampled} vs requested {mtp_sampled}")
+        if session.mtp is not None and session.mtp.device_accept != mtp_device_accept:
+            raise Qwen38ChatChainError(
+                f"session mtp device_accept {session.mtp.device_accept} vs requested {mtp_device_accept}"
+            )
         if chain.mtp is not None:
             report["mtp"]["admission"] = chain.mtp.admission
         if session.mtp is not None and (
@@ -1956,6 +1982,7 @@ def main() -> int:
                     "k": chain.mtp.drafts,
                     "anchor": chain.mtp.anchor,
                     "sampled": chain.mtp.sampled,
+                    "device_accept": chain.mtp.device_accept,
                     "traces": len(chain.mtp.captured_trace_ids()),
                     "long_chunk_extension": chain.mtp.long_chunk_extension is not None,
                     "capture_ms": chain.mtp.capture_ms,

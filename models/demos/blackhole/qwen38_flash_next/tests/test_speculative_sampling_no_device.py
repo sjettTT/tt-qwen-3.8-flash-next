@@ -820,15 +820,20 @@ def test_open_captures_the_fused_verify_always_and_the_split_form_beside_it_unde
     # the MTP traces are measured from the last prefill capture (the 32-row, 128-row and slab traces are their own terms)
     assert '"mtp_fused_traces": dram_after_fused - dram_after_prefill_captures' in after
     assert '"mtp_traces": dram_after_mtp - dram_after_prefill_captures' in after
-    assert 'trace_dram_bytes_per_bank["mtp_split_traces"] = dram_after_mtp - dram_after_fused' in after
+    assert 'trace_dram_bytes_per_bank["mtp_split_traces"] = dram_after_split - dram_after_fused' in after
     assert 'chain_mtp.dram_bytes_per_bank["traces"] = chain_mtp.trace_dram_bytes_per_bank["mtp_traces"]' in after
     # The warm rounds under the switch are the split form's four (the warm the split captures were proven with):
     # every op of the fused body runs in the head or the tail on tensors of the same specs, so the fused capture
-    # needs no round of its own; without the switch the fused body's four rounds, as before.
+    # needs no round of its own; without the switch the fused body's four rounds, as before; the device acceptance
+    # adds its own round per residue (tests/test_mtp_device_accept_chain_no_device.py).
     warm = opened[
         opened.index('marker("before-chat-mtp-warm-pass")') : opened.index('marker("after-chat-mtp-warm-pass")')
     ]
-    assert "if not chain_mtp.sampled:" in warm and "residue % 2" not in warm and '"fused"' not in warm
+    assert (
+        '("fused",) if not chain_mtp.sampled else ("split", "sampled") if chain_mtp.device_accept else ("split",)'
+        in warm
+    )
+    assert 'if warm_form == "fused":' in warm and "residue % 2" not in warm
     assert warm.index("mtp_v2.forward_verify(model, chain_mtp.verify, state, catch_up=False)") < warm.index(
         "mtp_v2.forward_verify_head(model, chain_mtp.verify, state, catch_up=False)"
     )
@@ -847,34 +852,40 @@ def test_open_captures_the_fused_verify_always_and_the_split_form_beside_it_unde
     # close() releases every trace once and both forms' outputs; the leave commits through the shared commit.
     close = _segment(SESSION_SOURCE, functions["close"])
     assert "self.mtp.traces = None self.mtp.split_traces = None" in close
-    assert 'for name in ("verify_output", "split_verify_output", "head_output"):' in close
+    assert 'for name in ("verify_output", "split_verify_output", "sampled_verify_output", "head_output"):' in close
     assert "commit=lambda: self._replay(mtp.traces.commit)" in _segment(SESSION_SOURCE, functions["mtp_leave"])
     ids = inspect.getsource(session_module.Qwen38ChainMTP.captured_trace_ids)
-    assert "for traces in (self.traces, self.split_traces):" in ids and "if trace_id not in ids" in ids
+    assert "for traces in (self.traces, self.split_traces, self.sampled_traces):" in ids
+    assert "if trace_id not in ids" in ids
     # The admission counts the forms the open captures, from one table read at both sites (the open, the server's
     # pre-mesh refusal), and both records name them; the open checks its captures against its record and the server
     # checks the two records agree.
-    assert session_module.MTP_VERIFY_FORMS_BY_SWITCH == {False: ("fused",), True: ("fused", "split")}
+    # The table is keyed by (mtp_sampled, mtp_device_accept); the device acceptance's third form is pinned in
+    # tests/test_mtp_device_accept_chain_no_device.py.
+    assert session_module.MTP_VERIFY_FORMS_BY_SWITCH[(False, False)] == ("fused",)
+    assert session_module.MTP_VERIFY_FORMS_BY_SWITCH[(True, False)] == ("fused", "split")
     assert session_module.mtp_verify_forms(False) == ("fused",) and session_module.mtp_verify_forms(True) == (
         "fused",
         "split",
     )
     with pytest.raises(ValueError, match="must be a bool"):
         session_module.mtp_verify_forms(1)
-    assert "forms = mtp_verify_forms(mtp_sampled)" in opened and "verify_forms=len(forms)" in opened
-    assert opened.index("forms = mtp_verify_forms(mtp_sampled)") < opened.index(
+    assert "forms = mtp_verify_forms(mtp_sampled, mtp_device_accept)" in opened and "verify_forms=len(forms)" in opened
+    assert opened.index("forms = mtp_verify_forms(mtp_sampled, mtp_device_accept)") < opened.index(
         "mtp_admission = mtp_capacity_admission("
     )
     assert 'mtp_admission["verify_forms_captured"] = list(forms)' in opened
     assert (
-        'captured_forms = ["fused"] + (["split"] if chain_mtp.split_traces is not None else [])' in opened
+        '(["split"] if chain_mtp.split_traces is not None else [])' in opened
         and 'if captured_forms != chain_mtp.admission["verify_forms_captured"]:' in opened
     )
     from models.demos.blackhole.qwen38_flash_next.tools import qwen38_chat_server as server
 
     main = inspect.getsource(server.main)
-    assert "forms = mtp_verify_forms(mtp_sampled)" in main and "verify_forms=len(forms)" in main
-    assert main.index("mtp_sampled = mtp_sampled_switch(") < main.index("forms = mtp_verify_forms(mtp_sampled)")
+    assert "forms = mtp_verify_forms(mtp_sampled, mtp_device_accept)" in main and "verify_forms=len(forms)" in main
+    assert main.index("mtp_sampled = mtp_sampled_switch(") < main.index(
+        "forms = mtp_verify_forms(mtp_sampled, mtp_device_accept)"
+    )
     assert 'mtp_admission_table["verify_forms_captured"] = list(forms)' in main
     assert 'session.mtp.admission["verify_forms"] != mtp_admission_table["verify_forms"]' in main
     assert 'session.mtp.admission["verify_forms_captured"] != mtp_admission_table["verify_forms_captured"]' in main

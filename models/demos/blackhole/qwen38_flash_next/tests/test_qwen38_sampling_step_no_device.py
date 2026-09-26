@@ -262,6 +262,7 @@ def test_clocks_summary_reports_period_and_host_segment() -> None:
         "first_token_rewrites",
         "verified_steps",
         "mtp_drafting",
+        "mtp_acceptance_arithmetic",
         "mtp",
     }
     assert request.as_dict()["logprobs_normalizer"] == "candidate_row"  # the reported logprobs are row-relative

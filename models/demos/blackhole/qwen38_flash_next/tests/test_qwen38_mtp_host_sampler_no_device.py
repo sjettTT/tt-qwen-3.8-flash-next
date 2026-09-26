@@ -63,8 +63,10 @@ def test_the_server_and_the_session_wire_the_host_sampler_on_an_mtp_chain():
         "device_sampler=bool(args.device_sampler),"
     )
     complete = inspect.getsource(session.Qwen38ChatSession.complete)
-    # the device policy and the first draw are bound only when the extension has a sampler; without one the request
-    # arrives at the drafting admission with device_loop False
-    assert 'if getattr(self.sampling, "sampler", None) is not None:' in complete
+    # the request start binds the device policy and the first draw only when the extension has a sampler (or the
+    # device acceptance, whose begin_request leaves the uniforms empty); otherwise the request arrives at the drafting
+    # admission with device_loop False and the pass loop drafts for it
+    assert 'getattr(self.sampling, "sampler", None) is not None' in complete
+    assert 'getattr(self.sampling, "device_accept", None) is not None' in complete
     assert "device_loop = sampling is not None and bool(sampling.uniforms)" in complete
     assert "sampling_step.drafting_admission(self.mtp, sampling, device_loop=device_loop)" in complete

@@ -159,6 +159,13 @@ Since 2026-09-25 the `--mtp` admission reads the mesh allocator's free bytes per
 are built (less the build's own remaining state and traces) and refuses only when the MTP pair, state and growth
 estimate for k and the verify forms do not fit there; the 2026-09-04 free-after-captures table is the no-device fallback and is logged, not enforced,
 before the mesh opens.
+`QWEN38_MTP_DEVICE_ACCEPT=1` (default off; needs the split verify) captures a third form beside the two verify forms:
+the head, the device's point-mass acceptance (`fused.mtp_accept`, the device sampler's arithmetic) and the tail in one
+trace, for the sampled requests its admission takes (`qwen38.sampling.mtp_acceptance_arithmetic` names the law
+realisation, `device-theta` or `host-fp32`); `/health.mtp.device_accept` is the switch, `device_accept_passes` and
+`device_accept_guard_deviations` its counters, and `QWEN38_MTP_DEVICE_ACCEPT_DUMP=<dir>` (dev) writes one JSON per
+request with every device-decided pass's rows, tokens, statistics and uniforms for the
+development-side law gate that re-derives each decision on the host.
 
 ## The prompt, follow-up turns and the prompt-end snapshot
 
