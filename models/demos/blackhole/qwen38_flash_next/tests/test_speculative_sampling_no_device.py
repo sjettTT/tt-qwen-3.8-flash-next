@@ -781,17 +781,18 @@ def test_open_captures_the_fused_verify_always_and_the_split_form_beside_it_unde
 
     functions = _functions(SESSION_SOURCE)
     opened = _segment(SESSION_SOURCE, functions["open"])
-    captures = opened[
-        opened.index('marker("before-chat-mtp-captures")') : opened.index('marker("after-chat-mtp-captures")')
-    ]
-    switch = captures.index("if chain_mtp.sampled:")
+    # The capture sequence lives in open's per-chain helper (QWEN38_MTP_DRAFTS_PER_REQUEST runs it once per chain,
+    # the default first): the same calls for every chain, on ``target``.
+    captures = _segment(SESSION_SOURCE, functions["capture_mtp_chain"])
+    assert "dram_after_previous = capture_mtp_chain(chain_mtp, dram_after_prefill_captures)" in opened
+    switch = captures.index("if target.sampled:")
     fused, split = captures[:switch], captures[switch:]
     # The fused form first, unconditional: verify, commit, draft, its traces object without a split field.
     order = [
         "verify_first, verify_output = mtp_v2.capture_verify(",
-        "commit = mtp_v2.capture_commit(model, chain_mtp.verify, state, guard=guard, cq_id=0)",
-        "draft = mtp_v2.capture_draft(model, chain_mtp.verify, chain_mtp.draft, state, verify_output, guard=guard",
-        "chain_mtp.traces = mtp_v2.Qwen38TTNNMTPTraces(verify_first=verify_first, draft=draft, commit=commit)",
+        "commit = mtp_v2.capture_commit(model, target.verify, state, guard=guard, cq_id=0)",
+        "draft = mtp_v2.capture_draft(model, target.verify, target.draft, state, verify_output, guard=guard",
+        "target.traces = mtp_v2.Qwen38TTNNMTPTraces(verify_first=verify_first, draft=draft, commit=commit)",
         "ttnn.mark_corruptible(verify_output.readback)",
         "dram_after_fused = dram_allocated_per_bank()",
     ]
@@ -803,25 +804,25 @@ def test_open_captures_the_fused_verify_always_and_the_split_form_beside_it_unde
     order = [
         "verify_head, head_output = mtp_v2.capture_verify_head(",
         "verify_tail, split_verify_output = mtp_v2.capture_verify_tail(",
-        "model, chain_mtp.verify, state, head_output, catch_up=False",
+        "model, target.verify, state, head_output, catch_up=False",
         "split_draft = mtp_v2.capture_draft(",
-        "model, chain_mtp.verify, chain_mtp.draft, state, split_verify_output, guard=guard",
-        "chain_mtp.split_traces = mtp_v2.Qwen38TTNNMTPTraces(",
+        "model, target.verify, target.draft, state, split_verify_output, guard=guard",
+        "target.split_traces = mtp_v2.Qwen38TTNNMTPTraces(",
         "verify_first=None, draft=split_draft, commit=commit, verify_head=verify_head, verify_tail=verify_tail",
-        "chain_mtp.split_verify_output = split_verify_output",
-        "chain_mtp.head_output = head_output",
+        "target.split_verify_output = split_verify_output",
+        "target.head_output = head_output",
         "split_verify_output.readback, head_output.readback, head_output.roots, head_output.logits.tensor",
     ]
     positions = [split.index(fragment) for fragment in order]
     assert positions == sorted(positions), order
     assert "capture_verify(" not in split and "capture_commit(" not in split
     # Both forms' bytes per bank are recorded; the MTP total keeps its key (the admission gate reads it).
-    after = opened[opened.index('marker("after-chat-mtp-captures")') :]
+    after = captures[captures.index("dram_after_target = dram_allocated_per_bank()") :]
     # the MTP traces are measured from the last prefill capture (the 32-row, 128-row and slab traces are their own terms)
-    assert '"mtp_fused_traces": dram_after_fused - dram_after_prefill_captures' in after
-    assert '"mtp_traces": dram_after_mtp - dram_after_prefill_captures' in after
+    assert '"mtp_fused_traces": dram_after_fused - dram_baseline' in after
+    assert '"mtp_traces": dram_after_target - dram_baseline' in after
     assert 'trace_dram_bytes_per_bank["mtp_split_traces"] = dram_after_split - dram_after_fused' in after
-    assert 'chain_mtp.dram_bytes_per_bank["traces"] = chain_mtp.trace_dram_bytes_per_bank["mtp_traces"]' in after
+    assert 'target.dram_bytes_per_bank["traces"] = target.trace_dram_bytes_per_bank["mtp_traces"]' in after
     # The warm rounds under the switch are the split form's four (the warm the split captures were proven with):
     # every op of the fused body runs in the head or the tail on tensors of the same specs, so the fused capture
     # needs no round of its own; without the switch the fused body's four rounds, as before; the device acceptance
@@ -829,15 +830,14 @@ def test_open_captures_the_fused_verify_always_and_the_split_form_beside_it_unde
     warm = opened[
         opened.index('marker("before-chat-mtp-warm-pass")') : opened.index('marker("after-chat-mtp-warm-pass")')
     ]
-    assert (
-        '("fused",) if not chain_mtp.sampled else ("split", "sampled") if chain_mtp.device_accept else ("split",)'
-        in warm
-    )
+    assert '("fused",) if not target.sampled else ("split", "sampled") if target.device_accept else ("split",)' in warm
+    # the rounds run per drafting chain (QWEN38_MTP_DRAFTS_PER_REQUEST: the default first) inside open's helper
+    assert "def warm_mtp_chain(target: Qwen38ChainMTP) -> None:" in warm
     assert 'if warm_form == "fused":' in warm and "residue % 2" not in warm
-    assert warm.index("mtp_v2.forward_verify(model, chain_mtp.verify, state, catch_up=False)") < warm.index(
-        "mtp_v2.forward_verify_head(model, chain_mtp.verify, state, catch_up=False)"
+    assert warm.index("mtp_v2.forward_verify(model, target.verify, state, catch_up=False)") < warm.index(
+        "mtp_v2.forward_verify_head(model, target.verify, state, catch_up=False)"
     )
-    assert warm.count("mtp_v2.forward_draft(model, chain_mtp.verify, chain_mtp.draft, state, output)") == 1
+    assert warm.count("mtp_v2.forward_draft(model, target.verify, target.draft, state, output)") == 1
     # The routing point.
     enter = _segment(SESSION_SOURCE, functions["mtp_enter"])
     assert "if decide is not None and (not mtp.sampled or mtp.split_traces is None):" in enter
@@ -851,7 +851,10 @@ def test_open_captures_the_fused_verify_always_and_the_split_form_beside_it_unde
     assert "head_output=head_output," in enter and "decide=decision," in enter
     # close() releases every trace once and both forms' outputs; the leave commits through the shared commit.
     close = _segment(SESSION_SOURCE, functions["close"])
-    assert "self.mtp.traces = None self.mtp.split_traces = None" in close
+    assert (
+        "for chain_mtp in self.drafting_chains(): chain_mtp.traces = None chain_mtp.split_traces = None "
+        "chain_mtp.sampled_traces = None" in close
+    )
     assert 'for name in ("verify_output", "split_verify_output", "sampled_verify_output", "head_output"):' in close
     assert "commit=lambda: self._replay(mtp.traces.commit)" in _segment(SESSION_SOURCE, functions["mtp_leave"])
     ids = inspect.getsource(session_module.Qwen38ChainMTP.captured_trace_ids)
@@ -876,8 +879,8 @@ def test_open_captures_the_fused_verify_always_and_the_split_form_beside_it_unde
     )
     assert 'mtp_admission["verify_forms_captured"] = list(forms)' in opened
     assert (
-        '(["split"] if chain_mtp.split_traces is not None else [])' in opened
-        and 'if captured_forms != chain_mtp.admission["verify_forms_captured"]:' in opened
+        '(["split"] if target.split_traces is not None else [])' in captures
+        and 'if captured_forms != target.admission["verify_forms_captured"]:' in captures
     )
     from models.demos.blackhole.qwen38_flash_next.tools import qwen38_chat_server as server
 

@@ -136,7 +136,7 @@ that leaves earlier than the pinned table is a regression (`docs/NUMERICS.md`).
 | `--prepare-only --bf4-stage-limit N` | convert at most N missing expert layers into the BF4 cache and stop |
 | `--long-chunks` | 128-row prefill chunks where the prompt allows (section 6); off by default; with `--mtp` the MTP layer's rows run inside the 128-row chunks too |
 | `--prefill-slab 2048` | prefill slabs of 2048 rows ahead of the 128-row chunks: one matmul per dense linear, the routed experts in one `moe_compute` call on three rings, tolerance-class against the chunk bodies (`docs/PREFILL.md`); off by default, not combined with `--mtp` |
-| `--mtp 3\|4\|5` | speculative drafting on greedy requests (section 6); off by default |
+| `--mtp 3\|4\|5` | speculative drafting on greedy requests (section 6); off by default; `QWEN38_MTP_DRAFTS_PER_REQUEST=1` opens the k = 4 and k = 5 chains together and a request picks with `extra_body.mtp_drafts` (`docs/SERVER.md`) |
 | `--port`, `--host` | the listening port; `--host` default `0.0.0.0`: the QuietBox and p150-line profiles serve the LAN |
 | `--serve-seconds N` | stop after N seconds (a drain: the request in flight gets its reply) |
 | `--sampling` / `--no-sampling` | the launcher passes `--sampling`: sampled requests are served, a request naming no sampling field is still the bitwise greedy stream; `--no-sampling` refuses sampling fields with HTTP 400 (+0.3 ms per token saved) |

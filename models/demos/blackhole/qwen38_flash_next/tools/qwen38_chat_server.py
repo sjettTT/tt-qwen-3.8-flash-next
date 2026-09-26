@@ -91,7 +91,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
 )
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_mtp_device_accept import SWITCH as DEVICE_ACCEPT_SWITCH
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_mtp_device_accept import device_accept_switch
-from models.demos.blackhole.qwen38_flash_next.ttnn import fused
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused, mtp_v2
 from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
     RESIDENT_MAX_QSA_CACHE_CAPACITY,
     RESIDENT_QSA_CACHE_CAPACITIES,
@@ -147,6 +147,7 @@ KNOWN_REQUEST_FIELDS = frozenset(
         "thinking_budget",
         "ignore_eos",
         "prefill_mode",
+        "mtp_drafts",
     )
     + sampling_step.SAMPLING_REQUEST_FIELDS
 )
@@ -194,6 +195,31 @@ def effective_device_sampler(args: Any) -> bool:
     return bool(requested)
 
 
+MTP_DRAFTS_PER_REQUEST_VARIABLE = "QWEN38_MTP_DRAFTS_PER_REQUEST"
+# The pair of chains a per-request server captures: the default (--mtp K) and the other member; a request picks with
+# extra_body.mtp_drafts (docs/SERVER.md).  The measured pair (2026-09-26): k = 5 on the 6-row verify MoE form pays on
+# structured output (json, code), k = 4 stays the chat / prose default.
+MTP_DRAFTS_PER_REQUEST_PAIR = (4, 5)
+
+
+def mtp_drafts_per_request_switch(environment: Mapping[str, str], *, drafts: int | None) -> tuple[int, ...]:
+    """``QWEN38_MTP_DRAFTS_PER_REQUEST``: 1 captures the other chain of :data:`MTP_DRAFTS_PER_REQUEST_PAIR` beside the
+    server's ``--mtp`` chain and admits ``mtp_drafts`` in requests; the result is the admitted draft counts, the default
+    first (empty = one chain, the field refused).  Unset or 0 leaves one chain; 1 needs ``--mtp`` in the pair."""
+
+    value = environment.get(MTP_DRAFTS_PER_REQUEST_VARIABLE)
+    if value is None or value == "0":
+        return ()
+    if value != "1":
+        raise SystemExit(f"{MTP_DRAFTS_PER_REQUEST_VARIABLE} must be 0 or 1, got {value!r}")
+    if drafts not in MTP_DRAFTS_PER_REQUEST_PAIR:
+        raise SystemExit(
+            f"{MTP_DRAFTS_PER_REQUEST_VARIABLE}=1 needs --mtp in {MTP_DRAFTS_PER_REQUEST_PAIR} (the chains it captures), "
+            f"got --mtp {drafts}"
+        )
+    return (drafts,) + tuple(count for count in MTP_DRAFTS_PER_REQUEST_PAIR if count != drafts)
+
+
 def mtp_sampled_switch(environment: Mapping[str, str], *, applicable: bool = True) -> bool:
     """The switch's resolution; ``applicable``: the server runs with ``--mtp`` and ``--sampling``."""
 
@@ -216,7 +242,9 @@ DEVICE_ACCEPT_DUMP_VARIABLE = "QWEN38_MTP_DEVICE_ACCEPT_DUMP"
 # -- requests and responses ----------------------------------------------------------------------
 
 
-def parse_chat_request(document: Any, *, seed: int | None = None, sampling_available: bool = True) -> dict[str, Any]:
+def parse_chat_request(
+    document: Any, *, seed: int | None = None, sampling_available: bool = True, mtp_drafts_admitted: Sequence[int] = ()
+) -> dict[str, Any]:
     """The fields the server honours, validated with actual-vs-expected messages (one completion; the sampling
     fields per ``qwen38_sampling_step``, ``extra_body`` merged under the top level, JSON null an absent field,
     ``chat_template_kwargs`` the thinking flags' other spelling).  ``seed`` is the server's draw for a request that
@@ -281,6 +309,23 @@ def parse_chat_request(document: Any, *, seed: int | None = None, sampling_avail
             f"response_format.type must be 'text' (this server has no constrained decoding), got {kind!r}",
             param="response_format",
         )
+    mtp_drafts = document.get("mtp_drafts")
+    if mtp_drafts is not None:
+        # The chain a request drafts with (extra_body.mtp_drafts): one of the draft counts this server captured at
+        # open (QWEN38_MTP_DRAFTS_PER_REQUEST=1: the --mtp chain and the pair's other member); anything else is
+        # refused with the admitted list, and a one-chain server refuses the field rather than dropping it.
+        admitted = tuple(mtp_drafts_admitted)
+        if not admitted:
+            raise Qwen38ChatRequestRejected(
+                f"mtp_drafts is not admitted by this server (one drafting chain; {MTP_DRAFTS_PER_REQUEST_VARIABLE}=1 "
+                f"opens the pair): drop it, got {mtp_drafts!r}",
+                param="mtp_drafts",
+            )
+        if isinstance(mtp_drafts, bool) or type(mtp_drafts) is not int or mtp_drafts not in admitted:
+            raise Qwen38ChatRequestRejected(
+                f"mtp_drafts must be one of {list(admitted)} (the chains this server captured), got {mtp_drafts!r}",
+                param="mtp_drafts",
+            )
     if document.get("logit_bias", {}) != {}:
         raise Qwen38ChatRequestRejected(
             f"logit_bias is not applied by this server: drop it, got {document.get('logit_bias')!r}", param="logit_bias"
@@ -356,6 +401,7 @@ def parse_chat_request(document: Any, *, seed: int | None = None, sampling_avail
         "stop": protocol.validate_stop(document.get("stop")),
         "ignore_eos": ignore_eos,
         "prefill_mode": prefill_mode,
+        "mtp_drafts": mtp_drafts,
         "sampling": sampling,
         "logprobs": logprobs,
         "top_logprobs": top_logprobs,
@@ -461,6 +507,7 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
         stall_seconds: float | None = None,
         system_fingerprint: str | None = None,
         dram_after_captures: Mapping[str, Any] | None = None,
+        mtp_drafts_admitted: Sequence[int] = (),
         listen: bool = True,
     ) -> None:
         # The address is bound here, so a taken port or a host the address family cannot carry fails at once (main
@@ -486,6 +533,7 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
         self.stall_seconds = stall_seconds
         self.progress: dict[str, Any] | None = None  # the request holding the device: start, last poll, polls
         self.system_fingerprint = system_fingerprint  # source head + runtime .so: what a seed reproduces against
+        self.mtp_drafts_admitted = tuple(mtp_drafts_admitted)  # the chains a request may pick (extra_body.mtp_drafts)
         # The mesh allocator read after the traces were captured (hardware_profiles.symmetric_mesh_dram_memory: one observation
         # that applies to every card): free_bytes_per_bank is the build's headroom, reported as read, never updated.
         self.dram_after_captures = dram_after_captures
@@ -748,6 +796,10 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                     # logprobs are relative to the read candidates (above the vocabulary's by -log of the row's mass).
                     "logprobs_normalizer": None if session.sampling is None else "candidate_row",
                     "mtp": None if session.mtp is None else session.mtp.summary(),
+                    # the chains captured at open by draft count (one entry without QWEN38_MTP_DRAFTS_PER_REQUEST)
+                    "mtp_chains": {
+                        str(drafts): chain_mtp.summary() for drafts, chain_mtp in sorted(session.mtp_chains.items())
+                    },
                     "sampling_defaults": {
                         "thinking": sampling_step.parameters_as_dict(
                             sampling_step.Qwen38SamplingParameters.official_thinking(seed=0)
@@ -790,6 +842,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             request = parse_chat_request(
                 json.loads(self.rfile.read(int(length)).decode("utf-8")),
                 sampling_available=session.sampling is not None,
+                mtp_drafts_admitted=self.server.mtp_drafts_admitted,
             )
             # The reference render is the device prompt (usage.prompt_tokens is the client's own count); it validates
             # the whole request and resolves the budget (the remaining context when max_tokens is absent) before any
@@ -1016,6 +1069,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 should_stop=should_stop,
                 prefill_mode=request["prefill_mode"],
                 sampling=sampling,
+                mtp_drafts=request["mtp_drafts"],
             )
             final_deltas = assembler.finish()
         except Exception as error:  # noqa: BLE001  the device loop failed: report, then end the server
@@ -1716,6 +1770,7 @@ def main() -> int:
         if os.environ.get(name) != expected:
             raise SystemExit(f"{name} is {os.environ.get(name)!r}, expected {expected!r}")
     mtp_sampled = mtp_sampled_switch(os.environ, applicable=args.mtp is not None and bool(args.sampling))
+    mtp_drafts_admitted = mtp_drafts_per_request_switch(os.environ, drafts=args.mtp)
     if mtp_sampled and (args.mtp is None or not args.sampling):
         raise SystemExit(
             f"{MTP_SAMPLED_VARIABLE}=1 needs --mtp and --sampling (the pass loop drafts for sampled requests)"
@@ -1751,6 +1806,11 @@ def main() -> int:
         )
     # The open captures these forms; its gate evaluates the same configuration.
     forms = mtp_verify_forms(mtp_sampled, mtp_device_accept)
+    # QWEN38_MTP_MOE_ROWS (diagnostic, default unset): the verify MoE row count forced on the chain (5, 6 or 32);
+    # it keys the admission's states term and reaches the chain open; needs --mtp.
+    mtp_moe_rows = mtp_v2.moe_rows_override()
+    if mtp_moe_rows is not None and args.mtp is None:
+        raise SystemExit(f"{mtp_v2.MOE_ROWS_SWITCH} needs --mtp (the verify MoE form is the MTP chain's)")
     mtp_admission_table = (
         None
         if args.mtp is None
@@ -1759,6 +1819,7 @@ def main() -> int:
             drafts=args.mtp,
             verify_forms=len(forms),
             long_chunks=bool(args.long_chunks),
+            moe_rows=mtp_moe_rows,
         )
     )
     if mtp_admission_table is not None:
@@ -1823,6 +1884,10 @@ def main() -> int:
             "admission_table_fallback": mtp_admission_table,
             "sampled": mtp_sampled,
             "device_accept": mtp_device_accept,
+            "moe_rows": mtp_moe_rows,  # the switch's forced verify MoE rows, None = moe_rows_for(k + 1)
+            # QWEN38_MTP_DRAFTS_PER_REQUEST=1: the chains captured at open, the default first; a request picks one
+            # with extra_body.mtp_drafts (the fingerprint and the acceptance baselines are the default chain's)
+            "drafts_admitted": list(mtp_drafts_admitted),
         },
         # What a seed reproduces against: the source head and the runtime; with the pass loop drafting for sampled
         # requests the draw order is the pass's, so the switch and k are part of the identity.
@@ -1867,6 +1932,7 @@ def main() -> int:
                 socket_timeout_seconds=args.socket_timeout_seconds,
                 stall_seconds=args.stall_seconds,
                 system_fingerprint=summary["system_fingerprint"],
+                mtp_drafts_admitted=mtp_drafts_admitted,
                 listen=False,
             )
         except OSError as error:
@@ -1918,6 +1984,8 @@ def main() -> int:
             device_sampler=bool(args.device_sampler),
             mtp_sampled=mtp_sampled,
             mtp_device_accept=mtp_device_accept,
+            mtp_moe_rows=mtp_moe_rows,
+            mtp_alternates=mtp_drafts_admitted[1:],
         )
         if chain.allocated_context != resident_context.allocated_context:
             raise Qwen38ChatChainError(
@@ -2071,6 +2139,8 @@ def main() -> int:
                 "free_bytes_per_bank": report["chain"]["dram_after_captures"]["free_bytes_per_bank"],
                 "acceptance_gate_pass": None if not records else report["acceptance"]["gate_pass"],
                 "mtp": report["chain"]["mtp"],
+                # the drafting chains a request may pick (QWEN38_MTP_DRAFTS_PER_REQUEST; one entry = the --mtp chain only)
+                "mtp_drafts_admitted": list(mtp_drafts_admitted),
                 "fused_kernels": sorted(fused.enabled_names()),
                 "dram_workers_per_bank": report["chain"]["dram_workers_per_bank"],
                 "moe_local_output": moe_local_output_enabled(),

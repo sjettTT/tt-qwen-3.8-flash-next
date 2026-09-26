@@ -882,16 +882,25 @@ def test_verify_token_rows_pad_with_the_zero_embedding_token_and_readback_parses
 def test_moe_row_admission_and_flags_are_untouched() -> None:
     assert moe_module.SUPPORTED_ROWS == (*range(1, 33), 128)
     assert moe_module.ROWS5_HARDWARE_PROVEN is True and moe_module.ROWS32_HARDWARE_PROVEN is True
-    assert [mtp_v2.moe_rows_for(k + 1) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, 32]
+    assert [mtp_v2.moe_rows_for(k + 1) for k in mtp_v2.SUPPORTED_DRAFTS] == [
+        5,
+        5,
+        6,
+    ]  # k = 5 runs the 6-row form since its silicon proof (ROWS6_HARDWARE_PROVEN)
     assert mtp_v2.SUPPORTED_DRAFTS == (3, 4, 5) and mtp_v2.DEFAULT_DRAFTS == 4
     # The 32-row form holds every k up to 31 (the DRAM admission's estimate keys k = 5..8 by it); the QSA verify path
     # caps a pass at VERIFY_MAX_ROWS = 6 rows, so k = 5 is the largest draft count the verify runs.
-    assert [mtp_v2.moe_rows_for(k + 1) for k in range(5, 9)] == [32, 32, 32, 32] and mtp_v2.moe_rows_for(32) == 32
+    # k = 5 runs the 6-row form since its silicon proof (ROWS6_HARDWARE_PROVEN); 6..8 the 32-row form
+    assert [mtp_v2.moe_rows_for(k + 1) for k in range(5, 9)] == [6, 32, 32, 32] and mtp_v2.moe_rows_for(32) == 32
     assert max(mtp_v2.SUPPORTED_DRAFTS) + 1 == qsa_module.VERIFY_MAX_ROWS
     with pytest.raises(ValueError):  # allow-pytest.raises: the row bound is a contract
         mtp_v2.moe_rows_for(33)
     # An explicit override (the runner's argument) is admitted for the instance it constructs, nothing else.
-    assert [mtp_v2.resolve_moe_rows(k + 1, None) for k in mtp_v2.SUPPORTED_DRAFTS] == [5, 5, 32]
+    assert [mtp_v2.resolve_moe_rows(k + 1, None) for k in mtp_v2.SUPPORTED_DRAFTS] == [
+        5,
+        5,
+        6,
+    ]  # k = 5 runs the 6-row form since its silicon proof (ROWS6_HARDWARE_PROVEN)
     assert mtp_v2.resolve_moe_rows(6, 6) == 6 and mtp_v2.resolve_moe_rows(4, 5) == 5
     source = inspect.getsource(mtp_v2._allocate_layer_verify_state)
     assert "admitted_rows=SUPPORTED_ROWS if moe_rows in SUPPORTED_ROWS else (moe_rows,)," in source

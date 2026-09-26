@@ -222,7 +222,14 @@ def mtp_verify_forms(mtp_sampled: bool, mtp_device_accept: bool = False) -> tupl
 # 4,462,592; traces 6,390,144 with one verify form and 11,107,904 with two, so 4,717,760 per further form (its verify
 # trace and its draft trace; the third form's figure is that line continued, not a measurement).
 MTP_COMPONENTS_BEYOND_PAIR_BYTES_PER_BANK = 6_231_232
-MTP_STATES_BEYOND_QSA_STATE_BYTES_PER_BANK_BY_MOE_ROWS = {5: 8_475_520, 32: 16_457_600}
+MTP_STATES_BEYOND_QSA_STATE_BYTES_PER_BANK_BY_MOE_ROWS = {
+    5: 8_475_520,
+    # the 6-row verify MoE form: the 5-row term plus the measured growth of a 6-row open over a 5-row one at k = 5
+    # (+744,064 B per bank after the captures; +252,928 at k = 4, measured 2026-09-26 on the 4x p150 line at 32,768)
+    6: 8_475_520 + 744_064,
+    32: 16_457_600,
+}
+MTP_STATES_ESTIMATE_PROVISIONAL_MOE_ROWS = frozenset()  # every row count's term is measured (6 re-seeded 2026-09-26)
 MTP_TRACES_BYTES_PER_BANK_ONE_VERIFY_FORM = 6_390_144
 MTP_TRACES_BYTES_PER_BANK_PER_ADDITIONAL_VERIFY_FORM = 4_717_760
 MTP_VERIFY_FORMS_MAX = 3
@@ -267,6 +274,8 @@ def mtp_capacity_admission(
     live: Mapping[str, Any] | None = None,
     live_point: str = "after_build",
     long_chunks: bool = False,
+    moe_rows: int | None = None,
+    components_shared: bool = False,
 ) -> dict[str, Any]:
     """Whether the MTP chain fits beside the resident build at ``allocated_context`` with ``drafts`` drafts per pass
     and ``verify_forms`` captured verify forms (1..:data:`MTP_VERIFY_FORMS_MAX`).  The required side is the estimate
@@ -296,7 +305,9 @@ def mtp_capacity_admission(
         raise ValueError(f"MTP drafts must be an int in [1, {CHUNK_ROWS - 1}], got {drafts!r}")
     if isinstance(verify_forms, bool) or type(verify_forms) is not int or not 1 <= verify_forms <= MTP_VERIFY_FORMS_MAX:
         raise ValueError(f"verify forms must be an int in [1, {MTP_VERIFY_FORMS_MAX}], got {verify_forms!r}")
-    moe_rows = mtp_v2.moe_rows_for(drafts + 1)
+    moe_rows = mtp_v2.resolve_moe_rows(drafts + 1, moe_rows)  # the switch's row count keys the states term too
+    if moe_rows not in MTP_STATES_BEYOND_QSA_STATE_BYTES_PER_BANK_BY_MOE_ROWS:
+        raise ValueError(f"no MTP states estimate for a {moe_rows}-row verify MoE form")
     context = Qwen38ResidentContext(allocated_context).allocated_context
     if live_point not in ("after_build", "after_captures"):
         raise ValueError(f"live_point must be after_build or after_captures, got {live_point!r}")
@@ -357,13 +368,24 @@ def mtp_capacity_admission(
     def with_margin(remainder: int) -> int:
         return -(-remainder * (100 + MTP_GROWTH_ESTIMATE_MARGIN_PERCENT) // 100)
 
+    if type(components_shared) is not bool:
+        raise ValueError(f"components_shared must be a bool, got {components_shared!r}")
+    # a second chain over one model (QWEN38_MTP_DRAFTS_PER_REQUEST) reuses the first's MTP components and its
+    # alignment history: its growth is its own states (the verify window, the draft) and its traces
+    components = (
+        0 if components_shared else w01_per_bank + w2_per_bank + with_margin(remainders["components_beyond_pair"])
+    )
     estimate = {
-        "components": w01_per_bank + w2_per_bank + with_margin(remainders["components_beyond_pair"]),
+        "components": components,
         "states": qsa_state + with_margin(remainders["states_beyond_qsa_state"] + remainders["long_chunk_extension"]),
         "traces": with_margin(remainders["traces"]),
     }
     required = sum(estimate.values())
-    contiguous = max(w01_per_bank, w2_per_bank, RESIDENT_MIN_CONTIGUOUS_BYTES_PER_BANK)
+    contiguous = (
+        RESIDENT_MIN_CONTIGUOUS_BYTES_PER_BANK
+        if components_shared
+        else max(w01_per_bank, w2_per_bank, RESIDENT_MIN_CONTIGUOUS_BYTES_PER_BANK)
+    )
     shortfalls = [
         name
         for name, short in (
@@ -376,7 +398,11 @@ def mtp_capacity_admission(
         "allocated_context": allocated_context,
         "drafts": drafts,
         "mtp_moe_rows": moe_rows,
+        # the states term for this row count is an interpolation until a served open measures it (the growth gate
+        # compares the measured sum against the estimate, so a wrong term shows as a refusal, never silently)
+        "mtp_states_estimate_provisional": moe_rows in MTP_STATES_ESTIMATE_PROVISIONAL_MOE_ROWS,
         "verify_forms": verify_forms,
+        "components_shared": components_shared,
         "ring_size": ring_size,
         "long_chunks": long_chunks,
         "num_banks": RESIDENT_DRAM_BANKS,
@@ -583,6 +609,13 @@ class Qwen38ChatSession:
         self.prefill_mode = prefill_mode if self.chunk_trace_available else "teacher_forced"
         self.sampling = getattr(chain, "sampling", None)  # the candidate-row extension, or None: greedy only
         self.mtp = getattr(chain, "mtp", None)  # the MTP drafting extension (verify / draft / commit traces), or None
+        # The drafting chains by draft count (QWEN38_MTP_DRAFTS_PER_REQUEST): a request may bind one of them as
+        # ``self.mtp`` (and the chain's) for its duration; ``mtp_default`` is the server's --mtp chain, restored after.
+        self.mtp_default = self.mtp
+        chains = getattr(chain, "mtp_chains", None) or {}
+        self.mtp_chains: dict[int, Qwen38ChainMTP] = (
+            dict(chains) if chains else ({} if self.mtp is None else {self.mtp.drafts: self.mtp})
+        )
         # A chain without the snapshot primitives (an older scripted chain) resets where a restore would apply.
         self.snapshot_available = callable(getattr(chain, "capture_prompt_snapshot", None))
         self.snapshot: Qwen38PromptSnapshot | None = None
@@ -1159,6 +1192,17 @@ class Qwen38ChatSession:
         self.last_finish = None
         self.row_unconsumed = False
 
+    def _bind_mtp(self, chain_mtp: Qwen38ChainMTP | None) -> None:
+        """The drafting chain the next passes run: the session's ``mtp`` and the traced chain's (its step writes, the
+        pass loop's entry and settle read that attribute).  The default chain when no request binds another."""
+
+        if chain_mtp is not self.mtp:
+            if self.mtp is not None and self.mtp.chain is not None:
+                raise Qwen38ChatChainError("cannot rebind the drafting chain while a pass loop is open")
+            self.mtp = chain_mtp
+            if hasattr(self.chain, "mtp"):
+                self.chain.mtp = chain_mtp
+
     def _capture_prompt_snapshot(self) -> None:
         """The device state after the committed ids (every prompt token but the last), copied on the chain; the
         record makes a later render that extends these ids a restore instead of a reset."""
@@ -1181,6 +1225,7 @@ class Qwen38ChatSession:
         sampling: sampling_step.Qwen38SamplingRequest | None = None,
         speculative: bool = True,
         verify_each_step: bool = False,
+        mtp_drafts: int | None = None,
     ) -> Qwen38ChatCompletion:
         """Prefill what the device does not already hold, then generate up to ``max_tokens`` tokens (the remaining
         context when ``None``; ``require_budget``).
@@ -1217,6 +1262,15 @@ class Qwen38ChatSession:
             raise Qwen38ChatRequestError("sampling is unavailable: this chain captured no candidate row (greedy only)")
         if self.poisoned:
             raise Qwen38ChatChainError("session is poisoned by an earlier device failure")
+        # The request's drafting chain (extra_body.mtp_drafts on a QWEN38_MTP_DRAFTS_PER_REQUEST server): bound as
+        # the session's and the traced chain's ``mtp`` for the request (the pass loop, the 1-row decode's step write,
+        # the settle, the summary go through it), the default restored on the way out.
+        if mtp_drafts is not None:
+            if mtp_drafts not in self.mtp_chains:
+                raise Qwen38ChatRequestError(
+                    f"mtp_drafts {mtp_drafts!r} is not a chain of this session (captured: {sorted(self.mtp_chains)})"
+                )
+            self._bind_mtp(self.mtp_chains[mtp_drafts])
         # MTP drafting serves the greedy requests of the chunked mode and, with the chain's switch on, the sampled
         # requests the pass loop can bound (drafting_admission); the rest take the 1-row loops (speculative=False is
         # the diagnostic form: a greedy request on the 1-row loop of an MTP chain).
@@ -1349,6 +1403,7 @@ class Qwen38ChatSession:
                 )
         except BaseException:
             self.poisoned = True
+            self._bind_mtp(self.mtp_default)
             raise
         decode_seconds = (last_ns - first_ns) / 1e9
         tokens_per_second = (
@@ -1359,7 +1414,7 @@ class Qwen38ChatSession:
         prefill_tokens = len(token_ids) - common
         if self.device_accept_dump is not None and self.device_accept_records and sampling is not None:
             self._write_device_accept_dump(sampling)
-        return Qwen38ChatCompletion(
+        completion = Qwen38ChatCompletion(
             token_ids=generated,
             finish_reason=finish,
             prompt_tokens=len(token_ids),
@@ -1386,6 +1441,8 @@ class Qwen38ChatSession:
             prefill_slab_wait_ms=0.0 if chunked is None else sum(chunked.timing.slab_wait_ms),
             mtp=None if not drafting else self.mtp.summary(since=mtp_before),
         )
+        self._bind_mtp(self.mtp_default)
+        return completion
 
     # -- teacher forcing with rows (the agreement records) -----------------------------------------
 
@@ -1802,6 +1859,10 @@ class Qwen38TracedChain:
     verify_each_prefill: bool = False
     sampling: sampling_step.Qwen38SamplingChainExtension | None = None
     mtp: Qwen38ChainMTP | None = None
+    # (QWEN38_MTP_DRAFTS_PER_REQUEST) every drafting chain captured at open by draft count, ``mtp`` (the default)
+    # included; the others share the MTP layer's generic state, the step inputs and the chunk extensions with it and
+    # own their verify window, draft state and traces.  A request binds one as ``mtp`` for its duration.
+    mtp_chains: dict[int, Qwen38ChainMTP] = field(default_factory=dict)
     # The prompt-end snapshot buffers (model.allocate_generic_snapshot over the generic state and the MTP alignment
     # layer's), allocated before the warm pass; the session captures and restores through the two methods below.
     snapshot: Any = None
@@ -1821,6 +1882,15 @@ class Qwen38TracedChain:
 
     def write_token_row(self, token_id: int) -> None:
         ttnn.copy_host_to_device_tensor(resident_decode.device_token_row(self.mesh, token_id), self.token_row_io)
+
+    def drafting_chains(self) -> list[Qwen38ChainMTP]:
+        """Every drafting chain this chain captured (``mtp_chains`` when the per-request form opened them, else the
+        default alone), the default first."""
+
+        if self.mtp is None:
+            return []
+        chains = [chain_mtp for _drafts, chain_mtp in sorted(self.mtp_chains.items()) if chain_mtp is not self.mtp]
+        return [self.mtp] + chains
 
     def write_mtp_next_token(self, next_token_id: int | None) -> None:
         """MTP chains: the TAIL's MTP row consumes the token at P + 1: this one, or None for the step's own argmax."""
@@ -2071,6 +2141,8 @@ class Qwen38TracedChain:
         slab_rows: int | None = None,
         mtp_sampled: bool = False,
         mtp_device_accept: bool = False,
+        mtp_moe_rows: int | None = None,
+        mtp_alternates: Sequence[int] = (),
     ) -> Qwen38TracedChain:
         """Target build, generic state (+ chunk state), warm pass (+ one eager chunk and both hand-off forms), miss
         guard, 8 decode captures (+ the chunk capture): the runner's chain prologue and the full-model gate's order.
@@ -2195,6 +2267,7 @@ class Qwen38TracedChain:
                 live=dram_free_view(),
                 verify_forms=len(forms),
                 long_chunks=long_chunks,
+                moe_rows=mtp_moe_rows,
             )
             mtp_admission["verify_forms_captured"] = list(forms)
             # the record at the decision, admitted or not (READY carries it again; a refused or crashed open has only
@@ -2251,6 +2324,7 @@ class Qwen38TracedChain:
                 model,
                 state,
                 drafts=mtp,
+                moe_rows=mtp_moe_rows,  # QWEN38_MTP_MOE_ROWS (the server) or None = moe_rows_for
                 mtp_components=mtp_components,
                 gdn_step_anchor_layers=MTP_GDN_ANCHOR_LAYERS[mtp_gdn_anchor],
                 candidates_constants=None if sampling_extension is None else sampling_extension.constants,
@@ -2291,6 +2365,80 @@ class Qwen38TracedChain:
                 "(QWEN38_MTP_DEVICE_ACCEPT decides both)"
             )
         accept_constants = None if device_acceptance is None else device_acceptance.constants
+        # The other drafting chains (mtp_alternates: QWEN38_MTP_DRAFTS_PER_REQUEST): admitted per k without the
+        # shared components, their states beside the default chain's BEFORE any capture (every trace bakes its
+        # addresses), the MTP layer's generic state, the step inputs and the chunk extensions the default chain's
+        # (one committed history, one decode tail; the sharing checked by identity), their own verify window, draft
+        # and traces.  The device acceptance's constants are one k's (rows = k + 1), so its form admits no alternate.
+        mtp_chains: dict[int, Qwen38ChainMTP] = {}
+        if mtp_alternates:
+            if chain_mtp is None:
+                raise Qwen38ChatChainError("mtp_alternates need the default drafting chain (mtp)")
+            if mtp_device_accept:
+                raise Qwen38ChatChainError(
+                    "mtp_alternates and the device acceptance do not combine: its accept constants are one k's"
+                )
+            alternates = tuple(mtp_alternates)
+            if (
+                len(set(alternates)) != len(alternates)
+                or mtp in alternates
+                or any(count not in mtp_v2.SUPPORTED_DRAFTS for count in alternates)
+            ):
+                raise Qwen38ChatChainError(
+                    f"mtp_alternates must be distinct supported draft counts other than {mtp}, got {alternates}"
+                )
+            mtp_chains[mtp] = chain_mtp
+            for count in alternates:
+                alternate_admission = mtp_capacity_admission(
+                    model.allocated_context,
+                    drafts=count,
+                    live=dram_free_view(),
+                    verify_forms=len(forms),
+                    long_chunks=False,  # the 128-row twin is the default chain's (shared): counted once, by its owner
+                    components_shared=True,
+                )
+                alternate_admission["verify_forms_captured"] = list(forms)
+                print(
+                    json.dumps(
+                        {"utc": utc_now(), "event": "mtp_admission_live", **alternate_admission}, sort_keys=True
+                    ),
+                    flush=True,
+                )
+                if not alternate_admission["fits"]:
+                    raise Qwen38ChatChainError(
+                        f"the k={count} drafting chain does not fit beside the k={mtp} chain at allocated context "
+                        f"{model.allocated_context}: {alternate_admission}"
+                    )
+                allocated_before_alternate = dram_allocated_per_bank()
+                alternate_verify = mtp_v2.allocate_verify_state(
+                    model,
+                    state,
+                    drafts=count,
+                    mtp_components=mtp_components,
+                    gdn_step_anchor_layers=MTP_GDN_ANCHOR_LAYERS[mtp_gdn_anchor],
+                    candidates_constants=None if sampling_extension is None else sampling_extension.constants,
+                    alignment_generic_state=chain_mtp.alignment.generic_state,
+                )
+                mtp_v2.validate_verify_state_sharing(model, alternate_verify, chain_mtp.verify)
+                alternate_dram: dict[str, int] = {"components": 0}
+                mtp_chains[count] = Qwen38ChainMTP(
+                    drafts=count,
+                    anchor=mtp_gdn_anchor,
+                    components=mtp_components,
+                    verify=alternate_verify,
+                    draft=mtp_v2.allocate_draft_state(model, alternate_verify),
+                    # shared: the decode TAIL trace bakes the default chain's step inputs (the hand-off token at
+                    # P + 1) and its chunk extensions seed the one alignment history; a request bound to this chain
+                    # writes through the same objects
+                    step_inputs=chain_mtp.step_inputs,
+                    chunk_extension=chain_mtp.chunk_extension,
+                    long_chunk_extension=chain_mtp.long_chunk_extension,
+                    admission=alternate_admission,
+                    dram_bytes_per_bank=alternate_dram,
+                    sampled=mtp_sampled,
+                )
+                synchronize()
+                alternate_dram["states"] = dram_allocated_per_bank() - allocated_before_alternate
         # The prompt-end snapshot buffers beside the states, before any capture (the tracker's post-capture check
         # then sees no later allocation); with MTP the alignment layer's generic state is a 49th layer of it.
         snapshot = model.allocate_generic_snapshot(
@@ -2327,6 +2475,7 @@ class Qwen38TracedChain:
             ),
             chunk_gdn_step_anchor=chunk_gdn_step_anchor,
             mtp=chain_mtp,
+            mtp_chains=mtp_chains,
             snapshot=snapshot,
         )
 
@@ -2425,92 +2574,103 @@ class Qwen38TracedChain:
             # sequence (the head, the accept program, the tail), so the accept program compiles before its capture.
             marker("before-chat-mtp-warm-pass")
             warm_fed = resident_decode.SINGLE_TRACE_WARM_POSITIONS  # positions the warm pass consumed so far
-            warm_forms = (
-                ("fused",) if not chain_mtp.sampled else ("split", "sampled") if chain_mtp.device_accept else ("split",)
-            )
-            rounds = [(residue, warm_form) for residue in range(RESIDUE_CLASSES) for warm_form in warm_forms]
-            for index, (residue, warm_form) in enumerate(rounds):
-                position = state.position.read()
-                if position != warm_fed or position % RESIDUE_CLASSES != residue:
-                    raise Qwen38ChatChainError(
-                        f"MTP warm round {residue} ({warm_form}) at position {position}, fed {warm_fed}"
-                    )
-                mtp_v2.enter_verify_mode(model, state, chain_mtp.verify, position=position, ple_context=ple_context)
-                warm_tokens_pass = [resolved] + [MTP_BOOTSTRAP_DRAFT_TOKEN] * mtp
-                mtp_v2.write_verify_inputs(model, chain_mtp.verify, warm_tokens_pass)
-                head = None
-                if warm_form == "fused":
-                    output = mtp_v2.forward_verify(model, chain_mtp.verify, state, catch_up=False)
-                elif warm_form == "sampled":
-                    # The device-decided form, the capture's eager sequence under the extension's warm policy and
-                    # k + 1 distinct uniforms; the program's statistics row must equal the host reference on the rows
-                    # the head landed, bitwise (the fusion gate's check, here in the warm).
-                    accept_constants.write_policy(sampling_step.WARM_POLICY)
-                    warm_uniforms = list(MTP_WARM_ACCEPT_UNIFORMS[: mtp + 1])
-                    accept_constants.write_uniforms(warm_uniforms)
-                    output = mtp_v2.forward_verify_sampled(
-                        model, chain_mtp.verify, state, accept_constants, catch_up=False
-                    )
-                    synchronize()
-                    reference = mtp_accept_module.accept_reference(
-                        mtp_v2.read_candidate_rows(chain_mtp.verify),
-                        warm_tokens_pass[1:],
-                        sampling_step.WARM_POLICY,
-                        warm_uniforms,
-                        sentinel=ZERO_EMBEDDING_TOKEN,
-                    )
-                    statistics = mtp_v2.read_accept_statistics(chain_mtp.verify)
-                    expected = reference.statistics_row()
-                    actual = torch.tensor(statistics.row, dtype=torch.float32)
-                    if not torch.equal(actual.view(torch.int32), expected.view(torch.int32)):
-                        raise Qwen38ChatChainError(
-                            f"MTP warm round {residue} device acceptance statistics {list(statistics.row)} vs the "
-                            f"host reference {expected.tolist()}"
-                        )
-                else:
-                    # The split form: the head, its row, the greedy decision checked against the device lanes, the rows
-                    # candidates against torch.topk of the eager rows gather (the fallback's program), the tail.
-                    head = mtp_v2.forward_verify_head(model, chain_mtp.verify, state, catch_up=False)
-                    synchronize()
-                    head_readback = mtp_v2.read_verify_head(head, rows=chain_mtp.verify.rows)
-                    chain.sampling.warm_rows(
-                        head.logits, head_readback.candidate_rows, label=f"MTP warm round {residue} verify rows"
-                    )
-                    mtp_v2.write_verify_decision(
-                        model, chain_mtp.verify, mtp_v2.decide_greedy(warm_tokens_pass, head_readback)
-                    )
-                    output = mtp_v2.forward_verify_tail(model, chain_mtp.verify, state, head, catch_up=False)
-                mtp_v2.forward_draft(model, chain_mtp.verify, chain_mtp.draft, state, output)
-                synchronize()
-                if head is not None:
-                    head.release_tensors()
-                # The pass row: the verify's accept row and the draft's token chain (checked to start at its t', d_1').
-                readback, _ = mtp_v2.read_pass_row(chain_mtp.verify, chain_mtp.draft)
-                mtp_v2.commit_verify_host(chain_mtp.verify, readback.accepted)
-                output.release_tensors()
-                if state.position.read() != position + readback.accepted + 1:
-                    raise Qwen38ChatChainError(
-                        f"MTP warm verify pass left P = {state.position.read()}, expected "
-                        f"{position + readback.accepted + 1}"
-                    )
-                # The settle form: every committed row this round, the next token unconsumed in the row.
-                committed_rows = readback.accepted + 1
-                ple_context = mtp_v2.leave_verify_mode(
-                    model,
-                    state,
-                    chain_mtp.verify,
-                    position=position + committed_rows,
-                    committed_rows=committed_rows,
-                    commit=lambda: mtp_v2.forward_commit(model, chain_mtp.verify, state),
+
+            def warm_mtp_chain(target: Qwen38ChainMTP) -> None:
+                """The rounds for one drafting chain (its verify MoE rows / alignment / accept / draft / commit programs
+                in every captured form at every position residue); with QWEN38_MTP_DRAFTS_PER_REQUEST every chain has its
+                rounds, the default first, so no capture meets a program its warm never compiled."""
+
+                nonlocal warm_fed, resolved, ple_context
+                warm_forms = (
+                    ("fused",) if not target.sampled else ("split", "sampled") if target.device_accept else ("split",)
                 )
-                warm_fed += committed_rows
-                resolved = readback.argmaxes[readback.accepted]
-                # 1-row steps to the next round's residue class (the seed's programs at every P mod 4): the same
-                # residue for the round's other form, the next one otherwise, none after the last round.
-                next_residue = rounds[index + 1][0] if index + 1 < len(rounds) else None
-                while next_residue is not None and warm_fed % RESIDUE_CLASSES != next_residue:
-                    resolved, ple_context = warm_step(warm_fed, resolved, ple_context, mtp_next=None)
-                    warm_fed += 1
+                rounds = [(residue, warm_form) for residue in range(RESIDUE_CLASSES) for warm_form in warm_forms]
+                for index, (residue, warm_form) in enumerate(rounds):
+                    # 1-row steps to this round's residue class (the seed's programs at every P mod 4; the first chain
+                    # starts aligned, a later chain wherever the previous one's rounds left P)
+                    while warm_fed % RESIDUE_CLASSES != residue:
+                        resolved, ple_context = warm_step(warm_fed, resolved, ple_context, mtp_next=None)
+                        warm_fed += 1
+                    position = state.position.read()
+                    if position != warm_fed or position % RESIDUE_CLASSES != residue:
+                        raise Qwen38ChatChainError(
+                            f"MTP warm round {residue} ({warm_form}) at position {position}, fed {warm_fed}"
+                        )
+                    mtp_v2.enter_verify_mode(model, state, target.verify, position=position, ple_context=ple_context)
+                    warm_tokens_pass = [resolved] + [MTP_BOOTSTRAP_DRAFT_TOKEN] * target.drafts
+                    mtp_v2.write_verify_inputs(model, target.verify, warm_tokens_pass)
+                    head = None
+                    if warm_form == "fused":
+                        output = mtp_v2.forward_verify(model, target.verify, state, catch_up=False)
+                    elif warm_form == "sampled":
+                        # The device-decided form, the capture's eager sequence under the extension's warm policy and
+                        # k + 1 distinct uniforms; the program's statistics row must equal the host reference on the rows
+                        # the head landed, bitwise (the fusion gate's check, here in the warm).
+                        accept_constants.write_policy(sampling_step.WARM_POLICY)
+                        warm_uniforms = list(MTP_WARM_ACCEPT_UNIFORMS[: target.drafts + 1])
+                        accept_constants.write_uniforms(warm_uniforms)
+                        output = mtp_v2.forward_verify_sampled(
+                            model, target.verify, state, accept_constants, catch_up=False
+                        )
+                        synchronize()
+                        reference = mtp_accept_module.accept_reference(
+                            mtp_v2.read_candidate_rows(target.verify),
+                            warm_tokens_pass[1:],
+                            sampling_step.WARM_POLICY,
+                            warm_uniforms,
+                            sentinel=ZERO_EMBEDDING_TOKEN,
+                        )
+                        statistics = mtp_v2.read_accept_statistics(target.verify)
+                        expected = reference.statistics_row()
+                        actual = torch.tensor(statistics.row, dtype=torch.float32)
+                        if not torch.equal(actual.view(torch.int32), expected.view(torch.int32)):
+                            raise Qwen38ChatChainError(
+                                f"MTP warm round {residue} device acceptance statistics {list(statistics.row)} vs the "
+                                f"host reference {expected.tolist()}"
+                            )
+                    else:
+                        # The split form: the head, its row, the greedy decision checked against the device lanes, the rows
+                        # candidates against torch.topk of the eager rows gather (the fallback's program), the tail.
+                        head = mtp_v2.forward_verify_head(model, target.verify, state, catch_up=False)
+                        synchronize()
+                        head_readback = mtp_v2.read_verify_head(head, rows=target.verify.rows)
+                        chain.sampling.warm_rows(
+                            head.logits, head_readback.candidate_rows, label=f"MTP warm round {residue} verify rows"
+                        )
+                        mtp_v2.write_verify_decision(
+                            model, target.verify, mtp_v2.decide_greedy(warm_tokens_pass, head_readback)
+                        )
+                        output = mtp_v2.forward_verify_tail(model, target.verify, state, head, catch_up=False)
+                    mtp_v2.forward_draft(model, target.verify, target.draft, state, output)
+                    synchronize()
+                    if head is not None:
+                        head.release_tensors()
+                    # The pass row: the verify's accept row and the draft's token chain (checked to start at its t', d_1').
+                    readback, _ = mtp_v2.read_pass_row(target.verify, target.draft)
+                    mtp_v2.commit_verify_host(target.verify, readback.accepted)
+                    output.release_tensors()
+                    if state.position.read() != position + readback.accepted + 1:
+                        raise Qwen38ChatChainError(
+                            f"MTP warm verify pass left P = {state.position.read()}, expected "
+                            f"{position + readback.accepted + 1}"
+                        )
+                    # The settle form: every committed row this round, the next token unconsumed in the row.
+                    committed_rows = readback.accepted + 1
+                    ple_context = mtp_v2.leave_verify_mode(
+                        model,
+                        state,
+                        target.verify,
+                        position=position + committed_rows,
+                        committed_rows=committed_rows,
+                        commit=lambda: mtp_v2.forward_commit(model, target.verify, state),
+                    )
+                    warm_fed += committed_rows
+                    resolved = readback.argmaxes[readback.accepted]
+
+            for target in [chain_mtp] + [
+                mtp_chains[count] for count in sorted(mtp_chains) if count != chain_mtp.drafts
+            ]:
+                warm_mtp_chain(target)
             synchronize()
             marker("after-chat-mtp-warm-pass")
 
@@ -2794,63 +2954,64 @@ class Qwen38TracedChain:
         # the verify / commit / draft captures add after the last prefill capture (the 128-row trace, MTP rows
         # included, is its own term, as the 32-row chunk trace with the extension's rows always was).
         dram_after_prefill_captures = dram_allocated_per_bank()
-        if chain_mtp is not None:
-            # The verify (first pass), commit and draft traces after the chunk trace, the fused form under both
-            # switch values (a greedy request's traces: the QWEN38_MTP_SAMPLED=0 server's exactly); the draft body
-            # reads the verify output's readback address, so the verify capture comes first.  With the split verify
-            # the head, the tail and a second draft follow: each verify body allocates its readback row inside its
-            # own capture, so the tail lands a row of its own and the split form needs a draft captured on that row;
-            # the commit reads neither row and is shared.  Capture records without executing: the device state is
-            # unchanged.
-            marker("before-chat-mtp-captures")
+
+        def capture_mtp_chain(target: Qwen38ChainMTP, dram_baseline: int) -> int:
+            """One drafting chain's traces: the verify (first pass), commit and draft traces after the prefill traces,
+            the fused form under both switch values (a greedy request's traces: the QWEN38_MTP_SAMPLED=0 server's
+            exactly); the draft body reads the verify output's readback address, so the verify capture comes first.
+            With the split verify the head, the tail and a second draft follow (each verify body allocates its readback
+            row inside its own capture, so the tail lands a row of its own and the split form needs a draft captured on
+            that row; the commit reads neither row and is shared), and with the device acceptance its one trace and
+            draft.  Capture records without executing: the device state is unchanged.  ``dram_baseline`` is the
+            allocation the chain's traces grow from (the last prefill capture's for the default chain, the previous
+            chain's for an alternate); the allocation after them is returned.  The same sequence of calls for every
+            chain (QWEN38_MTP_DRAFTS_PER_REQUEST: the alternates after the default, in draft-count order)."""
 
             def guard(label: str):
-                return resident_decode.forbid_trace_body_host_io_and_sync(phase=f"chat {label}")
+                return resident_decode.forbid_trace_body_host_io_and_sync(phase=f"chat k={target.drafts} {label}")
 
             capture_started_ns = clock_ns()
             verify_first, verify_output = mtp_v2.capture_verify(
-                model, chain_mtp.verify, state, catch_up=False, guard=guard, cq_id=0
+                model, target.verify, state, catch_up=False, guard=guard, cq_id=0
             )
-            chain_mtp.capture_ms["verify_first"] = (clock_ns() - capture_started_ns) / 1e6
+            target.capture_ms["verify_first"] = (clock_ns() - capture_started_ns) / 1e6
             capture_started_ns = clock_ns()
-            commit = mtp_v2.capture_commit(model, chain_mtp.verify, state, guard=guard, cq_id=0)
-            chain_mtp.capture_ms["commit"] = (clock_ns() - capture_started_ns) / 1e6
+            commit = mtp_v2.capture_commit(model, target.verify, state, guard=guard, cq_id=0)
+            target.capture_ms["commit"] = (clock_ns() - capture_started_ns) / 1e6
             capture_started_ns = clock_ns()
-            draft = mtp_v2.capture_draft(
-                model, chain_mtp.verify, chain_mtp.draft, state, verify_output, guard=guard, cq_id=0
-            )
-            chain_mtp.capture_ms["draft"] = (clock_ns() - capture_started_ns) / 1e6
-            chain_mtp.traces = mtp_v2.Qwen38TTNNMTPTraces(verify_first=verify_first, draft=draft, commit=commit)
-            chain_mtp.verify_output = verify_output
+            draft = mtp_v2.capture_draft(model, target.verify, target.draft, state, verify_output, guard=guard, cq_id=0)
+            target.capture_ms["draft"] = (clock_ns() - capture_started_ns) / 1e6
+            target.traces = mtp_v2.Qwen38TTNNMTPTraces(verify_first=verify_first, draft=draft, commit=commit)
+            target.verify_output = verify_output
             ttnn.mark_corruptible(verify_output.readback)
             synchronize()
             dram_after_fused = dram_allocated_per_bank()
-            if chain_mtp.sampled:
+            if target.sampled:
                 # The split verify: the head, the tail that reads its roots, the draft that reads the tail's row.
                 capture_started_ns = clock_ns()
                 verify_head, head_output = mtp_v2.capture_verify_head(
-                    model, chain_mtp.verify, state, catch_up=False, guard=guard, cq_id=0
+                    model, target.verify, state, catch_up=False, guard=guard, cq_id=0
                 )
-                chain_mtp.capture_ms["verify_head"] = (clock_ns() - capture_started_ns) / 1e6
+                target.capture_ms["verify_head"] = (clock_ns() - capture_started_ns) / 1e6
                 capture_started_ns = clock_ns()
                 verify_tail, split_verify_output = mtp_v2.capture_verify_tail(
-                    model, chain_mtp.verify, state, head_output, catch_up=False, guard=guard, cq_id=0
+                    model, target.verify, state, head_output, catch_up=False, guard=guard, cq_id=0
                 )
-                chain_mtp.capture_ms["verify_tail"] = (clock_ns() - capture_started_ns) / 1e6
+                target.capture_ms["verify_tail"] = (clock_ns() - capture_started_ns) / 1e6
                 capture_started_ns = clock_ns()
                 split_draft = mtp_v2.capture_draft(
-                    model, chain_mtp.verify, chain_mtp.draft, state, split_verify_output, guard=guard, cq_id=0
+                    model, target.verify, target.draft, state, split_verify_output, guard=guard, cq_id=0
                 )
-                chain_mtp.capture_ms["split_draft"] = (clock_ns() - capture_started_ns) / 1e6
-                chain_mtp.split_traces = mtp_v2.Qwen38TTNNMTPTraces(
+                target.capture_ms["split_draft"] = (clock_ns() - capture_started_ns) / 1e6
+                target.split_traces = mtp_v2.Qwen38TTNNMTPTraces(
                     verify_first=None,
                     draft=split_draft,
                     commit=commit,
                     verify_head=verify_head,
                     verify_tail=verify_tail,
                 )
-                chain_mtp.split_verify_output = split_verify_output
-                chain_mtp.head_output = head_output
+                target.split_verify_output = split_verify_output
+                target.head_output = head_output
                 for tensor in (
                     split_verify_output.readback,
                     head_output.readback,
@@ -2860,59 +3021,68 @@ class Qwen38TracedChain:
                     ttnn.mark_corruptible(tensor)
                 synchronize()
             dram_after_split = dram_allocated_per_bank()
-            if chain_mtp.device_accept:
+            if target.device_accept:
                 # The device-decided sampled form: one trace (the head, the accept program, the tail), the draft on its
                 # row; the statistics row it writes and the accept constants were marked with the split's buffers.
                 capture_started_ns = clock_ns()
                 verify_sampled, sampled_verify_output = mtp_v2.capture_verify_sampled(
-                    model, chain_mtp.verify, state, accept_constants, catch_up=False, guard=guard, cq_id=0
+                    model, target.verify, state, accept_constants, catch_up=False, guard=guard, cq_id=0
                 )
-                chain_mtp.capture_ms["verify_sampled"] = (clock_ns() - capture_started_ns) / 1e6
+                target.capture_ms["verify_sampled"] = (clock_ns() - capture_started_ns) / 1e6
                 capture_started_ns = clock_ns()
                 sampled_draft = mtp_v2.capture_draft(
-                    model, chain_mtp.verify, chain_mtp.draft, state, sampled_verify_output, guard=guard, cq_id=0
+                    model, target.verify, target.draft, state, sampled_verify_output, guard=guard, cq_id=0
                 )
-                chain_mtp.capture_ms["sampled_draft"] = (clock_ns() - capture_started_ns) / 1e6
-                chain_mtp.sampled_traces = mtp_v2.Qwen38TTNNMTPTraces(
+                target.capture_ms["sampled_draft"] = (clock_ns() - capture_started_ns) / 1e6
+                target.sampled_traces = mtp_v2.Qwen38TTNNMTPTraces(
                     verify_first=None, draft=sampled_draft, commit=commit, verify_sampled=verify_sampled
                 )
-                chain_mtp.sampled_verify_output = sampled_verify_output
+                target.sampled_verify_output = sampled_verify_output
                 ttnn.mark_corruptible(sampled_verify_output.readback)
                 synchronize()
-            marker("after-chat-mtp-captures")
-            dram_after_mtp = dram_allocated_per_bank()
-            chain_mtp.trace_dram_bytes_per_bank = {
+            dram_after_target = dram_allocated_per_bank()
+            target.trace_dram_bytes_per_bank = {
                 "decode_traces": dram_after_decode - dram_before_captures,
                 "chunk_trace": dram_after_chunk - dram_after_decode,
                 "long_chunk_trace": dram_after_long_chunk - dram_after_chunk,
-                "mtp_fused_traces": dram_after_fused - dram_after_prefill_captures,
-                "mtp_traces": dram_after_mtp - dram_after_prefill_captures,
+                "mtp_fused_traces": dram_after_fused - dram_baseline,
+                "mtp_traces": dram_after_target - dram_baseline,
             }
-            if chain_mtp.sampled:
-                chain_mtp.trace_dram_bytes_per_bank["mtp_split_traces"] = dram_after_split - dram_after_fused
-            if chain_mtp.device_accept:
-                chain_mtp.trace_dram_bytes_per_bank["mtp_sampled_traces"] = dram_after_mtp - dram_after_split
-            chain_mtp.dram_bytes_per_bank["traces"] = chain_mtp.trace_dram_bytes_per_bank["mtp_traces"]
-            chain_mtp.admission["measured_after_captures"] = dram_free_view()  # the allocator with the MTP chain in
+            if target.sampled:
+                target.trace_dram_bytes_per_bank["mtp_split_traces"] = dram_after_split - dram_after_fused
+            if target.device_accept:
+                target.trace_dram_bytes_per_bank["mtp_sampled_traces"] = dram_after_target - dram_after_split
+            target.dram_bytes_per_bank["traces"] = target.trace_dram_bytes_per_bank["mtp_traces"]
+            target.admission["measured_after_captures"] = dram_free_view()  # the allocator with the MTP chain in
             captured_forms = (
                 ["fused"]
-                + (["split"] if chain_mtp.split_traces is not None else [])
-                + (["sampled"] if chain_mtp.sampled_traces is not None else [])
+                + (["split"] if target.split_traces is not None else [])
+                + (["sampled"] if target.sampled_traces is not None else [])
             )
-            if captured_forms != chain_mtp.admission["verify_forms_captured"]:
+            if captured_forms != target.admission["verify_forms_captured"]:
                 raise Qwen38ChatChainError(
-                    f"captured verify forms {captured_forms} vs the admission's {chain_mtp.admission['verify_forms_captured']}"
+                    f"captured verify forms {captured_forms} vs the admission's {target.admission['verify_forms_captured']}"
                 )
-            mtp_growth = sum(chain_mtp.dram_bytes_per_bank.values())
-            if mtp_growth > chain_mtp.admission["required_free_bytes_per_bank"]:
+            mtp_growth = sum(target.dram_bytes_per_bank.values())
+            if mtp_growth > target.admission["required_free_bytes_per_bank"]:
                 raise Qwen38ChatChainError(
-                    f"MTP DRAM growth {mtp_growth} bytes per bank {chain_mtp.dram_bytes_per_bank} exceeds the admission's "
-                    f"estimate {chain_mtp.admission['required_free_bytes_per_bank']} "
-                    f"{chain_mtp.admission['mtp_growth_estimate_bytes_per_bank']} for k={chain_mtp.drafts} "
-                    f"(verify MoE rows {chain_mtp.admission['mtp_moe_rows']}, "
-                    f"{chain_mtp.admission['verify_forms']} verify form(s); the required side decided, the free side "
-                    f"read {chain_mtp.admission['free_bytes_source']}) at allocated context {model.allocated_context}"
+                    f"MTP DRAM growth {mtp_growth} bytes per bank {target.dram_bytes_per_bank} exceeds the admission's "
+                    f"estimate {target.admission['required_free_bytes_per_bank']} "
+                    f"{target.admission['mtp_growth_estimate_bytes_per_bank']} for k={target.drafts} "
+                    f"(verify MoE rows {target.admission['mtp_moe_rows']}"
+                    f"{' [states estimate PROVISIONAL]' if target.admission.get('mtp_states_estimate_provisional') else ''}, "
+                    f"{target.admission['verify_forms']} verify form(s); the required side decided, the free side "
+                    f"read {target.admission['free_bytes_source']}) at allocated context {model.allocated_context}"
                 )
+            return dram_after_target
+
+        if chain_mtp is not None:
+            marker("before-chat-mtp-captures")
+            dram_after_previous = capture_mtp_chain(chain_mtp, dram_after_prefill_captures)
+            for count in sorted(mtp_chains):
+                if count != chain_mtp.drafts:
+                    dram_after_previous = capture_mtp_chain(mtp_chains[count], dram_after_previous)
+            marker("after-chat-mtp-captures")
         phases, position = conv_phases(), state.position.read()
         if set(phases.values()) != {0} or position != 0:
             raise Qwen38ChatChainError(f"after the captures ring phases {phases} and position {position}, expected 0")
@@ -2939,7 +3109,7 @@ class Qwen38TracedChain:
                 for trace_id in (self.chunk_trace_id, self.long_chunk_trace_id, self.slab_trace_id)
                 if trace_id is not None
             ]
-            + ([] if self.mtp is None else self.mtp.captured_trace_ids())
+            + [trace_id for chain_mtp in self.drafting_chains() for trace_id in chain_mtp.captured_trace_ids()]
         )
 
     def close(self) -> None:
@@ -2959,15 +3129,15 @@ class Qwen38TracedChain:
         self.chunk_trace_id = None
         self.long_chunk_trace_id = None
         self.slab_trace_id = None
-        if self.mtp is not None:
-            self.mtp.traces = None
-            self.mtp.split_traces = None
-            self.mtp.sampled_traces = None
+        for chain_mtp in self.drafting_chains():
+            chain_mtp.traces = None
+            chain_mtp.split_traces = None
+            chain_mtp.sampled_traces = None
             for name in ("verify_output", "split_verify_output", "sampled_verify_output", "head_output"):
-                output = getattr(self.mtp, name)
+                output = getattr(chain_mtp, name)
                 if output is not None:
                     output.release_tensors()
-                    setattr(self.mtp, name, None)
+                    setattr(chain_mtp, name, None)
         for candidates in self.trace_candidates:
             ttnn.deallocate(candidates.local_indices)
             ttnn.deallocate(candidates.local_values)
@@ -2993,6 +3163,12 @@ class Qwen38TracedChain:
         if self.mtp is not None:
             # The MTP states before the chunk and generic states they sit beside.
             model = self.built_target.model
+            # The sharing chains first (their release leaves the shared generic state, step inputs and extensions
+            # alone), the owning default last.
+            for chain_mtp in self.drafting_chains():
+                if chain_mtp is not self.mtp:
+                    mtp_v2.release_draft_state(model, chain_mtp.verify, chain_mtp.draft)
+                    mtp_v2.release_verify_state(model, chain_mtp.verify)
             if self.mtp.long_chunk_extension is not None:  # before the 32-row twin it was allocated beside
                 self.mtp.long_chunk_extension.release()
             if self.mtp.chunk_extension is not None:
@@ -3028,6 +3204,8 @@ def construct_chain(
     slab_rows: int | None = None,
     mtp_sampled: bool = False,
     mtp_device_accept: bool = False,
+    mtp_moe_rows: int | None = None,
+    mtp_alternates: Sequence[int] = (),
 ) -> Qwen38TracedChain:
     """Live construction on the open mesh (missing BF4 layers converted first), then the chain prologue."""
 
@@ -3050,4 +3228,6 @@ def construct_chain(
         slab_rows=slab_rows,
         mtp_sampled=mtp_sampled,
         mtp_device_accept=mtp_device_accept,
+        mtp_moe_rows=mtp_moe_rows,
+        mtp_alternates=mtp_alternates,
     )

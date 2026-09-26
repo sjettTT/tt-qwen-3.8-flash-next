@@ -42,6 +42,7 @@ The 1-row production paths are untouched: everything here is a new entry point o
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
@@ -377,6 +378,9 @@ class Qwen38TTNNVerifyAlignment:
     generic_state: Qwen38TTNNDecoderLayerGenericState
     verify_state: Qwen38TTNNVerifyLayerState
     residual: Any
+    # False for a chain that shares the MTP layer's generic state (the committed history) with another chain's verify
+    # state: the sharing chain's release leaves it to the owner (``release_verify_state``).
+    owns_generic_state: bool = True
 
 
 @dataclass(frozen=True)
@@ -510,18 +514,45 @@ class Qwen38TTNNVerifyReadback:
     argmaxes: tuple[int, ...]
 
 
-def moe_rows_for(rows: int) -> int:
-    """The smallest admitted MoE row count that holds ``rows`` (5 for k = 3 and 4; 32 for rows 6..32, k = 5 today:
-    the two verify forms proven on silicon); a verify pass is one 32-row tile, so the 128-row prefill form is not a
-    candidate."""
+# The 6-row verify MoE form (k = 5 on its own tile rows instead of the 32-row chunk feed) proven on silicon
+# 2026-09-26: the component discriminator on the four-die line reads the 6-row MoE output, routing scores and
+# indices bitwise against six 1-row steps (the 5-row control identical in form), the mixers bitwise, the accept
+# chain exact, the GDN rows tool at 6 = the 5-row control. Its admission states term is measured (2026-09-26, the
+# first served 6-row open's growth over the 5-row form; tools/qwen38_chat_session.py).
+ROWS6_HARDWARE_PROVEN = True
 
-    # The verify forms proven on silicon: 5 and 32 rows.  SUPPORTED_ROWS also admits the batched lanes' 1..32, which
-    # are not verify candidates (the choice is pinned by the MTP tables).
-    candidates = tuple(count for count in (TARGET_VERIFIER_ROWS, CHUNK_ROWS) if count in SUPPORTED_ROWS)
+
+def moe_rows_for(rows: int) -> int:
+    """The smallest admitted MoE row count that holds ``rows`` (5 for k = 3 and 4; 6 for k = 5 since the 6-row form's
+    silicon proof, ROWS6_HARDWARE_PROVEN; 32 for rows 7..32); a verify pass is one 32-row tile, so the 128-row prefill
+    form is not a candidate."""
+
+    # The verify forms proven on silicon: 5, 6 (behind ROWS6_HARDWARE_PROVEN) and 32 rows.  SUPPORTED_ROWS also admits
+    # the batched lanes' 1..32, which are not verify candidates (the choice is pinned by the MTP tables).
+    proven = (TARGET_VERIFIER_ROWS, *((TARGET_VERIFIER_ROWS + 1,) if ROWS6_HARDWARE_PROVEN else ()), CHUNK_ROWS)
+    candidates = tuple(count for count in proven if count in SUPPORTED_ROWS)
     admitted = [count for count in candidates if rows <= count <= CHUNK_ROWS]
     if not admitted:
         raise ValueError(f"no admitted MoE row count holds {rows} rows (candidates {candidates})")
     return min(admitted)
+
+
+MOE_ROWS_SWITCH = "QWEN38_MTP_MOE_ROWS"
+# The verify MoE row counts a server may force through the switch: the 5-row form (k = 3, 4), the 6-row form (k = 5,
+# the default since its proof), the 32-row chunk form.
+MOE_ROWS_SWITCH_VALUES = (TARGET_VERIFIER_ROWS, TARGET_VERIFIER_ROWS + 1, CHUNK_ROWS)
+
+
+def moe_rows_override(environ: Mapping[str, str] | None = None) -> int | None:
+    """``QWEN38_MTP_MOE_ROWS``: the verify MoE row count a server forces (a diagnostic switch, default unset =
+    :func:`moe_rows_for`); one of :data:`MOE_ROWS_SWITCH_VALUES`, anything else refused with the reason."""
+
+    raw = (os.environ if environ is None else environ).get(MOE_ROWS_SWITCH, "").strip()
+    if not raw:
+        return None
+    if not raw.isdigit() or int(raw) not in MOE_ROWS_SWITCH_VALUES:
+        raise ValueError(f"{MOE_ROWS_SWITCH} must be one of {MOE_ROWS_SWITCH_VALUES} (verify MoE rows), got {raw!r}")
+    return int(raw)
 
 
 def resolve_moe_rows(rows: int, moe_rows: int | None) -> int:
@@ -635,9 +666,20 @@ def _validate_layer_verify_state(
         )
 
 
-def _validate_verify_state(model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState) -> None:
+def _validate_verify_state(
+    model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState, *, shared_with: Qwen38TTNNVerifyState | None = None
+) -> None:
     if not isinstance(verify, Qwen38TTNNVerifyState) or verify._owner is not model._state_owner:
         raise ValueError("verify state was not allocated by this model owner")
+    if shared_with is not None:
+        # The sharing invariant (a second chain over one committed history): the MTP layer's generic state is the
+        # owner's very object, never a copy (a private history would diverge silently after the first pass).
+        if verify is shared_with or verify.alignment is None or shared_with.alignment is None:
+            raise ValueError("verify state sharing needs two distinct verify states with MTP alignment components")
+        if verify.alignment.owns_generic_state or not shared_with.alignment.owns_generic_state:
+            raise ValueError("the sharing verify state must not own the MTP layer generic state; the owner must")
+        if verify.alignment.generic_state is not shared_with.alignment.generic_state:
+            raise ValueError("the sharing verify state's MTP layer generic state is not the owner's object")
     if verify.drafts not in SUPPORTED_DRAFTS or verify.rows != verify.drafts + 1:
         raise ValueError(f"verify state has k={verify.drafts} rows={verify.rows}")
     if len(verify.layers) != BACKBONE_LAYERS or verify.rows_constants.rows != verify.rows:
@@ -731,8 +773,14 @@ def allocate_verify_state(
     moe_rows: int | None = None,
     gdn_step_anchor_layers: Sequence[int] = (),
     candidates_constants: Qwen38TTNNSamplingCandidateConstants | None = None,
+    alignment_generic_state: Qwen38TTNNDecoderLayerGenericState | None = None,
 ) -> Qwen38TTNNVerifyState:
     """Allocate the verify constants and every layer's verify buffers beside ``state`` (before any capture).
+
+    ``alignment_generic_state``: another verify state's MTP layer generic state to SHARE instead of allocating one
+    (a second drafting chain over the same model state, e.g. k = 5 beside k = 4): the committed history is one; the
+    window is the chain's.  The sharing state does not release it (``owns_generic_state`` False); the active chain's
+    commit writes it and the other chain's verify window is stale until its next pass starts from it.
 
     ``mtp_components`` (the builder's ``decoder_layer`` / ``input_mixer`` / ``final_mixer``) enables the
     alignment rows; without it the pass reports ``first_draft = None`` and skips the MTP layer.  ``moe_rows``
@@ -816,10 +864,15 @@ def allocate_verify_state(
         ple_rows = ple_layer.ple.prepare_rows_input([0] * rows, ple_state)
         actions.append(("verify PLE rows", ple_rows.release))
         alignment = None
+        if mtp is None and alignment_generic_state is not None:
+            raise ValueError("alignment_generic_state needs the MTP alignment components (mtp_components)")
         if mtp is not None:
             mtp_layer, input_mixer, final_mixer = mtp
-            generic_state = mtp_layer.allocate_generic_state()
-            actions.append(("MTP layer generic state", lambda: mtp_layer.release_generic_state(generic_state)))
+            if alignment_generic_state is not None:
+                generic_state = alignment_generic_state  # shared with the owning chain's verify state
+            else:
+                generic_state = mtp_layer.allocate_generic_state()
+                actions.append(("MTP layer generic state", lambda: mtp_layer.release_generic_state(generic_state)))
             mtp_verify = _allocate_layer_verify_state(mtp_layer, rows, rows_constants, moe_rows=moe_rows)
             actions.append(("MTP layer verify state", lambda: _release_layer_verify_state(mtp_layer, mtp_verify)))
             residual = _allocate_hidden_sharded_zeros(
@@ -827,7 +880,13 @@ def allocate_verify_state(
             )
             actions.append(("MTP alignment residual", lambda: _deallocate(residual)))
             alignment = Qwen38TTNNVerifyAlignment(
-                mtp_layer, input_mixer, final_mixer, generic_state, mtp_verify, residual
+                mtp_layer,
+                input_mixer,
+                final_mixer,
+                generic_state,
+                mtp_verify,
+                residual,
+                owns_generic_state=alignment_generic_state is None,
             )
         split = None
         if candidates_constants is not None:
@@ -858,6 +917,16 @@ def allocate_verify_state(
         raise
 
 
+def validate_verify_state_sharing(
+    model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState, owner: Qwen38TTNNVerifyState
+) -> None:
+    """``verify`` shares the MTP layer's generic state with ``owner`` (allocated with ``alignment_generic_state`` =
+    the owner's): both valid, the shared object the owner's by identity, the ownership flags as the sharing says."""
+
+    _validate_verify_state(model, owner)
+    _validate_verify_state(model, verify, shared_with=owner)
+
+
 def release_verify_state(model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState) -> None:
     _validate_verify_state(model, verify)
     actions: list[tuple[str, Callable[[], Any]]] = []
@@ -869,9 +938,10 @@ def release_verify_state(model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifySta
         actions.append(
             ("MTP layer verify state", lambda: _release_layer_verify_state(alignment.layer, alignment.verify_state))
         )
-        actions.append(
-            ("MTP layer generic state", lambda: alignment.layer.release_generic_state(alignment.generic_state))
-        )
+        if alignment.owns_generic_state:
+            actions.append(
+                ("MTP layer generic state", lambda: alignment.layer.release_generic_state(alignment.generic_state))
+            )
     actions.append(("verify PLE rows", verify.ple_rows.release))
     actions.append(("verify accept scalar", lambda: _deallocate(verify.accepted)))
     actions.append(("verify draft lanes", lambda: _deallocate(verify.draft_lanes)))
@@ -1367,6 +1437,28 @@ def forward_verify(
         model._mark_poisoned("forward_verify", processed_layers, error)
 
 
+def _capture_trace(mesh_device, cq_id: int, body: Callable[[], Any]) -> tuple[int, Any]:
+    """One trace capture around ``body`` on ``cq_id``: begun, the body recorded, ended; returns the trace id and the
+    body's result.  When the body raises (a forbidden program-cache miss, a poisoned model) the capture is ENDED and
+    the trace released before the error propagates: a mesh closed with a capture still open never returns (the
+    "Event Synchronization is not supported during trace capture" hang), so no capture site may leave one behind."""
+
+    trace_id = ttnn.begin_trace_capture(mesh_device, cq_id=cq_id)
+    try:
+        result = body()
+    except BaseException:
+        try:
+            ttnn.end_trace_capture(mesh_device, trace_id, cq_id=cq_id)
+        finally:
+            try:
+                ttnn.release_trace(mesh_device, trace_id)
+            except Exception:  # the trace is the lesser loss: the primary error is the one to raise
+                pass
+        raise
+    ttnn.end_trace_capture(mesh_device, trace_id, cq_id=cq_id)
+    return trace_id, result
+
+
 def capture_verify(
     model: Qwen38TTNNTextModel,
     verify: Qwen38TTNNVerifyState,
@@ -1384,10 +1476,12 @@ def capture_verify(
     """
 
     with ttnn.corruptible_allocation_scope(model.mesh_device):
-        trace_id = ttnn.begin_trace_capture(model.mesh_device, cq_id=cq_id)
-        with guard(f"verify capture catch_up={catch_up}"):
-            output = forward_verify(model, verify, state, catch_up=catch_up)
-        ttnn.end_trace_capture(model.mesh_device, trace_id, cq_id=cq_id)
+
+        def _body():
+            with guard(f"verify capture catch_up={catch_up}"):
+                return forward_verify(model, verify, state, catch_up=catch_up)
+
+        trace_id, output = _capture_trace(model.mesh_device, cq_id, _body)
     return trace_id, output
 
 
@@ -1630,10 +1724,12 @@ def capture_verify_head(
     cq_id: int = 0,
 ) -> tuple[int, Qwen38TTNNVerifyHeadOutput]:
     with ttnn.corruptible_allocation_scope(model.mesh_device):
-        trace_id = ttnn.begin_trace_capture(model.mesh_device, cq_id=cq_id)
-        with guard(f"verify head capture catch_up={catch_up}"):
-            output = forward_verify_head(model, verify, state, catch_up=catch_up)
-        ttnn.end_trace_capture(model.mesh_device, trace_id, cq_id=cq_id)
+
+        def _body():
+            with guard(f"verify head capture catch_up={catch_up}"):
+                return forward_verify_head(model, verify, state, catch_up=catch_up)
+
+        trace_id, output = _capture_trace(model.mesh_device, cq_id, _body)
     return trace_id, output
 
 
@@ -1650,10 +1746,12 @@ def capture_verify_tail(
     """Capture the tail after the head whose roots it reads; the draft body is captured after this tail's output."""
 
     with ttnn.corruptible_allocation_scope(model.mesh_device):
-        trace_id = ttnn.begin_trace_capture(model.mesh_device, cq_id=cq_id)
-        with guard(f"verify tail capture catch_up={catch_up}"):
-            output = forward_verify_tail(model, verify, state, head, catch_up=catch_up)
-        ttnn.end_trace_capture(model.mesh_device, trace_id, cq_id=cq_id)
+
+        def _body():
+            with guard(f"verify tail capture catch_up={catch_up}"):
+                return forward_verify_tail(model, verify, state, head, catch_up=catch_up)
+
+        trace_id, output = _capture_trace(model.mesh_device, cq_id, _body)
     return trace_id, output
 
 
@@ -1866,10 +1964,12 @@ def capture_verify_sampled(
     lands), the policy and the uniforms the program reads are host-written before every replay."""
 
     with ttnn.corruptible_allocation_scope(model.mesh_device):
-        trace_id = ttnn.begin_trace_capture(model.mesh_device, cq_id=cq_id)
-        with guard(f"verify sampled capture catch_up={catch_up}"):
-            output = forward_verify_sampled(model, verify, state, constants, catch_up=catch_up)
-        ttnn.end_trace_capture(model.mesh_device, trace_id, cq_id=cq_id)
+
+        def _body():
+            with guard(f"verify sampled capture catch_up={catch_up}"):
+                return forward_verify_sampled(model, verify, state, constants, catch_up=catch_up)
+
+        trace_id, output = _capture_trace(model.mesh_device, cq_id, _body)
     return trace_id, output
 
 
@@ -1936,10 +2036,12 @@ def capture_commit(
     cq_id: int = 0,
 ) -> int:
     with ttnn.corruptible_allocation_scope(model.mesh_device):
-        trace_id = ttnn.begin_trace_capture(model.mesh_device, cq_id=cq_id)
-        with guard("commit capture"):
-            forward_commit(model, verify, state)
-        ttnn.end_trace_capture(model.mesh_device, trace_id, cq_id=cq_id)
+
+        def _body():
+            with guard("commit capture"):
+                forward_commit(model, verify, state)
+
+        trace_id, _ = _capture_trace(model.mesh_device, cq_id, _body)
     return trace_id
 
 
@@ -2136,10 +2238,12 @@ def capture_draft_history(
     cq_id: int = 0,
 ) -> int:
     with ttnn.corruptible_allocation_scope(model.mesh_device):
-        trace_id = ttnn.begin_trace_capture(model.mesh_device, cq_id=cq_id)
-        with guard(f"draft history capture k={verify.drafts}"):
-            forward_draft_history(model, verify, draft)
-        ttnn.end_trace_capture(model.mesh_device, trace_id, cq_id=cq_id)
+
+        def _body():
+            with guard(f"draft history capture k={verify.drafts}"):
+                forward_draft_history(model, verify, draft)
+
+        trace_id, _ = _capture_trace(model.mesh_device, cq_id, _body)
     return trace_id
 
 
@@ -2301,10 +2405,12 @@ def capture_draft(
     """Capture the draft body (after the verify body whose readback address it reads); returns the trace id."""
 
     with ttnn.corruptible_allocation_scope(model.mesh_device):
-        trace_id = ttnn.begin_trace_capture(model.mesh_device, cq_id=cq_id)
-        with guard(f"draft capture k={verify.drafts}"):
-            forward_draft(model, verify, draft, state, verify_output, derive_history=derive_history)
-        ttnn.end_trace_capture(model.mesh_device, trace_id, cq_id=cq_id)
+
+        def _body():
+            with guard(f"draft capture k={verify.drafts}"):
+                forward_draft(model, verify, draft, state, verify_output, derive_history=derive_history)
+
+        trace_id, _ = _capture_trace(model.mesh_device, cq_id, _body)
     return trace_id
 
 

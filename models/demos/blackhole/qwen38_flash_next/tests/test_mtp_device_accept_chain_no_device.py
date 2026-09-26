@@ -141,7 +141,8 @@ def test_verify_sampled_body_is_head_then_the_accept_program_then_tail_and_the_c
     capture = _segment(MTP_V2_SOURCE, functions["capture_verify_sampled"])
     assert 'guard(f"verify sampled capture catch_up={catch_up}")' in capture
     assert "forward_verify_sampled(model, verify, state, constants, catch_up=catch_up)" in capture
-    assert "ttnn.begin_trace_capture" in capture and "ttnn.end_trace_capture" in capture
+    # the capture runs through mtp_v2._capture_trace, which begins it, ends it and releases a failed one before raising
+    assert "_capture_trace(model.mesh_device, cq_id, _body)" in capture and "ttnn.begin_trace_capture" not in capture
 
 
 def test_split_state_carries_the_statistics_row_and_validates_it() -> None:
@@ -252,47 +253,46 @@ def test_open_warms_and_captures_the_device_form_the_same_way_and_mtp_enter_rout
         opened.index('marker("before-chat-mtp-warm-pass")') : opened.index('marker("after-chat-mtp-warm-pass")')
     ]
     assert (
-        '("fused",) if not chain_mtp.sampled else ("split", "sampled") if chain_mtp.device_accept else ("split",)'
-        in warm
+        '("fused",) if not target.sampled else ("split", "sampled") if target.device_accept else ("split",)'
+        in warm  # the rounds run per drafting chain (warm_mtp_chain) since QWEN38_MTP_DRAFTS_PER_REQUEST
     )
     assert 'elif warm_form == "sampled":' in warm and "accept_constants.write_policy(sampling_step.WARM_POLICY)" in warm
-    assert "warm_uniforms = list(MTP_WARM_ACCEPT_UNIFORMS[: mtp + 1])" in warm
+    assert "warm_uniforms = list(MTP_WARM_ACCEPT_UNIFORMS[: target.drafts + 1])" in warm
     assert "accept_constants.write_uniforms(warm_uniforms)" in warm
-    eager = "mtp_v2.forward_verify_sampled(model, chain_mtp.verify, state, accept_constants, catch_up=False"
+    eager = "mtp_v2.forward_verify_sampled(model, target.verify, state, accept_constants, catch_up=False"
     assert eager in warm
     _in_order(
         warm,
         [
             eager,
             "mtp_accept_module.accept_reference(",
-            "mtp_v2.read_candidate_rows(chain_mtp.verify)",
+            "mtp_v2.read_candidate_rows(target.verify)",
             "sentinel=ZERO_EMBEDDING_TOKEN",
-            "mtp_v2.read_accept_statistics(chain_mtp.verify)",
+            "mtp_v2.read_accept_statistics(target.verify)",
             "reference.statistics_row()",
             "torch.equal(actual.view(torch.int32), expected.view(torch.int32))",
         ],
     )
-    captures = opened[
-        opened.index('marker("before-chat-mtp-captures")') : opened.index('marker("after-chat-mtp-captures")')
-    ]
+    # the capture sequence lives in open's per-chain helper (run for the default chain, then each alternate)
+    captures = _segment(SESSION_SOURCE, functions["capture_mtp_chain"])
     _in_order(
         captures,
         [
             "mtp_v2.capture_verify_head(",
             "mtp_v2.capture_verify_tail(",
             "dram_after_split = dram_allocated_per_bank()",
-            "if chain_mtp.device_accept:",
-            "mtp_v2.capture_verify_sampled(model, chain_mtp.verify, state, accept_constants, catch_up=False, guard=guard, cq_id=0",
+            "if target.device_accept:",
+            "mtp_v2.capture_verify_sampled(model, target.verify, state, accept_constants, catch_up=False, guard=guard, cq_id=0",
             "sampled_draft = mtp_v2.capture_draft(",
             "sampled_verify_output, guard=guard, cq_id=0",
-            "chain_mtp.sampled_traces = mtp_v2.Qwen38TTNNMTPTraces(",
+            "target.sampled_traces = mtp_v2.Qwen38TTNNMTPTraces(",
             "verify_first=None, draft=sampled_draft, commit=commit, verify_sampled=verify_sampled",
             "ttnn.mark_corruptible(sampled_verify_output.readback)",
         ],
     )
-    after = opened[opened.index('marker("after-chat-mtp-captures")') :]
-    assert '"mtp_sampled_traces"] = dram_after_mtp - dram_after_split' in after
-    assert '(["sampled"] if chain_mtp.sampled_traces is not None else [])' in after
+    after = captures[captures.index("dram_after_target = dram_allocated_per_bank()") :]
+    assert '"mtp_sampled_traces"] = dram_after_target - dram_after_split' in after
+    assert '(["sampled"] if target.sampled_traces is not None else [])' in after
     # The routing: the hook selects the device form; both hooks together are refused; the form needs its traces.
     enter = _segment(SESSION_SOURCE, functions["mtp_enter"])
     _in_order(
@@ -310,7 +310,7 @@ def test_open_warms_and_captures_the_device_form_the_same_way_and_mtp_enter_rout
         ],
     )
     close = _segment(SESSION_SOURCE, functions["close"])
-    assert "self.mtp.sampled_traces = None" in close
+    assert "chain_mtp.sampled_traces = None" in close
     assert '("verify_output", "split_verify_output", "sampled_verify_output", "head_output")' in close
     construct = _segment(SESSION_SOURCE, functions["construct_chain"])
     assert "mtp_device_accept: bool = False" in construct and "mtp_device_accept=mtp_device_accept" in construct

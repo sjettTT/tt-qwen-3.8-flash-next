@@ -154,6 +154,19 @@ the 1-row loop's stream (the 1-row stream is the `QWEN38_MTP_SAMPLED=0` server's
 both verify forms: a greedy request runs the fused verify, the pinned greedy stream (the traces the
 `QWEN38_MTP_SAMPLED=0` server runs, bitwise), and a sampled request the split form, the host deciding between its head
 and its tail.
+`QWEN38_MTP_DRAFTS_PER_REQUEST=1` (a server switch, default off; the launcher passes it through) opens TWO drafting
+chains: the `--mtp K` chain and the other member of the pair (4, 5), the k = 5 chain on the 6-row verify MoE form; a
+request picks one with `extra_body.mtp_drafts` (`4` or `5`; anything else, or the field on a one-chain server, is HTTP
+400 with the admitted list -- the field is refused, never dropped), and the response's `qwen38.mtp.k` says which ran.
+The default chain and its stream are untouched (the `system_fingerprint` and the acceptance baselines are the default
+chain's; `/health` lists every chain under `mtp_chains`).  Measured 2026-09-26 on the 4x p150 line (256-token requests):
+k = 5 pays on structured output -- json +4.7..+6.8 % and code +6.6..+8.8 % tokens per second over k = 4 (5.2 vs 4.55
+tokens per pass against a pass 3.1..3.7 ms longer) -- and loses on chat (-12 %) and prose (-25 %), whose k = 5 stream
+accepts fewer tokens per pass; the two chains share the model's state, so a request may pick either at any point of a
+conversation.  DRAM: the second chain adds its verify window, draft state and traces (about 27 MB per bank at 32k; the
+MTP components, the alignment history, the decode step's MTP inputs and the prefill extensions are shared), admitted per
+chain at open.  The switch does not combine with `QWEN38_MTP_DEVICE_ACCEPT=1` (the device acceptance's
+constants are one k's; the open refuses the pair).
 `--mtp-gdn-anchor layer0` (a server flag) re-anchors the layer-0 GDN state from the 1-row recurrence.
 Since 2026-09-25 the `--mtp` admission reads the mesh allocator's free bytes per DRAM bank after the resident weights
 are built (less the build's own remaining state and traces) and refuses only when the MTP pair, state and growth
@@ -166,6 +179,7 @@ realisation, `device-theta` or `host-fp32`); `/health.mtp.device_accept` is the 
 `device_accept_guard_deviations` its counters, and `QWEN38_MTP_DEVICE_ACCEPT_DUMP=<dir>` (dev) writes one JSON per
 request with every device-decided pass's rows, tokens, statistics and uniforms for the
 development-side law gate that re-derives each decision on the host.
+`QWEN38_MTP_MOE_ROWS=5|6|32` (diagnostic, default unset) forces the verify MoE row count the chain runs (`moe_rows_for(k + 1)` otherwise: 5 for k = 3 and 4, 6 for k = 5 since the 6-row form's silicon proof of 2026-09-26, its states term provisional until the first served 6-row open re-seeds it), keyed into the admission's states term and reported under `/health` `mtp.moe_rows`; the 6-row form is under proof for k = 5.
 
 ## The prompt, follow-up turns and the prompt-end snapshot
 

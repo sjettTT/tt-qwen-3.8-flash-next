@@ -478,11 +478,16 @@ def test_chain_open_allocates_warms_captures_and_marks_the_128_row_twin_in_order
         "dram_after_long_chunk = dram_allocated_per_bank()",
         'marker("after-chat-slab-capture")',
         "dram_after_prefill_captures = dram_allocated_per_bank()",
-        'marker("before-chat-mtp-captures")',
+        # the MTP captures and the growth gate live in open's per-chain helper (QWEN38_MTP_DRAFTS_PER_REQUEST runs it
+        # once per drafting chain), defined after the prefill captures and run at the marker below; the chain's traces
+        # grow from the baseline the caller passes -- the last prefill capture's allocation for the default chain
+        "def capture_mtp_chain(target: Qwen38ChainMTP, dram_baseline: int) -> int:",
         '"long_chunk_trace": dram_after_long_chunk - dram_after_chunk,',
-        '"mtp_fused_traces": dram_after_fused - dram_after_prefill_captures,',
-        '"mtp_traces": dram_after_mtp - dram_after_prefill_captures,',
-        'if mtp_growth > chain_mtp.admission["required_free_bytes_per_bank"]:',
+        '"mtp_fused_traces": dram_after_fused - dram_baseline,',
+        '"mtp_traces": dram_after_target - dram_baseline,',
+        'if mtp_growth > target.admission["required_free_bytes_per_bank"]:',
+        'marker("before-chat-mtp-captures")',
+        "dram_after_previous = capture_mtp_chain(chain_mtp, dram_after_prefill_captures)",
     )
     positions = [opened.index(fragment) for fragment in order]
     assert positions == sorted(positions), order
@@ -575,6 +580,7 @@ def test_server_admits_long_chunks_with_mtp_and_reports_the_twin() -> None:
         "            drafts=args.mtp,\n"
         "            verify_forms=len(forms),\n"
         "            long_chunks=bool(args.long_chunks),\n"
+        "            moe_rows=mtp_moe_rows,\n"  # the verify MoE row count knob (QWEN38_MTP_MOE_ROWS) sits beside it
         "        )"
     ) in server
     assert '"long_chunk_extension": chain.mtp.long_chunk_extension is not None,' in server
