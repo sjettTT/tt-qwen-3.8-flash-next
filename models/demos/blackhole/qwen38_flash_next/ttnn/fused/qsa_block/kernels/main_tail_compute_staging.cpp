@@ -12,6 +12,7 @@
 #include "api/compute/tile_move_copy.h"
 #include "ttnn/cpp/ttnn/kernel_lib/untilize_helpers.hpp"
 #include "main_tail_cbs.h"
+#include "../../kernels/zones.h"
 
 using namespace main_tail;
 
@@ -20,6 +21,7 @@ void kernel_main() {
     compute_kernel_hw_startup(CB_STG, CB_ONES, CB_STGC);
     cb_wait_front(CB_ONES, 1);
     for (uint32_t i = 0; i < lane_count; ++i) {
+        FUSED_ZONE("fz_qs_mt_cs_lane");
         cb_wait_front(CB_STG, PACK_TILES);
         cb_reserve_back(CB_STGC, PACK_TILES);
         cb_reserve_back(CB_STGW, PACK_TILES);

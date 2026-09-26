@@ -12,6 +12,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t Vt = get_compile_time_arg_val(0);
 constexpr uint32_t DEBUG = get_compile_time_arg_val(1);
@@ -37,11 +38,15 @@ void kernel_main() {
         s.pop_front(1);
         c.pop_front(1);
     }
-    DataflowBuffer o(c_out);
-    o.wait_front(Vt);
-    for (uint32_t t = 0; t < Vt; ++t) {
-        noc.async_write(o, out, BF16_TILE, {.offset_bytes = t * BF16_TILE}, {.page_id = first + t, .offset_bytes = 0});
+    {
+        FUSED_ZONE("fz_pl_gate_w_main");
+        DataflowBuffer o(c_out);
+        o.wait_front(Vt);
+        for (uint32_t t = 0; t < Vt; ++t) {
+            noc.async_write(
+                o, out, BF16_TILE, {.offset_bytes = t * BF16_TILE}, {.page_id = first + t, .offset_bytes = 0});
+        }
+        noc.async_write_barrier();
+        o.pop_front(Vt);
     }
-    noc.async_write_barrier();
-    o.pop_front(Vt);
 }

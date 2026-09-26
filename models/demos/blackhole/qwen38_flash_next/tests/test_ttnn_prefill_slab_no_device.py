@@ -351,6 +351,9 @@ def test_qsa_slab_constants_pool_every_block_and_carry_no_row_templates() -> Non
     assert host["page_offsets"].reshape(-1).tolist() == list(range(tiles))
     assert tuple(host["arange_blocks_row"].shape) == (1, 1, 1, BLOCKS)
     assert host["row_index_col"].reshape(-1).tolist() == list(range(SLAB))
+    assert tuple(host["row_index_row"].shape) == (1, 1, 1, SLAB) and host["row_index_row"].reshape(-1).tolist() == list(
+        range(SLAB)
+    )
     assert tuple(host["row_keep_bits" if "row_keep_bits" in host else "row_index_slots"].shape) == (1, 1, SLAB, 2080)
     # The chunk forms are as before.
     short = qsa_module.qsa_chunk_constant_rows(BLOCKS, CHUNK_ROWS)
@@ -371,6 +374,7 @@ def test_qsa_slab_emulation_is_the_one_row_rule_per_row(position: int) -> None:
         assert int(complete[row]) == (position + row + 1) // 4 == visible
         assert torch.equal(inputs["row_keep_bits"][0, 0, row], one["row_keep_bits"].reshape(-1))
         assert torch.equal(inputs["row_fill"][0, 0, row], one["row_fill"].reshape(-1))
+    assert inputs["q_positions_row"].tolist() == [[[list(range(position, position + SLAB))]]]
 
 
 # --------------------------------------------------------------------------- the driver's plan
@@ -614,7 +618,17 @@ def test_slab_source_pins() -> None:
     forward = inspect.getsource(qsa_module.Qwen38TTNNQSA.forward_chunk_generic)
     assert (
         "if is_slab_rows(rows):" in forward
-        and "self._sparse_indices_slab(index_query, state, chunk, constants)" in forward
+        and "self._sparse_indices_slab(index_query, state, chunk, constants, expand=not block_shared)" in forward
+    )
+    # The block-shared attention (QWEN38_FUSED=sparse_sdpa_tiled) ends the selection at the block ids and takes the
+    # slab's positions row; the chain keeps the expansion.  Its admission is per slab on the shapes.
+    assert "block_shared = self._slab_attention_admits(rows, state)" in forward
+    assert "self._block_shared_attention_rows(" in forward and "chunk.q_positions_row" in forward
+    attention = inspect.getsource(qsa_module.Qwen38TTNNQSA._block_shared_attention_rows)
+    assert "self._slab_attention_fused(" in attention and "ttnn.to_layout(query, ttnn.ROW_MAJOR_LAYOUT" in attention
+    select = inspect.getsource(qsa_module.Qwen38TTNNQSA._sparse_indices_slab)
+    assert "if not expand:" in select and select.index("if not expand:") < select.index(
+        "ttnn.bitwise_left_shift(block_ids"
     )
     # The 32-row and 128-row bodies keep their forms (their own pins hold): the per-tile loops are still there.
     assert "dram_sharded_row_tiles(full_hidden, self.in_proj_act_memory_config)" in inspect.getsource(gdn_module)

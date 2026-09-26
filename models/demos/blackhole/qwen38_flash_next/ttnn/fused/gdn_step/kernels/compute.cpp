@@ -29,13 +29,7 @@
 #include "api/compute/eltwise_unary/sqrt.h"
 #include "api/compute/eltwise_unary/recip.h"
 #include "api/compute/eltwise_unary/binop_with_scalar.h"
-// Per-phase device profiler zones (study build: QWEN38_GDN_STEP_ZONES=1 defines FGS_ZONES); the served build has none.
-#ifdef FGS_ZONES
-#include "tools/profiler/kernel_profiler.hpp"
-#define FGS_ZONE(name) DeviceZoneScopedN(name)
-#else
-#define FGS_ZONE(name)
-#endif
+#include "../../kernels/zones.h"
 
 using namespace ckernel;
 
@@ -606,13 +600,13 @@ void kernel_main() {
 
     for (uint32_t item = 0; item < items; ++item) {
         {
-            FGS_ZONE("fgs_wait_inputs");
+            FUSED_ZONE("fz_gs_c_wait");
             cb_wait_front(CB_P, 1);  // the first tile's group; the conv waits for the rest tile by tile
             cb_wait_front(CB_S, 3);
             cb_wait_front(CB_T, 4);
         }
         {
-            FGS_ZONE("fgs_conv_silu");
+            FUSED_ZONE("fz_gs_c_conv_silu");
             conv_silu();
         }
         cb_pop_front(CB_P, QKV_TILES);
@@ -621,22 +615,22 @@ void kernel_main() {
 
         cb_wait_front(CB_QKV, 2 * HT);
         {
-            FGS_ZONE("fgs_l2_norms");
+            FUSED_ZONE("fz_gs_c_l2_norms");
             l2_norm(0, CB_QROW);
             l2_norm(HT, CB_KROW);
         }
         cb_pop_front(CB_QKV, 2 * HT);
 
         {
-            FGS_ZONE("fgs_gates");
+            FUSED_ZONE("fz_gs_c_gates");
             gate_scalars();
         }
         {
-            FGS_ZONE("fgs_recurrence");
+            FUSED_ZONE("fz_gs_c_recurrence");
             recurrence();
         }
         {
-            FGS_ZONE("fgs_gated_norm");
+            FUSED_ZONE("fz_gs_c_gated_norm");
             gated_norm();
         }
     }

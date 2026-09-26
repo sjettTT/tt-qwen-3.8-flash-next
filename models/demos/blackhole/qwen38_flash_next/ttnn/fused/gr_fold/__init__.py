@@ -41,9 +41,16 @@ TP_AXIS = 1
 TRANSPORT_KERNEL = fp.kernel_source(NAME, "transport.cpp")
 SEM_PROBE = fp.kernel_source(NAME, "sem_probe.cpp")
 SCRATCH_CB = 0
-SEM_GO, SEM_SCRATCH, SEM_DONE = 0, 1, 2  # program-local, allocated first: barrier passed (BRISC -> NCRISC), producers' tiles landed, NCRISC done
+SEM_GO, SEM_SCRATCH, SEM_DONE = (
+    0,
+    1,
+    2,
+)  # program-local, allocated first: barrier passed (BRISC -> NCRISC), producers' tiles landed, NCRISC done
 SOURCE_TENSOR, SOURCE_PRODUCERS = 0, 1
-PHASES = ("stats", "partials")  # one (barrier, data) global semaphore pair per gather phase, never cycled: the design note's proof
+PHASES = (
+    "stats",
+    "partials",
+)  # one (barrier, data) global semaphore pair per gather phase, never cycled: the design note's proof
 STATS_SCRATCH_CB = 3  # beside the stats program's CBs 0, 1, 2, 16
 PARTIALS_SCRATCH_CB = 11  # beside normalize_down's CBs 0-10, 16, 17
 # the transport cores per phase, one per link: the stats phase next to the four stats cores, the partials phase
@@ -61,7 +68,12 @@ PARTIALS_SEMAPHORES = (1, 2, 3)  # normalize_down's in0 multicast owns program s
 TRANSPORT2_KERNEL = fp.kernel_source(NAME, "transport2.cpp")
 FRONT_STATS_SCRATCH_SEM = 4  # on the transport cores, beside the partials' (go, scratch, done) = 1, 2, 3
 FRONT_STATS_READY = 5  # on the norm cores, beside the in0 multicast's 0
-FRONT_STATS_CBS = (20, 21, 22, 23)  # the stats phase's scaler (fp32), x^2 (fp32), stats tile (bf16), transport scratch (bf16)
+FRONT_STATS_CBS = (
+    20,
+    21,
+    22,
+    23,
+)  # the stats phase's scaler (fp32), x^2 (fp32), stats tile (bf16), transport scratch (bf16)
 STATS_NORM = fp.kernel_source(NAME, "stats_norm_compute.cpp")
 MCAST_WRITER2 = fp.kernel_source(NAME, "mcast_writer2.cpp")
 PROBED_CORES = TRANSPORT["stats"] + TRANSPORT["partials"]
@@ -110,7 +122,13 @@ class Line:
         self.nodes = [mesh.get_fabric_node_id(coordinate) for coordinate in self.coordinates]
         forward = [ttnn.get_eth_forwarding_direction(self.nodes[r], self.nodes[r + 1]) for r in range(TP_SIZE - 1)]
         backward = [ttnn.get_eth_forwarding_direction(self.nodes[r + 1], self.nodes[r]) for r in range(TP_SIZE - 1)]
-        if None in forward or None in backward or len(set(forward)) != 1 or len(set(backward)) != 1 or forward[0] == backward[0]:
+        if (
+            None in forward
+            or None in backward
+            or len(set(forward)) != 1
+            or len(set(backward)) != 1
+            or forward[0] == backward[0]
+        ):
             raise RuntimeError(f"mesh axis {TP_AXIS} is not the fabric's line: forward {forward} backward {backward}")
         degree = Counter()
         for rank in range(TP_SIZE):
@@ -119,8 +137,12 @@ class Line:
                     degree[rank] += 1
         # every rank can forward to every other on a line; the immediate-neighbour count is what the transport uses
         neighbours = {rank: (rank > 0) + (rank + 1 < TP_SIZE) for rank in range(TP_SIZE)}
-        if Counter(neighbours.values()) != Counter({1: 2, 2: 2}) or any(degree[r] != TP_SIZE - 1 for r in range(TP_SIZE)):
-            raise RuntimeError(f"line degree histogram is not {{1: 2, 2: 2}}: neighbours {neighbours} reachable {dict(degree)}")
+        if Counter(neighbours.values()) != Counter({1: 2, 2: 2}) or any(
+            degree[r] != TP_SIZE - 1 for r in range(TP_SIZE)
+        ):
+            raise RuntimeError(
+                f"line degree histogram is not {{1: 2, 2: 2}}: neighbours {neighbours} reachable {dict(degree)}"
+            )
         link_counts = {
             len(ttnn.get_forwarding_link_indices(self.nodes[a], self.nodes[b]))
             for a, b in [(r, r + 1) for r in range(TP_SIZE - 1)] + [(r + 1, r) for r in range(TP_SIZE - 1)]
@@ -168,7 +190,9 @@ class Transport:
     delays: Any = None
 
 
-def transport_mesh_program(mesh, transports, *, semaphores, cbs, kernels=lambda rank: [], links: int = 1) -> "ttnn.MeshProgramDescriptor":
+def transport_mesh_program(
+    mesh, transports, *, semaphores, cbs, kernels=lambda rank: [], links: int = 1
+) -> "ttnn.MeshProgramDescriptor":
     """One ProgramDescriptor per mesh coordinate: ``kernels(rank)`` plus, per link, the transport core's reader (NCRISC,
     backward) and writer (BRISC, forward) with the device's rank and fabric connections.  One ``Transport`` runs
     ``kernels/transport.cpp``; two run ``kernels/transport2.cpp`` on the SAME cores, both phases on one connection per
@@ -187,12 +211,18 @@ def transport_mesh_program(mesh, transports, *, semaphores, cbs, kernels=lambda 
     cores = first.cores[:links]
     for t in transports:
         if not 1 <= links <= min(len(t.cores), geometry.links, t.tiles):
-            raise ValueError(f"links must be 1..{min(len(t.cores), geometry.links, t.tiles)} for the {t.phase} transport, got {links}")
+            raise ValueError(
+                f"links must be 1..{min(len(t.cores), geometry.links, t.tiles)} for the {t.phase} transport, got {links}"
+            )
         if t.cores[:links] != cores:
-            raise ValueError("the transports of one program run on the same cores (one open sender per link per direction)")
+            raise ValueError(
+                "the transports of one program run on the same cores (one open sender per link per direction)"
+            )
         if (t.semaphore_ids[0], t.semaphore_ids[2]) != (first.semaphore_ids[0], first.semaphore_ids[2]):
             raise ValueError("the transports of one program share the go and done semaphores")
-    if len({t.phase for t in transports}) != len(transports) or len({t.semaphore_ids[1] for t in transports}) != len(transports):
+    if len({t.phase for t in transports}) != len(transports) or len({t.semaphore_ids[1] for t in transports}) != len(
+        transports
+    ):
         raise ValueError("one transport per phase per program, each with its own scratch semaphore")
     addresses = {t.phase: line_semaphores(mesh).pair(t.phase) for t in transports}
     go, done = first.semaphore_ids[0], first.semaphore_ids[2]
@@ -207,7 +237,18 @@ def transport_mesh_program(mesh, transports, *, semaphores, cbs, kernels=lambda 
         compile_args = []
         for i in range(links):
             if len(transports) == 1:
-                args = [first.scratch_cb, first.tiles, go, TP_SIZE, first.source, first.semaphore_ids[1], done, i, links, *first.page_strides]
+                args = [
+                    first.scratch_cb,
+                    first.tiles,
+                    go,
+                    TP_SIZE,
+                    first.source,
+                    first.semaphore_ids[1],
+                    done,
+                    i,
+                    links,
+                    *first.page_strides,
+                ]
             else:
                 args = [go, TP_SIZE, done, i, links]
                 for t in transports:
@@ -219,19 +260,30 @@ def transport_mesh_program(mesh, transports, *, semaphores, cbs, kernels=lambda 
 
         def transport(build, per_link_args):
             return [
-                build(kernel, ttnn.CoreRangeSet([ttnn.CoreRange(cores[i], cores[i])]), compile_args[i], [(cores[i], base + list(per_link_args[i]))])
+                build(
+                    kernel,
+                    ttnn.CoreRangeSet([ttnn.CoreRange(cores[i], cores[i])]),
+                    compile_args[i],
+                    [(cores[i], base + list(per_link_args[i]))],
+                )
                 for i in range(links)
             ]
 
         others = list(kernels(rank))
         empty = [[] for _ in range(links)]
-        seed = fp.program_descriptor(others + transport(fp.reader_kernel, empty) + transport(fp.writer_kernel, empty), cbs=cbs, semaphores=semaphores)
+        seed = fp.program_descriptor(
+            others + transport(fp.reader_kernel, empty) + transport(fp.writer_kernel, empty),
+            cbs=cbs,
+            semaphores=semaphores,
+        )
         backward = [
             ttnn.setup_fabric_connection(node, geometry.nodes[rank - 1], i, seed, cores[i]) if rank > 0 else []
             for i in range(links)
         ]
         forward = [
-            ttnn.setup_fabric_connection(node, geometry.nodes[rank + 1], i, seed, cores[i]) if rank + 1 < TP_SIZE else []
+            ttnn.setup_fabric_connection(node, geometry.nodes[rank + 1], i, seed, cores[i])
+            if rank + 1 < TP_SIZE
+            else []
             for i in range(links)
         ]
         mesh_program[ttnn.MeshCoordinateRange(coordinate, coordinate)] = ttnn.ProgramDescriptor(
@@ -272,8 +324,23 @@ def gather_line(local, *, links: int = 1, delays=None, dim: int = 3):
     cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in transports[:links]])
     cbs = [fp.cb_descriptor(SCRATCH_CB, local.dtype, tile_bytes, tiles, cores)]
     semaphores = [fp.semaphore_descriptor(sem, cores) for sem in (SEM_GO, SEM_SCRATCH, SEM_DONE)]
-    spec = Transport(out, local, SCRATCH_CB, tiles, SOURCE_TENSOR, phase, transports, page_strides=strides, delays=delays)
-    ttnn.generic_op([local, out], transport_mesh_program(mesh, [spec], semaphores=semaphores, cbs=cbs, links=links))
+    spec = Transport(
+        out, local, SCRATCH_CB, tiles, SOURCE_TENSOR, phase, transports, page_strides=strides, delays=delays
+    )
+    # the local tiles in, every device's tiles landing in the gathered pages (the own copy and the peers' over the
+    # fabric); the tiles staged in the transport cores' scratch (L1); data movement
+    meta = fp.program_meta(
+        NAME,
+        "gather_line",
+        shape[2],
+        reads=(local,),
+        dram_bytes=TP_SIZE * tiles * tile_bytes,
+        l1_bytes=tiles * tile_bytes,
+        cores=links,
+    )
+    fp.run_program(
+        [local, out], transport_mesh_program(mesh, [spec], semaphores=semaphores, cbs=cbs, links=links), meta=meta
+    )
     return fp.stamp_topology(out, local)
 
 
@@ -294,6 +361,7 @@ def read_semaphores(mesh):
     fp.run_program(
         [out, out],
         fp.program_descriptor([probe], cbs=[fp.cb_descriptor(0, ttnn.uint32, fp.TILE_BYTES[ttnn.uint32], 1, cores)]),
+        meta=fp.program_meta(NAME, "sem_probe", 1, writes=(out,), cores=len(probed)),
     )
     values = []
     for shard in ttnn.get_device_tensors(out):
@@ -366,7 +434,23 @@ def stats_gather(residual, *, links: int | None = None):
         return [reader, compute, writer]
 
     spec = Transport(out, out, STATS_SCRATCH_CB, gr_read.BRANCHES, SOURCE_PRODUCERS, "stats", TRANSPORT["stats"])
-    ttnn.generic_op([residual, out], transport_mesh_program(mesh, [spec], semaphores=semaphores, cbs=cbs, kernels=kernels, links=links))
+    # the residual in, every device's stats tiles landing in the gathered pages; the four tiles handed to the
+    # transport cores (L1); square and sum per element
+    meta = fp.program_meta(
+        NAME,
+        "stats_gather",
+        rows,
+        reads=(residual,),
+        dram_bytes=TP_SIZE * gr_read.BRANCHES * gr_read.TILE_BF16,
+        l1_bytes=gr_read.BRANCHES * gr_read.TILE_BF16,
+        flops=2 * rows * gr_read.FLAT_WIDTH,
+        cores=len(work) + links,
+    )
+    fp.run_program(
+        [residual, out],
+        transport_mesh_program(mesh, [spec], semaphores=semaphores, cbs=cbs, kernels=kernels, links=links),
+        meta=meta,
+    )
     return fp.stamp_topology(out, residual)
 
 
@@ -378,8 +462,12 @@ def normalize_down_gather(residual, gathered_stats, norm_scale, down_inject, *, 
     Returns ``(normalized, gathered_partials)``; ``low_rank_gate`` reads the gathered tensor exactly as today."""
 
     rows = gr_read.residual_rows(residual)
-    gr_read._expect(gathered_stats, (1, gr_read.BRANCHES, rows, fp.TILE * gr_read.STATS_TILES), gr_read.BF16, "GR gathered stats")
-    gr_read._expect(norm_scale, (1, gr_read.BRANCHES, fp.TILE, gr_read.LOCAL_HIDDEN), gr_read.FP32, "GR norm_scale rows")
+    gr_read._expect(
+        gathered_stats, (1, gr_read.BRANCHES, rows, fp.TILE * gr_read.STATS_TILES), gr_read.BF16, "GR gathered stats"
+    )
+    gr_read._expect(
+        norm_scale, (1, gr_read.BRANCHES, fp.TILE, gr_read.LOCAL_HIDDEN), gr_read.FP32, "GR norm_scale rows"
+    )
     gr_read._expect(down_inject, (1, 1, gr_read.FLAT_WIDTH, gr_read.PARTIAL_WIDTH), gr_read.BF16, "GR down_inject")
     mesh = residual.device()
     transports = TRANSPORT["partials"]
@@ -396,7 +484,14 @@ def normalize_down_gather(residual, gathered_stats, norm_scale, down_inject, *, 
     w_set, p_set = gr_read._core_set(workers), gr_read._core_set(producers)
     all_set = gr_read._core_set(workers + producers)
     wt_set = gr_read._core_set(workers + list(transports))
-    T_BF16, T_FP32, HT, ST, FT, PT = gr_read.TILE_BF16, gr_read.TILE_FP32, gr_read.HIDDEN_TILES, gr_read.STATS_TILES, gr_read.FLAT_TILES, gr_read.PARTIAL_TILES
+    T_BF16, T_FP32, HT, ST, FT, PT = (
+        gr_read.TILE_BF16,
+        gr_read.TILE_FP32,
+        gr_read.HIDDEN_TILES,
+        gr_read.STATS_TILES,
+        gr_read.FLAT_TILES,
+        gr_read.PARTIAL_TILES,
+    )
     cbs = [
         fp.cb_descriptor(0, gr_read.BF16, T_BF16, HT, p_set),
         fp.cb_descriptor(1, gr_read.BF16, T_BF16, ST, p_set),
@@ -459,14 +554,43 @@ def normalize_down_gather(residual, gathered_stats, norm_scale, down_inject, *, 
         for w, core in enumerate(workers):
             x, y = noc[(transports[w % links].x, transports[w % links].y)]
             runtime.append((core, (w // links, (x, y, x, y), (PT * rank + w, 1), (0, 0, 1, 1))))
-        writer = gr_read._mcast_writer(w_set, runtime, src_cb=17, dst_cb=PARTIALS_SCRATCH_CB, tiles=1, tiles_tensor=gathered, sem=scratch)
+        writer = gr_read._mcast_writer(
+            w_set, runtime, src_cb=17, dst_cb=PARTIALS_SCRATCH_CB, tiles=1, tiles_tensor=gathered, sem=scratch
+        )
         return [reader, norm, sender, receiver, down, writer]
 
-    semaphores = [fp.semaphore_descriptor(0, all_set)] + [fp.semaphore_descriptor(sem, wt_set) for sem in (go, scratch, done)]
-    spec = Transport(gathered, gathered, PARTIALS_SCRATCH_CB, PT, SOURCE_PRODUCERS, "partials", transports, semaphore_ids=PARTIALS_SEMAPHORES, page_strides=(1, PT))
-    ttnn.generic_op(
+    semaphores = [fp.semaphore_descriptor(0, all_set)] + [
+        fp.semaphore_descriptor(sem, wt_set) for sem in (go, scratch, done)
+    ]
+    spec = Transport(
+        gathered,
+        gathered,
+        PARTIALS_SCRATCH_CB,
+        PT,
+        SOURCE_PRODUCERS,
+        "partials",
+        transports,
+        semaphore_ids=PARTIALS_SEMAPHORES,
+        page_strides=(1, PT),
+    )
+    # gr_read.normalize_down's operands in and its flat row out, every device's fp32 partial tiles landing in the
+    # gathered pages; the flat row multicast into the twelve down cores' CB and the partial tiles handed to the
+    # transport cores (L1); the norm's four passes, then the down+inject matmul
+    meta = fp.program_meta(
+        NAME,
+        "normalize_down_gather",
+        rows,
+        reads=(residual, gathered_stats, norm_scale, down_inject),
+        writes=(normalized,),
+        dram_bytes=TP_SIZE * PT * T_FP32,
+        l1_bytes=len(workers) * fp.tensor_bytes(normalized) + PT * T_FP32,
+        flops=4 * rows * gr_read.FLAT_WIDTH + 2 * rows * gr_read.FLAT_WIDTH * gr_read.PARTIAL_WIDTH,
+        cores=len(workers) + len(producers) + links,
+    )
+    fp.run_program(
         [residual, gathered_stats, norm_scale, down_inject, normalized, gathered],
         transport_mesh_program(mesh, [spec], semaphores=semaphores, cbs=cbs, kernels=kernels, links=links),
+        meta=meta,
     )
     return normalized, gathered
 
@@ -483,7 +607,9 @@ def stats_normalize_down_gather(residual, norm_scale, down_inject, *, links: int
     program).  The workers are normalize_down_gather's.  Returns ``(gathered_stats, normalized, gathered_partials)``."""
 
     rows = gr_read.residual_rows(residual)
-    gr_read._expect(norm_scale, (1, gr_read.BRANCHES, fp.TILE, gr_read.LOCAL_HIDDEN), gr_read.FP32, "GR norm_scale rows")
+    gr_read._expect(
+        norm_scale, (1, gr_read.BRANCHES, fp.TILE, gr_read.LOCAL_HIDDEN), gr_read.FP32, "GR norm_scale rows"
+    )
     gr_read._expect(down_inject, (1, 1, gr_read.FLAT_WIDTH, gr_read.PARTIAL_WIDTH), gr_read.BF16, "GR down_inject")
     mesh = residual.device()
     transports = TRANSPORT["partials"]
@@ -502,7 +628,14 @@ def stats_normalize_down_gather(residual, norm_scale, down_inject, *, links: int
     pw_set = gr_read._core_set(workers + producers)
     ps_set = gr_read._core_set(producers + list(transports))
     wt_set = gr_read._core_set(workers + list(transports))
-    T_BF16, T_FP32, HT, ST, FT, PT = gr_read.TILE_BF16, gr_read.TILE_FP32, gr_read.HIDDEN_TILES, gr_read.STATS_TILES, gr_read.FLAT_TILES, gr_read.PARTIAL_TILES
+    T_BF16, T_FP32, HT, ST, FT, PT = (
+        gr_read.TILE_BF16,
+        gr_read.TILE_FP32,
+        gr_read.HIDDEN_TILES,
+        gr_read.STATS_TILES,
+        gr_read.FLAT_TILES,
+        gr_read.PARTIAL_TILES,
+    )
     c_sscaler, c_x2, c_sout, c_sscratch = FRONT_STATS_CBS
     cbs = [
         fp.cb_descriptor(0, gr_read.BF16, T_BF16, HT, p_set),
@@ -547,7 +680,9 @@ def stats_normalize_down_gather(residual, norm_scale, down_inject, *, links: int
         ],
         gate=(3, FRONT_STATS_READY, links + 1),
     )
-    compute = fp.compute_kernel(STATS_NORM, p_set, [HT, ST, 4, 16, c_sscaler, c_x2, c_sout], fp32_dest=True, unpack_to_dest_fp32=(4, 7))
+    compute = fp.compute_kernel(
+        STATS_NORM, p_set, [HT, ST, 4, 16, c_sscaler, c_x2, c_sout], fp32_dest=True, unpack_to_dest_fp32=(4, 7)
+    )
     receiver = gr_read._mcast_reader(
         w_set,
         [(down_inject, 9)],
@@ -559,7 +694,12 @@ def stats_normalize_down_gather(residual, norm_scale, down_inject, *, links: int
     down = fp.compute_kernel(gr_read.DOWN, w_set, [FT, 8, 8, 9, 17, gr_read.DOWN_SPILL, 10], fp32_dest=True)
     p_go, p_scratch, p_done = PARTIALS_SEMAPHORES
     s_scratch = FRONT_STATS_SCRATCH_SEM
-    accessors = fp.accessor_args(gathered_stats) + fp.accessor_args(gathered_stats) + fp.accessor_args(normalized) + fp.accessor_args(normalized)
+    accessors = (
+        fp.accessor_args(gathered_stats)
+        + fp.accessor_args(gathered_stats)
+        + fp.accessor_args(normalized)
+        + fp.accessor_args(normalized)
+    )
 
     def kernels(rank):
         # the norm cores' two-phase writer: A = the stats tile into transport core (b % links)'s stats scratch slot
@@ -574,7 +714,8 @@ def stats_normalize_down_gather(residual, norm_scale, down_inject, *, links: int
         writer2 = fp.writer_kernel(
             MCAST_WRITER2,
             p_set,
-            [c_sout, c_sscratch, 1, 1, gr_read.NONE_CB, s_scratch, 16, 8, HT, 1, gr_read.NONE_CB, 0, FRONT_STATS_READY] + accessors,
+            [c_sout, c_sscratch, 1, 1, gr_read.NONE_CB, s_scratch, 16, 8, HT, 1, gr_read.NONE_CB, 0, FRONT_STATS_READY]
+            + accessors,
             runtime,
         )
         # the workers' writer: the partial tile into transport core (w % links)'s partials scratch slot w // links and
@@ -583,7 +724,9 @@ def stats_normalize_down_gather(residual, norm_scale, down_inject, *, links: int
         for w, core in enumerate(workers):
             x, y = noc[(transports[w % links].x, transports[w % links].y)]
             runtime.append((core, (w // links, (x, y, x, y), (PT * rank + w, 1), (0, 0, 1, 1))))
-        writer = gr_read._mcast_writer(w_set, runtime, src_cb=17, dst_cb=PARTIALS_SCRATCH_CB, tiles=1, tiles_tensor=gathered, sem=p_scratch)
+        writer = gr_read._mcast_writer(
+            w_set, runtime, src_cb=17, dst_cb=PARTIALS_SCRATCH_CB, tiles=1, tiles_tensor=gathered, sem=p_scratch
+        )
         return [reader, compute, writer2, receiver, down, writer]
 
     semaphores = (
@@ -604,11 +747,37 @@ def stats_normalize_down_gather(residual, norm_scale, down_inject, *, links: int
             consumers=tuple(noc[(c.x, c.y)] for c in producers),
             consumer_sem=FRONT_STATS_READY,
         ),
-        Transport(gathered, gathered, PARTIALS_SCRATCH_CB, PT, SOURCE_PRODUCERS, "partials", transports, semaphore_ids=PARTIALS_SEMAPHORES, page_strides=(1, PT)),
+        Transport(
+            gathered,
+            gathered,
+            PARTIALS_SCRATCH_CB,
+            PT,
+            SOURCE_PRODUCERS,
+            "partials",
+            transports,
+            semaphore_ids=PARTIALS_SEMAPHORES,
+            page_strides=(1, PT),
+        ),
     ]
-    ttnn.generic_op(
+    # the residual twice (the stats phase, then the norm phase), gamma and the weight in, the flat row out, every
+    # device's stats and partial tiles landing in the two gathered tensors' pages; the flat row multicast to the
+    # twelve down cores and the stats / partial tiles handed to the transport cores (L1); the stats' two passes, the
+    # norm's four, the down+inject matmul
+    meta = fp.program_meta(
+        NAME,
+        "stats_normalize_down_gather",
+        rows,
+        reads=(residual, residual, norm_scale, down_inject),
+        writes=(normalized,),
+        dram_bytes=TP_SIZE * (gr_read.BRANCHES * T_BF16 + PT * T_FP32),
+        l1_bytes=len(workers) * fp.tensor_bytes(normalized) + gr_read.BRANCHES * T_BF16 + PT * T_FP32,
+        flops=6 * rows * gr_read.FLAT_WIDTH + 2 * rows * gr_read.FLAT_WIDTH * gr_read.PARTIAL_WIDTH,
+        cores=len(workers) + len(producers) + links,
+    )
+    fp.run_program(
         [residual, norm_scale, down_inject, gathered_stats, normalized, gathered],
         transport_mesh_program(mesh, phases, semaphores=semaphores, cbs=cbs, kernels=kernels, links=links),
+        meta=meta,
     )
     return gathered_stats, normalized, gathered
 

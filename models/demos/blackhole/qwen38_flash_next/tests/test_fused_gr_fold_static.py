@@ -49,7 +49,9 @@ def test_registered_opt_in_bitwise_over_gr_read():
     assert entry.tolerance == fused.BITWISE and entry.default_on  # on by default since the 2026-09-25 landing
     assert entry.fused is gr_fold.gr_read_fold and entry.composed is gr_read.gr_read_fused
     assert fused.resolve("gr_fold", {}) is gr_fold.gr_read_fold
-    assert fused.resolve("gr_fold", {fused.OFF_ENV: "gr_fold"}) is gr_read.gr_read_fused  # the merged three-program form
+    assert (
+        fused.resolve("gr_fold", {fused.OFF_ENV: "gr_fold"}) is gr_read.gr_read_fused
+    )  # the merged three-program form
     assert fused.resolve("gr_fold", {fused.ENV: "gr_fold"}) is gr_fold.gr_read_fold
     hook = GR_SOURCE[GR_SOURCE.index('if fused_kernels.enabled("gr_read"):') :]
     assert 'name = "gr_fold" if fused_kernels.enabled("gr_fold") else "gr_read"' in hook
@@ -57,14 +59,25 @@ def test_registered_opt_in_bitwise_over_gr_read():
     fold = flat(inspect.getsource(gr_fold.gr_read_fold))
     assert 'scaler_mode="chain",matmul="chain",read_front=read_front' in fold
     front = flat(inspect.getsource(gr_fold.read_front))
-    assert "gathered_stats,normalized,gathered_partials=stats_normalize_down_gather(residual,gamma_rows,down_inject)" in front
+    assert (
+        "gathered_stats,normalized,gathered_partials=stats_normalize_down_gather(residual,gamma_rows,down_inject)"
+        in front
+    )
     assert "ttnn.deallocate(gathered_stats)" in front and "returnnormalized,gathered_partials" in front
     read = inspect.getsource(gr_read.gr_read_fused)
-    assert "if stats_gather is None:" in read and "gathered_stats = stats_gather(residual)" in read  # stages b, c stay callable
-    assert "normalized, gathered_partials = partial_gather(residual, gathered_stats, gamma_rows, module.weights.down_inject)" in read
+    assert (
+        "if stats_gather is None:" in read and "gathered_stats = stats_gather(residual)" in read
+    )  # stages b, c stay callable
+    assert (
+        "normalized, gathered_partials = partial_gather(residual, gathered_stats, gamma_rows, module.weights.down_inject)"
+        in read
+    )
     assert "normalized, gathered_partials = read_front(residual, gamma_rows, module.weights.down_inject)" in read
-    assert "partial_gather / read_front fold the merged normalize_down form" in read  # the split forms keep the collectives
-    assert FRONT.count("ttnn.generic_op(") == 1  # the fold's read: this program + low_rank_gate
+    assert (
+        "partial_gather / read_front fold the merged normalize_down form" in read
+    )  # the split forms keep the collectives
+    # the fold's read: this program + low_rank_gate; the launch goes through fp.run_program so its meta is recorded
+    assert FRONT.count("fp.run_program(") == 1 and "ttnn.generic_op(" not in FRONT
 
 
 def test_geometry():
@@ -73,17 +86,30 @@ def test_geometry():
     assert (gr_fold.SOURCE_TENSOR, gr_fold.SOURCE_PRODUCERS) == (0, 1)
     assert gr_fold.SCRATCH_CB < fp.CB_COUNT and gr_fold.STATS_SCRATCH_CB not in (0, 1, 2, 16)  # beside the stats CBs
     assert [(c.x, c.y) for c in gr_fold.TRANSPORT["stats"]] == [(4, 0), (5, 0)]  # one per link, off the stats cores
-    assert [(c.x, c.y) for c in gr_fold.TRANSPORT["partials"]] == [(6, 0), (7, 0)]  # off normalize_down's 6x2 workers + row 2
-    assert gr_fold.PARTIALS_SEMAPHORES == (1, 2, 3) and gr_fold.PARTIALS_SCRATCH_CB not in range(0, 11) and gr_fold.PARTIALS_SCRATCH_CB not in (16, 17)
+    assert [(c.x, c.y) for c in gr_fold.TRANSPORT["partials"]] == [
+        (6, 0),
+        (7, 0),
+    ]  # off normalize_down's 6x2 workers + row 2
+    assert (
+        gr_fold.PARTIALS_SEMAPHORES == (1, 2, 3)
+        and gr_fold.PARTIALS_SCRATCH_CB not in range(0, 11)
+        and gr_fold.PARTIALS_SCRATCH_CB not in (16, 17)
+    )
     assert not hasattr(gr_fold.LineSemaphores, "cycle")  # one pair per phase, never cycled (the design note's proof)
     # stage (d): both phases on the partials transport pair (one open sender per link per direction); the stats
     # phase's scratch semaphore beside the partials' (go, scratch, done) = 1-3, the gate beside the in0 multicast's 0
     # on the norm cores; its CBs beside normalize_down's 0-10, 16, 17 and the partials scratch
     used = {0, *gr_fold.PARTIALS_SEMAPHORES}
     assert gr_fold.FRONT_STATS_SCRATCH_SEM == 4 and gr_fold.FRONT_STATS_READY == 5
-    assert not {gr_fold.FRONT_STATS_SCRATCH_SEM, gr_fold.FRONT_STATS_READY} & used and max(used | {5}) < 16  # NUM_SEMAPHORES
+    assert (
+        not {gr_fold.FRONT_STATS_SCRATCH_SEM, gr_fold.FRONT_STATS_READY} & used and max(used | {5}) < 16
+    )  # NUM_SEMAPHORES
     taken = set(range(0, 11)) | {16, 17, gr_fold.PARTIALS_SCRATCH_CB}
-    assert len(set(gr_fold.FRONT_STATS_CBS)) == 4 and not set(gr_fold.FRONT_STATS_CBS) & taken and max(gr_fold.FRONT_STATS_CBS) < fp.CB_COUNT
+    assert (
+        len(set(gr_fold.FRONT_STATS_CBS)) == 4
+        and not set(gr_fold.FRONT_STATS_CBS) & taken
+        and max(gr_fold.FRONT_STATS_CBS) < fp.CB_COUNT
+    )
     assert gr_fold.PROBED_CORES == gr_fold.TRANSPORT["stats"] + gr_fold.TRANSPORT["partials"]
 
 
@@ -103,48 +129,82 @@ def test_compile_time_arg_layout_matches_the_python_side():
         "PAGE_RANK_STRIDE": "10",
     }
     assert "constexpr uint32_t ACCESSOR_BASE = 11;" in KERNEL and KERNEL.count("next_compile_time_args_offset()") == 1
-    assert "args=[first.scratch_cb,first.tiles,go,TP_SIZE,first.source,first.semaphore_ids[1],done,i,links,*first.page_strides]" in BUILDER
+    assert (
+        "args=[first.scratch_cb,first.tiles,go,TP_SIZE,first.source,first.semaphore_ids[1],done,i,links,*first.page_strides,]"
+        in BUILDER
+    )
     two = dict(re.findall(pattern, KERNEL2))
     assert [two[k] for k in ("SEM_GO", "RING", "SEM_DONE", "TILE_FIRST", "TILE_STEP")] == ["0", "1", "2", "3", "4"]
     for phase, base in (("A", 5), ("B", 11)):
-        assert [two[f"{phase}_{k}"] for k in ("SCRATCH_CB", "TILES", "SOURCE", "SEM_SCRATCH", "PAGE_TILE_STRIDE", "PAGE_RANK_STRIDE")] == [str(base + j) for j in range(6)]
+        assert [
+            two[f"{phase}_{k}"]
+            for k in ("SCRATCH_CB", "TILES", "SOURCE", "SEM_SCRATCH", "PAGE_TILE_STRIDE", "PAGE_RANK_STRIDE")
+        ] == [str(base + j) for j in range(6)]
     assert "constexpr uint32_t ACCESSOR_BASE = 17;" in KERNEL2 and KERNEL2.count("next_compile_time_args_offset()") == 3
-    assert "args=[go,TP_SIZE,done,i,links]" in BUILDER and "args+=[t.scratch_cb,t.tiles,t.source,t.semaphore_ids[1],*t.page_strides]" in BUILDER
+    assert (
+        "args=[go,TP_SIZE,done,i,links]" in BUILDER
+        and "args+=[t.scratch_cb,t.tiles,t.source,t.semaphore_ids[1],*t.page_strides]" in BUILDER
+    )
     assert "fortintransports:args+=fp.accessor_args(t.out)+fp.accessor_args(t.local)" in BUILDER
     assert "kernel=TRANSPORT_KERNELiflen(transports)==1elseTRANSPORT2_KERNEL" in BUILDER
-    assert "semaphore_ids:tuple=(SEM_GO,SEM_SCRATCH,SEM_DONE)" in TRANSPORT_SPEC and "page_strides:tuple=(TP_SIZE,1)" in TRANSPORT_SPEC and "consumers:tuple=()" in TRANSPORT_SPEC
+    assert (
+        "semaphore_ids:tuple=(SEM_GO,SEM_SCRATCH,SEM_DONE)" in TRANSPORT_SPEC
+        and "page_strides:tuple=(TP_SIZE,1)" in TRANSPORT_SPEC
+        and "consumers:tuple=()" in TRANSPORT_SPEC
+    )
     # the phase body takes every layout item as a template parameter; both kernels pass their constants in that order
     params = "SCRATCH_CB,TILES,TILE_FIRST,TILE_STEP,PAGE_TILE_STRIDE,PAGE_RANK_STRIDE,SOURCE,RING,SEM_GO,SEM_SCRATCH,SEM_DONE,true"
     assert "transport_phase<" + params + ">(line,out_args,local_args,PHASE_RT,delay_after_reset)" in flat(KERNEL)
     for phase, close in (("A", "false"), ("B", "true")):
         p = phase
-        assert f"transport_phase<{p}_SCRATCH_CB,{p}_TILES,TILE_FIRST,TILE_STEP,{p}_PAGE_TILE_STRIDE,{p}_PAGE_RANK_STRIDE,{p}_SOURCE,RING,SEM_GO,{p}_SEM_SCRATCH,SEM_DONE,{close}>" in flat(KERNEL2)
-    assert 'static_assert(A_SOURCE == 1 && B_SOURCE == 1' in KERNEL2 and "static_assert(A_SEM_SCRATCH != B_SEM_SCRATCH" in KERNEL2
+        assert (
+            f"transport_phase<{p}_SCRATCH_CB,{p}_TILES,TILE_FIRST,TILE_STEP,{p}_PAGE_TILE_STRIDE,{p}_PAGE_RANK_STRIDE,{p}_SOURCE,RING,SEM_GO,{p}_SEM_SCRATCH,SEM_DONE,{close}>"
+            in flat(KERNEL2)
+        )
+    assert (
+        "static_assert(A_SOURCE == 1 && B_SOURCE == 1" in KERNEL2
+        and "static_assert(A_SEM_SCRATCH != B_SEM_SCRATCH" in KERNEL2
+    )
     assert "constexpr uint32_t WORDS = get_compile_time_arg_val(0);" in PROBE and "TensorAccessorArgs<1>()" in PROBE
 
 
 def test_runtime_arg_layout_matches_the_python_side():
     # common: 0 rank, 1 delay before the arrive, 2 delay after the reset; then the phase blocks; then the connection
     assert [int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d)\)", KERNEL + KERNEL2)] == [0, 1, 2, 0, 1, 2]
-    assert "constexpr uint32_t PHASE_RT_ARGS = 6;" in PHASE and "constexpr uint32_t PHASE_RT = 3;" in KERNEL and "constexpr uint32_t A_RT = 3;" in KERNEL2
+    assert (
+        "constexpr uint32_t PHASE_RT_ARGS = 6;" in PHASE
+        and "constexpr uint32_t PHASE_RT = 3;" in KERNEL
+        and "constexpr uint32_t A_RT = 3;" in KERNEL2
+    )
     assert [int(i) for i in re.findall(r"get_arg_val<uint32_t>\(rt \+ (\d)\)", PHASE)] == [0, 1, 2, 3, 4, 5]
     assert "size_t arg_idx = PHASE_RT + PHASE_RT_ARGS + 2 * get_arg_val<uint32_t>(PHASE_RT + 4);" in KERNEL
     assert "const uint32_t b_rt = A_RT + PHASE_RT_ARGS + 2 * get_arg_val<uint32_t>(A_RT + 4);" in KERNEL2
     assert "size_t arg_idx = b_rt + PHASE_RT_ARGS + 2 * get_arg_val<uint32_t>(b_rt + 4);" in KERNEL2
-    assert "ready.up(noc, get_arg_val<uint32_t>(rt + PHASE_RT_ARGS + 2 * c), get_arg_val<uint32_t>(rt + PHASE_RT_ARGS + 1 + 2 * c), 1);" in PHASE
+    assert (
+        "ready.up(noc, get_arg_val<uint32_t>(rt + PHASE_RT_ARGS + 2 * c), get_arg_val<uint32_t>(rt + PHASE_RT_ARGS + 1 + 2 * c), 1);"
+        in PHASE
+    )
     assert "base=[rank,before,after]" in BUILDER
-    assert "base+=[t.out.buffer_address(),t.local.buffer_address(),barrier,data,len(t.consumers),t.consumer_sem]" in BUILDER
+    assert (
+        "base+=[t.out.buffer_address(),t.local.buffer_address(),barrier,data,len(t.consumers),t.consumer_sem]"
+        in BUILDER
+    )
     assert "base+=[vforxyint.consumersforvinxy]" in BUILDER
     assert "ifrank>0else[]" in BUILDER and "ifrank+1<TP_SIZEelse[]" in BUILDER
     # BRISC forward (ranks above) takes the forward connection, NCRISC backward (ranks below) the backward one; the
     # program's own semaphores are in the seed descriptor before the connections' (backward, then forward)
     assert "transport(fp.reader_kernel,backward)+transport(fp.writer_kernel,forward)" in BUILDER
-    assert BUILDER.index("semaphores=semaphores)") < BUILDER.index("backward=[") < BUILDER.index("forward=[")
+    assert BUILDER.index("semaphores=semaphores,)") < BUILDER.index("backward=[") < BUILDER.index("forward=[")
     assert "semaphores=list(seed.semaphores)" in BUILDER  # the connections' semaphores travel with the program
     assert "range = RING - 1 - rank;" in PHASE and "range = rank;" in PHASE
     assert "line.arrive(get_arg_val<uint32_t>(PHASE_RT + 2));" in KERNEL
-    assert "line.arrive(get_arg_val<uint32_t>(A_RT + 2));" in KERNEL2 and "line.arrive(get_arg_val<uint32_t>(b_rt + 2));" in KERNEL2
-    assert PROBE.count("get_arg_val<uint32_t>(2 + i)") == 1 and "[(core,[out.buffer_address(),slot]+addresses)" in flat(inspect.getsource(gr_fold.read_semaphores))
+    assert (
+        "line.arrive(get_arg_val<uint32_t>(A_RT + 2));" in KERNEL2
+        and "line.arrive(get_arg_val<uint32_t>(b_rt + 2));" in KERNEL2
+    )
+    assert PROBE.count("get_arg_val<uint32_t>(2 + i)") == 1 and "[(core,[out.buffer_address(),slot]+addresses)" in flat(
+        inspect.getsource(gr_fold.read_semaphores)
+    )
     # a program's transports: the same cores, shared go/done, distinct phases and scratch semaphores, at most two
     for text in (
         "thetransportsofoneprogramrunonthesamecores",
@@ -174,14 +234,21 @@ def test_page_map_is_all_gathers_tile_order():
                 assert t * strides[0] + d * strides[1] == expect(t, d)
     assert 'phase,strides="stats",(TP_SIZE,1)' in re.sub(r"\s+", "", inspect.getsource(gr_fold.gather_line))
     assert 'phase,strides="partials",(1,tiles)' in re.sub(r"\s+", "", inspect.getsource(gr_fold.gather_line))
-    assert 'PT,SOURCE_PRODUCERS,"partials",transports,semaphore_ids=PARTIALS_SEMAPHORES,page_strides=(1,PT))' in PARTIALS
-    assert "(w//links,(x,y,x,y),(PT*rank+w,1),(0,0,1,1))" in PARTIALS  # worker w: own page 12 * rank + w, scratch slot w // links
+    assert (
+        'PT,SOURCE_PRODUCERS,"partials",transports,semaphore_ids=PARTIALS_SEMAPHORES,page_strides=(1,PT),)' in PARTIALS
+    )
+    assert (
+        "(w//links,(x,y,x,y),(PT*rank+w,1),(0,0,1,1))" in PARTIALS
+    )  # worker w: own page 12 * rank + w, scratch slot w // links
     assert "src_cb=17,dst_cb=PARTIALS_SCRATCH_CB,tiles=1,tiles_tensor=gathered,sem=scratch" in PARTIALS
     # stats_gather: stats core b (unit w.start = b) writes its own page 4b + rank and transport core (b % links)'s slot
     assert "(w.start//links,(x,y,x,y),(w.start*TP_SIZE+rank,1),(0,0,1,1))" in STATS
     assert "transports[w.start%links]" in STATS
     assert "src_cb=16,dst_cb=STATS_SCRATCH_CB,tiles=1,tiles_tensor=out,sem=SEM_SCRATCH" in STATS
-    assert 'STATS_SCRATCH_CB,gr_read.BRANCHES,SOURCE_PRODUCERS,"stats",TRANSPORT["stats"])' in STATS and "[reader,compute,writer]" in STATS
+    assert (
+        'STATS_SCRATCH_CB,gr_read.BRANCHES,SOURCE_PRODUCERS,"stats",TRANSPORT["stats"])' in STATS
+        and "[reader,compute,writer]" in STATS
+    )
     # the front keeps both page maps: norm core b's own stats page 4b + rank and slot b // links, worker w's own
     # partial page 12 * rank + w and slot w // links
     assert "phase_a=[b//links,x,y,x,y,gathered_stats.buffer_address(),b*TP_SIZE+rank,1,0,0,0,1,1]" in FRONT
@@ -191,16 +258,27 @@ def test_page_map_is_all_gathers_tile_order():
         'Transport(gathered_stats,gathered_stats,c_sscratch,gr_read.BRANCHES,SOURCE_PRODUCERS,"stats",transports,'
         "semaphore_ids=(p_go,s_scratch,p_done),consumers=tuple(noc[(c.x,c.y)]forcinproducers),consumer_sem=FRONT_STATS_READY,)"
     ) in FRONT
-    assert 'Transport(gathered,gathered,PARTIALS_SCRATCH_CB,PT,SOURCE_PRODUCERS,"partials",transports,semaphore_ids=PARTIALS_SEMAPHORES,page_strides=(1,PT))' in FRONT
-    assert 'transports=TRANSPORT["partials"]' in FRONT and "s_scratch=FRONT_STATS_SCRATCH_SEM" in FRONT  # both phases on the partials pair
+    assert (
+        'Transport(gathered,gathered,PARTIALS_SCRATCH_CB,PT,SOURCE_PRODUCERS,"partials",transports,semaphore_ids=PARTIALS_SEMAPHORES,page_strides=(1,PT),)'
+        in FRONT
+    )
+    assert (
+        'transports=TRANSPORT["partials"]' in FRONT and "s_scratch=FRONT_STATS_SCRATCH_SEM" in FRONT
+    )  # both phases on the partials pair
 
 
 def test_fact_1_exactly_n_minus_1_arrivals_per_counter_per_call():
     """Every device raises every peer's counter exactly once: the forward multicast covers ranks r+1..3, the backward
     one ranks 0..r-1, one increment per packet, one packet per direction per call."""
 
-    assert PHASE.count("fabric_multicast_noc_unicast_atomic_inc(") == 1 and KERNEL.count("line.arrive(") == 1 and KERNEL2.count("line.arrive(") == 2
-    assert PHASE.index("noc_async_writes_flushed();") < PHASE.index("fabric_multicast_noc_unicast_atomic_inc(")  # the shared header is rewritten only after a flush
+    assert (
+        PHASE.count("fabric_multicast_noc_unicast_atomic_inc(") == 1
+        and KERNEL.count("line.arrive(") == 1
+        and KERNEL2.count("line.arrive(") == 2
+    )
+    assert PHASE.index("noc_async_writes_flushed();") < PHASE.index(
+        "fabric_multicast_noc_unicast_atomic_inc("
+    )  # the shared header is rewritten only after a flush
     ring = gr_fold.TP_SIZE
     for receiver in range(ring):
         arrivals = 0
@@ -214,10 +292,16 @@ def test_fact_1_exactly_n_minus_1_arrivals_per_counter_per_call():
 
 def test_fact_2_reset_is_program_ordered_before_the_release_that_gates_every_send():
     brisc = PHASE[PHASE.index("#if defined(COMPILE_FOR_BRISC)\n    noc_semaphore_wait_min(barrier") :]
-    assert brisc.index("noc_semaphore_set(barrier, 0);") < brisc.index("go.set(1);") < brisc.index("fabric_multicast_noc_fused_unicast_with_atomic_inc(")
+    assert (
+        brisc.index("noc_semaphore_set(barrier, 0);")
+        < brisc.index("go.set(1);")
+        < brisc.index("fabric_multicast_noc_fused_unicast_with_atomic_inc(")
+    )
     ncrisc = PHASE[PHASE.index("#else\n    uint32_t scratch_addr;") :]
     assert ncrisc.index("go.wait(1);") < ncrisc.index("fabric_multicast_noc_fused_unicast_with_atomic_inc(")
-    assert "riscv_wait(delay_after_reset)" in brisc and brisc.index("noc_semaphore_set(barrier, 0);") < brisc.index("riscv_wait(delay_after_reset)") < brisc.index("go.set(1);")
+    assert "riscv_wait(delay_after_reset)" in brisc and brisc.index("noc_semaphore_set(barrier, 0);") < brisc.index(
+        "riscv_wait(delay_after_reset)"
+    ) < brisc.index("go.set(1);")
 
 
 def test_fact_3_data_wait_is_every_peers_every_tile_and_every_counter_is_reset_by_its_owner():
@@ -226,13 +310,25 @@ def test_fact_3_data_wait_is_every_peers_every_tile_and_every_counter_is_reset_b
     body = PHASE[PHASE.index("for (uint32_t i = 0; i < MY_TILES; ++i) {\n            noc_async_writes_flushed();") :]
     assert body.index("noc_async_writes_flushed();") < body.index("fabric_multicast_noc_fused_unicast_with_atomic_inc(")
     assert "go.set(0);" in PHASE and PHASE.count("scratch_ready.wait_min(MY_TILES);") == 2
-    assert "done.set(1);" in PHASE and "done.wait(1);" in PHASE and "done.set(0);" in PHASE and "scratch_ready.set(0);" in PHASE
+    assert (
+        "done.set(1);" in PHASE
+        and "done.wait(1);" in PHASE
+        and "done.set(0);" in PHASE
+        and "scratch_ready.set(0);" in PHASE
+    )
     assert "connection.close();" in PHASE and "if constexpr (CLOSE) {\n        line.close();" in PHASE
     for kernel in (KERNEL, KERNEL2):
-        assert kernel.rstrip().endswith("noc_async_full_barrier();\n}") and kernel.count("line.open<RING>(rank, arg_idx);") == 1
+        assert (
+            kernel.rstrip().endswith("noc_async_full_barrier();\n}")
+            and kernel.count("line.open<RING>(rank, arg_idx);") == 1
+        )
     assert "MulticastRoutingCommandHeader" not in PHASE  # the linear API sets the route from (start 1, range)
     # the consumer signal follows the data wait and its reset
-    assert PHASE.index("noc_semaphore_wait_min(data, (RING - 1) * MY_TILES);") < PHASE.index("noc_semaphore_set(data, 0);") < PHASE.index("ready.up(noc, get_arg_val<uint32_t>(rt + PHASE_RT_ARGS + 2 * c)")
+    assert (
+        PHASE.index("noc_semaphore_wait_min(data, (RING - 1) * MY_TILES);")
+        < PHASE.index("noc_semaphore_set(data, 0);")
+        < PHASE.index("ready.up(noc, get_arg_val<uint32_t>(rt + PHASE_RT_ARGS + 2 * c)")
+    )
 
 
 def test_two_phases_on_one_connection_reuse_go_and_done_in_order():
@@ -241,15 +337,30 @@ def test_two_phases_on_one_connection_reuse_go_and_done_in_order():
     phase-B go.set(1) follows its phase-A done.wait(1) (program order), which follows NCRISC's phase-A done.set(1),
     which follows NCRISC's phase-A go.set(0) in NCRISC program order; a phase needs SOURCE 1 for that handshake."""
 
-    a = KERNEL2.index("transport_phase<A_SCRATCH_CB")
-    b = KERNEL2.index("transport_phase<B_SCRATCH_CB")
-    assert KERNEL2.index("line.open<RING>(rank, arg_idx);") < KERNEL2.index("line.arrive(get_arg_val<uint32_t>(A_RT + 2));") < KERNEL2.index("line.arrive(get_arg_val<uint32_t>(b_rt + 2));") < a < b
-    assert "SEM_DONE, false>" in KERNEL2[a:b] and "SEM_DONE, true>" in KERNEL2[b:]
+    two = flat(KERNEL2)  # the phase calls sit in FUSED_ZONE blocks and wrap over lines; the order is what matters
+    a = two.index("transport_phase<A_SCRATCH_CB")
+    b = two.index("transport_phase<B_SCRATCH_CB")
+    assert (
+        two.index("line.open<RING>(rank,arg_idx);")
+        < two.index("line.arrive(get_arg_val<uint32_t>(A_RT+2));")
+        < two.index("line.arrive(get_arg_val<uint32_t>(b_rt+2));")
+        < a
+        < b
+    )
+    assert "SEM_DONE,false>" in two[a:b] and "SEM_DONE,true>" in two[b:]
     # within one phase body BRISC's go.set(1) precedes its done.wait(1); the body runs twice, so phase B's release
     # follows phase A's done wait in program order
-    assert PHASE.index("go.set(1);") < PHASE.index("done.wait(1);") and PHASE.count("go.set(1);") == 1 and PHASE.count("done.wait(1);") == 1
+    assert (
+        PHASE.index("go.set(1);") < PHASE.index("done.wait(1);")
+        and PHASE.count("go.set(1);") == 1
+        and PHASE.count("done.wait(1);") == 1
+    )
     ncrisc = PHASE[PHASE.index("#else\n    uint32_t scratch_addr;") :]
-    assert ncrisc.index("go.set(0);") < ncrisc.index("fabric_multicast_noc_fused_unicast_with_atomic_inc(") < ncrisc.index("done.set(1);")
+    assert (
+        ncrisc.index("go.set(0);")
+        < ncrisc.index("fabric_multicast_noc_fused_unicast_with_atomic_inc(")
+        < ncrisc.index("done.set(1);")
+    )
     assert "static_assert(A_SOURCE == 1 && B_SOURCE == 1" in KERNEL2
     # the Python side: the two specs run on the same cores with the same go/done and distinct scratch ids and phases
     assert "semaphore_ids=(p_go,s_scratch,p_done)" in FRONT and "semaphore_ids=PARTIALS_SEMAPHORES" in FRONT
@@ -261,7 +372,9 @@ def test_line_checks_neighbours_degree_and_links():
     assert "ttnn.get_eth_forwarding_direction(self.nodes[r], self.nodes[r + 1])" in source
     assert "Counter(neighbours.values()) != Counter({1: 2, 2: 2})" in source
     assert "ttnn.get_forwarding_link_indices(self.nodes[a], self.nodes[b])" in source
-    assert "links must be 1..{min(len(t.cores), geometry.links, t.tiles)}" in inspect.getsource(gr_fold.transport_mesh_program)
+    assert "links must be 1..{min(len(t.cores), geometry.links, t.tiles)}" in inspect.getsource(
+        gr_fold.transport_mesh_program
+    )
     # the link budget: one open sender per link per direction per program (fabric.cpp: sender channel 0; the open
     # handshake does not queue), hence one core per link carrying every phase of the program
     assert "ift.cores[:links]!=cores:" in BUILDER
@@ -341,19 +454,46 @@ def test_front_compute_kernel_is_both_bodies_verbatim():
     def body(source: str, start: str, end: str) -> str:
         return flat(source[source.index(start) : source.index(end) + len(end)])
 
-    stats_body = body(STATS_SRC, "DataflowBuffer res(c_res);", "scaler.pop_front(1);").replace("c_scaler", "c_sscaler").replace("c_out", "c_sout")
+    stats_body = (
+        body(STATS_SRC, "DataflowBuffer res(c_res);", "scaler.pop_front(1);")
+        .replace("c_scaler", "c_sscaler")
+        .replace("c_out", "c_sout")
+    )
     norm_body = body(NORM_SRC, "DataflowBuffer res(c_res);", "eps.pop_front(1);")
     fused = flat(STATS_NORM_SRC)
     assert stats_body in fused and norm_body in fused and fused.index(stats_body) < fused.index(norm_body)
-    assert "compute_kernel_hw_startup(c_res, c_scaler, c_x2);" in STATS_SRC and "compute_kernel_hw_startup(c_res, c_res, c_var);" in NORM_SRC
-    assert STATS_NORM_SRC.count("compute_kernel_hw_startup(") == 1 and "compute_kernel_hw_startup(c_res, c_sscaler, c_x2);" in STATS_NORM_SRC
-    between = STATS_NORM_SRC[STATS_NORM_SRC.index("scaler.pop_front(1);") : STATS_NORM_SRC.index("DataflowBuffer res(c_res);", STATS_NORM_SRC.index("scaler.pop_front(1);"))]
+    assert (
+        "compute_kernel_hw_startup(c_res, c_scaler, c_x2);" in STATS_SRC
+        and "compute_kernel_hw_startup(c_res, c_res, c_var);" in NORM_SRC
+    )
+    assert (
+        STATS_NORM_SRC.count("compute_kernel_hw_startup(") == 1
+        and "compute_kernel_hw_startup(c_res, c_sscaler, c_x2);" in STATS_NORM_SRC
+    )
+    between = STATS_NORM_SRC[
+        STATS_NORM_SRC.index("scaler.pop_front(1);") : STATS_NORM_SRC.index(
+            "DataflowBuffer res(c_res);", STATS_NORM_SRC.index("scaler.pop_front(1);")
+        )
+    ]
     assert "reconfig_data_format(c_res, c_res);" in between and "pack_reconfig_data_format(c_var);" in between
-    for name, index in (("res", 0), ("stats", 1), ("scaler", 2), ("eps", 3), ("gamma", 4), ("var", 5), ("recip", 6), ("unit", 7)):
+    for name, index in (
+        ("res", 0),
+        ("stats", 1),
+        ("scaler", 2),
+        ("eps", 3),
+        ("gamma", 4),
+        ("var", 5),
+        ("recip", 6),
+        ("unit", 7),
+    ):
         assert f"c_{name} = {index};" in STATS_NORM_SRC
     for name, index in (("out", 3), ("sscaler", 4), ("x2", 5), ("sout", 6)):
         assert f"c_{name} = get_compile_time_arg_val({index});" in STATS_NORM_SRC
-    assert "Wt = get_compile_time_arg_val(0)" in STATS_NORM_SRC and "S = get_compile_time_arg_val(1)" in STATS_NORM_SRC and "blk = get_compile_time_arg_val(2)" in STATS_NORM_SRC
+    assert (
+        "Wt = get_compile_time_arg_val(0)" in STATS_NORM_SRC
+        and "S = get_compile_time_arg_val(1)" in STATS_NORM_SRC
+        and "blk = get_compile_time_arg_val(2)" in STATS_NORM_SRC
+    )
 
 
 def test_front_gate_orders_every_gathered_stats_page_before_the_norm_cores_read_it():
@@ -363,23 +503,41 @@ def test_front_gate_orders_every_gathered_stats_page_before_the_norm_cores_read_
     returns (mcast_phase raises the transport's scratch semaphore BEFORE that write, so nothing else orders it)."""
 
     # reader: ct 12-14, wait for the count then reset, before stream GATE_STREAM
-    assert "GATE_STREAM = get_compile_time_arg_val(12);" in READER_SRC and "GATE_SEM = get_compile_time_arg_val(13);" in READER_SRC
-    assert "GATE_COUNT = get_compile_time_arg_val(14);" in READER_SRC and "constexpr uint32_t ACCESSOR_BASE = 15;" in READER_SRC
+    assert (
+        "GATE_STREAM = get_compile_time_arg_val(12);" in READER_SRC
+        and "GATE_SEM = get_compile_time_arg_val(13);" in READER_SRC
+    )
+    assert (
+        "GATE_COUNT = get_compile_time_arg_val(14);" in READER_SRC
+        and "constexpr uint32_t ACCESSOR_BASE = 15;" in READER_SRC
+    )
     assert READER_SRC.index("ready.wait(GATE_COUNT);") < READER_SRC.index("ready.set(0);")
     for i in range(4):
         assert READER_SRC.index(f"gate({i});") < READER_SRC.index(f"read_stream(args{i},")
     assert "compile_args+=list(gate)ifgateisnotNoneelse[NONE_CB,0,0]" in flat(inspect.getsource(gr_read._reader))
     # transport: the consumer signal after the data wait and its reset (test_fact_3)
     # the two-phase writer: phase A, the own gate increment, phase B; ct 12 the gate id, accessors from 13, own NoC at rt 26-27
-    assert "constexpr uint32_t GATE_SEM = get_compile_time_arg_val(12);" in WRITER2_SRC and "constexpr uint32_t ACCESSOR_BASE = 13;" in WRITER2_SRC
-    assert WRITER2_SRC.index("(a_tiles, a_extra, 0);") < WRITER2_SRC.index("gate.up(noc, get_arg_val<uint32_t>(26), get_arg_val<uint32_t>(27), 1);") < WRITER2_SRC.index("(b_tiles, b_extra, 13);")
+    assert (
+        "constexpr uint32_t GATE_SEM = get_compile_time_arg_val(12);" in WRITER2_SRC
+        and "constexpr uint32_t ACCESSOR_BASE = 13;" in WRITER2_SRC
+    )
+    assert (
+        WRITER2_SRC.index("(a_tiles, a_extra, 0);")
+        < WRITER2_SRC.index("gate.up(noc, get_arg_val<uint32_t>(26), get_arg_val<uint32_t>(27), 1);")
+        < WRITER2_SRC.index("(b_tiles, b_extra, 13);")
+    )
     assert "noc.async_atomic_barrier();" in WRITER2_SRC[WRITER2_SRC.index("gate.up(") :]
     # mcast_phase: rt layout 0..12 relative to `rt`; the scratch signal precedes the own-page write, whose barrier
     # precedes the pop (so the phase returns with the page written)
     assert [int(i) for i in re.findall(r"get_arg_val<uint32_t>\(rt \+ (\d+)\)", MCAST_PHASE_SRC)] == list(range(13))
     signal = MCAST_PHASE_SRC.index("sem.up(noc, x, y, 1);")
     write = MCAST_PHASE_SRC.index("noc.async_write(src, tiles, tile_bytes")
-    assert signal < write < MCAST_PHASE_SRC.index("noc.async_write_barrier();", write) < MCAST_PHASE_SRC.index("src.pop_front(NUM_TILES);")
+    assert (
+        signal
+        < write
+        < MCAST_PHASE_SRC.index("noc.async_write_barrier();", write)
+        < MCAST_PHASE_SRC.index("src.pop_front(NUM_TILES);")
+    )
     # the gate semaphore lives on the norm cores only; the stats transport's (go, scratch, done) on it and the norm cores
     assert "fp.semaphore_descriptor(s_scratch,ps_set),fp.semaphore_descriptor(FRONT_STATS_READY,p_set)" in FRONT
     assert "[fp.semaphore_descriptor(sem,wt_set)forseminPARTIALS_SEMAPHORES]" in FRONT

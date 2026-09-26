@@ -12,6 +12,7 @@
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 namespace {
 constexpr uint32_t CB_P = 0, CB_S = 1, CB_T = 2, CB_Z = 3, CB_AB = 4, CB_DTNA = 5, CB_W = 6, CB_STATE = 7;
@@ -90,6 +91,7 @@ void kernel_main() {
     const auto newest = TensorAccessor(newest_args, newest_addr);
 
     {
+        FUSED_ZONE("fz_gs_r_setup");
         uint32_t ids[HT] = {0, 1, 2, 3};
         read_tiles(CB_W, w, ids, HT, BF16_TILE);
         noc_async_read_barrier();
@@ -103,6 +105,7 @@ void kernel_main() {
     }
 
     for (uint32_t item = 0; item < items; ++item) {
+        FUSED_ZONE("fz_gs_r_item");
         const uint32_t lane = get_arg_val<uint32_t>(arg++);
         const uint32_t head = get_arg_val<uint32_t>(arg++);
         const uint32_t qk_head = head / 3;

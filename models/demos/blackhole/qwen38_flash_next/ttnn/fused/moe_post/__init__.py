@@ -134,8 +134,6 @@ def moe_post_program(pages, scores, indices, owner, shared, sigmoid, out, *, row
         ("owner_bytes", OWNER_BYTES),
         ("route_contiguous", route_contiguous(scores, indices)),
     ]
-    # study build: per-phase device profiler zones in the three kernels (QWEN38_MOE_POST_ZONES=1); the served build has none
-    defines = [("FMP_ZONES", "1")] if os.environ.get("QWEN38_MOE_POST_ZONES") == "1" else []
     cbs = [
         fp.cb_descriptor(index, dtype, page_bytes, stage_pages if pages_ is None else pages_, cores)
         for _name, index, dtype, page_bytes, pages_ in CBS
@@ -168,7 +166,6 @@ def moe_post_program(pages, scores, indices, owner, shared, sigmoid, out, *, row
             )
             for w in work
         ],
-        defines=defines,
         named=named,
     )
     writer = fp.writer_kernel(
@@ -176,11 +173,10 @@ def moe_post_program(pages, scores, indices, owner, shared, sigmoid, out, *, row
         cores,
         fp.accessor_args(out),
         [(w.core, [out.buffer_address(), w.start]) for w in work],
-        defines=defines,
         named=named,
     )
     compute = fp.compute_kernel(
-        KERNELS["compute"], cores, [], defines=defines, named=named, fidelity=ttnn.MathFidelity.HiFi4, fp32_dest=True
+        KERNELS["compute"], cores, [], named=named, fidelity=ttnn.MathFidelity.HiFi4, fp32_dest=True
     )
     return fp.program_descriptor([reader, writer, compute], cbs=cbs)
 
@@ -196,8 +192,37 @@ def moe_post(pages, scores, indices, owner, shared, *, sigmoid=None, memory_conf
     mesh = pages.device()
     out = fp.stamp_topology(fp.allocate((1, 1, rows, HIDDEN), BF16, ttnn.TILE_LAYOUT, mesh, memory_config), pages)
     io = [pages, scores, indices, owner, shared] + ([] if sigmoid is None else [sigmoid]) + [out]
-    fp.run_program(io, moe_post_program(pages, scores, indices, owner, shared, sigmoid, out, rows=rows))
+    fp.run_program(
+        io,
+        moe_post_program(pages, scores, indices, owner, shared, sigmoid, out, rows=rows),
+        meta=moe_post_meta(pages, scores, indices, owner, shared, sigmoid, out, rows=rows),
+    )
     return out
+
+
+def moe_post_meta(pages, scores, indices, owner, shared, sigmoid, out, *, rows: int) -> "fp.FusedProgramMeta":
+    """What the program moves and issues, by construction (the census's model): the owned fragments of the pages at
+    their bound (every slot owned: the whole ``[10, rows, 2560]``), the routing rows and the owner row once per core
+    (the routing rows from the drain core's L1 shard when they are sharded there), the shared partial and the sigmoid
+    tile once (each core its column), the sum out; per element of the ``rows x 2560`` output the ten-slot MAC, the
+    shared add and, with the sigmoid, its multiply."""
+
+    cores = HIDDEN_TILES
+    routing = fp.tensor_bytes(scores) + fp.tensor_bytes(indices)
+    per_core = cores * (routing + fp.tensor_bytes(owner))
+    l1 = per_core if fp.in_l1(scores) else 0
+    reads = (pages, shared) + (() if sigmoid is None else (sigmoid,))
+    return fp.program_meta(
+        NAME,
+        "post" if sigmoid is None else "post_sigmoid",
+        rows,
+        reads=reads,
+        writes=(out,),
+        dram_bytes=0 if l1 else per_core,
+        l1_bytes=l1,
+        flops=rows * HIDDEN * (2 * TOP_K + 1 + (0 if sigmoid is None else 1)),
+        cores=cores,
+    )
 
 
 def _compute_config(mesh):
@@ -271,6 +296,11 @@ def _chain_mapping(owner):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
     return ttnn.subtract(_ONES_ROWS[key], owner, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+
+# public names for the other MoE kernels' one-chip chain replicas (moe_combine)
+chain_mapping = _chain_mapping
+chain_compute_config = _compute_config
 
 
 def local_sum_rows(result) -> torch.Tensor:

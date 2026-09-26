@@ -17,6 +17,7 @@
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_dataflow.hpp"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t T = get_compile_time_arg_val(0);
 constexpr uint32_t D = get_compile_time_arg_val(1);
@@ -34,20 +35,31 @@ void kernel_main() {
     const uint32_t first = get_arg_val<uint32_t>(2);
     Noc noc;
     DataflowBuffer st(c_st);
-    st.reserve_back(T);
-    for (uint32_t t = 0; t < T; ++t) {
-        noc.async_read(zero, st, TILE_BYTES, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = t * TILE_BYTES});
-    }
-    noc.async_read_barrier();  // the zero copies land before the rows they must not overwrite
-    for (uint32_t t = 0; t < T; ++t) {
-        for (uint32_t d = 0; d < D; ++d) {
-            const uint32_t tile = t * TILE_BYTES + d * ROW_BYTES;  // row d of face 0; face 1 is +FACE_BYTES
-            const uint32_t page = d * W + first + t;
-            noc.async_read(partials, st, ROW_BYTES, {.page_id = page, .offset_bytes = 0}, {.offset_bytes = tile});
-            noc.async_read(partials, st, ROW_BYTES, {.page_id = page, .offset_bytes = FACE_BYTES}, {.offset_bytes = tile + FACE_BYTES});
+    {
+        FUSED_ZONE("fz_fm_lr_r_zero");
+        st.reserve_back(T);
+        for (uint32_t t = 0; t < T; ++t) {
+            noc.async_read(zero, st, TILE_BYTES, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = t * TILE_BYTES});
         }
+        noc.async_read_barrier();  // the zero copies land before the rows they must not overwrite
     }
-    noc.async_read_barrier();
-    st.push_back(T);
+    {
+        FUSED_ZONE("fz_fm_lr_r_rows");
+        for (uint32_t t = 0; t < T; ++t) {
+            for (uint32_t d = 0; d < D; ++d) {
+                const uint32_t tile = t * TILE_BYTES + d * ROW_BYTES;  // row d of face 0; face 1 is +FACE_BYTES
+                const uint32_t page = d * W + first + t;
+                noc.async_read(partials, st, ROW_BYTES, {.page_id = page, .offset_bytes = 0}, {.offset_bytes = tile});
+                noc.async_read(
+                    partials,
+                    st,
+                    ROW_BYTES,
+                    {.page_id = page, .offset_bytes = FACE_BYTES},
+                    {.offset_bytes = tile + FACE_BYTES});
+            }
+        }
+        noc.async_read_barrier();
+        st.push_back(T);
+    }
     dataflow_kernel_lib::prepare_reduce_scaler<c_scaler, ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_COL>(1.0f);
 }

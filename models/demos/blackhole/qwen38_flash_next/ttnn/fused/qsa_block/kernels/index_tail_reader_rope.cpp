@@ -14,6 +14,7 @@
 #include "api/tensor/noc_traits.h"
 #include "ttnn/kernel/dataflow/generate_bcast_scalar.hpp"
 #include "index_tail_cbs.h"
+#include "../../kernels/zones.h"
 
 using namespace index_tail;
 
@@ -42,6 +43,7 @@ void kernel_main() {
 
     generate_bcast_col_scalar(CircularBuffer(CB_SCALAR), 0xBF800000u);
     if (do_query) {
+        FUSED_ZONE("fz_qs_it_rr_query");
         cb_reserve_back(CB_COS, ROPE_TILES);
         cb_reserve_back(CB_SIN, ROPE_TILES);
         for (uint32_t t = 0; t < ROPE_TILES; ++t) {
@@ -60,6 +62,7 @@ void kernel_main() {
     }
 
     for (uint32_t i = 0; i < lane_count; ++i) {
+        FUSED_ZONE("fz_qs_it_rr_lane");
         const uint32_t lane = lane_first + i;
         cb_reserve_back(CB_IN_K, ROPE_TILES);
         cb_reserve_back(CB_ROT_K, ROPE_TILES);

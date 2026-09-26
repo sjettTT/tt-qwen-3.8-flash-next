@@ -24,6 +24,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t CB_STAGE = get_named_compile_time_arg_val("cb_stage");
 constexpr uint32_t CORES = get_named_compile_time_arg_val("cores");
@@ -73,6 +74,7 @@ void kernel_main() {
     constexpr uint32_t STAGE_TILE = 0, STAGE_PAIRS = TILE_BYTES;
     noc.async_read(zero, stage, TILE_BYTES, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_TILE});
     if constexpr (ROWS == 1 && PACKED_LANES == 2) {
+        FUSED_ZONE("fz_gt_m_one_row");
         constexpr uint32_t STAGE_OUT = TILE_BYTES + PAIRS_BYTES;
         noc.async_read(pairs, stage, PAIRS_BYTES, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_PAIRS});
         noc.async_read_barrier();
@@ -100,6 +102,7 @@ void kernel_main() {
         noc.async_write(stage, indices, 4, {.offset_bytes = STAGE_OUT + 16}, {.page_id = 0, .offset_bytes = 0});
         noc.async_write_barrier();
     } else {
+        FUSED_ZONE("fz_gt_m_rows");
         // pairs row r at STAGE_PAIRS + r * PAIRS_BYTES; the packed rows then the indices row after them
         constexpr uint32_t STAGE_PACKED = STAGE_PAIRS + ROWS * PAIRS_BYTES;
         constexpr uint32_t STAGE_IDX = STAGE_PACKED + ROWS * PACKED_ROW_BYTES;
@@ -138,6 +141,7 @@ void kernel_main() {
     }
 #ifdef GT_CANDIDATE_ROW
     {
+        FUSED_ZONE("fz_gt_m_candidates");
         constexpr auto a_lists = TensorAccessorArgs<a_packed.next_compile_time_args_offset()>();
         constexpr auto a_start = TensorAccessorArgs<a_lists.next_compile_time_args_offset()>();
         constexpr auto a_row = TensorAccessorArgs<a_start.next_compile_time_args_offset()>();

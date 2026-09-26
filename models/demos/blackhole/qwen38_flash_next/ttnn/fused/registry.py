@@ -40,6 +40,7 @@ DEFAULT_ON: frozenset[str] = frozenset(
         "gr_read",
         "gr_write",
         "greedy_tail",
+        "moe_combine",
         "moe_post",
         "ple",
         "position_derive",
@@ -53,6 +54,7 @@ DEFAULT_ON: frozenset[str] = frozenset(
         "sampler_tail",
         "candidate_row",
         "shared_expert",
+        "sparse_sdpa_tiled",
     }
 )
 

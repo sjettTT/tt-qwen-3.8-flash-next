@@ -10,6 +10,7 @@
 #include "api/dataflow/dataflow_api.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t inter_addr = get_arg_val<uint32_t>(0);
@@ -27,15 +28,18 @@ void kernel_main() {
 
     DataflowBuffer inter_tile(cb_inter);
     DataflowBuffer sig_tile(cb_sig_bcast);
-    inter_tile.wait_front(1);
-    noc_async_write(inter_tile.get_read_ptr(), inter.get_noc_addr(tile), tile_bytes);
-    if (has_scalar) {
-        sig_tile.wait_front(1);
-        noc_async_write(sig_tile.get_read_ptr(), sig.get_noc_addr(0), tile_bytes);
-    }
-    noc_async_write_barrier();
-    inter_tile.pop_front(1);
-    if (has_scalar) {
-        sig_tile.pop_front(1);
+    {
+        FUSED_ZONE("fz_se_w_main");
+        inter_tile.wait_front(1);
+        noc_async_write(inter_tile.get_read_ptr(), inter.get_noc_addr(tile), tile_bytes);
+        if (has_scalar) {
+            sig_tile.wait_front(1);
+            noc_async_write(sig_tile.get_read_ptr(), sig.get_noc_addr(0), tile_bytes);
+        }
+        noc_async_write_barrier();
+        inter_tile.pop_front(1);
+        if (has_scalar) {
+            sig_tile.pop_front(1);
+        }
     }
 }

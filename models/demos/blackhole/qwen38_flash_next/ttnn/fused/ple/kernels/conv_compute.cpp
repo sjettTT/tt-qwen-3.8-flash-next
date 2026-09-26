@@ -28,6 +28,7 @@
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/compute/eltwise_unary/mac.h"
 #include "api/dataflow/dataflow_buffer.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     constexpr uint32_t T = get_compile_time_arg_val(0);
@@ -48,6 +49,7 @@ void kernel_main() {
     }
     gated.wait_front(T);
     for (uint32_t t = 0; t < T; ++t) {
+        FUSED_ZONE("fz_pl_conv_c_tile");
         // tap 0: the SFPU multiply of binary_ng (bf16 operands in the dest, fp32 product, bf16 pack)
         tile_regs_acquire();
         reconfig_data_format_srca(c_tap[0], c_row[0]);
@@ -158,6 +160,7 @@ void kernel_main() {
     }
     gated.pop_front(T);
     if constexpr (INJECT && DEBUG_STAGE == 0) {
+        FUSED_ZONE("fz_pl_conv_c_inject");
         // the layer's add(residual, delta): per branch b the residual block tile + the delta's row b as a row-0 tile
         DataflowBuffer drows(c_rows), resid(c_resid), inj(c_inj);
         drows.wait_front(4);

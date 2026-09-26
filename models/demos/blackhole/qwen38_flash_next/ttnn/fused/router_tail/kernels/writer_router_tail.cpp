@@ -13,6 +13,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t scores_addr = get_arg_val<uint32_t>(0);
@@ -43,30 +44,33 @@ void kernel_main() {
     const uint32_t stage_scores = stage_base;
     const uint32_t stage_indices = stage_base + 32 * stage_pitch;
 
-    idx_t.wait_front(1);
-    scores.wait_front(1);
-    volatile tt_l1_ptr uint32_t* idx = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(idx_t.get_read_ptr());
-    volatile tt_l1_ptr uint16_t* sc = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scores.get_read_ptr());
-    for (uint32_t row = 0; row < rows_in_tile; ++row) {
-        if (((token_mask >> row) & 1u) == 0) {
-            continue;  // another core's token
+    {
+        FUSED_ZONE("fz_rt_w_main");
+        idx_t.wait_front(1);
+        scores.wait_front(1);
+        volatile tt_l1_ptr uint32_t* idx = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(idx_t.get_read_ptr());
+        volatile tt_l1_ptr uint16_t* sc = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scores.get_read_ptr());
+        for (uint32_t row = 0; row < rows_in_tile; ++row) {
+            if (((token_mask >> row) & 1u) == 0) {
+                continue;  // another core's token
+            }
+            volatile tt_l1_ptr uint16_t* srow =
+                reinterpret_cast<volatile tt_l1_ptr uint16_t*>(stage_scores + row * stage_pitch);
+            volatile tt_l1_ptr uint16_t* irow =
+                reinterpret_cast<volatile tt_l1_ptr uint16_t*>(stage_indices + row * stage_pitch);
+            const uint32_t face_row = row >> 4;
+            const uint32_t in_face = row & 15;
+            for (uint32_t k = 0; k < top_k; ++k) {
+                srow[k] = sc[(face_row * 2) * 256 + in_face * 16 + k];                    // [token, k] bf16, k < 16
+                irow[k] = static_cast<uint16_t>(idx[face_row * 256 + k * 16 + in_face]);  // [k, token] uint32
+            }
+            const uint32_t page = tile_row * 32 + row;
+            noc_async_write(stage_scores + row * stage_pitch, scores_out.get_noc_addr(page), row_bytes);
+            noc_async_write(stage_indices + row * stage_pitch, indices_out.get_noc_addr(page), row_bytes);
         }
-        volatile tt_l1_ptr uint16_t* srow =
-            reinterpret_cast<volatile tt_l1_ptr uint16_t*>(stage_scores + row * stage_pitch);
-        volatile tt_l1_ptr uint16_t* irow =
-            reinterpret_cast<volatile tt_l1_ptr uint16_t*>(stage_indices + row * stage_pitch);
-        const uint32_t face_row = row >> 4;
-        const uint32_t in_face = row & 15;
-        for (uint32_t k = 0; k < top_k; ++k) {
-            srow[k] = sc[(face_row * 2) * 256 + in_face * 16 + k];             // [token, k] bf16, k < 16
-            irow[k] = static_cast<uint16_t>(idx[face_row * 256 + k * 16 + in_face]);  // [k, token] uint32
-        }
-        const uint32_t page = tile_row * 32 + row;
-        noc_async_write(stage_scores + row * stage_pitch, scores_out.get_noc_addr(page), row_bytes);
-        noc_async_write(stage_indices + row * stage_pitch, indices_out.get_noc_addr(page), row_bytes);
+        noc_async_write_barrier();
+        idx_t.pop_front(1);
+        scores.pop_front(1);
+        stage.push_back(stage_pages);
     }
-    noc_async_write_barrier();
-    idx_t.pop_front(1);
-    scores.pop_front(1);
-    stage.push_back(stage_pages);
 }

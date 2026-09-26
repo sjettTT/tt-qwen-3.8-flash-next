@@ -23,6 +23,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t CB_STAGE = get_named_compile_time_arg_val("cb_stage");
 constexpr uint32_t ROWS = get_named_compile_time_arg_val("rows");
@@ -89,13 +90,16 @@ void kernel_main() {
     stage.reserve_back(1);
     const uint32_t base = stage.get_write_ptr();
     volatile tt_l1_ptr uint32_t* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(base);
-    for (uint32_t r = 0; r < ROWS; ++r) {
-        noc.async_read(
-            row, stage, ROW_BYTES, {.page_id = r, .offset_bytes = 0}, {.offset_bytes = STAGE_ROWS + r * ROW_BYTES});
+    {
+        FUSED_ZONE("fz_st_setup");
+        for (uint32_t r = 0; r < ROWS; ++r) {
+            noc.async_read(
+                row, stage, ROW_BYTES, {.page_id = r, .offset_bytes = 0}, {.offset_bytes = STAGE_ROWS + r * ROW_BYTES});
+        }
+        noc.async_read(policy, stage, GRAIN, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_POLICY});
+        noc.async_read(uniforms, stage, GRAIN, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_UNIFORMS});
+        noc.async_read_barrier();
     }
-    noc.async_read(policy, stage, GRAIN, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_POLICY});
-    noc.async_read(uniforms, stage, GRAIN, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_UNIFORMS});
-    noc.async_read_barrier();
 
     volatile tt_l1_ptr uint32_t* policy_words = words + STAGE_POLICY / 4;
     const uint32_t top_k = static_cast<uint32_t>(as_float(policy_words[0]));  // an exact small integer
@@ -105,6 +109,7 @@ void kernel_main() {
     const float presence = as_float(policy_words[4]);
 
     if (greedy_flag) {
+        FUSED_ZONE("fz_st_greedy");
         // the composite's greedy_row * 1 + sampled * 0: the greedy tile, bitwise
         noc.async_read(greedy, stage, TILE_BYTES, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_TILE});
         noc.async_read_barrier();
@@ -127,6 +132,7 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* inclusive = words + WORK_INCLUSIVE;
     volatile tt_l1_ptr uint32_t* chunk_offset = words + WORK_CHUNK;
     for (uint32_t r = 0; r < ROWS; ++r) {
+        FUSED_ZONE("fz_st_row");
         volatile tt_l1_ptr uint32_t* lanes = words + (STAGE_ROWS + r * ROW_BYTES) / 4;
         volatile tt_l1_ptr uint32_t* hist = history + r * HIST_WORDS;
         for (uint32_t d = 0; d < LANES / SHARD_LANES; ++d) {

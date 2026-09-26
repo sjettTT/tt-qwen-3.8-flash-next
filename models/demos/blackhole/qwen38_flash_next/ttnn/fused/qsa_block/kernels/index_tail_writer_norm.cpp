@@ -13,6 +13,7 @@
 #include "api/tensor/noc_traits.h"
 #include "index_tail_cbs.h"
 #include "positions.h"
+#include "../../kernels/zones.h"
 
 using namespace index_tail;
 
@@ -56,6 +57,7 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* positions = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pos_l1);
 
     if (do_query) {
+        FUSED_ZONE("fz_qs_it_wn_query");
         cb_wait_front(CB_NQ, HEAD_TILES);
         const uint32_t l1 = get_read_ptr(CB_NQ);
         noc_async_write(l1, peer_in_q, ROPE_TILES * TILE_BYTES);
@@ -70,6 +72,7 @@ void kernel_main() {
     }
 
     for (uint32_t i = 0; i < lane_count; ++i) {
+        FUSED_ZONE("fz_qs_it_wn_lane");
         const uint32_t lane = lane_first + i;
         cb_wait_front(CB_RINGW, HEAD_TILES);
         {

@@ -14,6 +14,7 @@
 //   (addr, count, first, stride, batch).
 
 #include "mcast_phase.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t SRC_CB = get_compile_time_arg_val(0);
 constexpr uint32_t DST_CB = get_compile_time_arg_val(1);
@@ -26,5 +27,8 @@ constexpr uint32_t ACCESSOR_BASE = 6;
 void kernel_main() {
     constexpr auto tiles_args = TensorAccessorArgs<ACCESSOR_BASE>();
     constexpr auto extra_args = TensorAccessorArgs<tiles_args.next_compile_time_args_offset()>();
-    mcast_phase<SRC_CB, DST_CB, NUM_TILES, WRITE_TILES, EXTRA_CB, SEM_ID>(tiles_args, extra_args, 0);
+    {
+        FUSED_ZONE("fz_gr_mcw_main");
+        mcast_phase<SRC_CB, DST_CB, NUM_TILES, WRITE_TILES, EXTRA_CB, SEM_ID>(tiles_args, extra_args, 0);
+    }
 }

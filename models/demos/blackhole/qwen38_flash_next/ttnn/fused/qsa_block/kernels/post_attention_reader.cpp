@@ -13,6 +13,7 @@
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
 #include "tile_rows.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t att_addr = get_arg_val<uint32_t>(0);
@@ -32,24 +33,28 @@ void kernel_main() {
     cb_reserve_back(CB_ATT, HEAD_TILES);
     const uint32_t gate_l1 = get_write_ptr(CB_GATE), att_l1 = get_write_ptr(CB_ATT);
     {
+        FUSED_ZONE("fz_qs_pa_r_zero");
         Noc noc;
         DataflowBuffer att_cb(CB_ATT);
         noc.async_write_zeros(att_cb, HEAD_TILES * TILE_BYTES);
         noc.write_zeros_l1_barrier();
     }
-    for (uint32_t t = 0; t < HEAD_TILES; ++t) {
-        noc_async_read_page(qg_first + 2 * HEAD_TILES * head + GATE_FIRST + t, qg, gate_l1 + t * TILE_BYTES);
-    }
-    // DRAM reads land whole (64-byte aligned) rows in the scratch; the RISC places the chunks into the tile faces
-    cb_reserve_back(CB_ROW, 1);
-    const uint32_t row_l1 = get_write_ptr(CB_ROW);
-    for (uint32_t lane = 0; lane < rows; ++lane) {
-        noc_async_read(att.get_noc_addr(head * rows + lane, 0), row_l1, HEAD_TILES * 2 * ROW_BYTES);
+    {
+        FUSED_ZONE("fz_qs_pa_r_rows");
+        for (uint32_t t = 0; t < HEAD_TILES; ++t) {
+            noc_async_read_page(qg_first + 2 * HEAD_TILES * head + GATE_FIRST + t, qg, gate_l1 + t * TILE_BYTES);
+        }
+        // DRAM reads land whole (64-byte aligned) rows in the scratch; the RISC places the chunks into the tile faces
+        cb_reserve_back(CB_ROW, 1);
+        const uint32_t row_l1 = get_write_ptr(CB_ROW);
+        for (uint32_t lane = 0; lane < rows; ++lane) {
+            noc_async_read(att.get_noc_addr(head * rows + lane, 0), row_l1, HEAD_TILES * 2 * ROW_BYTES);
+            noc_async_read_barrier();
+            invalidate_l1_cache();
+            tile_rows::place_row(row_l1, att_l1, HEAD_TILES, lane);
+        }
         noc_async_read_barrier();
-        invalidate_l1_cache();
-        tile_rows::place_row(row_l1, att_l1, HEAD_TILES, lane);
+        cb_push_back(CB_GATE, HEAD_TILES);
+        cb_push_back(CB_ATT, HEAD_TILES);
     }
-    noc_async_read_barrier();
-    cb_push_back(CB_GATE, HEAD_TILES);
-    cb_push_back(CB_ATT, HEAD_TILES);
 }

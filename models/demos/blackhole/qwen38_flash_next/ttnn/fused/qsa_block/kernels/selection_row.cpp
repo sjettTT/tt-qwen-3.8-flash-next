@@ -13,6 +13,7 @@
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t ids_addr = get_arg_val<uint32_t>(0);
@@ -59,6 +60,7 @@ void kernel_main() {
         noc_async_read(sentinel.get_noc_addr(0, 0), l1 + 256 + 1024, TAIL * 4);
     }
     for (uint32_t r = row_first; r < rows; r += row_step) {
+        FUSED_ZONE("fz_qs_sel_row");
         if (offset_rows != 1) {
             noc_async_read(off.get_noc_addr(r, col0 * 4), l1 + 256, COLS * 4);  // row r's offsets (the lanes)
         }

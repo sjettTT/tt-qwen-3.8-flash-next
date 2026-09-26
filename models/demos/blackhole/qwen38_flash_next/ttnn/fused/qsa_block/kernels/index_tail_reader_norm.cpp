@@ -19,6 +19,7 @@
 #include "ttnn/kernel/dataflow/generate_bcast_scalar.hpp"
 #include "index_tail_cbs.h"
 #include "positions.h"
+#include "../../kernels/zones.h"
 
 using namespace index_tail;
 
@@ -68,25 +69,29 @@ void kernel_main() {
     cb_reserve_back(CB_POSCR, 1);
     const uint32_t gq_l1 = get_write_ptr(CB_GAMMA_Q), gk_l1 = get_write_ptr(CB_GAMMA_K);
     const uint32_t x_l1 = get_write_ptr(CB_X), raw_l1 = get_write_ptr(CB_RAW), pos_l1 = get_write_ptr(CB_POS_R);
-    for (uint32_t c = 0; c < HEAD_TILES; ++c) {
-        noc_async_read_page(c, gk, gk_l1 + c * TILE_BYTES);
-        noc_async_read_page(raw_first + c, raw, raw_l1 + c * TILE_BYTES);
-        if (do_query) {
-            noc_async_read_page(c, gq, gq_l1 + c * TILE_BYTES);
-            noc_async_read_page(q_first + c, q, x_l1 + c * TILE_BYTES);
+    {
+        FUSED_ZONE("fz_qs_it_rn_setup");
+        for (uint32_t c = 0; c < HEAD_TILES; ++c) {
+            noc_async_read_page(c, gk, gk_l1 + c * TILE_BYTES);
+            noc_async_read_page(raw_first + c, raw, raw_l1 + c * TILE_BYTES);
+            if (do_query) {
+                noc_async_read_page(c, gq, gq_l1 + c * TILE_BYTES);
+                noc_async_read_page(q_first + c, q, x_l1 + c * TILE_BYTES);
+            }
         }
-    }
-    noc_async_read_barrier();
-    tile_rows::read_positions(
-        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pos_l1), pos, hit, rows, get_write_ptr(CB_POSCR));
-    cb_push_back(CB_GAMMA_K, HEAD_TILES);
-    if (do_query) {
-        cb_push_back(CB_GAMMA_Q, HEAD_TILES);
-        cb_push_back(CB_X, HEAD_TILES);
+        noc_async_read_barrier();
+        tile_rows::read_positions(
+            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pos_l1), pos, hit, rows, get_write_ptr(CB_POSCR));
+        cb_push_back(CB_GAMMA_K, HEAD_TILES);
+        if (do_query) {
+            cb_push_back(CB_GAMMA_Q, HEAD_TILES);
+            cb_push_back(CB_X, HEAD_TILES);
+        }
     }
     volatile tt_l1_ptr uint32_t* positions = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pos_l1);
 
     for (uint32_t i = 0; i < lane_count; ++i) {
+        FUSED_ZONE("fz_qs_it_rn_lane");
         const uint32_t lane = lane_first + i;
         const uint32_t slot = positions[lane] & 3;
         cb_reserve_back(CB_RING, HEAD_TILES);

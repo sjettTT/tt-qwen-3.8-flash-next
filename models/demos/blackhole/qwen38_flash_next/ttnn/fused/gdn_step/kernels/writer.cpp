@@ -8,6 +8,7 @@
 
 #include "api/dataflow/dataflow_api.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 namespace {
 constexpr uint32_t CB_OUTS = 25, CB_OUTG = 26, CB_DBG = 28;
@@ -34,6 +35,7 @@ void kernel_main() {
     const auto out = TensorAccessor(out_args, out_addr);
 
     for (uint32_t item = 0; item < items; ++item) {
+        FUSED_ZONE("fz_gs_w_item");
         const uint32_t lane = get_arg_val<uint32_t>(arg++);
         const uint32_t head = get_arg_val<uint32_t>(arg++);
 

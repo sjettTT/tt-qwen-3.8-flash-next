@@ -8,10 +8,12 @@
 #include "rope_mirror.h"
 #ifdef ROUND_RNE
 #include "api/compute/eltwise_unary/typecast.h"
+#include "../../kernels/zones.h"
 static_assert(static_cast<uint32_t>(DataFormat::Float32) == 0 && static_cast<uint32_t>(DataFormat::Float16_b) == 5);
 #endif
 
 void kernel_main() {
+    FUSED_ZONE("fz_qs_rope_c_main");
     const uint32_t rows = get_arg_val<uint32_t>(0);
     CircularBuffer scalar_cb(4);
     scalar_cb.wait_front(1);

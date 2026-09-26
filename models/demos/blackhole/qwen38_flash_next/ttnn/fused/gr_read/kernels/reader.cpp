@@ -21,6 +21,7 @@
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_dataflow.hpp"
 #include "ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp"
 #include "ttnn/kernel/dataflow/generate_bcast_scalar.hpp"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t NUM_STREAMS = get_compile_time_arg_val(0);
 constexpr uint32_t NUM_CONSTS = get_compile_time_arg_val(5);
@@ -77,15 +78,18 @@ FORCE_INLINE void make_const(uint32_t bits) {
 }
 
 void kernel_main() {
-    constexpr uint32_t const_rt = NUM_STREAMS * STREAM_RT_ARGS;
-    if constexpr (NUM_CONSTS > 0) {
-        make_const<get_compile_time_arg_val(6), get_compile_time_arg_val(7)>(get_arg_val<uint32_t>(const_rt));
-    }
-    if constexpr (NUM_CONSTS > 1) {
-        make_const<get_compile_time_arg_val(8), get_compile_time_arg_val(9)>(get_arg_val<uint32_t>(const_rt + 1));
-    }
-    if constexpr (NUM_CONSTS > 2) {
-        make_const<get_compile_time_arg_val(10), get_compile_time_arg_val(11)>(get_arg_val<uint32_t>(const_rt + 2));
+    {
+        FUSED_ZONE("fz_gr_rd_consts");
+        constexpr uint32_t const_rt = NUM_STREAMS * STREAM_RT_ARGS;
+        if constexpr (NUM_CONSTS > 0) {
+            make_const<get_compile_time_arg_val(6), get_compile_time_arg_val(7)>(get_arg_val<uint32_t>(const_rt));
+        }
+        if constexpr (NUM_CONSTS > 1) {
+            make_const<get_compile_time_arg_val(8), get_compile_time_arg_val(9)>(get_arg_val<uint32_t>(const_rt + 1));
+        }
+        if constexpr (NUM_CONSTS > 2) {
+            make_const<get_compile_time_arg_val(10), get_compile_time_arg_val(11)>(get_arg_val<uint32_t>(const_rt + 2));
+        }
     }
     // Four accessor arg sets are always present (unused slots repeat a used tensor's): a discarded `if constexpr`
     // branch of a non-template function is still compiled.
@@ -102,18 +106,21 @@ void kernel_main() {
             }
         }
     };
-    gate(0);
-    read_stream(args0, get_compile_time_arg_val(1), 0);
-    if constexpr (NUM_STREAMS > 1) {
-        gate(1);
-        read_stream(args1, get_compile_time_arg_val(2), STREAM_RT_ARGS);
-    }
-    if constexpr (NUM_STREAMS > 2) {
-        gate(2);
-        read_stream(args2, get_compile_time_arg_val(3), 2 * STREAM_RT_ARGS);
-    }
-    if constexpr (NUM_STREAMS > 3) {
-        gate(3);
-        read_stream(args3, get_compile_time_arg_val(4), 3 * STREAM_RT_ARGS);
+    {
+        FUSED_ZONE("fz_gr_rd_streams");
+        gate(0);
+        read_stream(args0, get_compile_time_arg_val(1), 0);
+        if constexpr (NUM_STREAMS > 1) {
+            gate(1);
+            read_stream(args1, get_compile_time_arg_val(2), STREAM_RT_ARGS);
+        }
+        if constexpr (NUM_STREAMS > 2) {
+            gate(2);
+            read_stream(args2, get_compile_time_arg_val(3), 2 * STREAM_RT_ARGS);
+        }
+        if constexpr (NUM_STREAMS > 3) {
+            gate(3);
+            read_stream(args3, get_compile_time_arg_val(4), 3 * STREAM_RT_ARGS);
+        }
     }
 }

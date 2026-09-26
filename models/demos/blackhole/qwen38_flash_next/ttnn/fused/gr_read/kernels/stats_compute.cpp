@@ -16,8 +16,10 @@
 #include "api/compute/compute_kernel_api.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.hpp"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
+    FUSED_ZONE("fz_gr_stats_c");
     constexpr uint32_t Wt = get_compile_time_arg_val(0);
     constexpr uint32_t c_res = 0;
     constexpr uint32_t c_scaler = 1;

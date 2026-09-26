@@ -15,6 +15,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t block_addr = get_arg_val<uint32_t>(0);
@@ -42,6 +43,7 @@ void kernel_main() {
     DataflowBuffer coef(cb_coef);
 
     for (uint32_t u = first; u < first + units; ++u) {
+        FUSED_ZONE("fz_gw_r_unit");
         const uint32_t b = u % branches;
         const uint32_t j = u / branches;
         blk.reserve_back(1);

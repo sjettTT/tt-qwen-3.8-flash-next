@@ -12,6 +12,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t out_addr = get_arg_val<uint32_t>(0);
@@ -27,6 +28,7 @@ void kernel_main() {
     Noc noc;
     DataflowBuffer dfb(cb_out);
     for (uint32_t u = first; u < first + units; ++u) {
+        FUSED_ZONE("fz_gw_w_unit");
         dfb.wait_front(1);
         noc.async_write(
             dfb, out, tile_bytes, {.offset_bytes = 0}, {.page_id = hidden_tiles * (u % branches) + u / branches});

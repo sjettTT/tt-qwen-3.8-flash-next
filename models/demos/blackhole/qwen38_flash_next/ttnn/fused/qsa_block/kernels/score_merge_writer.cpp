@@ -7,6 +7,7 @@
 #include "api/dataflow/dataflow_api.h"
 #include "api/tensor/noc_traits.h"
 #include "tile_rows.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t out_addr = get_arg_val<uint32_t>(0);
@@ -18,6 +19,7 @@ void kernel_main() {
     const auto out = TensorAccessor(out_args, out_addr);
     for (uint32_t chunk = first_chunk; chunk < first_chunk + chunks; ++chunk) {
         for (uint32_t r = 0; r < rows; ++r) {
+            FUSED_ZONE("fz_qs_sm_w_row");
             cb_wait_front(CB_OUT, 1);
             noc_async_write(get_read_ptr(CB_OUT), out.get_noc_addr(r, chunk * CHUNK_BYTES), CHUNK_BYTES);
             noc_async_write_barrier();

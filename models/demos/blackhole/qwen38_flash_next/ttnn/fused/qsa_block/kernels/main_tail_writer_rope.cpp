@@ -12,6 +12,7 @@
 #include "api/dataflow/noc_semaphore.h"
 #include "api/tensor/noc_traits.h"
 #include "main_tail_cbs.h"
+#include "../../kernels/zones.h"
 
 using namespace main_tail;
 
@@ -29,6 +30,7 @@ void kernel_main() {
     cb_wait_front(CB_OUT, ROPE_TILES);
     const uint32_t l1 = get_read_ptr(CB_OUT);
     if constexpr (ROLE == 0) {
+        FUSED_ZONE("fz_qs_mt_wr_query");
         for (uint32_t lane = 0; lane < rows; ++lane) {
             const uint32_t page = head * rows + lane;
             for (uint32_t t = 0; t < ROPE_TILES; ++t) {
@@ -42,6 +44,7 @@ void kernel_main() {
         }
         noc_async_write_barrier();
     } else {
+        FUSED_ZONE("fz_qs_mt_wr_key");
         for (uint32_t s = 0; s < staging_cores; ++s) {
             const uint32_t st_x = get_arg_val<uint32_t>(4 + 2 * s), st_y = get_arg_val<uint32_t>(5 + 2 * s);
             noc_async_write(

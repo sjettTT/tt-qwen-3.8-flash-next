@@ -8,8 +8,10 @@
 #include "api/compute/cb_api.h"
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/tile_move_copy.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
+    FUSED_ZONE("fz_qs_wid_c_main");
     const uint32_t tiles = get_arg_val<uint32_t>(0);
     constexpr uint32_t CB_IN = 0, CB_OUT = 16;
     compute_kernel_hw_startup(CB_IN, CB_IN, CB_OUT);

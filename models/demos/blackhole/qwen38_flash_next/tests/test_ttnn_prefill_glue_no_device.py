@@ -38,6 +38,7 @@ SLAB_UINT32_TEMPLATES = (
     "arange_slots_rows",
     "all_ones_rows",
     "arange_blocks_row",
+    "row_index_row",
 )
 
 

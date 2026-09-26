@@ -22,6 +22,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t CB_STAGE = get_named_compile_time_arg_val("cb_stage");
 constexpr uint32_t DEVICES = get_named_compile_time_arg_val("devices");
@@ -51,36 +52,49 @@ void kernel_main() {
     stage.reserve_back(1);
     const uint32_t base = stage.get_write_ptr();
     constexpr uint32_t STAGE_TILE = 0, STAGE_GATHERED = FP32_TILE_BYTES, STAGE_TIE = STAGE_GATHERED + ROWS * ROW_BYTES, STAGE_STARTS = STAGE_TIE + GRAIN;
-    noc.async_read(zero, stage, FP32_TILE_BYTES, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_TILE});
-    for (uint32_t r = 0; r < ROWS; ++r) {
-        noc.async_read(gathered, stage, ROW_BYTES, {.page_id = r, .offset_bytes = 0}, {.offset_bytes = STAGE_GATHERED + r * ROW_BYTES});
-    }
-    noc.async_read(tie, stage, GRAIN, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_TIE});
-    noc.async_read(starts, stage, GRAIN, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_STARTS});
-    noc.async_read_barrier();
-
-    volatile tt_l1_ptr float* t = reinterpret_cast<volatile tt_l1_ptr float*>(base + STAGE_TIE);
-    volatile tt_l1_ptr float* s = reinterpret_cast<volatile tt_l1_ptr float*>(base + STAGE_STARTS);
-    volatile tt_l1_ptr float* row = reinterpret_cast<volatile tt_l1_ptr float*>(base + STAGE_TILE);
-    for (uint32_t r = 0; r < ROWS; ++r) {
-        volatile tt_l1_ptr float* g = reinterpret_cast<volatile tt_l1_ptr float*>(base + STAGE_GATHERED + r * ROW_BYTES);
-        uint32_t owner = 0;
-        float best = g[0] - t[0];
-        for (uint32_t d = 1; d < DEVICES; ++d) {
-            const float ranked = g[STRIDE * d] - t[d];
-            if (ranked > best) {
-                best = ranked;
-                owner = d;
-            }
+    {
+        FUSED_ZONE("fz_gt_res_setup");
+        noc.async_read(zero, stage, FP32_TILE_BYTES, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_TILE});
+        for (uint32_t r = 0; r < ROWS; ++r) {
+            noc.async_read(
+                gathered,
+                stage,
+                ROW_BYTES,
+                {.page_id = r, .offset_bytes = 0},
+                {.offset_bytes = STAGE_GATHERED + r * ROW_BYTES});
         }
-        const float id = g[STRIDE * owner + 1] + s[owner];
-        // lane (0, r) of the fp32 token tile: face r >> 4 (1024 bytes = 256 words each), row 0, column r & 15
-        row[(r >> 4) * 256 + (r & 15)] = id;
+        noc.async_read(tie, stage, GRAIN, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_TIE});
+        noc.async_read(starts, stage, GRAIN, {.page_id = 0, .offset_bytes = 0}, {.offset_bytes = STAGE_STARTS});
+        noc.async_read_barrier();
     }
-    noc.async_write(stage, token, FP32_TILE_BYTES, {.offset_bytes = STAGE_TILE}, {.page_id = 0, .offset_bytes = 0});
-    if constexpr (COPY_INTO) {
-        noc.async_write(stage, into, FP32_TILE_BYTES, {.offset_bytes = STAGE_TILE}, {.page_id = 0, .offset_bytes = 0});
+
+    {
+        FUSED_ZONE("fz_gt_res_main");
+        volatile tt_l1_ptr float* t = reinterpret_cast<volatile tt_l1_ptr float*>(base + STAGE_TIE);
+        volatile tt_l1_ptr float* s = reinterpret_cast<volatile tt_l1_ptr float*>(base + STAGE_STARTS);
+        volatile tt_l1_ptr float* row = reinterpret_cast<volatile tt_l1_ptr float*>(base + STAGE_TILE);
+        for (uint32_t r = 0; r < ROWS; ++r) {
+            volatile tt_l1_ptr float* g =
+                reinterpret_cast<volatile tt_l1_ptr float*>(base + STAGE_GATHERED + r * ROW_BYTES);
+            uint32_t owner = 0;
+            float best = g[0] - t[0];
+            for (uint32_t d = 1; d < DEVICES; ++d) {
+                const float ranked = g[STRIDE * d] - t[d];
+                if (ranked > best) {
+                    best = ranked;
+                    owner = d;
+                }
+            }
+            const float id = g[STRIDE * owner + 1] + s[owner];
+            // lane (0, r) of the fp32 token tile: face r >> 4 (1024 bytes = 256 words each), row 0, column r & 15
+            row[(r >> 4) * 256 + (r & 15)] = id;
+        }
+        noc.async_write(stage, token, FP32_TILE_BYTES, {.offset_bytes = STAGE_TILE}, {.page_id = 0, .offset_bytes = 0});
+        if constexpr (COPY_INTO) {
+            noc.async_write(
+                stage, into, FP32_TILE_BYTES, {.offset_bytes = STAGE_TILE}, {.page_id = 0, .offset_bytes = 0});
+        }
+        noc.async_write_barrier();
     }
-    noc.async_write_barrier();
     stage.push_back(1);
 }

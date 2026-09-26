@@ -5,8 +5,10 @@
 // x^2 4, var 5, rsqrt 6, unit 7, out 16.  Compile-time args: 0 Wt, 1 W.  Runtime arg 0: rows.
 
 #include "rms_norm_mirror.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
+    FUSED_ZONE("fz_qs_rms_c_main");
     constexpr uint32_t Wt = get_compile_time_arg_val(0);
     constexpr uint32_t W = get_compile_time_arg_val(1);
     const uint32_t rows = get_arg_val<uint32_t>(0);

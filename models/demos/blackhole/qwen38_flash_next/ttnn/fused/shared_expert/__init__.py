@@ -136,8 +136,21 @@ def shared_expert(
     sigmoid = fp.stamp_topology(
         fp.allocate((1, 1, fp.TILE, fp.TILE), BF16, ttnn.TILE_LAYOUT, mesh, ttnn.DRAM_MEMORY_CONFIG), hidden
     )
+    # the concatenated linear's L1 shard in, the intermediate shard (L1) and the sigmoid tile out; silu and product
+    # per element of the rows x 160 intermediate, the sigmoid on the scalar column and its broadcast
+    meta = fp.program_meta(
+        NAME,
+        "eltwise",
+        rows,
+        reads=(gate_up_scalar_ws,),
+        writes=(intermediate, sigmoid),
+        flops=rows * LOCAL_INTERMEDIATE * 3 + rows * fp.TILE,
+        cores=STORAGE_CORES,
+    )
     fp.run_program(
-        [gate_up_scalar_ws, intermediate, sigmoid], shared_eltwise_program(gate_up_scalar_ws, intermediate, sigmoid)
+        [gate_up_scalar_ws, intermediate, sigmoid],
+        shared_eltwise_program(gate_up_scalar_ws, intermediate, sigmoid),
+        meta=meta,
     )
     ttnn.deallocate(gate_up_scalar_ws)
     partial = ttnn.linear(

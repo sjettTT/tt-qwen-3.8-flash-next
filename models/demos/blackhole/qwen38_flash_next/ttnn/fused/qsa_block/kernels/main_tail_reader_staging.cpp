@@ -15,6 +15,7 @@
 #include "api/tensor/noc_traits.h"
 #include "main_tail_cbs.h"
 #include "positions.h"
+#include "../../kernels/zones.h"
 
 using namespace main_tail;
 
@@ -46,17 +47,24 @@ void kernel_main() {
     const uint32_t pos_l1 = get_write_ptr(CB_POS_R), pack_l1 = get_write_ptr(CB_PACK);
     tile_rows::read_positions(
         reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pos_l1), pos, hit, rows, get_write_ptr(CB_POSCR));
-    for (uint32_t c = 0; c < HEAD_TILES; ++c) {
-        noc_async_read_page(v_first + c, v, pack_l1 + c * TILE_BYTES);
+    {
+        FUSED_ZONE("fz_qs_mt_rs_value");
+        for (uint32_t c = 0; c < HEAD_TILES; ++c) {
+            noc_async_read_page(v_first + c, v, pack_l1 + c * TILE_BYTES);
+        }
+        noc_async_read_barrier();
+        invalidate_l1_cache();
     }
-    noc_async_read_barrier();
-    invalidate_l1_cache();
     volatile tt_l1_ptr uint32_t* positions = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pos_l1);
-    sem_krot.wait_min(1);
-    sem_knorm.wait_min(1);
-    invalidate_l1_cache();
+    {
+        FUSED_ZONE("fz_qs_mt_rs_key_wait");
+        sem_krot.wait_min(1);
+        sem_knorm.wait_min(1);
+        invalidate_l1_cache();
+    }
 
     for (uint32_t i = 0; i < lane_count; ++i) {
+        FUSED_ZONE("fz_qs_mt_rs_lane");
         const uint32_t lane = lane_first + i;
         const uint32_t slot = positions[lane] & 31;
         cb_reserve_back(CB_STG, PACK_TILES);

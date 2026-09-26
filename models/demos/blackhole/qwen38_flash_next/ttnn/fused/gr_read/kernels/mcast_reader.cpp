@@ -14,6 +14,7 @@
 #include "api/dataflow/noc_semaphore.h"
 #include "api/tensor/noc_traits.h"
 #include "ttnn/cpp/ttnn/kernel_lib/l1_helpers.hpp"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t RECV_CB = get_compile_time_arg_val(0);
 constexpr uint32_t RECV_TILES = get_compile_time_arg_val(1);
@@ -66,14 +67,20 @@ void kernel_main() {
         dataflow_kernel_lib::prepare_zero_tile<ZERO_CB>();
     }
     // The streams' CBs hold their whole stream, so they prefetch while the producers still compute.
-    constexpr auto args0 = TensorAccessorArgs<ACCESSOR_BASE>();
-    constexpr auto args1 = TensorAccessorArgs<args0.next_compile_time_args_offset()>();
-    if constexpr (NUM_STREAMS > 0) {
-        read_stream(args0, get_compile_time_arg_val(5), 0);
+    {
+        FUSED_ZONE("fz_gr_mcr_streams");
+        constexpr auto args0 = TensorAccessorArgs<ACCESSOR_BASE>();
+        constexpr auto args1 = TensorAccessorArgs<args0.next_compile_time_args_offset()>();
+        if constexpr (NUM_STREAMS > 0) {
+            read_stream(args0, get_compile_time_arg_val(5), 0);
+        }
+        if constexpr (NUM_STREAMS > 1) {
+            read_stream(args1, get_compile_time_arg_val(6), STREAM_RT_ARGS);
+        }
     }
-    if constexpr (NUM_STREAMS > 1) {
-        read_stream(args1, get_compile_time_arg_val(6), STREAM_RT_ARGS);
+    {
+        FUSED_ZONE("fz_gr_mcr_wait");
+        sem.wait(SENDERS);
+        recv.push_back(RECV_TILES);
     }
-    sem.wait(SENDERS);
-    recv.push_back(RECV_TILES);
 }

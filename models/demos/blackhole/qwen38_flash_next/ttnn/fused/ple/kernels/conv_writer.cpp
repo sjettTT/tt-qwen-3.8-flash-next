@@ -13,6 +13,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t T = get_compile_time_arg_val(0);
 constexpr uint32_t INJECT = get_compile_time_arg_val(1);
@@ -26,39 +27,51 @@ void kernel_main() {
     const uint32_t first = get_arg_val<uint32_t>(1);
     Noc noc;
     DataflowBuffer o(c_out);
-    o.wait_front(T);
-    if constexpr (!INJECT) {
-        for (uint32_t t = 0; t < T; ++t) {
-            noc.async_write(o, out, BF16_TILE, {.offset_bytes = t * BF16_TILE}, {.page_id = first + t, .offset_bytes = 0});
+    {
+        FUSED_ZONE("fz_pl_conv_w_delta");
+        o.wait_front(T);
+        if constexpr (!INJECT) {
+            for (uint32_t t = 0; t < T; ++t) {
+                noc.async_write(
+                    o, out, BF16_TILE, {.offset_bytes = t * BF16_TILE}, {.page_id = first + t, .offset_bytes = 0});
+            }
+            noc.async_write_barrier();
+            o.pop_front(T);
+            return;
         }
-        noc.async_write_barrier();
-        o.pop_front(T);
-        return;
     }
     // INJECT: the delta tile's row b (face 0 row b, face 1 row b: 32 bytes each) -> row 0 of tile b in CB 18
-    const auto injected = TensorAccessor(a_inj, get_arg_val<uint32_t>(2));
-    DataflowBuffer drows(c_rows), inj(c_inj);
-    drows.reserve_back(4);
-    volatile tt_l1_ptr uint32_t* src = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o.get_read_ptr());
-    volatile tt_l1_ptr uint32_t* dst = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(drows.get_write_ptr());
-    for (uint32_t w = 0; w < 4 * BF16_TILE / 4; ++w) {
-        dst[w] = 0;
-    }
-    for (uint32_t b = 0; b < 4; ++b) {
-        for (uint32_t face = 0; face < 2; ++face) {
-            const uint32_t s = (face * BF16_FACE + b * BF16_ROW) / 4;   // delta tile, face `face`, row b
-            const uint32_t d = (b * BF16_TILE + face * BF16_FACE) / 4;  // tile b, face `face`, row 0
-            for (uint32_t k = 0; k < BF16_ROW / 4; ++k) {
-                dst[d + k] = src[s + k];
+    {
+        FUSED_ZONE("fz_pl_conv_w_inject");
+        const auto injected = TensorAccessor(a_inj, get_arg_val<uint32_t>(2));
+        DataflowBuffer drows(c_rows), inj(c_inj);
+        drows.reserve_back(4);
+        volatile tt_l1_ptr uint32_t* src = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(o.get_read_ptr());
+        volatile tt_l1_ptr uint32_t* dst = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(drows.get_write_ptr());
+        for (uint32_t w = 0; w < 4 * BF16_TILE / 4; ++w) {
+            dst[w] = 0;
+        }
+        for (uint32_t b = 0; b < 4; ++b) {
+            for (uint32_t face = 0; face < 2; ++face) {
+                const uint32_t s = (face * BF16_FACE + b * BF16_ROW) / 4;   // delta tile, face `face`, row b
+                const uint32_t d = (b * BF16_TILE + face * BF16_FACE) / 4;  // tile b, face `face`, row 0
+                for (uint32_t k = 0; k < BF16_ROW / 4; ++k) {
+                    dst[d + k] = src[s + k];
+                }
             }
         }
+        drows.push_back(4);
+        o.pop_front(T);
+        inj.wait_front(4);
+        for (uint32_t b = 0; b < 4; ++b) {
+            noc.async_write(
+                inj,
+                injected,
+                BF16_TILE,
+                {.offset_bytes = b * BF16_TILE},
+                {.page_id = b * BLOCK_TILES + first, .offset_bytes = 0});
+        }
+        noc.async_write_barrier();
+        inj.pop_front(4);
     }
-    drows.push_back(4);
-    o.pop_front(T);
-    inj.wait_front(4);
-    for (uint32_t b = 0; b < 4; ++b) {
-        noc.async_write(inj, injected, BF16_TILE, {.offset_bytes = b * BF16_TILE}, {.page_id = b * BLOCK_TILES + first, .offset_bytes = 0});
-    }
-    noc.async_write_barrier();
-    inj.pop_front(4);
 }

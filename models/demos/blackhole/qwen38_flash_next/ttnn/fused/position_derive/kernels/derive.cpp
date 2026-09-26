@@ -19,6 +19,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t BLOCKS = get_named_compile_time_arg_val("blocks");
 constexpr uint32_t SLOTS = get_named_compile_time_arg_val("slots");
@@ -111,12 +112,15 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(base);
     volatile tt_l1_ptr uint16_t* halves = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(base);
 
-    // P and the whole template rows / tiles in one batch of reads
-    read_bytes(noc, p_in, stage, DRAM_READ_GRAIN, 0, 0, STAGE_SCALARS);
-    read_bytes(noc, bf16_tpl, stage, BF16_ROW_BYTES, 0, BF16_ROW_BYTES, STAGE_BF16);  // the MASK half
-    read_bytes(noc, tile_tpl, stage, TILE_BYTES, 0, 0, STAGE_TILES);                  // zero tile
-    read_bytes(noc, tile_tpl, stage, TILE_BYTES, 1, 0, STAGE_TILES + TILE_BYTES);     // ones-column tile
-    noc.async_read_barrier();
+    {
+        FUSED_ZONE("fz_pd_r_setup");
+        // P and the whole template rows / tiles in one batch of reads
+        read_bytes(noc, p_in, stage, DRAM_READ_GRAIN, 0, 0, STAGE_SCALARS);
+        read_bytes(noc, bf16_tpl, stage, BF16_ROW_BYTES, 0, BF16_ROW_BYTES, STAGE_BF16);  // the MASK half
+        read_bytes(noc, tile_tpl, stage, TILE_BYTES, 0, 0, STAGE_TILES);                  // zero tile
+        read_bytes(noc, tile_tpl, stage, TILE_BYTES, 1, 0, STAGE_TILES + TILE_BYTES);     // ones-column tile
+        noc.async_read_barrier();
+    }
 
     const uint32_t p = words[STAGE_SCALARS / 4];
     const uint32_t kv_row = p & KV_ROW_MASK;
@@ -129,91 +133,97 @@ void kernel_main() {
     const uint32_t tail_shift = (complete_blocks - selected) << 2;
     const uint32_t block_start = p & LANE_BLOCK_MASK;
 
-    // scalars and index rows
-    words[STAGE_SCALARS / 4 + 4] = p & KV_BLOCK_START_MASK;
-    words[STAGE_SCALARS / 4 + 8] = p >> 2;
-    for (uint32_t lane = 0; lane < 32; ++lane) {
-        words[STAGE_INDEX / 4 + lane] = p;
-        words[STAGE_INDEX / 4 + 32 + lane] = block_start;
-    }
-    write_bytes(noc, stage, o_kvbs, 4, STAGE_SCALARS + 16, 0, 0);
-    write_bytes(noc, stage, o_bidx, 4, STAGE_SCALARS + 32, 0, 0);
-    write_bytes(noc, stage, o_irow, 128, STAGE_INDEX, 0, 0);
-    write_bytes(noc, stage, o_brow, 128, STAGE_INDEX + 128, 0, 0);
-
-    // indexer_neg_mask: MASK everywhere, +0.0 for blocks below complete_blocks (the chain's 0 * MASK is +0.0)
     {
-        const uint32_t zero_bytes = complete_blocks * 2;
-        const uint32_t bulk = zero_bytes & ~(DRAM_READ_GRAIN - 1);
-        read_bytes(noc, bf16_tpl, stage, bulk, 0, 0, STAGE_BF16);
-        for (uint32_t lane = bulk / 2; lane < complete_blocks; ++lane) {
-            halves[STAGE_BF16 / 2 + lane] = 0;
+        FUSED_ZONE("fz_pd_r_main");
+        // scalars and index rows
+        words[STAGE_SCALARS / 4 + 4] = p & KV_BLOCK_START_MASK;
+        words[STAGE_SCALARS / 4 + 8] = p >> 2;
+        for (uint32_t lane = 0; lane < 32; ++lane) {
+            words[STAGE_INDEX / 4 + lane] = p;
+            words[STAGE_INDEX / 4 + 32 + lane] = block_start;
         }
-    }
-    // the four one-hots: tile lane (row, 0) is 16-bit word (row >> 4) * 512 + (row & 15) * 16
-    const uint32_t kv_lane = (kv_row >> 4) * 512 + (kv_row & 15) * 16;
-    const uint32_t ring_lane = (ring_row >> 4) * 512 + (ring_row & 15) * 16;
-    volatile tt_l1_ptr uint16_t* zero_tile = halves + STAGE_TILES / 2;
-    volatile tt_l1_ptr uint16_t* ones_tile = halves + (STAGE_TILES + TILE_BYTES) / 2;
-    noc.async_read_barrier();  // the zero-lane bulk read landed before the mask row is written
-    write_bytes(noc, stage, o_mask, BF16_ROW_BYTES, STAGE_BF16, 0, 0);
-    zero_tile[kv_lane] = ONE_BF16;
-    write_bytes(noc, stage, o_kvhit, TILE_BYTES, STAGE_TILES, 0, 0);
-    ones_tile[kv_lane] = 0;
-    write_bytes(noc, stage, o_kvkeep, TILE_BYTES, STAGE_TILES + TILE_BYTES, 0, 0);
-    noc.async_write_barrier();
-    zero_tile[kv_lane] = 0;
-    ones_tile[kv_lane] = ONE_BF16;
-    zero_tile[ring_lane] = ONE_BF16;
-    write_bytes(noc, stage, o_rhit, TILE_BYTES, STAGE_TILES, 0, 0);
-    ones_tile[ring_lane] = 0;
-    write_bytes(noc, stage, o_rkeep, TILE_BYTES, STAGE_TILES + TILE_BYTES, 0, 0);
+        write_bytes(noc, stage, o_kvbs, 4, STAGE_SCALARS + 16, 0, 0);
+        write_bytes(noc, stage, o_bidx, 4, STAGE_SCALARS + 32, 0, 0);
+        write_bytes(noc, stage, o_irow, 128, STAGE_INDEX, 0, 0);
+        write_bytes(noc, stage, o_brow, 128, STAGE_INDEX + 128, 0, 0);
 
-    // row_keep_bits: zeros, ALL_ONES below lo
-    read_bytes(noc, u32_tpl, stage, U32_ROW_BYTES, 0, 0, STAGE_U32);
-    noc.async_read_barrier();
-    {
-        const uint32_t bulk = (lo * 4) & ~(DRAM_READ_GRAIN - 1);
-        read_bytes(noc, u32_tpl, stage, bulk, 0, U32_ROW_BYTES, STAGE_U32);
+        // indexer_neg_mask: MASK everywhere, +0.0 for blocks below complete_blocks (the chain's 0 * MASK is +0.0)
+        {
+            const uint32_t zero_bytes = complete_blocks * 2;
+            const uint32_t bulk = zero_bytes & ~(DRAM_READ_GRAIN - 1);
+            read_bytes(noc, bf16_tpl, stage, bulk, 0, 0, STAGE_BF16);
+            for (uint32_t lane = bulk / 2; lane < complete_blocks; ++lane) {
+                halves[STAGE_BF16 / 2 + lane] = 0;
+            }
+        }
+        // the four one-hots: tile lane (row, 0) is 16-bit word (row >> 4) * 512 + (row & 15) * 16
+        const uint32_t kv_lane = (kv_row >> 4) * 512 + (kv_row & 15) * 16;
+        const uint32_t ring_lane = (ring_row >> 4) * 512 + (ring_row & 15) * 16;
+        volatile tt_l1_ptr uint16_t* zero_tile = halves + STAGE_TILES / 2;
+        volatile tt_l1_ptr uint16_t* ones_tile = halves + (STAGE_TILES + TILE_BYTES) / 2;
+        noc.async_read_barrier();  // the zero-lane bulk read landed before the mask row is written
+        write_bytes(noc, stage, o_mask, BF16_ROW_BYTES, STAGE_BF16, 0, 0);
+        zero_tile[kv_lane] = ONE_BF16;
+        write_bytes(noc, stage, o_kvhit, TILE_BYTES, STAGE_TILES, 0, 0);
+        ones_tile[kv_lane] = 0;
+        write_bytes(noc, stage, o_kvkeep, TILE_BYTES, STAGE_TILES + TILE_BYTES, 0, 0);
+        noc.async_write_barrier();
+        zero_tile[kv_lane] = 0;
+        ones_tile[kv_lane] = ONE_BF16;
+        zero_tile[ring_lane] = ONE_BF16;
+        write_bytes(noc, stage, o_rhit, TILE_BYTES, STAGE_TILES, 0, 0);
+        ones_tile[ring_lane] = 0;
+        write_bytes(noc, stage, o_rkeep, TILE_BYTES, STAGE_TILES + TILE_BYTES, 0, 0);
+
+        // row_keep_bits: zeros, ALL_ONES below lo
+        read_bytes(noc, u32_tpl, stage, U32_ROW_BYTES, 0, 0, STAGE_U32);
         noc.async_read_barrier();
-        for (uint32_t lane = bulk / 4; lane < lo; ++lane) {
-            words[STAGE_U32 / 4 + lane] = ALL_ONES;
+        {
+            const uint32_t bulk = (lo * 4) & ~(DRAM_READ_GRAIN - 1);
+            read_bytes(noc, u32_tpl, stage, bulk, 0, U32_ROW_BYTES, STAGE_U32);
+            noc.async_read_barrier();
+            for (uint32_t lane = bulk / 4; lane < lo; ++lane) {
+                words[STAGE_U32 / 4 + lane] = ALL_ONES;
+            }
         }
-    }
-    noc.async_write_barrier();  // the ring tiles are out before the staging tiles change again (none do) and before the u32 row is written
-    write_bytes(noc, stage, o_keep, U32_ROW_BYTES, STAGE_U32, 0, 0);
-    noc.async_write_barrier();
+        noc.async_write_barrier();  // the ring tiles are out before the staging tiles change again (none do) and before
+                                    // the u32 row is written
+        write_bytes(noc, stage, o_keep, U32_ROW_BYTES, STAGE_U32, 0, 0);
+        noc.async_write_barrier();
 
-    // row_fill: ALL_ONES from hi, slot + tail_shift on [lo, hi), zeros below lo
-    read_bytes(noc, u32_tpl, stage, U32_ROW_BYTES, 0, U32_ROW_BYTES, STAGE_U32);
-    noc.async_read_barrier();
-    {
-        const uint32_t bulk = (hi * 4) & ~(DRAM_READ_GRAIN - 1);
-        read_bytes(noc, u32_tpl, stage, bulk, 0, 0, STAGE_U32);
+        // row_fill: ALL_ONES from hi, slot + tail_shift on [lo, hi), zeros below lo
+        read_bytes(noc, u32_tpl, stage, U32_ROW_BYTES, 0, U32_ROW_BYTES, STAGE_U32);
         noc.async_read_barrier();
-        for (uint32_t lane = bulk / 4; lane < hi; ++lane) {
-            words[STAGE_U32 / 4 + lane] = 0;
+        {
+            const uint32_t bulk = (hi * 4) & ~(DRAM_READ_GRAIN - 1);
+            read_bytes(noc, u32_tpl, stage, bulk, 0, 0, STAGE_U32);
+            noc.async_read_barrier();
+            for (uint32_t lane = bulk / 4; lane < hi; ++lane) {
+                words[STAGE_U32 / 4 + lane] = 0;
+            }
+            for (uint32_t lane = lo; lane < hi; ++lane) {
+                words[STAGE_U32 / 4 + lane] = lane + tail_shift;
+            }
         }
-        for (uint32_t lane = lo; lane < hi; ++lane) {
-            words[STAGE_U32 / 4 + lane] = lane + tail_shift;
-        }
-    }
-    write_bytes(noc, stage, o_fill, U32_ROW_BYTES, STAGE_U32, 0, 0);
+        write_bytes(noc, stage, o_fill, U32_ROW_BYTES, STAGE_U32, 0, 0);
 
-    // RoPE rows: table row P and P & ~3 into row 0 of the two output tiles (faces 0 and 1 of each tile)
-    read_bytes(noc, cos_tbl, stage, ROPE_ROW_BYTES, p, 0, STAGE_ROPE);
-    read_bytes(noc, sin_tbl, stage, ROPE_ROW_BYTES, p, 0, STAGE_ROPE + ROPE_ROW_BYTES);
-    read_bytes(noc, cos_tbl, stage, ROPE_ROW_BYTES, block_start, 0, STAGE_ROPE + 2 * ROPE_ROW_BYTES);
-    read_bytes(noc, sin_tbl, stage, ROPE_ROW_BYTES, block_start, 0, STAGE_ROPE + 3 * ROPE_ROW_BYTES);
-    noc.async_read_barrier();
-    const uint32_t rope_src[4] = {STAGE_ROPE, STAGE_ROPE + ROPE_ROW_BYTES, STAGE_ROPE + 2 * ROPE_ROW_BYTES, STAGE_ROPE + 3 * ROPE_ROW_BYTES};
-    for (uint32_t face = 0; face < ROPE_DIM / 16; ++face) {  // face f: lanes 16f..16f+15 -> tile f/2, face f%2 row 0
-        const uint32_t page = face >> 1, offset = (face & 1) * 512;
-        write_bytes(noc, stage, o_cos, FACE_ROW_BYTES, rope_src[0] + face * FACE_ROW_BYTES, page, offset);
-        write_bytes(noc, stage, o_sin, FACE_ROW_BYTES, rope_src[1] + face * FACE_ROW_BYTES, page, offset);
-        write_bytes(noc, stage, o_bcos, FACE_ROW_BYTES, rope_src[2] + face * FACE_ROW_BYTES, page, offset);
-        write_bytes(noc, stage, o_bsin, FACE_ROW_BYTES, rope_src[3] + face * FACE_ROW_BYTES, page, offset);
+        // RoPE rows: table row P and P & ~3 into row 0 of the two output tiles (faces 0 and 1 of each tile)
+        read_bytes(noc, cos_tbl, stage, ROPE_ROW_BYTES, p, 0, STAGE_ROPE);
+        read_bytes(noc, sin_tbl, stage, ROPE_ROW_BYTES, p, 0, STAGE_ROPE + ROPE_ROW_BYTES);
+        read_bytes(noc, cos_tbl, stage, ROPE_ROW_BYTES, block_start, 0, STAGE_ROPE + 2 * ROPE_ROW_BYTES);
+        read_bytes(noc, sin_tbl, stage, ROPE_ROW_BYTES, block_start, 0, STAGE_ROPE + 3 * ROPE_ROW_BYTES);
+        noc.async_read_barrier();
+        const uint32_t rope_src[4] = {
+            STAGE_ROPE, STAGE_ROPE + ROPE_ROW_BYTES, STAGE_ROPE + 2 * ROPE_ROW_BYTES, STAGE_ROPE + 3 * ROPE_ROW_BYTES};
+        for (uint32_t face = 0; face < ROPE_DIM / 16;
+             ++face) {  // face f: lanes 16f..16f+15 -> tile f/2, face f%2 row 0
+            const uint32_t page = face >> 1, offset = (face & 1) * 512;
+            write_bytes(noc, stage, o_cos, FACE_ROW_BYTES, rope_src[0] + face * FACE_ROW_BYTES, page, offset);
+            write_bytes(noc, stage, o_sin, FACE_ROW_BYTES, rope_src[1] + face * FACE_ROW_BYTES, page, offset);
+            write_bytes(noc, stage, o_bcos, FACE_ROW_BYTES, rope_src[2] + face * FACE_ROW_BYTES, page, offset);
+            write_bytes(noc, stage, o_bsin, FACE_ROW_BYTES, rope_src[3] + face * FACE_ROW_BYTES, page, offset);
+        }
+        noc.async_write_barrier();
     }
-    noc.async_write_barrier();
     stage.push_back(1);
 }

@@ -38,6 +38,7 @@ from . import (
     gr_read,
     gr_write,
     greedy_tail,
+    moe_combine,
     moe_post,
     ple,
     position_derive,
@@ -45,6 +46,7 @@ from . import (
     router_tail,
     sampler_tail,
     shared_expert,
+    sparse_sdpa_tiled,
     untilize_rows,
 )
 from . import gr_fold  # after gr_read: it composes gr_read's programs
@@ -70,6 +72,7 @@ __all__ = [
     "greedy_tail",
     "kernel",
     "kernels",
+    "moe_combine",
     "moe_post",
     "ple",
     "position_derive",
@@ -80,6 +83,7 @@ __all__ = [
     "router_tail",
     "sampler_tail",
     "shared_expert",
+    "sparse_sdpa_tiled",
     "untilize_rows",
     "AdmittedStep",
     "resolve_admitted",

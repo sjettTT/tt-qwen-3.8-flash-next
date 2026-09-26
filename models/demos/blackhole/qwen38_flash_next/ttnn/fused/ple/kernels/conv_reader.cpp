@@ -19,6 +19,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t T = get_compile_time_arg_val(0);
 constexpr uint32_t SHIFT = get_compile_time_arg_val(1);
@@ -79,16 +80,20 @@ void kernel_main() {
     const auto c3 = TensorAccessor(a1, get_arg_val<uint32_t>(1));
     const auto c6 = TensorAccessor(a2, get_arg_val<uint32_t>(2));
     const auto n = TensorAccessor(a3, get_arg_val<uint32_t>(3));
-    stream(noc, c0, 0, first);
-    stream(noc, c3, 1, first);
-    stream(noc, c6, 2, first);
-    stream(noc, n, 3, first);
-    stream(noc, TensorAccessor(a4, get_arg_val<uint32_t>(4)), 4, tap_first);
-    stream(noc, TensorAccessor(a5, get_arg_val<uint32_t>(5)), 5, tap_first);
-    stream(noc, TensorAccessor(a6, get_arg_val<uint32_t>(6)), 6, tap_first);
-    stream(noc, TensorAccessor(a7, get_arg_val<uint32_t>(7)), 7, tap_first);
-    stream(noc, TensorAccessor(a8, get_arg_val<uint32_t>(8)), 8, first);
+    {
+        FUSED_ZONE("fz_pl_conv_r_streams");
+        stream(noc, c0, 0, first);
+        stream(noc, c3, 1, first);
+        stream(noc, c6, 2, first);
+        stream(noc, n, 3, first);
+        stream(noc, TensorAccessor(a4, get_arg_val<uint32_t>(4)), 4, tap_first);
+        stream(noc, TensorAccessor(a5, get_arg_val<uint32_t>(5)), 5, tap_first);
+        stream(noc, TensorAccessor(a6, get_arg_val<uint32_t>(6)), 6, tap_first);
+        stream(noc, TensorAccessor(a7, get_arg_val<uint32_t>(7)), 7, tap_first);
+        stream(noc, TensorAccessor(a8, get_arg_val<uint32_t>(8)), 8, first);
+    }
     if constexpr (INJECT) {
+        FUSED_ZONE("fz_pl_conv_r_residual");
         const auto residual = TensorAccessor(a15, get_arg_val<uint32_t>(15));
         DataflowBuffer resid(19);
         resid.reserve_back(4);
@@ -99,6 +104,7 @@ void kernel_main() {
         resid.push_back(4);
     }
     if constexpr (SHIFT) {
+        FUSED_ZONE("fz_pl_conv_r_shift");
         const auto c1 = TensorAccessor(a9, get_arg_val<uint32_t>(9));
         const auto c2 = TensorAccessor(a10, get_arg_val<uint32_t>(10));
         const auto c4 = TensorAccessor(a11, get_arg_val<uint32_t>(11));

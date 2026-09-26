@@ -10,6 +10,7 @@
 #include "api/dataflow/dataflow_api.h"
 #include "api/tensor/noc_traits.h"
 #include "tile_rows.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t gathered_addr = get_arg_val<uint32_t>(0);
@@ -29,6 +30,7 @@ void kernel_main() {
     cb_push_back(CB_ZERO, 1);
     for (uint32_t chunk = first_chunk; chunk < first_chunk + chunks; ++chunk) {
         for (uint32_t r = 0; r < rows; ++r) {
+            FUSED_ZONE("fz_qs_sm_r_row");
             cb_reserve_back(CB_IN, DEVICES);
             cb_reserve_back(CB_MASK, 1);
             const uint32_t in_l1 = get_write_ptr(CB_IN);

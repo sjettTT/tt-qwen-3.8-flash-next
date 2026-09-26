@@ -21,13 +21,7 @@
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
 
-// Per-phase device profiler zones (study build: QWEN38_MOE_POST_ZONES=1 defines FMP_ZONES); the served build has none.
-#ifdef FMP_ZONES
-#include "tools/profiler/kernel_profiler.hpp"
-#define FMP_ZONE(name) DeviceZoneScopedN(name)
-#else
-#define FMP_ZONE(name)
-#endif
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t pages_addr = get_arg_val<uint32_t>(0);
@@ -92,7 +86,7 @@ void kernel_main() {
     uint32_t route_words = route_pitch / 2;  // uint16 per staged routing row
     uint32_t owned[32];
     {
-        FMP_ZONE("fmp_r_setup");
+        FUSED_ZONE("fz_mp_r_setup");
         // the shared partial tile (and the sigmoid tile) first: the reads overlap the routing work
         shared_tile.reserve_back(1);
         noc.async_read(
@@ -136,7 +130,7 @@ void kernel_main() {
     }
 
     {
-        FMP_ZONE("fmp_r_scores");
+        FUSED_ZONE("fz_mp_r_scores");
         // deepseek_moe_fast_reduce_nc_fused_reader.cpp: tile k, column 0, row j = score[j][k] when the expert is on
         // this device's axis, else bf16 +0.0 (the zero seed; rows past the tokens stay +0.0); the other columns are
         // never read (COL broadcast)
@@ -162,7 +156,7 @@ void kernel_main() {
     }
 
     {
-        FMP_ZONE("fmp_r_frag_dram");
+        FUSED_ZONE("fz_mp_r_frag_dram");
         // owned fragments: 64-byte reads (DRAM read alignment) into a 64-byte-aligned staging area, then each 32-byte
         // half into face (j / 16) * 2 and (j / 16) * 2 + 1, row j % 16, of the slot's tile
         stage.reserve_back(stage_pages);
@@ -184,7 +178,7 @@ void kernel_main() {
         noc.async_read_barrier();  // the zero pages and the fragments have landed
     }
     {
-        FMP_ZONE("fmp_r_frag_place");
+        FUSED_ZONE("fz_mp_r_frag_place");
         n = 0;
         for (uint32_t j = 0; j < rows; ++j) {
             for (uint32_t k = 0; k < top_k; ++k) {

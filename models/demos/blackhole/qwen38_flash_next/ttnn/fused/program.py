@@ -10,10 +10,19 @@ or a descriptor is picked up by the JIT.
 
 Rows contract: every decode activation is one 32-row tile with ``rows`` valid rows (1 for decode, up to 32 for lanes
 and MTP verify); ``rows_of`` reads and checks it.  A kernel takes the padded tile and produces only the valid rows.
+
+Legibility: the device profiler and tt-perf-report see every fused program as ``GenericOp`` with ``runtime_id=N`` for
+its attributes (generic_op's operation attributes are the descriptor, which the profiler cannot reflect), so each
+builder states what its program is with ``run_program(io, descriptor, meta=program_meta(...))``: the kernel, the
+program form, the rows, the DRAM and L1 bytes the descriptor addresses and the arithmetic it issues, by construction
+from the builder's shapes.  With recording on (``record_program_meta``; the census switches it on around its
+captures, the served process never pays for it) every launch is recorded in call order with the device operation id it
+took -- the program's runtime id, the census's ``base`` -- and the census joins its per-program rows to the records.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -178,8 +187,25 @@ def _named(named_compile_time_args) -> list[tuple[str, int]]:
     return [(str(name), int(value)) for name, value in items]
 
 
+# The study build's per-phase device profiler zones: every fused kernel marks its phases with FUSED_ZONE(name)
+# (``kernels/zones.h``), which is DeviceZoneScopedN under the define QWEN38_FUSED_ZONES and nothing otherwise.  The
+# define goes on every kernel descriptor built here when the environment says QWEN38_FUSED_ZONES=1 (the census's zones
+# arm); with it unset the descriptors are the served build's, byte for byte.
+ZONES_ENV = "QWEN38_FUSED_ZONES"
+ZONES_DEFINE = "QWEN38_FUSED_ZONES"
+
+
+def zone_defines(environ=None) -> list[tuple[str, str]]:
+    """``[(QWEN38_FUSED_ZONES, 1)]`` when the environment (default ``os.environ``) says ``QWEN38_FUSED_ZONES=1``, else ``[]``."""
+
+    import os
+
+    return [(ZONES_DEFINE, "1")] if (os.environ if environ is None else environ).get(ZONES_ENV) == "1" else []
+
+
 def _kernel(source, cores, compile_time_args, runtime_args, defines, config, named=()) -> ttnn.KernelDescriptor:
-    """``named`` = named compile-time args (``get_named_compile_time_arg_val`` in the kernel), a dict or pairs."""
+    """``named`` = named compile-time args (``get_named_compile_time_arg_val`` in the kernel), a dict or pairs; the
+    zone define is appended when the study build asks for it (``zone_defines``)."""
 
     return ttnn.KernelDescriptor(
         kernel_source=source,
@@ -187,7 +213,7 @@ def _kernel(source, cores, compile_time_args, runtime_args, defines, config, nam
         core_ranges=cores,
         compile_time_args=[int(a) for a in compile_time_args],
         named_compile_time_args=_named(named),
-        defines=list(defines),
+        defines=[*defines, *zone_defines()],
         runtime_args=[(core, [int(a) for a in args]) for core, args in runtime_args],
         config=config,
     )
@@ -265,10 +291,133 @@ def stamp_topology(tensor, reference, shard_dim: int | None = None):
     return tensor
 
 
-def run_program(io_tensors: Sequence, descriptor: ttnn.ProgramDescriptor):
-    """Inputs first, pre-allocated outputs last; returns the last tensor."""
+# ---------------------------------------------------------------- what a program is and what it moves (the census's legibility)
 
-    return ttnn.generic_op(list(io_tensors), descriptor)
+
+@dataclass(frozen=True)
+class FusedProgramMeta:
+    """One fused program as its builder states it, by construction from the shapes the descriptor was built from.
+
+    ``kernel`` is the registry name the program serves (the module's ``NAME``; the QSA block's helpers that are not a
+    registered kernel of their own say ``qsa_block``), ``variant`` the program form (one name per builder), ``rows``
+    the valid rows served (1 = the decode step).  ``dram_bytes`` = the DRAM bytes the descriptor addresses, reads and
+    writes (an operand every core streams counts once per core; a data-dependent partial read counts at its bound);
+    ``l1_bytes`` = the bytes moved through L1 besides that: L1-resident operands read or written, multicasts and
+    core-to-core hand-offs; ``flops`` = the arithmetic issued (a matmul 2MNK, a reduction or an elementwise pass one
+    operation per element; 0 for data movement).  OUR model of the program, not the profiler's: the census divides
+    these by the measured kernel time for achieved GB/s and TFLOPs."""
+
+    kernel: str
+    variant: str
+    rows: int
+    dram_bytes: int
+    l1_bytes: int
+    flops: int
+    cores: int = 0  # the cores the program runs on (0 = not stated)
+
+
+@dataclass(frozen=True)
+class FusedProgramRecord:
+    """One recorded launch: the device operation ids ``[first_id, end_id)`` the launch spanned (``first_id`` is the
+    program's runtime id, the census's ``base``) and its meta."""
+
+    first_id: int
+    end_id: int
+    meta: FusedProgramMeta
+
+    def covers(self, base: int) -> bool:
+        return self.first_id <= base < self.end_id
+
+
+_META_RECORDS: list[FusedProgramRecord] = []
+_META_RECORDING = False
+
+
+def tensor_bytes(tensor) -> int:
+    """The bytes of ``tensor``'s padded volume in its dtype (block floats by whole tiles)."""
+
+    volume = math.prod(int(v) for v in _padded_shape(tensor))
+    if tensor.dtype in ELEMENT_BYTES:
+        return volume * ELEMENT_BYTES[tensor.dtype]
+    if tensor.dtype in TILE_BYTES:
+        return volume // (TILE * TILE) * TILE_BYTES[tensor.dtype]
+    raise ValueError(f"no byte size for dtype {tensor.dtype}")
+
+
+def in_l1(tensor) -> bool:
+    """Whether ``tensor``'s buffer lives in L1 (a host fake without a memory config counts as DRAM)."""
+
+    try:
+        return tensor.memory_config().buffer_type == ttnn.BufferType.L1
+    except (AttributeError, RuntimeError, TypeError):
+        return False
+
+
+def program_meta(
+    kernel: str,
+    variant: str,
+    rows: int,
+    *,
+    reads: Iterable = (),
+    writes: Iterable = (),
+    partial: Iterable = (),
+    flops: int = 0,
+    dram_bytes: int = 0,
+    l1_bytes: int = 0,
+    cores: int = 0,
+) -> FusedProgramMeta:
+    """The meta of one program: every tensor of ``reads`` and ``writes`` once and every ``(tensor, bytes)`` of
+    ``partial`` (a window of a tensor) at those bytes, to ``dram_bytes`` or ``l1_bytes`` by where the tensor's buffer
+    lives, plus the explicit bytes (per-core re-reads of an operand, multicasts) and the FLOPs the builder states."""
+
+    dram, l1 = int(dram_bytes), int(l1_bytes)
+    for tensor, count in [*((t, None) for t in (*reads, *writes)), *partial]:
+        size = tensor_bytes(tensor) if count is None else int(count)
+        if in_l1(tensor):
+            l1 += size
+        else:
+            dram += size
+    if dram < 0 or l1 < 0 or int(flops) < 0 or int(rows) < 1:
+        raise ValueError(f"program meta of {kernel}/{variant}: bytes and flops must be >= 0 and rows >= 1")
+    return FusedProgramMeta(str(kernel), str(variant), int(rows), dram, l1, int(flops), int(cores))
+
+
+def record_program_meta(enabled: bool = True) -> None:
+    """Switch the recording of launches on (the census, around its captures) or off (the default: no host cost)."""
+
+    global _META_RECORDING
+    _META_RECORDING = bool(enabled)
+
+
+def program_meta_recording() -> bool:
+    return _META_RECORDING
+
+
+def reset_program_meta() -> None:
+    _META_RECORDS.clear()
+
+
+def program_meta_records() -> tuple[FusedProgramRecord, ...]:
+    """Every launch recorded since the last reset, in call order."""
+
+    return tuple(_META_RECORDS)
+
+
+def _device_operation_id() -> int:
+    return int(ttnn._ttnn.get_device_operation_id())
+
+
+def run_program(io_tensors: Sequence, descriptor, *, meta: FusedProgramMeta | None = None):
+    """Inputs first, pre-allocated outputs last; returns the last tensor.  ``descriptor`` is a ProgramDescriptor or a
+    MeshProgramDescriptor; ``meta`` (``program_meta``) is recorded with the launch's device operation ids while
+    recording is on."""
+
+    if not _META_RECORDING or meta is None:
+        return ttnn.generic_op(list(io_tensors), descriptor)
+    first = _device_operation_id()
+    result = ttnn.generic_op(list(io_tensors), descriptor)
+    _META_RECORDS.append(FusedProgramRecord(first, max(first + 1, _device_operation_id()), meta))
+    return result
 
 
 def traced_us_per_call(mesh, call, *, calls: int = 20, replays: int = 10, release=None) -> float:

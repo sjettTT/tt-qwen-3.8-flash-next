@@ -11,6 +11,7 @@
 //   the fabric connection (ttnn.setup_fabric_connection) when this RISC's direction has peers.
 
 #include "transport_phase.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t SCRATCH_CB = get_compile_time_arg_val(0);
 constexpr uint32_t TILES = get_compile_time_arg_val(1);
@@ -38,8 +39,22 @@ void kernel_main() {
     if (delay_before_arrive != 0) {
         riscv_wait(delay_before_arrive);
     }
-    line.arrive(get_arg_val<uint32_t>(PHASE_RT + 2));
-    transport_phase<SCRATCH_CB, TILES, TILE_FIRST, TILE_STEP, PAGE_TILE_STRIDE, PAGE_RANK_STRIDE, SOURCE, RING, SEM_GO, SEM_SCRATCH, SEM_DONE, true>(
-        line, out_args, local_args, PHASE_RT, delay_after_reset);
+    {
+        FUSED_ZONE("fz_gf_tr_main");
+        line.arrive(get_arg_val<uint32_t>(PHASE_RT + 2));
+        transport_phase<
+            SCRATCH_CB,
+            TILES,
+            TILE_FIRST,
+            TILE_STEP,
+            PAGE_TILE_STRIDE,
+            PAGE_RANK_STRIDE,
+            SOURCE,
+            RING,
+            SEM_GO,
+            SEM_SCRATCH,
+            SEM_DONE,
+            true>(line, out_args, local_args, PHASE_RT, delay_after_reset);
+    }
     noc_async_full_barrier();
 }

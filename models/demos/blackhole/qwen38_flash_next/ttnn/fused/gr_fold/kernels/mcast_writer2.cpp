@@ -15,6 +15,7 @@
 // NoC (x, y) for the gate increment.
 
 #include "../../gr_read/kernels/mcast_phase.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t GATE_SEM = get_compile_time_arg_val(12);
 constexpr uint32_t ACCESSOR_BASE = 13;
@@ -24,24 +25,30 @@ void kernel_main() {
     constexpr auto a_extra = TensorAccessorArgs<a_tiles.next_compile_time_args_offset()>();
     constexpr auto b_tiles = TensorAccessorArgs<a_extra.next_compile_time_args_offset()>();
     constexpr auto b_extra = TensorAccessorArgs<b_tiles.next_compile_time_args_offset()>();
-    mcast_phase<
-        get_compile_time_arg_val(0),
-        get_compile_time_arg_val(1),
-        get_compile_time_arg_val(2),
-        get_compile_time_arg_val(3),
-        get_compile_time_arg_val(4),
-        get_compile_time_arg_val(5)>(a_tiles, a_extra, 0);
+    {
+        FUSED_ZONE("fz_gf_mw2_stats");
+        mcast_phase<
+            get_compile_time_arg_val(0),
+            get_compile_time_arg_val(1),
+            get_compile_time_arg_val(2),
+            get_compile_time_arg_val(3),
+            get_compile_time_arg_val(4),
+            get_compile_time_arg_val(5)>(a_tiles, a_extra, 0);
+    }
     if constexpr (GATE_SEM != 0xFF) {
         Noc noc;
         Semaphore<> gate(GATE_SEM);
         gate.up(noc, get_arg_val<uint32_t>(26), get_arg_val<uint32_t>(27), 1);
         noc.async_atomic_barrier();
     }
-    mcast_phase<
-        get_compile_time_arg_val(6),
-        get_compile_time_arg_val(7),
-        get_compile_time_arg_val(8),
-        get_compile_time_arg_val(9),
-        get_compile_time_arg_val(10),
-        get_compile_time_arg_val(11)>(b_tiles, b_extra, 13);
+    {
+        FUSED_ZONE("fz_gf_mw2_partials");
+        mcast_phase<
+            get_compile_time_arg_val(6),
+            get_compile_time_arg_val(7),
+            get_compile_time_arg_val(8),
+            get_compile_time_arg_val(9),
+            get_compile_time_arg_val(10),
+            get_compile_time_arg_val(11)>(b_tiles, b_extra, 13);
+    }
 }

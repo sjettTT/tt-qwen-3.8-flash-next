@@ -190,7 +190,18 @@ def position_derive(position, cos_table, sin_table, *, blocks: int, memory_confi
     compile_args = [a for t in tensors for a in fp.accessor_args(t)]
     reader = fp.reader_kernel(KERNEL, grid, compile_args, [(core, [t.buffer_address() for t in tensors])], named=named)
     cbs = [fp.cb_descriptor(CB_STAGE, ttnn.bfloat16, STAGE_PAGE_BYTES, STAGE_PAGES, grid)]
-    fp.run_program(tensors, fp.program_descriptor([reader], cbs=cbs))
+    # the position, the templates and the four table rows (two 128-byte rows per table) in, every output page out;
+    # integer and copy work only
+    meta = fp.program_meta(
+        NAME,
+        "derive",
+        1,
+        reads=(position, bf16_tpl, u32_tpl, tile_tpl),
+        writes=tuple(outs.values()),
+        dram_bytes=4 * ROPE_DIM * 2,
+        cores=1,
+    )
+    fp.run_program(tensors, fp.program_descriptor([reader], cbs=cbs), meta=meta)
     topology = position.tensor_topology()
     for tensor in outs.values():
         tensor.update_tensor_topology(topology)  # generic_op leaves the allocation's placement; these are replicated
@@ -273,7 +284,24 @@ def position_derive_lanes(
         named=named,
     )
     cbs = [fp.cb_descriptor(CB_STAGE, ttnn.bfloat16, STAGE_PAGE_BYTES, LANES_STAGE_PAGES, grid_set)]
-    fp.run_program(tensors, fp.program_descriptor([reader], cbs=cbs))
+    # per lane core: the position and offsets rows, the templates and its four table rows in; every output page out
+    meta = fp.program_meta(
+        NAME,
+        "derive_lanes",
+        lanes,
+        writes=tuple(outs.values()),
+        dram_bytes=TILE
+        * (
+            fp.tensor_bytes(position_row)
+            + fp.tensor_bytes(lane_offsets)
+            + fp.tensor_bytes(bf16_tpl)
+            + fp.tensor_bytes(u32_tpl)
+            + fp.tensor_bytes(tile_tpl)
+            + 4 * ROPE_DIM * 2
+        ),
+        cores=TILE,
+    )
+    fp.run_program(tensors, fp.program_descriptor([reader], cbs=cbs), meta=meta)
     topology = position_row.tensor_topology()
     for tensor in outs.values():
         tensor.update_tensor_topology(topology)  # generic_op leaves the allocation's placement; these are replicated
@@ -445,9 +473,11 @@ def advance(position, count: int = 1):
         [(core, [position.buffer_address()])],
         named={"cb_stage": CB_STAGE, "count": count},
     )
+    meta = fp.program_meta(ADVANCE_NAME, "advance", 1, reads=(position,), writes=(position,), flops=1, cores=1)
     fp.run_program(  # generic_op wants an input and an output: the resident scalar is both (read, then written)
         [position, position],
         fp.program_descriptor([kernel], cbs=[fp.cb_descriptor(CB_STAGE, ttnn.uint32, ADVANCE_STAGE_BYTES, 1, one)]),
+        meta=meta,
     )
     return position
 

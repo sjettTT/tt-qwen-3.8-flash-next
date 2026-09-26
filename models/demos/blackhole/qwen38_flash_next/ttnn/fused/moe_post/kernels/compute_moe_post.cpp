@@ -28,13 +28,7 @@
 #include "api/compute/pack.h"
 #include "api/dataflow/dataflow_buffer.h"
 
-// Per-phase device profiler zones (study build: QWEN38_MOE_POST_ZONES=1 defines FMP_ZONES); the served build has none.
-#ifdef FMP_ZONES
-#include "tools/profiler/kernel_profiler.hpp"
-#define FMP_ZONE(name) DeviceZoneScopedN(name)
-#else
-#define FMP_ZONE(name)
-#endif
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     constexpr uint32_t cb_act = get_named_compile_time_arg_val("cb_act");
@@ -63,12 +57,12 @@ void kernel_main() {
         cb_act, cb_scores, 1 /*acc_to_dest*/)));
     reconfig_data_format(cb_act, cb_scores);
     {
-        FMP_ZONE("fmp_c_wait");
+        FUSED_ZONE("fz_mp_c_wait");
         scores.wait_front(top_k);
         act.wait_front(top_k);
     }
     {
-        FMP_ZONE("fmp_c_mac");
+        FUSED_ZONE("fz_mp_c_mac");
         tile_regs_acquire();
         for (uint32_t k = 0; k < top_k; ++k) {
             mul_tiles_bcast_cols(cb_act, cb_scores, k, k, 0);
@@ -85,7 +79,7 @@ void kernel_main() {
     }
 
     {
-        FMP_ZONE("fmp_c_sig");
+        FUSED_ZONE("fz_mp_c_sig");
         // ---- binary_ng SFPU multiply of the ungated shared partial by its broadcast sigmoid (has_sig) ----
         shared.wait_front(1);
         if constexpr (has_sig) {
@@ -113,7 +107,7 @@ void kernel_main() {
     }
 
     {
-        FMP_ZONE("fmp_c_add");
+        FUSED_ZONE("fz_mp_c_add");
         // ---- binary_ng eltwise_binary_no_bcast.cpp: FPU ELWADD of the routed and the shared tile ----
         routed.wait_front(1);
         out.reserve_back(1);

@@ -198,6 +198,7 @@ def router_tail_program(logits, index_template, scores, indices, *, rows: int, t
             core_ranges=grid,
             compile_time_args=[int(a) for a in compile_time_args],
             named_compile_time_args=named,
+            defines=fp.zone_defines(),  # the study build's phase zones (kernels/zones.h), nothing otherwise
             runtime_args=runtime_args,
             config=config,
         )
@@ -215,7 +216,7 @@ def router_tail_program(logits, index_template, scores, indices, *, rows: int, t
         ttnn.WriterConfigDescriptor(),
     )
     compute = kernel(KERNELS["compute"], [], per_core(lambda _t, _r, p, _m: [p]), compute_config)
-    compute.defines = _dev_defines()
+    compute.defines = _dev_defines() + fp.zone_defines()
     return fp.program_descriptor([reader, writer, compute], cbs=cbs)
 
 
@@ -281,9 +282,24 @@ def router_tail_into(logits, scores, indices, *, top_k: int = TOP_K):
                 f"router tail {name} output must be ROW_MAJOR {dtype} [.., {rows}, {top_k}], got {list(shape)} {tensor.dtype}"
             )
     index_template = router_tail_prepare(logits.device())
+    plan, lanes = _core_plan(rows)
+    # every core streams the logits tile row (the fp32 tiles, or the router linear's bf16 L1 shard) and the index
+    # template; the scores and indices rows out; per token the softmax (max, exp, sum, reciprocal, scale), the
+    # bitonic top-k over the 16 width tiles and the sum / division / typecasts of the k scores
+    meta = fp.program_meta(
+        NAME,
+        "lanes" if lanes else "single_core",
+        rows,
+        writes=(scores, indices),
+        dram_bytes=len(plan) * (fp.tensor_bytes(index_template) + (0 if fp.in_l1(logits) else fp.tensor_bytes(logits))),
+        l1_bytes=len(plan) * fp.tensor_bytes(logits) if fp.in_l1(logits) else 0,
+        flops=rows * EXPERTS * (5 + 2 * WIDTH_TILES) + rows * top_k * 3,
+        cores=len(plan),
+    )
     fp.run_program(
         [logits, index_template, scores, indices],
         router_tail_program(logits, index_template, scores, indices, rows=rows, top_k=top_k),
+        meta=meta,
     )
     return scores, indices
 

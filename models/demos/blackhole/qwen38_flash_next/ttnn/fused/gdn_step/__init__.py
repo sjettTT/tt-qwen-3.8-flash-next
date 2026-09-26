@@ -167,8 +167,6 @@ def run(projected, older, newest, taps, constants, norm, recurrent, out, *, debu
     writer_cta = [rows, *fp.accessor_args(recurrent), *fp.accessor_args(out)]
     writer_addrs = [recurrent.buffer_address(), out.buffer_address()]
     defines = [("INP_FLOAT32", "1")]
-    if os.environ.get("QWEN38_GDN_STEP_ZONES") == "1":  # study: per-phase device profiler zones in the compute kernel
-        defines.append(("FGS_ZONES", "1"))
     cbs = [fp.cb_descriptor(index, dtype, fp.TILE_BYTES[dtype], pages, cores) for index, dtype, pages in CBS]
     # the new state is read back by the compute (CB_SNEW) and drained by the writer (CB_OUTS): one allocation
     cbs.append(
@@ -204,7 +202,21 @@ def run(projected, older, newest, taps, constants, norm, recurrent, out, *, debu
     io = [projected, *older, *taps, constants, norm, recurrent, newest]
     if debug is not None:
         io.append(debug)
-    fp.run_program([*io, out], fp.program_descriptor([reader, writer, compute], cbs))
+    # the projection, the ring slots and the taps once (each core its head's columns), the fp32 state read and
+    # written in place, the newest slot and the output written, the constant tiles once per core; per lane: the
+    # 4-tap conv, the two l2 norms, the fp32 delta-rule update (outer products, decay, delta) and read-out on 12
+    # heads of 128 x 128, the gated norm
+    meta = fp.program_meta(
+        NAME,
+        "step",
+        rows,
+        reads=(projected, *older, *taps, norm, recurrent),
+        writes=(recurrent, newest, out, *([debug] if debug is not None else [])),
+        dram_bytes=len(work) * 2 * fp.TILE_BYTES[FP32],
+        flops=rows * (2 * 4 * QKV_WIDTH + 6 * 2 * QK_WIDTH + 8 * HEADS * HEAD_DIM * HEAD_DIM + 6 * VALUE_WIDTH),
+        cores=len(work),
+    )
+    fp.run_program([*io, out], fp.program_descriptor([reader, writer, compute], cbs), meta=meta)
     return out
 
 

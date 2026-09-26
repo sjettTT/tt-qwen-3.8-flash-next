@@ -25,7 +25,8 @@ Every number here was measured on 4x p150 unless a date and host say otherwise.
 
 Decode chains run as fused programs (`ttnn/fused/`, built on `ttnn.generic_op`) where a kernel is bitwise against the
 chain it replaces on device, leaves every pinned table above unchanged and beats the previous step time in its own
-timing slot. On by default: `gr_read` with `gr_fold`, `gr_write`, `greedy_tail`, `moe_post`, `ple`, `position_derive`,
+timing slot. On by default: `gr_read` with `gr_fold`, `gr_write`, `greedy_tail`, `moe_combine` (the prefill slab's
+MoE combine as one program), `moe_post`, `ple`, `position_derive`,
 `qsa_block`, `router_tail`, `shared_expert`: the gated-residual read as two programs with its two all-gathers inside
 them (the stats, their gather, normalize + down-project and the partial gather as one program whose transport cores send
 the tiles over the 1D fabric line into the pages the stock collectives write, then low-rank + gate: 18 programs per read
@@ -85,6 +86,37 @@ token on the 200-step pin recipe (36.8 tokens/s greedy), flat with depth; the de
 tokens/s sampled) on both model cards (thinking; instruct with its presence penalty); the batched-decode lane body at
 4 / 8 lanes 34.6 / 42.7 ms per step, 28.9 / 23.4 tokens/s per user and 116 / 187 aggregate (the chat server serves one
 stream; the lane sweep measures the lane body directly).
+
+The slab's one-pass MoE combine (`moe_combine`, the default since 2026-09-26; `QWEN38_FUSED_OFF=moe_combine` restores the
+512-row blocks) is bitwise class: it issues the fused reduce's own multiply-accumulate in its slot order on the
+page's owned rows, and the line gate of 2026-09-26 (4x p150, 32k context, `--prefill-slab 2048`) read the twelve
+acceptance records, the 3232 agreement columns and the four probes identical to the blocks', with the attention
+identity through the stack unchanged; TTFT at 31,716 tokens 14.30 -> 12.38 s (`PREFILL.md`).
+
+## The slab's block-shared attention (`QWEN38_FUSED=sparse_sdpa_tiled`, 2026-09-25)
+
+A tolerance-class fused kernel, opt-in: `sparse_sdpa_tiled` replaces the prefill slab's block-id expansion, zero V
+half, head pad, `sparse_sdpa` and head slice with one program per QSA layer (`PREFILL.md`).  The attended set per query
+and the bf16 scores are the chain's; the flash loop's order and chunk size differ, so the running max / sum / out round
+elsewhere.  Judged as the slab itself is (the long windows against the references) and, per layer, against an fp32
+oracle on the same bf16 inputs, where it must be no farther than the chain: on a QuietBox 2 die (2x p300c) with the
+captured slab selections it reads PCC 0.99979 against the oracle (the chain 0.99978), row rel_err p50 0.021 (0.022),
+PCC 0.99954 against the chain at P = 28672 and 0.99988 at P = 0; bit-exact run to run and across trace replays.  The
+chunk forms and the decode path never see it.
+
+The line gate (4x p150, 32k context, `--prefill-slab 2048`, 2026-09-26; the chain as the control; acceptance pins
+12/12 and the acceptance columns identical on every arm; the 31,716-token long part identical through the first slab
+and diverging from position 8128, where a query first attends across a slab boundary):
+
+| arm | KL control -> arm, mean / max (long part) | top-1 vs the control | top-1 vs HF | TTFT 31,716 tokens | attention per 2048-row slab (device profiler, the prompt's first slab, 12 layers) |
+|---|---|---|---|---|---|
+| control (the chain) | - | - | 0.9875 | 15.92 s | 89.77 ms (`sparse_sdpa` 81.14 + expansion, pad, concat, slice 8.63); the slab's kernel time 899.5 ms |
+| kernel, HiFi4 / fp32 DEST (`QWEN38_SPARSE_SDPA_TILED_FIDELITY=hifi4`) | 0.0059 / 0.55 | 159/160 | 0.9812 | 14.36 s | 18.45 ms; 818.6 ms |
+| kernel, HiFi2 / bf16 DEST (the default) | 0.0028 / 0.084 | 160/160 | 0.9875 | 14.25 s | 16.28 ms; 816.6 ms (2,257 -> 2,484 tok/s over the slab) |
+
+The HiFi2 form is the default: closer to the control and to the reference than the HiFi4 form (whose fp32
+destination changes where the scores round) and 10 % faster to the first token at 32k; under the device profiler the
+attention class of one slab is 5.5x shorter than the chain's (89.77 -> 16.28 ms) and the slab's kernel time 9 % shorter.
 
 ## The acceptance mechanism
 

@@ -14,6 +14,7 @@
 //   B's block (transport_phase.h: 6 words + the consumers' (x, y) pairs each), then the fabric connection.
 
 #include "transport_phase.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t SEM_GO = get_compile_time_arg_val(0);
 constexpr uint32_t RING = get_compile_time_arg_val(1);
@@ -52,11 +53,39 @@ void kernel_main() {
     if (delay_before_arrive != 0) {
         riscv_wait(delay_before_arrive);
     }
-    line.arrive(get_arg_val<uint32_t>(A_RT + 2));
-    line.arrive(get_arg_val<uint32_t>(b_rt + 2));
-    transport_phase<A_SCRATCH_CB, A_TILES, TILE_FIRST, TILE_STEP, A_PAGE_TILE_STRIDE, A_PAGE_RANK_STRIDE, A_SOURCE, RING, SEM_GO, A_SEM_SCRATCH, SEM_DONE, false>(
-        line, a_out_args, a_local_args, A_RT, delay_after_reset);
-    transport_phase<B_SCRATCH_CB, B_TILES, TILE_FIRST, TILE_STEP, B_PAGE_TILE_STRIDE, B_PAGE_RANK_STRIDE, B_SOURCE, RING, SEM_GO, B_SEM_SCRATCH, SEM_DONE, true>(
-        line, b_out_args, b_local_args, b_rt, 0);
+    {
+        FUSED_ZONE("fz_gf_tr2_stats");
+        line.arrive(get_arg_val<uint32_t>(A_RT + 2));
+        line.arrive(get_arg_val<uint32_t>(b_rt + 2));
+        transport_phase<
+            A_SCRATCH_CB,
+            A_TILES,
+            TILE_FIRST,
+            TILE_STEP,
+            A_PAGE_TILE_STRIDE,
+            A_PAGE_RANK_STRIDE,
+            A_SOURCE,
+            RING,
+            SEM_GO,
+            A_SEM_SCRATCH,
+            SEM_DONE,
+            false>(line, a_out_args, a_local_args, A_RT, delay_after_reset);
+    }
+    {
+        FUSED_ZONE("fz_gf_tr2_partials");
+        transport_phase<
+            B_SCRATCH_CB,
+            B_TILES,
+            TILE_FIRST,
+            TILE_STEP,
+            B_PAGE_TILE_STRIDE,
+            B_PAGE_RANK_STRIDE,
+            B_SOURCE,
+            RING,
+            SEM_GO,
+            B_SEM_SCRATCH,
+            SEM_DONE,
+            true>(line, b_out_args, b_local_args, b_rt, 0);
+    }
     noc_async_full_barrier();
 }

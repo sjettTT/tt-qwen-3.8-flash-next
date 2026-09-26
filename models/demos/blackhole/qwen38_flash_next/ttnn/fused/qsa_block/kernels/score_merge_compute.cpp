@@ -13,6 +13,7 @@
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "api/compute/tile_move_copy.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t rows = get_arg_val<uint32_t>(0);
@@ -21,6 +22,7 @@ void kernel_main() {
     compute_kernel_hw_startup(CB_IN, CB_ZERO, CB_SUM);
     cb_wait_front(CB_ZERO, 1);
     for (uint32_t r = 0; r < rows * chunks; ++r) {  // the reader streams the core's chunks one after another, rows within a chunk
+        FUSED_ZONE("fz_qs_sm_c_row");
         cb_wait_front(CB_IN, DEVICES);
         cb_reserve_back(CB_SUM, 1);
         reconfig_data_format(CB_IN, CB_ZERO);

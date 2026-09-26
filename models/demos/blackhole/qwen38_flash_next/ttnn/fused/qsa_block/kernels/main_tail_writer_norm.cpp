@@ -14,6 +14,7 @@
 #include "api/dataflow/noc_semaphore.h"
 #include "api/tensor/noc_traits.h"
 #include "main_tail_cbs.h"
+#include "../../kernels/zones.h"
 
 using namespace main_tail;
 
@@ -32,13 +33,17 @@ void kernel_main() {
 
     cb_wait_front(CB_N, HEAD_TILES);
     const uint32_t l1 = get_read_ptr(CB_N);
-    noc_async_write(l1, get_noc_addr(rope_x, rope_y, get_write_ptr(CB_IN)), ROPE_TILES * TILE_BYTES);
-    noc_async_write(l1 + TILE_BYTES, get_noc_addr(rope_x, rope_y, get_write_ptr(CB_ROT)), TILE_BYTES);
-    noc_async_write(l1, get_noc_addr(rope_x, rope_y, get_write_ptr(CB_ROT) + TILE_BYTES), TILE_BYTES);
-    noc_async_write_barrier();
-    sem_rope.up(noc, rope_x, rope_y, 1);
+    {
+        FUSED_ZONE("fz_qs_mt_wn_handoff");
+        noc_async_write(l1, get_noc_addr(rope_x, rope_y, get_write_ptr(CB_IN)), ROPE_TILES * TILE_BYTES);
+        noc_async_write(l1 + TILE_BYTES, get_noc_addr(rope_x, rope_y, get_write_ptr(CB_ROT)), TILE_BYTES);
+        noc_async_write(l1, get_noc_addr(rope_x, rope_y, get_write_ptr(CB_ROT) + TILE_BYTES), TILE_BYTES);
+        noc_async_write_barrier();
+        sem_rope.up(noc, rope_x, rope_y, 1);
+    }
 
     if constexpr (ROLE == 0) {
+        FUSED_ZONE("fz_qs_mt_wn_query");
         cb_wait_front(CB_ZERO, 1);
         const uint32_t zero = get_read_ptr(CB_ZERO);
         for (uint32_t lane = 0; lane < rows; ++lane) {
@@ -58,6 +63,7 @@ void kernel_main() {
         }
         noc_async_write_barrier();
     } else {
+        FUSED_ZONE("fz_qs_mt_wn_key");
         for (uint32_t s = 0; s < staging_cores; ++s) {
             const uint32_t st_x = get_arg_val<uint32_t>(6 + 2 * s), st_y = get_arg_val<uint32_t>(7 + 2 * s);
             noc_async_write(

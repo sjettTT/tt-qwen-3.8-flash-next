@@ -13,6 +13,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t CB_STAGE = get_named_compile_time_arg_val("cb_stage");
 constexpr uint32_t ADVANCE_COUNT = get_named_compile_time_arg_val("count");  // COUNT is core_config.h's enumerator
@@ -20,6 +21,7 @@ constexpr uint32_t DRAM_READ_GRAIN = 64;
 constexpr uint32_t SCALAR_BYTES = 4;
 
 void kernel_main() {
+    FUSED_ZONE("fz_pd_adv_main");
     constexpr auto a_p = TensorAccessorArgs<0>();
     const auto position = TensorAccessor(a_p, get_arg_val<uint32_t>(0));
     Noc noc;

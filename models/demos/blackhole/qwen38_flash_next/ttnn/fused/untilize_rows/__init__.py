@@ -44,7 +44,8 @@ def untilize_rows(tensor, *, memory_config=ttnn.DRAM_MEMORY_CONFIG):
         [fp.ELEMENT_BYTES[tensor.dtype], rows, *fp.accessor_args(out)],
         [(w.core, [out.buffer_address(), w.count, w.start]) for w in work],
     )
-    return fp.run_program([tensor, out], fp.program_descriptor([reader, writer], cbs=[tile_cb]))
+    meta = fp.program_meta(NAME, "rows", rows, reads=(tensor,), writes=(out,), cores=len(work))  # data movement
+    return fp.run_program([tensor, out], fp.program_descriptor([reader, writer], cbs=[tile_cb]), meta=meta)
 
 
 def untilize_rows_composed(tensor, *, memory_config=ttnn.DRAM_MEMORY_CONFIG):

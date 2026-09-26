@@ -314,9 +314,24 @@ def sampler_tail(row: Any, greedy_token_row: Any, constants: "Qwen38TTNNSamplerT
         named={"cb_stage": CB_STAGE, "rows": rows, "lanes": LANES, "table_size": TABLE_SIZE, "hist_words": HIST_WORDS},
     )
     pages = -(-stage_bytes(rows) // TILE_BYTES)
+    # the candidate rows, the greedy tile and the two scalar pages in, the table's top-k weight chunks (64-byte
+    # grains), the history words of the candidates (L1) and the bit it sets, the token tile out; per row the
+    # penalty, order, weights, prefix sums and the two products over the 128 candidates
+    meta = fp.program_meta(
+        NAME,
+        "sample",
+        rows,
+        reads=(row, greedy_token_row, constants.policy_row, constants.uniforms),
+        writes=(token,),
+        dram_bytes=MAX_TOP_K * GRAIN,
+        l1_bytes=rows * (LANES + 1) * 4,
+        flops=rows * LANES * 6,
+        cores=1,
+    )
     fp.run_program(
         [row, greedy_token_row, *constants.tensors(), token],
         fp.program_descriptor([kernel], cbs=[fp.cb_descriptor(CB_STAGE, ttnn.float32, TILE_BYTES, pages, one)]),
+        meta=meta,
     )
     return fp.stamp_topology(token, greedy_token_row)
 

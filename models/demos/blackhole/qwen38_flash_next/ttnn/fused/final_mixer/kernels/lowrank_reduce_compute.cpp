@@ -21,6 +21,7 @@
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/eltwise_unary/typecast.h"
 #include "api/dataflow/dataflow_buffer.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     constexpr uint32_t T = get_compile_time_arg_val(0);
@@ -34,58 +35,67 @@ void kernel_main() {
     DataflowBuffer q(c_q);
     DataflowBuffer lr(c_lr);
 
-    // 1. the chain's reduce: the accurate fp32 SFPU fold of each stacked tile's rows (REDUCE_COL: Ht = 1 tile tall,
-    //    Wt = T tiles wide, one batch); the helper waits on the scaler tile and pops the input and scaler itself
-    compute_kernel_lib::reduce<
-        PoolType::SUM,
-        ReduceDim::REDUCE_COL,
-        c_st,
-        c_scaler,
-        c_sum,
-        compute_kernel_lib::ReduceInputPolicy::BulkWaitBulkPop,
-        compute_kernel_lib::ReduceDataFormatReconfigMode::INPUT,
-        ReduceFp32Mode::Accurate>(
-        compute_kernel_lib::ReduceInputBlockShape::of(1, T, 1),
-        compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
-        compute_kernel_lib::NoAccumulation{},
-        compute_kernel_lib::NoOp{});
-    scaler.pop_front(1);
-
-    // 2. the chain's typecast: the fp32 sum tile exact in the dest, RNE to bf16
-    sum.wait_front(T);
-    reconfig_data_format_srca(c_st, c_sum);
-    copy_init(c_sum);
-    for (uint32_t t = 0; t < T; ++t) {
-        tile_regs_acquire();
-        copy_tile(c_sum, t, 0);
-        typecast_tile_init<fp32, bf16>();
-        typecast_tile<fp32, bf16>(0);
-        tile_regs_commit();
-        q.reserve_back(1);
-        tile_regs_wait();
-        pack_reconfig_data_format(c_q);
-        pack_tile(0, c_q);
-        tile_regs_release();
-        q.push_back(1);
+    {
+        FUSED_ZONE("fz_fm_lr_c_reduce");
+        // 1. the chain's reduce: the accurate fp32 SFPU fold of each stacked tile's rows (REDUCE_COL: Ht = 1 tile tall,
+        //    Wt = T tiles wide, one batch); the helper waits on the scaler tile and pops the input and scaler itself
+        compute_kernel_lib::reduce<
+            PoolType::SUM,
+            ReduceDim::REDUCE_COL,
+            c_st,
+            c_scaler,
+            c_sum,
+            compute_kernel_lib::ReduceInputPolicy::BulkWaitBulkPop,
+            compute_kernel_lib::ReduceDataFormatReconfigMode::INPUT,
+            ReduceFp32Mode::Accurate>(
+            compute_kernel_lib::ReduceInputBlockShape::of(1, T, 1),
+            compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
+            compute_kernel_lib::NoAccumulation{},
+            compute_kernel_lib::NoOp{});
+        scaler.pop_front(1);
     }
-    sum.pop_front(T);
 
-    // 3. the chain's silu on the bf16 tensor
-    q.wait_front(T);
-    reconfig_data_format_srca(c_sum, c_q);
-    copy_init(c_q);
-    silu_tile_init();
-    for (uint32_t t = 0; t < T; ++t) {
-        tile_regs_acquire();
-        copy_tile(c_q, t, 0);
-        silu_tile<false>(0);
-        tile_regs_commit();
-        lr.reserve_back(1);
-        tile_regs_wait();
-        pack_reconfig_data_format(c_lr);
-        pack_tile(0, c_lr);
-        tile_regs_release();
-        lr.push_back(1);
+    {
+        FUSED_ZONE("fz_fm_lr_c_cast");
+        // 2. the chain's typecast: the fp32 sum tile exact in the dest, RNE to bf16
+        sum.wait_front(T);
+        reconfig_data_format_srca(c_st, c_sum);
+        copy_init(c_sum);
+        for (uint32_t t = 0; t < T; ++t) {
+            tile_regs_acquire();
+            copy_tile(c_sum, t, 0);
+            typecast_tile_init<fp32, bf16>();
+            typecast_tile<fp32, bf16>(0);
+            tile_regs_commit();
+            q.reserve_back(1);
+            tile_regs_wait();
+            pack_reconfig_data_format(c_q);
+            pack_tile(0, c_q);
+            tile_regs_release();
+            q.push_back(1);
+        }
+        sum.pop_front(T);
     }
-    q.pop_front(T);
+
+    {
+        FUSED_ZONE("fz_fm_lr_c_silu");
+        // 3. the chain's silu on the bf16 tensor
+        q.wait_front(T);
+        reconfig_data_format_srca(c_sum, c_q);
+        copy_init(c_q);
+        silu_tile_init();
+        for (uint32_t t = 0; t < T; ++t) {
+            tile_regs_acquire();
+            copy_tile(c_q, t, 0);
+            silu_tile<false>(0);
+            tile_regs_commit();
+            lr.reserve_back(1);
+            tile_regs_wait();
+            pack_reconfig_data_format(c_lr);
+            pack_tile(0, c_lr);
+            tile_regs_release();
+            lr.push_back(1);
+        }
+        q.pop_front(T);
+    }
 }

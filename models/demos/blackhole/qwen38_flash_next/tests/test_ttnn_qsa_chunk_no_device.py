@@ -166,16 +166,21 @@ def test_chunk_constants_and_inputs_declare_the_device_fields() -> None:
         "arange_blocks_row",
         "row_index_col",
         "page_offsets",
+        # The slab's row index as a row: the block-shared attention kernel's positions (None for the chunk forms).
+        "row_index_row",
         # The slab's hoist decision for its block masks (qsa_mask_hoist; None for the chunk forms).
         "hoist_masks",
     )
     # compressed_tile_i32: the 128-row chunk's / the slab's page table (None for the 32-row forms);
     # complete_blocks_col: the slab's mask column (None for the chunk forms); block_masks: the slab's hoisted
     # block masks under the qsa_mask_hoist glue form (empty otherwise).
+    # q_positions_row: the slab's query positions P + j as a row (the block-shared attention kernel's input; None
+    # for the chunk forms).
     assert tuple(Qwen38TTNNQSAChunkInputs.__dataclass_fields__) == ("rows",) + CHUNK_INPUT_FIELDS + (
         "compressed_tile_i32",
         "complete_blocks_col",
         "block_masks",
+        "q_positions_row",
     )
     build = inspect.getsource(Qwen38TTNNQSAChunkConstants.build)
     assert "_upload_uint32(" in build and "replicate_tensor_2d_mesh_mapper(mesh_device)" in build
@@ -363,8 +368,9 @@ def test_chunk_body_has_no_host_ints_no_host_io_and_the_decode_order() -> None:
         for line in decode.splitlines()
         if "self._" in line and "validate" not in line
     ]
-    # The long chunk's hidden row tiles (moved once for the five linears) and the slab's block selection (its
-    # scoring + top-k per 512-row block) are chunk-only stages.
+    # The long chunk's hidden row tiles (moved once for the five linears), the slab's block selection (its
+    # scoring + top-k per 512-row block) and the slab's block-shared attention branch (QWEN38_FUSED=sparse_sdpa_tiled:
+    # its admission on the shapes and the kernel call) are chunk-only stages.
     chunk_order = [
         line.strip().split("=", 1)[-1].strip() if "=" in line else line.strip()
         for line in body.splitlines()
@@ -372,6 +378,8 @@ def test_chunk_body_has_no_host_ints_no_host_io_and_the_decode_order() -> None:
         and "validate" not in line
         and "_hidden_row_tiles" not in line
         and "_sparse_indices_slab" not in line
+        and "_slab_attention_admits" not in line
+        and "_block_shared_attention_rows" not in line
     ]
 
     # The same nine stages in the same order (the chunk names end in _rows / _chunk).

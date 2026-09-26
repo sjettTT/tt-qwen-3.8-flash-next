@@ -11,6 +11,7 @@
 #include "api/tensor/noc_traits.h"
 #include "ttnn/kernel/dataflow/generate_bcast_scalar.hpp"
 #include "main_tail_cbs.h"
+#include "../../kernels/zones.h"
 
 using namespace main_tail;
 
@@ -23,21 +24,27 @@ void kernel_main() {
     const auto sin = TensorAccessor(sin_args, sin_addr);
     Semaphore<> sem_rope(SEM_ROPE);
 
-    generate_bcast_col_scalar(CircularBuffer(CB_SCALAR), 0xBF800000u);
-    cb_reserve_back(CB_COS, ROPE_TILES);
-    cb_reserve_back(CB_SIN, ROPE_TILES);
-    for (uint32_t t = 0; t < ROPE_TILES; ++t) {
-        noc_async_read_page(t, cos, get_write_ptr(CB_COS) + t * TILE_BYTES);
-        noc_async_read_page(t, sin, get_write_ptr(CB_SIN) + t * TILE_BYTES);
+    {
+        FUSED_ZONE("fz_qs_mt_rr_reads");
+        generate_bcast_col_scalar(CircularBuffer(CB_SCALAR), 0xBF800000u);
+        cb_reserve_back(CB_COS, ROPE_TILES);
+        cb_reserve_back(CB_SIN, ROPE_TILES);
+        for (uint32_t t = 0; t < ROPE_TILES; ++t) {
+            noc_async_read_page(t, cos, get_write_ptr(CB_COS) + t * TILE_BYTES);
+            noc_async_read_page(t, sin, get_write_ptr(CB_SIN) + t * TILE_BYTES);
+        }
+        noc_async_read_barrier();
+        cb_push_back(CB_COS, ROPE_TILES);
+        cb_push_back(CB_SIN, ROPE_TILES);
     }
-    noc_async_read_barrier();
-    cb_push_back(CB_COS, ROPE_TILES);
-    cb_push_back(CB_SIN, ROPE_TILES);
 
-    cb_reserve_back(CB_IN, ROPE_TILES);
-    cb_reserve_back(CB_ROT, ROPE_TILES);
-    sem_rope.wait_min(1);
-    cb_push_back(CB_IN, ROPE_TILES);
-    cb_push_back(CB_ROT, ROPE_TILES);
-    sem_rope.set(0);
+    {
+        FUSED_ZONE("fz_qs_mt_rr_handoff");
+        cb_reserve_back(CB_IN, ROPE_TILES);
+        cb_reserve_back(CB_ROT, ROPE_TILES);
+        sem_rope.wait_min(1);
+        cb_push_back(CB_IN, ROPE_TILES);
+        cb_push_back(CB_ROT, ROPE_TILES);
+        sem_rope.set(0);
+    }
 }

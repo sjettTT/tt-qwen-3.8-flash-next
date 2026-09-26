@@ -23,6 +23,7 @@
 #include "api/compute/eltwise_unary/rsqrt.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.hpp"
+#include "../../kernels/zones.h"
 
 ALWI void ACQ() {
     tile_regs_acquire();
@@ -34,6 +35,7 @@ ALWI void REL() {
 }
 
 void kernel_main() {
+    FUSED_ZONE("fz_gr_norm_c");
     constexpr uint32_t Wt = get_compile_time_arg_val(0);
     constexpr uint32_t S = get_compile_time_arg_val(1);
     constexpr uint32_t blk = get_compile_time_arg_val(2);

@@ -19,6 +19,7 @@
 #include "api/compute/bcast.h"
 #include "api/compute/eltwise_binary.h"
 #include "api/compute/eltwise_binary_sfpu.h"
+#include "../../kernels/zones.h"
 
 using namespace ckernel;
 
@@ -34,6 +35,7 @@ void kernel_main() {
     compute_kernel_hw_startup(cb_block, cb_coef, cb_out);
     mul_binary_tile_init();
     for (uint32_t u = 0; u < units; ++u) {
+        FUSED_ZONE("fz_gw_c_unit");
         cb_wait_front(cb_block, 1);
         cb_wait_front(cb_coef, 1);
         cb_reserve_back(cb_upd, 1);

@@ -34,6 +34,7 @@
 #include "api/dataflow/dataflow_buffer.h"
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.hpp"
 #include "topk_lanes.h"
+#include "../../kernels/zones.h"
 
 // One tile of the insertion chain into DST: the probabilities tile transposed into value slot `slot`, its
 // pre-transposed index tile copied into slot + 2 (topk.cpp loads both the same way).
@@ -93,111 +94,115 @@ void kernel_main() {
     DataflowBuffer recips(cb_recip);
     DataflowBuffer probs(cb_probs);
 
-    // ---- softmax.cpp: NUMERIC_STABLE, no mask, EXP_APPROX 0 ----
-    compute_kernel_hw_startup(cb_in0, cb_max_scaler, cb_exps);
+    {
+        FUSED_ZONE("fz_rt_c_softmax");
+        // ---- softmax.cpp: NUMERIC_STABLE, no mask, EXP_APPROX 0 ----
+        compute_kernel_hw_startup(cb_in0, cb_max_scaler, cb_exps);
 #ifdef FRT_SOFTMAX_COPY_ONLY
-    // dev knob (timing): probabilities = logits, no softmax math
-    max_scaler.wait_front(1);
-    sum_scaler.wait_front(1);
-    in0.wait_front(Wt);
-    copy_init(cb_in0);
-    pack_reconfig_data_format(cb_probs);
-    for (uint32_t wt = 0; wt < Wt; wt += ndst) {
-        tile_regs_acquire();
-        probs.reserve_back(ndst);
-        for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
-            copy_tile(cb_in0, wt + wt8, wt8);
+        // dev knob (timing): probabilities = logits, no softmax math
+        max_scaler.wait_front(1);
+        sum_scaler.wait_front(1);
+        in0.wait_front(Wt);
+        copy_init(cb_in0);
+        pack_reconfig_data_format(cb_probs);
+        for (uint32_t wt = 0; wt < Wt; wt += ndst) {
+            tile_regs_acquire();
+            probs.reserve_back(ndst);
+            for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
+                copy_tile(cb_in0, wt + wt8, wt8);
+            }
+            tile_regs_commit();
+            tile_regs_wait();
+            for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
+                pack_tile(wt8, cb_probs);
+            }
+            tile_regs_release();
+            probs.push_back(ndst);
         }
-        tile_regs_commit();
-        tile_regs_wait();
-        for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
-            pack_tile(wt8, cb_probs);
-        }
-        tile_regs_release();
-        probs.push_back(ndst);
-    }
-    in0.pop_front(Wt);
-    max_scaler.pop_front(1);
-    sum_scaler.pop_front(1);
+        in0.pop_front(Wt);
+        max_scaler.pop_front(1);
+        sum_scaler.pop_front(1);
 #else
-    max_scaler.wait_front(1);
-    sum_scaler.wait_front(1);
-    reconfig_data_format(cb_in0, cb_in0);
-    pack_reconfig_data_format(cb_exps);
-    copy_init(cb_in0);
+        max_scaler.wait_front(1);
+        sum_scaler.wait_front(1);
+        reconfig_data_format(cb_in0, cb_in0);
+        pack_reconfig_data_format(cb_exps);
+        copy_init(cb_in0);
 
-    compute_kernel_lib::reduce<
-        PoolType::MAX,
-        ReduceDim::REDUCE_ROW,
-        cb_in0,
-        cb_max_scaler,
-        cb_max,
-        compute_kernel_lib::ReduceInputPolicy::WaitUpfrontNoPop,
-        compute_kernel_lib::ReduceDataFormatReconfigMode::INPUT>(compute_kernel_lib::ReduceInputBlockShape::row(Wt));
+        compute_kernel_lib::reduce<
+            PoolType::MAX,
+            ReduceDim::REDUCE_ROW,
+            cb_in0,
+            cb_max_scaler,
+            cb_max,
+            compute_kernel_lib::ReduceInputPolicy::WaitUpfrontNoPop,
+            compute_kernel_lib::ReduceDataFormatReconfigMode::INPUT>(
+            compute_kernel_lib::ReduceInputBlockShape::row(Wt));
 
-    exp_tile_init<false>();
-    reconfig_data_format_srcb(cb_max);
-    maxv.wait_front(1);
-    sub_bcast_cols_init(cb_in0, cb_max);
-    for (uint32_t wt = 0; wt < Wt; wt += ndst) {
-        tile_regs_acquire();
-        for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
-            sub_tiles_bcast_cols(cb_in0, cb_max, wt + wt8, 0, wt8);
+        exp_tile_init<false>();
+        reconfig_data_format_srcb(cb_max);
+        maxv.wait_front(1);
+        sub_bcast_cols_init(cb_in0, cb_max);
+        for (uint32_t wt = 0; wt < Wt; wt += ndst) {
+            tile_regs_acquire();
+            for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
+                sub_tiles_bcast_cols(cb_in0, cb_max, wt + wt8, 0, wt8);
+            }
+            exps.reserve_back(ndst);
+            for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
+                exp_tile<false>(wt8);
+            }
+            tile_regs_commit();
+            tile_regs_wait();
+            for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
+                pack_tile(wt8, cb_exps);
+            }
+            tile_regs_release();
+            exps.push_back(ndst);
         }
-        exps.reserve_back(ndst);
-        for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
-            exp_tile<false>(wt8);
-        }
-        tile_regs_commit();
-        tile_regs_wait();
-        for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
-            pack_tile(wt8, cb_exps);
-        }
-        tile_regs_release();
-        exps.push_back(ndst);
-    }
-    in0.pop_front(Wt);
-    maxv.pop_front(1);
-    exps.wait_front(Wt);
+        in0.pop_front(Wt);
+        maxv.pop_front(1);
+        exps.wait_front(Wt);
 
-    compute_kernel_lib::reduce<
-        PoolType::SUM,
-        ReduceDim::REDUCE_ROW,
-        cb_exps,
-        cb_sum_scaler,
-        cb_recip,
-        compute_kernel_lib::ReduceInputPolicy::WaitUpfrontNoPop>(
-        compute_kernel_lib::ReduceInputBlockShape::row(Wt),
-        compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
-        compute_kernel_lib::NoAccumulation{},
-        [](uint32_t) {
-            recip_tile_init();
-            recip_tile(0);
-        });
+        compute_kernel_lib::reduce<
+            PoolType::SUM,
+            ReduceDim::REDUCE_ROW,
+            cb_exps,
+            cb_sum_scaler,
+            cb_recip,
+            compute_kernel_lib::ReduceInputPolicy::WaitUpfrontNoPop>(
+            compute_kernel_lib::ReduceInputBlockShape::row(Wt),
+            compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
+            compute_kernel_lib::NoAccumulation{},
+            [](uint32_t) {
+                recip_tile_init();
+                recip_tile(0);
+            });
 
-    recips.wait_front(1);
-    reconfig_data_format(cb_exps, cb_recip);
-    pack_reconfig_data_format(cb_probs);
-    mul_bcast_cols_init(cb_exps, cb_recip);
-    for (uint32_t wt = 0; wt < Wt; wt += ndst) {
-        tile_regs_acquire();
-        probs.reserve_back(ndst);
-        for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
-            mul_tiles_bcast<BroadcastType::COL>(cb_exps, cb_recip, wt + wt8, 0, wt8);
+        recips.wait_front(1);
+        reconfig_data_format(cb_exps, cb_recip);
+        pack_reconfig_data_format(cb_probs);
+        mul_bcast_cols_init(cb_exps, cb_recip);
+        for (uint32_t wt = 0; wt < Wt; wt += ndst) {
+            tile_regs_acquire();
+            probs.reserve_back(ndst);
+            for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
+                mul_tiles_bcast<BroadcastType::COL>(cb_exps, cb_recip, wt + wt8, 0, wt8);
+            }
+            tile_regs_commit();
+            tile_regs_wait();
+            for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
+                pack_tile(wt8, cb_probs);
+            }
+            tile_regs_release();
+            probs.push_back(ndst);
         }
-        tile_regs_commit();
-        tile_regs_wait();
-        for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
-            pack_tile(wt8, cb_probs);
-        }
-        tile_regs_release();
-        probs.push_back(ndst);
-    }
-    recips.pop_front(1);
-    exps.pop_front(Wt);
-    max_scaler.pop_front(1);
-    sum_scaler.pop_front(1);
+        recips.pop_front(1);
+        exps.pop_front(Wt);
+        max_scaler.pop_front(1);
+        sum_scaler.pop_front(1);
 #endif
+    }
 
     // ---- topk.cpp single core, Wt tiles, output_tiles 1, largest, stable_sort false ----
     // The running top 32 stays in DST 0 (values) / DST 2 (indices) instead of the kernel's result_prep CB round
@@ -209,59 +214,62 @@ void kernel_main() {
     ckernel::topk_tile_init();
     probs.wait_front(Wt);
     index.wait_front(Wt);
+    {
+        FUSED_ZONE("fz_rt_c_topk_sort");
 #ifndef FRT_TOPK_SPLIT
-    tile_regs_acquire();
-    for (uint32_t w = 0; w < topk_tiles; ++w) {
-        frt_load_tile(cb_probs, cb_index, w, (w == 0) ? 0 : 1);
-        if (w != 0) {
-            frt_sort64(pass_mask);
+        tile_regs_acquire();
+        for (uint32_t w = 0; w < topk_tiles; ++w) {
+            frt_load_tile(cb_probs, cb_index, w, (w == 0) ? 0 : 1);
+            if (w != 0) {
+                frt_sort64(pass_mask);
+            }
         }
-    }
-    tile_regs_commit();
+        tile_regs_commit();
 #else
-    // dev knob (study, never serves): a two-core width split emulated on one core.  The chain over tiles 0..Wt/2-1
-    // (its running top 32 staged through cb_vals_t / cb_idx_t), the chain over tiles Wt/2..Wt-1, then one sort of
-    // the two running sets.  The values agree with the sequential chain, the tie order does not.
-    static_assert(FRT_TOPK_SPLIT == 2, "the split emulation is two-way");
-    constexpr uint32_t half = Wt / 2;
-    tile_regs_acquire();
-    for (uint32_t w = 0; w < half; ++w) {
-        frt_load_tile(cb_probs, cb_index, w, (w == 0) ? 0 : 1);
-        if (w != 0) {
-            frt_sort64(pass_mask);
+        // dev knob (study, never serves): a two-core width split emulated on one core.  The chain over tiles 0..Wt/2-1
+        // (its running top 32 staged through cb_vals_t / cb_idx_t), the chain over tiles Wt/2..Wt-1, then one sort of
+        // the two running sets.  The values agree with the sequential chain, the tie order does not.
+        static_assert(FRT_TOPK_SPLIT == 2, "the split emulation is two-way");
+        constexpr uint32_t half = Wt / 2;
+        tile_regs_acquire();
+        for (uint32_t w = 0; w < half; ++w) {
+            frt_load_tile(cb_probs, cb_index, w, (w == 0) ? 0 : 1);
+            if (w != 0) {
+                frt_sort64(pass_mask);
+            }
         }
-    }
-    tile_regs_commit();
-    vals_t.reserve_back(1);
-    idx_t.reserve_back(1);
-    tile_regs_wait();
-    pack_reconfig_data_format(cb_vals_t);
-    pack_tile(0, cb_vals_t);
-    pack_reconfig_data_format(cb_idx_t);
-    pack_tile(2, cb_idx_t);
-    tile_regs_release();
-    vals_t.push_back(1);
-    idx_t.push_back(1);
-    tile_regs_acquire();
-    for (uint32_t w = half; w < Wt; ++w) {
-        frt_load_tile(cb_probs, cb_index, w, (w == half) ? 0 : 1);
-        if (w != half) {
-            frt_sort64(pass_mask);
+        tile_regs_commit();
+        vals_t.reserve_back(1);
+        idx_t.reserve_back(1);
+        tile_regs_wait();
+        pack_reconfig_data_format(cb_vals_t);
+        pack_tile(0, cb_vals_t);
+        pack_reconfig_data_format(cb_idx_t);
+        pack_tile(2, cb_idx_t);
+        tile_regs_release();
+        vals_t.push_back(1);
+        idx_t.push_back(1);
+        tile_regs_acquire();
+        for (uint32_t w = half; w < Wt; ++w) {
+            frt_load_tile(cb_probs, cb_index, w, (w == half) ? 0 : 1);
+            if (w != half) {
+                frt_sort64(pass_mask);
+            }
         }
-    }
-    vals_t.wait_front(1);
-    idx_t.wait_front(1);
-    reconfig_data_format_srca(cb_vals_t);
-    copy_init(cb_vals_t);
-    copy_tile(cb_vals_t, 0, 1);
-    reconfig_data_format_srca(cb_idx_t);
-    copy_init(cb_idx_t);
-    copy_tile(cb_idx_t, 0, 3);
-    frt_sort64(pass_mask);
-    tile_regs_commit();
-    vals_t.pop_front(1);
-    idx_t.pop_front(1);
+        vals_t.wait_front(1);
+        idx_t.wait_front(1);
+        reconfig_data_format_srca(cb_vals_t);
+        copy_init(cb_vals_t);
+        copy_tile(cb_vals_t, 0, 1);
+        reconfig_data_format_srca(cb_idx_t);
+        copy_init(cb_idx_t);
+        copy_tile(cb_idx_t, 0, 3);
+        frt_sort64(pass_mask);
+        tile_regs_commit();
+        vals_t.pop_front(1);
+        idx_t.pop_front(1);
 #endif
+    }
     probs.pop_front(Wt);
     index.pop_front(Wt);
     vals_t.reserve_back(1);
@@ -296,55 +304,61 @@ void kernel_main() {
     pad_div.push_back(1);
     vals_t.pop_front(1);
 
-    // ---- reduce.cpp: SUM REDUCE_ROW, Ht 1, Wt 1, NC 1, enable_fp32_sfpu 1 (ttnn.sum on fp32 with fp32 dest) ----
-    DataflowBuffer norm_scaler(cb_norm_scaler);
-    DataflowBuffer vals_ready(cb_vals_ready);
-    compute_kernel_hw_startup(cb_vals, cb_norm_scaler, cb_sums);
-    vals_ready.wait_front(1);
-    compute_kernel_lib::reduce<
-        PoolType::SUM,
-        ReduceDim::REDUCE_ROW,
-        cb_vals,
-        cb_norm_scaler,
-        cb_sums,
-        compute_kernel_lib::ReduceInputPolicy::WaitAndPopPerTile,
-        compute_kernel_lib::ReduceDataFormatReconfigMode::INPUT,
-        ReduceFp32Mode::Accurate>(
-        compute_kernel_lib::ReduceInputBlockShape::of(1, 1, 1),
-        compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
-        compute_kernel_lib::NoAccumulation{},
-        compute_kernel_lib::NoOp{});
-    norm_scaler.pop_front(1);
-    vals_ready.pop_front(1);
+    {
+        FUSED_ZONE("fz_rt_c_sum");
+        // ---- reduce.cpp: SUM REDUCE_ROW, Ht 1, Wt 1, NC 1, enable_fp32_sfpu 1 (ttnn.sum on fp32 with fp32 dest) ----
+        DataflowBuffer norm_scaler(cb_norm_scaler);
+        DataflowBuffer vals_ready(cb_vals_ready);
+        compute_kernel_hw_startup(cb_vals, cb_norm_scaler, cb_sums);
+        vals_ready.wait_front(1);
+        compute_kernel_lib::reduce<
+            PoolType::SUM,
+            ReduceDim::REDUCE_ROW,
+            cb_vals,
+            cb_norm_scaler,
+            cb_sums,
+            compute_kernel_lib::ReduceInputPolicy::WaitAndPopPerTile,
+            compute_kernel_lib::ReduceDataFormatReconfigMode::INPUT,
+            ReduceFp32Mode::Accurate>(
+            compute_kernel_lib::ReduceInputBlockShape::of(1, 1, 1),
+            compute_kernel_lib::ReduceInputMemoryLayout::contiguous(),
+            compute_kernel_lib::NoAccumulation{},
+            compute_kernel_lib::NoOp{});
+        norm_scaler.pop_front(1);
+        vals_ready.pop_front(1);
+    }
 
     // ---- eltwise_binary_sfpu.cpp DIV (lhs DST 0, rhs DST 1: the sums tile with column 0 broadcast in place by the
     // reader), then the typecast op's fp32 -> bf16 ----
-    DataflowBuffer sums(cb_sums);
-    DataflowBuffer sums_ready(cb_sums_ready);
-    DataflowBuffer scores(cb_scores);
-    compute_kernel_hw_startup(cb_pad_div, cb_scores);
-    copy_init(cb_pad_div);
-    div_binary_tile_init();
-    pad_div.wait_front(1);
-    sums_ready.wait_front(1);
-    scores.reserve_back(1);
-    tile_regs_acquire();
-    reconfig_data_format_srca(cb_sums, cb_pad_div);
-    copy_init(cb_pad_div);
-    copy_tile(cb_pad_div, 0, 0);
-    reconfig_data_format_srca(cb_pad_div, cb_sums);
-    copy_init(cb_sums);
-    copy_tile(cb_sums, 0, 1);
-    div_binary_tile(0, 1, 0);
-    typecast_tile_init<static_cast<uint32_t>(DataFormat::Float32), static_cast<uint32_t>(DataFormat::Float16_b)>();
-    typecast_tile<static_cast<uint32_t>(DataFormat::Float32), static_cast<uint32_t>(DataFormat::Float16_b)>(0);
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_reconfig_data_format(cb_scores);
-    pack_tile(0, cb_scores);
-    tile_regs_release();
-    scores.push_back(1);
-    pad_div.pop_front(1);
-    sums.pop_front(1);
-    sums_ready.pop_front(1);
+    {
+        FUSED_ZONE("fz_rt_c_div");
+        DataflowBuffer sums(cb_sums);
+        DataflowBuffer sums_ready(cb_sums_ready);
+        DataflowBuffer scores(cb_scores);
+        compute_kernel_hw_startup(cb_pad_div, cb_scores);
+        copy_init(cb_pad_div);
+        div_binary_tile_init();
+        pad_div.wait_front(1);
+        sums_ready.wait_front(1);
+        scores.reserve_back(1);
+        tile_regs_acquire();
+        reconfig_data_format_srca(cb_sums, cb_pad_div);
+        copy_init(cb_pad_div);
+        copy_tile(cb_pad_div, 0, 0);
+        reconfig_data_format_srca(cb_pad_div, cb_sums);
+        copy_init(cb_sums);
+        copy_tile(cb_sums, 0, 1);
+        div_binary_tile(0, 1, 0);
+        typecast_tile_init<static_cast<uint32_t>(DataFormat::Float32), static_cast<uint32_t>(DataFormat::Float16_b)>();
+        typecast_tile<static_cast<uint32_t>(DataFormat::Float32), static_cast<uint32_t>(DataFormat::Float16_b)>(0);
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_reconfig_data_format(cb_scores);
+        pack_tile(0, cb_scores);
+        tile_regs_release();
+        scores.push_back(1);
+        pad_div.pop_front(1);
+        sums.pop_front(1);
+        sums_ready.pop_front(1);
+    }
 }

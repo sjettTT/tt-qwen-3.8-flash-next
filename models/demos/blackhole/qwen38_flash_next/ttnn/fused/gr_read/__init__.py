@@ -196,7 +196,10 @@ def stats(residual):
     )
     compute = fp.compute_kernel(STATS, cores, [HIDDEN_TILES], fp32_dest=True)
     writer = _writer(cores, [(out, 16)], [(w.core, [(1, w.start, 1, 1)]) for w in work])
-    return fp.run_program([residual, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+    meta = fp.program_meta(  # the residual in (each core its branch), the stats tiles out; square and sum per element
+        NAME, "stats", rows, reads=(residual,), writes=(out,), flops=2 * rows * FLAT_WIDTH, cores=len(work)
+    )
+    return fp.run_program([residual, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta)
 
 
 def normalize(residual, gathered_stats, norm_scale, *, scaler_mode: str = "chain"):
@@ -246,8 +249,19 @@ def normalize(residual, gathered_stats, norm_scale, *, scaler_mode: str = "chain
         NORM, cores, [HIDDEN_TILES, STATS_TILES, 4, 16], fp32_dest=True, unpack_to_dest_fp32=(4, 7)
     )
     writer = _writer(cores, [(out, 16)], [(w.core, [(HIDDEN_TILES, w.start * HIDDEN_TILES, 1, 4)]) for w in work])
+    meta = fp.program_meta(  # the residual, the gathered stats and gamma in, the flat row out; four passes per element
+        NAME,
+        "normalize",
+        rows,
+        reads=(residual, gathered_stats, norm_scale),
+        writes=(out,),
+        flops=4 * rows * FLAT_WIDTH,
+        cores=len(work),
+    )
     return fp.run_program(
-        [residual, gathered_stats, norm_scale, out], fp.program_descriptor([reader, compute, writer], cbs=cbs)
+        [residual, gathered_stats, norm_scale, out],
+        fp.program_descriptor([reader, compute, writer], cbs=cbs),
+        meta=meta,
     )
 
 
@@ -291,7 +305,19 @@ def down_project(normalized, down_inject, *, matmul: str = "chain"):
         DOWN, cores, [FLAT_TILES, blk, 0, 1, 16, DOWN_SPILL if matmul == "chain" else 0, 2], fp32_dest=True
     )
     writer = _writer(cores, [(out, 16)], [(w.core, [(1, w.start, 1, 1)]) for w in work])
-    return fp.run_program([normalized, down_inject, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+    meta = fp.program_meta(  # the weight once (each core its column), the flat row once per core, the partial out
+        NAME,
+        "down_project",
+        rows,
+        reads=(down_inject,),
+        writes=(out,),
+        dram_bytes=len(work) * fp.tensor_bytes(normalized),
+        flops=2 * rows * FLAT_WIDTH * PARTIAL_WIDTH,
+        cores=len(work),
+    )
+    return fp.run_program(
+        [normalized, down_inject, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta
+    )
 
 
 def low_rank(gathered_partials):
@@ -339,7 +365,18 @@ def low_rank(gathered_partials):
             [(w.core, [(t, w.start * t, 1, 1), (1, 0, 1, 1)]) for w in work if w.start == inject_core],
         ),
     ]
-    fp.run_program([gathered_partials, out, injection], fp.program_descriptor([reader, *computes, *writers], cbs=cbs))
+    meta = fp.program_meta(  # the four partial rows in, the bf16 row and the injection out; fold, typecast, silu, 2 sigmoid
+        NAME,
+        "low_rank",
+        rows,
+        reads=(gathered_partials,),
+        writes=(out, injection),
+        flops=(TP_SIZE + 3) * rows * PARTIAL_WIDTH,
+        cores=len(work),
+    )
+    fp.run_program(
+        [gathered_partials, out, injection], fp.program_descriptor([reader, *computes, *writers], cbs=cbs), meta=meta
+    )
     return out, injection
 
 
@@ -394,10 +431,25 @@ def gate(low_rank_row, normalized, up, *, matmul: str = "chain", debug: bool = F
         fp32_dest=True,
         unpack_to_dest_fp32=(2, 4, 5),
     )
+
+    # the up weight and the flat row once (each core its columns), the low-rank row once per core, the block out; the
+    # up matmul, then sigmoid, gate multiply and branch sum per element
+    def meta(*extra_writes):
+        return fp.program_meta(
+            NAME,
+            "gate",
+            rows,
+            reads=(up, normalized),
+            writes=(out, *extra_writes),
+            dram_bytes=len(work) * fp.tensor_bytes(low_rank_row),
+            flops=2 * rows * PARTIAL_WIDTH * FLAT_WIDTH + 3 * rows * FLAT_WIDTH,
+            cores=len(work),
+        )
+
     if not debug:
         writer = _writer(cores, [(out, 16)], [(w.core, [(1, w.start, 1, 1)]) for w in work])
         return fp.run_program(
-            [low_rank_row, normalized, up, out], fp.program_descriptor([reader, compute, writer], cbs=cbs)
+            [low_rank_row, normalized, up, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta()
         )
     up_tiles = fp.allocate((1, BRANCHES, rows, LOCAL_HIDDEN), BF16, ttnn.TILE_LAYOUT, mesh)
     gated = fp.allocate((1, BRANCHES, rows, LOCAL_HIDDEN), BF16, ttnn.TILE_LAYOUT, mesh)
@@ -417,7 +469,9 @@ def gate(low_rank_row, normalized, up, *, matmul: str = "chain", debug: bool = F
         ],
     )
     fp.run_program(
-        [low_rank_row, normalized, up, out, up_tiles, gated], fp.program_descriptor([reader, compute, writer], cbs=cbs)
+        [low_rank_row, normalized, up, out, up_tiles, gated],
+        fp.program_descriptor([reader, compute, writer], cbs=cbs),
+        meta=meta(up_tiles, gated),
     )
     return out, up_tiles, gated
 
@@ -447,6 +501,7 @@ def noc_map(mesh) -> dict[tuple[int, int], tuple[int, int]]:
             fp.program_descriptor(
                 [probe], cbs=[fp.cb_descriptor(0, ttnn.uint32, fp.TILE_BYTES[ttnn.uint32], 1, core_set)]
             ),
+            meta=fp.program_meta(NAME, "noc_probe", 1, writes=(out,), cores=len(cores)),  # once per mesh
         )
         maps = []
         for shard in ttnn.get_device_tensors(out):  # one probe tile per device of the mesh
@@ -609,11 +664,24 @@ def normalize_down(
         DOWN, w_set, [FLAT_TILES, 8, 8, 9, 17, DOWN_SPILL if matmul == "chain" else 0, 10], fp32_dest=True
     )
     writer = _writer(w_set, [(partial, 17)], [(core, [(1, w, 1, 1)]) for w, core in enumerate(workers)])
+    # the norm operands and the weight once, the flat row and the partial out; the flat row multicast into the twelve
+    # down cores' CB (L1); the norm's four passes per element, then the down+inject matmul
+    meta = fp.program_meta(
+        NAME,
+        "normalize_down",
+        rows,
+        reads=(residual, gathered_stats, norm_scale, down_inject),
+        writes=(normalized, partial),
+        l1_bytes=len(workers) * fp.tensor_bytes(normalized),
+        flops=4 * rows * FLAT_WIDTH + 2 * rows * FLAT_WIDTH * PARTIAL_WIDTH,
+        cores=len(workers) + len(producers),
+    )
     fp.run_program(
         [residual, gathered_stats, norm_scale, down_inject, normalized, partial],
         fp.program_descriptor(
             [reader, norm, sender, receiver, down, writer], cbs=cbs, semaphores=[fp.semaphore_descriptor(0, all_set)]
         ),
+        meta=meta,
     )
     return normalized, partial
 
@@ -714,6 +782,19 @@ def low_rank_gate(gathered_partials, normalized, up, *, matmul: str = "chain"):
         unpack_to_dest_fp32=(10, 12, 13),
     )
     writer = _writer(w_set, [(block, 18)], [(core, [(1, j, 1, 1)]) for j, core in enumerate(workers)])
+    # the partials, the flat row and the up weight once, the block and the injection out; the low-rank row multicast
+    # into the twenty gate cores' CB (L1); the fold, typecast, silu and 2 sigmoid, the up matmul, sigmoid, gate
+    # multiply and branch sum
+    meta = fp.program_meta(
+        NAME,
+        "low_rank_gate",
+        rows,
+        reads=(gathered_partials, normalized, up),
+        writes=(block, injection),
+        l1_bytes=len(workers) * PARTIAL_TILES * TILE_BF16,
+        flops=(TP_SIZE + 3) * rows * PARTIAL_WIDTH + 2 * rows * PARTIAL_WIDTH * FLAT_WIDTH + 3 * rows * FLAT_WIDTH,
+        cores=len(workers) + len(producers),
+    )
     fp.run_program(
         [gathered_partials, normalized, up, block, injection],
         fp.program_descriptor(
@@ -721,6 +802,7 @@ def low_rank_gate(gathered_partials, normalized, up, *, matmul: str = "chain"):
             cbs=cbs,
             semaphores=[fp.semaphore_descriptor(0, all_set)],
         ),
+        meta=meta,
     )
     return block, injection
 
@@ -780,7 +862,9 @@ def gr_read_fused(
     if gamma_rows is None:
         raise RuntimeError("the fused GR read needs weights.norm_scale_rows (gamma/4 repeated over the tile rows)")
     if (partial_gather is not None or read_front is not None) and not merged:
-        raise ValueError("partial_gather / read_front fold the merged normalize_down form; the split forms keep the collectives")
+        raise ValueError(
+            "partial_gather / read_front fold the merged normalize_down form; the split forms keep the collectives"
+        )
     if read_front is not None:
         normalized, gathered_partials = read_front(residual, gamma_rows, module.weights.down_inject)
         _topology(module, normalized, 3)

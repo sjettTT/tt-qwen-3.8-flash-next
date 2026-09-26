@@ -12,6 +12,7 @@
 #include "api/tensor/noc_traits.h"
 #include "main_tail_cbs.h"
 #include "positions.h"
+#include "../../kernels/zones.h"
 
 using namespace main_tail;
 
@@ -41,6 +42,7 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* positions = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(pos_l1);
 
     for (uint32_t i = 0; i < lane_count; ++i) {
+        FUSED_ZONE("fz_qs_mt_ws_lane");
         const uint32_t lane = lane_first + i;
         cb_wait_front(CB_STGW, PACK_TILES);
         const uint32_t l1 = get_read_ptr(CB_STGW);

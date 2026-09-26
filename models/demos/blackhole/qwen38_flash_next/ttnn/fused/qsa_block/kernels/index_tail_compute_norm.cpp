@@ -10,6 +10,7 @@
 #include "api/compute/eltwise_binary_sfpu.h"
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.hpp"
 #include "index_tail_cbs.h"
+#include "../../kernels/zones.h"
 
 using namespace index_tail;
 
@@ -18,12 +19,14 @@ void kernel_main() {
     const uint32_t do_query = get_arg_val<uint32_t>(1);
     compute_kernel_hw_startup(CB_X, CB_X, CB_XMM2);
     if (do_query) {
+        FUSED_ZONE("fz_qs_it_cn_query");
         rms_norm_rows<HEAD_TILES, 128, CB_X, CB_SCALER, CB_EPS, CB_GAMMA_Q, CB_XMM2, CB_EX2, CB_EX2PE, CB_FUSION, CB_NQ>(
             1);
     }
 
     cb_wait_front(CB_ONES, 1);
     for (uint32_t i = 0; i < lane_count; ++i) {
+        FUSED_ZONE("fz_qs_it_cn_lane");
         cb_wait_front(CB_RING, HEAD_TILES);
         cb_reserve_back(CB_RINGC, HEAD_TILES);
         cb_reserve_back(CB_RINGW, HEAD_TILES);

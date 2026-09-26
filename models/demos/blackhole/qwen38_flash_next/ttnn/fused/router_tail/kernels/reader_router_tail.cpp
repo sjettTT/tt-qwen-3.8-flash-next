@@ -16,6 +16,7 @@
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_dataflow.hpp"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t logits_addr = get_arg_val<uint32_t>(0);
@@ -46,72 +47,81 @@ void kernel_main() {
     DataflowBuffer in0(cb_in0);
     DataflowBuffer index(cb_index);
 
-    const uint32_t tile_bytes = in0.get_entry_size();
-    in0.reserve_back(Wt);
-    for (uint32_t w = 0; w < Wt; ++w) {
-        noc.async_read(logits, in0, tile_bytes, {.page_id = tile_row * Wt + w}, {.offset_bytes = w * tile_bytes});
-    }
-    noc.async_read_barrier();
-    in0.push_back(Wt);
+    {
+        FUSED_ZONE("fz_rt_r_reads");
+        const uint32_t tile_bytes = in0.get_entry_size();
+        in0.reserve_back(Wt);
+        for (uint32_t w = 0; w < Wt; ++w) {
+            noc.async_read(logits, in0, tile_bytes, {.page_id = tile_row * Wt + w}, {.offset_bytes = w * tile_bytes});
+        }
+        noc.async_read_barrier();
+        in0.push_back(Wt);
 
-    // softmax reader: MAX and SUM scalers (1.0 in row 0 of every face); reduce reader: the SUM scaler 1.0
-    dataflow_kernel_lib::calculate_and_prepare_reduce_scaler<
-        cb_max_scaler,
-        ckernel::PoolType::MAX,
-        ckernel::ReduceDim::REDUCE_ROW>();
-    dataflow_kernel_lib::calculate_and_prepare_reduce_scaler<
-        cb_sum_scaler,
-        ckernel::PoolType::SUM,
-        ckernel::ReduceDim::REDUCE_ROW>();
-    dataflow_kernel_lib::prepare_reduce_scaler<cb_norm_scaler, ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_ROW>(
-        1.0f);
+        // softmax reader: MAX and SUM scalers (1.0 in row 0 of every face); reduce reader: the SUM scaler 1.0
+        dataflow_kernel_lib::calculate_and_prepare_reduce_scaler<
+            cb_max_scaler,
+            ckernel::PoolType::MAX,
+            ckernel::ReduceDim::REDUCE_ROW>();
+        dataflow_kernel_lib::calculate_and_prepare_reduce_scaler<
+            cb_sum_scaler,
+            ckernel::PoolType::SUM,
+            ckernel::ReduceDim::REDUCE_ROW>();
+        dataflow_kernel_lib::
+            prepare_reduce_scaler<cb_norm_scaler, ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_ROW>(1.0f);
 
-    index.reserve_back(Wt);
-    for (uint32_t w = 0; w < Wt; ++w) {
-        noc.async_read(index_template, index, tile_bytes, {.page_id = w}, {.offset_bytes = w * tile_bytes});
+        index.reserve_back(Wt);
+        for (uint32_t w = 0; w < Wt; ++w) {
+            noc.async_read(index_template, index, tile_bytes, {.page_id = w}, {.offset_bytes = w * tile_bytes});
+        }
+        noc.async_read_barrier();
+        index.push_back(Wt);
     }
-    noc.async_read_barrier();
-    index.push_back(Wt);
 
     // fill_implicit_tile_padding(scores, 0) in place: columns >= top_k (faces 1 and 3 whole; columns top_k..15 of
     // faces 0 and 2) and rows >= rows_in_tile of the [token, k] tile (and the rows this core does not produce, like
     // padding); the compute kernel pops the tile after its sum
-    DataflowBuffer vals(cb_vals);
-    DataflowBuffer vals_ready(cb_vals_ready);
-    vals.wait_front(1);
     {
-        volatile tt_l1_ptr uint32_t* tile = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(vals.get_read_ptr());
-        for (uint32_t i = 0; i < 256; ++i) {
-            tile[256 + i] = 0u;  // face 1: rows 0..15, columns 16..31
-            tile[768 + i] = 0u;  // face 3: rows 16..31, columns 16..31
-        }
-        for (uint32_t row = 0; row < 32; ++row) {
-            const uint32_t face = (row >> 4) * 2;
-            const uint32_t base = face * 256 + (row & 15) * 16;
-            const uint32_t first_zero = (row < rows_in_tile && ((token_mask >> row) & 1u)) ? top_k : 0u;
-            for (uint32_t col = first_zero; col < 16; ++col) {
-                tile[base + col] = 0u;
+        FUSED_ZONE("fz_rt_r_pad_fill");
+        DataflowBuffer vals(cb_vals);
+        DataflowBuffer vals_ready(cb_vals_ready);
+        vals.wait_front(1);
+        {
+            volatile tt_l1_ptr uint32_t* tile = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(vals.get_read_ptr());
+            for (uint32_t i = 0; i < 256; ++i) {
+                tile[256 + i] = 0u;  // face 1: rows 0..15, columns 16..31
+                tile[768 + i] = 0u;  // face 3: rows 16..31, columns 16..31
+            }
+            for (uint32_t row = 0; row < 32; ++row) {
+                const uint32_t face = (row >> 4) * 2;
+                const uint32_t base = face * 256 + (row & 15) * 16;
+                const uint32_t first_zero = (row < rows_in_tile && ((token_mask >> row) & 1u)) ? top_k : 0u;
+                for (uint32_t col = first_zero; col < 16; ++col) {
+                    tile[base + col] = 0u;
+                }
             }
         }
+        vals_ready.reserve_back(1);
+        vals_ready.push_back(1);
     }
-    vals_ready.reserve_back(1);
-    vals_ready.push_back(1);
 
     // binary_ng col-bcast reader, in place on the sums tile: columns 1..15 of faces 0 and 2 take column 0 (the
     // quotient's columns >= top_k are never read, so faces 1 and 3 stay as the reduce packed them)
-    DataflowBuffer sums(cb_sums);
-    DataflowBuffer sums_ready(cb_sums_ready);
-    sums.wait_front(1);
     {
-        volatile tt_l1_ptr uint32_t* tile = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sums.get_read_ptr());
-        for (uint32_t row = 0; row < 32; ++row) {
-            const uint32_t base = (row >> 4) * 2 * 256 + (row & 15) * 16;
-            const uint32_t value = tile[base];
-            for (uint32_t col = 1; col < 16; ++col) {
-                tile[base + col] = value;
+        FUSED_ZONE("fz_rt_r_sum_bcast");
+        DataflowBuffer sums(cb_sums);
+        DataflowBuffer sums_ready(cb_sums_ready);
+        sums.wait_front(1);
+        {
+            volatile tt_l1_ptr uint32_t* tile = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(sums.get_read_ptr());
+            for (uint32_t row = 0; row < 32; ++row) {
+                const uint32_t base = (row >> 4) * 2 * 256 + (row & 15) * 16;
+                const uint32_t value = tile[base];
+                for (uint32_t col = 1; col < 16; ++col) {
+                    tile[base + col] = value;
+                }
             }
         }
+        sums_ready.reserve_back(1);
+        sums_ready.push_back(1);
     }
-    sums_ready.reserve_back(1);
-    sums_ready.push_back(1);
 }

@@ -12,6 +12,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t gus_addr = get_arg_val<uint32_t>(0);
@@ -32,18 +33,22 @@ void kernel_main() {
     DataflowBuffer up(cb_up);
     DataflowBuffer scalar(cb_scalar);
 
-    gate.reserve_back(1);
-    up.reserve_back(1);
-    noc.async_read(gus, CoreLocalMem<uint32_t>(gate.get_write_ptr()), tile_bytes, {.page_id = tile}, {});
-    noc.async_read(gus, CoreLocalMem<uint32_t>(up.get_write_ptr()), tile_bytes, {.page_id = gate_tiles + tile}, {});
-    if (has_scalar) {
-        scalar.reserve_back(1);
-        noc.async_read(gus, CoreLocalMem<uint32_t>(scalar.get_write_ptr()), tile_bytes, {.page_id = 2 * gate_tiles}, {});
-    }
-    noc.async_read_barrier();
-    gate.push_back(1);
-    up.push_back(1);
-    if (has_scalar) {
-        scalar.push_back(1);
+    {
+        FUSED_ZONE("fz_se_r_main");
+        gate.reserve_back(1);
+        up.reserve_back(1);
+        noc.async_read(gus, CoreLocalMem<uint32_t>(gate.get_write_ptr()), tile_bytes, {.page_id = tile}, {});
+        noc.async_read(gus, CoreLocalMem<uint32_t>(up.get_write_ptr()), tile_bytes, {.page_id = gate_tiles + tile}, {});
+        if (has_scalar) {
+            scalar.reserve_back(1);
+            noc.async_read(
+                gus, CoreLocalMem<uint32_t>(scalar.get_write_ptr()), tile_bytes, {.page_id = 2 * gate_tiles}, {});
+        }
+        noc.async_read_barrier();
+        gate.push_back(1);
+        up.push_back(1);
+        if (has_scalar) {
+            scalar.push_back(1);
+        }
     }
 }

@@ -19,7 +19,7 @@ No prebuilt archive, no pinned binary, no host-specific configuration.
 
 | path | measured | notes |
 |---|---|---|
-| prompt prefill | 410 tok/s; 750-790 tok/s with `--long-chunks`; 1,870 tok/s with `--prefill-slab 2048` | 2026-09-25; the slab is tolerance-class against the chunk bodies (`docs/PREFILL.md`: the ms per prompt token, the TTFTs, the one-call expert stream) |
+| prompt prefill | 410 tok/s; 750-790 tok/s with `--long-chunks`; 2,562 tok/s with `--prefill-slab 2048` | 2026-09-26 (block-shared attention + one-pass combine defaults: 31,716 tokens in 12.38 s; the chunk rates 2026-09-25); the slab is tolerance-class against the chunk bodies (`docs/PREFILL.md`: the ms per prompt token, the TTFTs, the one-call expert stream) |
 | decode, one stream | 36.8 tok/s greedy, 36.5 tok/s sampled | 27.2 ms per token, flat with depth (2026-09-25, bitwise: `docs/NUMERICS.md`); the defaults are listed below the table |
 | decode, 4 / 8 streams | 28.9 / 23.4 tok/s per user (116 / 187 aggregate) | the batched-decode lane body measured directly, 34.6 / 42.7 ms per step; the chat server serves one stream (2026-09-25, component class: `docs/NUMERICS.md`) |
 | decode with MTP (`--mtp 4`) | greedy 39 tok/s median over the acceptance prompts, 68 tok/s on structured output; sampled 40.8 / 40.7 tok/s (the card profiles, non-thinking / thinking) | speculative drafting with exact acceptance for greedy requests and, by default on an `--mtp --sampling` server, sampled ones (2026-09-25; section 6, `docs/NUMERICS.md`) |

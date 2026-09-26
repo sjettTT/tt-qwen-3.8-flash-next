@@ -9,8 +9,10 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
+    FUSED_ZONE("fz_gr_probe");
     const uint32_t addr = get_arg_val<uint32_t>(0);
     const uint32_t slot = get_arg_val<uint32_t>(1);
     constexpr auto args = TensorAccessorArgs<0>();

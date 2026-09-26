@@ -111,9 +111,23 @@ def gr_write(block_output, residual, injection, *, memory_config=ttnn.DRAM_MEMOR
     rows = rows_of(block_output, residual, injection)
     mesh = residual.device()
     output = fp.allocate((1, BRANCHES, rows, LOCAL_HIDDEN), ttnn.bfloat16, ttnn.TILE_LAYOUT, mesh, memory_config)
+    cores = cores_of(mesh)
+    # the block output once per branch tile, the residual and the coefficient tile once per core, the residual out;
+    # the multiply and the add per element of the four branches
+    meta = fp.program_meta(
+        NAME,
+        "write",
+        rows,
+        reads=(residual,),
+        writes=(output,),
+        dram_bytes=BRANCHES * fp.tensor_bytes(block_output) + cores * fp.tensor_bytes(injection),
+        flops=2 * rows * BRANCHES * LOCAL_HIDDEN,
+        cores=cores,
+    )
     fp.run_program(
         [block_output, residual, injection, output],
-        gr_write_program(block_output, residual, injection, output, cores=cores_of(mesh)),
+        gr_write_program(block_output, residual, injection, output, cores=cores),
+        meta=meta,
     )
     output.update_tensor_topology(residual.tensor_topology())  # generic_op leaves the allocation's placement
     return output

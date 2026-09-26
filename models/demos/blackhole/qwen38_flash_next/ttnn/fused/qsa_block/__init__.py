@@ -118,7 +118,17 @@ def rms_norm_rows(x, weight, *, eps: float = EPS):
     )
     compute = fp.compute_kernel(RMS_NORM, cores, [wt, width], [(w.core, [w.count]) for w in work], fp32_dest=True)
     writer = _writer(cores, [(out, 16)], [(w.core, [(w.count * wt, w.start * wt, 1, wt)]) for w in work])
-    return fp.run_program([x, weight, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+    meta = fp.program_meta(  # the tiles in, the weight once per core, the tiles out; four passes per element
+        NAME,
+        "rms_norm_rows",
+        1,
+        reads=(x,),
+        writes=(out,),
+        dram_bytes=len(work) * fp.tensor_bytes(weight),
+        flops=4 * n * fp.TILE * width,
+        cores=len(work),
+    )
+    return fp.run_program([x, weight, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta)
 
 
 def rope64(x, cos, sin, *, dest: str = "dest16"):
@@ -172,7 +182,17 @@ def rope64(x, cos, sin, *, dest: str = "dest16"):
         fp32_dest=dest != "dest16",
     )
     writer = _writer(cores, [(out, 16)], [(w.core, [(ROPE_TILES, w.start * ROPE_TILES, 1, ROPE_TILES)]) for w in work])
-    return fp.run_program([x, cos, sin, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+    meta = fp.program_meta(  # the tiles twice (the row and its rotated half), cos / sin once per core, the tiles out
+        NAME,
+        "rope64",
+        1,
+        reads=(x, x),
+        writes=(out,),
+        dram_bytes=len(work) * (fp.tensor_bytes(cos) + fp.tensor_bytes(sin)),
+        flops=6 * n * fp.TILE * ROPE_DIM,
+        cores=len(work),
+    )
+    return fp.run_program([x, cos, sin, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta)
 
 
 # ----------------------------------------------------------------------------------------------- program A: index tail
@@ -243,6 +263,7 @@ def noc_coords(mesh, cores) -> dict[tuple[int, int], tuple[int, int]]:
     fp.run_program(
         [out, out],
         fp.program_descriptor([probe], cbs=[fp.cb_descriptor(0, ttnn.uint32, fp.TILE_BYTES[ttnn.uint32], 1, core_set)]),
+        meta=fp.program_meta(NAME, "noc_probe", 1, writes=(out,), cores=len(probed)),  # once per mesh
     )
     per_device = [
         ttnn.to_torch(local).reshape(fp.TILE, len(probed), fp.TILE)[0] for local in ttnn.get_device_tensors(out)
@@ -533,7 +554,24 @@ def index_tail(
         compressed_cache,
         out,
     )
-    return fp.run_program(io, fp.program_descriptor(kernels, cbs=cbs, semaphores=semaphores))
+    # per lane: the index query and raw key windows (four tiles each, from the projection shard), the position
+    # inputs, the two norm weights and the four RoPE tiles, the ring read and written, one compressed row written,
+    # the rotated query out; the two rms_norms, the two partial RoPEs, the ring one-hot update and its 0.25 sum
+    meta = fp.program_meta(
+        "qsa_index_tail",
+        "index_tail",
+        rows,
+        reads=(block_start, row_hit, index_q_norm, index_k_norm, cos, sin, block_cos, block_sin, ring),
+        writes=(ring, out),
+        partial=(
+            (index_q_ws, INDEX_TILES * TILE_BF16),
+            (raw_key_ws, INDEX_TILES * TILE_BF16),
+            (compressed_cache, rows * INDEX_HEAD_DIM * 2),
+        ),
+        flops=rows * (8 * INDEX_HEAD_DIM + 12 * ROPE_DIM + 3 * fp.TILE * INDEX_HEAD_DIM),
+        cores=2 * rows,
+    )
+    return fp.run_program(io, fp.program_descriptor(kernels, cbs=cbs, semaphores=semaphores), meta=meta)
 
 
 def index_tail_composed(
@@ -847,7 +885,25 @@ def main_tail(
     ]
     semaphores = [fp.semaphore_descriptor(i, all_set) for i in range(3)]
     io = _io(qg_ws, k_ws, v_ws, block_start, row_hit, q_norm, k_norm, cos, sin, staging, kv_cache, query)
-    return fp.run_program(io, fp.program_descriptor(kernels, cbs=cbs, semaphores=semaphores))
+    # the qg, k and v windows (from the projection shards), the position inputs, the two norm weights and the RoPE
+    # tiles in, the staging read and written, one 32-row KV block per lane written, the sparse query out; the seven
+    # rms_norms and partial RoPEs, the staging one-hot update
+    meta = fp.program_meta(
+        "qsa_main_tail",
+        "main_tail",
+        rows,
+        reads=(block_start, row_hit, q_norm, k_norm, cos, sin, staging),
+        writes=(staging, query),
+        partial=(
+            (qg_ws, 2 * LOCAL_HEADS * HEAD_TILES * TILE_BF16),
+            (k_ws, HEAD_TILES * TILE_BF16),
+            (v_ws, HEAD_TILES * TILE_BF16),
+            (kv_cache, rows * fp.TILE * KV_WIDTH * 2),
+        ),
+        flops=rows * ((LOCAL_HEADS + 1) * (4 * HEAD_DIM + 6 * ROPE_DIM) + 3 * fp.TILE * KV_WIDTH),
+        cores=2 * (LOCAL_HEADS + 1) + rows,
+    )
+    return fp.run_program(io, fp.program_descriptor(kernels, cbs=cbs, semaphores=semaphores), meta=meta)
 
 
 _ZERO_HALVES: dict[int, object] = {}
@@ -1003,7 +1059,16 @@ def post_attention(attention, qg_ws, *, memory_config=None, qg_first: int = 0):
     writer = _writer(
         cores, [(out, 16)], [(c, [(HEAD_TILES, h * HEAD_TILES, 1, HEAD_TILES)]) for h, c in enumerate(head_cores)]
     )
-    return fp.run_program([attention, qg_ws, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+    meta = fp.program_meta(  # the six local heads' attention rows and gate tiles in, the head-major row out
+        "qsa_post_attention",
+        "post_attention",
+        rows,
+        writes=(out,),
+        partial=((attention, LOCAL_HEADS * rows * HEAD_DIM * 2), (qg_ws, LOCAL_HEADS * HEAD_TILES * TILE_BF16)),
+        flops=2 * rows * OUT_WIDTH,
+        cores=LOCAL_HEADS,
+    )
+    return fp.run_program([attention, qg_ws, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta)
 
 
 def post_attention_composed(attention, qg_ws, *, memory_config=None):
@@ -1055,7 +1120,16 @@ def widen_partial(out_ws):
     writer = _writer(
         cores, [(out, 16)], [(c, [(per_core, i * per_core, 1, per_core)]) for i, c in enumerate(core_list)]
     )
-    return fp.run_program([out_ws, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+    meta = fp.program_meta(  # the bf16 shard in (L1), the fp32 row out; the typecast per element
+        "qsa_widen_partial",
+        "widen_partial",
+        rows,
+        reads=(out_ws,),
+        writes=(out,),
+        flops=rows * PARTIAL_WIDTH,
+        cores=WIDEN_CORES,
+    )
+    return fp.run_program([out_ws, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta)
 
 
 def widen_partial_composed(out_ws):
@@ -1125,7 +1199,17 @@ def selection_row(block_ids, sentinel_pad, block_offsets, row_keep_bits, row_fil
         ],
     )
     cbs = [fp.cb_descriptor(0, ttnn.uint32, 8192, 1, cores)]
-    return fp.run_program([*tensors[:-1], out], fp.program_descriptor([kernel], cbs=cbs))
+    meta = fp.program_meta(  # the block ids, offsets and sentinel rows, the rows' keep / fill rows in, the row out
+        "qsa_selection_row",
+        "selection_row",
+        rows,
+        reads=(block_ids, block_offsets, sentinel_pad),
+        writes=(out,),
+        partial=((row_keep_bits, rows * SELECTION_WIDTH * 4), (row_fill, rows * SELECTION_WIDTH * 4)),
+        flops=4 * rows * SELECTION_WIDTH,
+        cores=SELECTION_SLICES * row_groups,
+    )
+    return fp.run_program([*tensors[:-1], out], fp.program_descriptor([kernel], cbs=cbs), meta=meta)
 
 
 def selection_row_composed(block_ids, sentinel_pad, block_offsets, row_keep_bits, row_fill):
@@ -1221,7 +1305,10 @@ def lane_score_rows_of(local_scores, lanes_of_rows, lanes: int, cache_rows: int,
         ],
     )
     cbs = [fp.cb_descriptor(0, BF16, blocks * 2, 1, core_set)]
-    return fp.run_program([local_scores, out], fp.program_descriptor([kernel], cbs=cbs))
+    meta = fp.program_meta(  # each row's window of the wide scores in, the rows out; data movement
+        NAME, "lane_score_rows", rows, writes=(out,), partial=((local_scores, rows * blocks * 2),), cores=rows
+    )
+    return fp.run_program([local_scores, out], fp.program_descriptor([kernel], cbs=cbs), meta=meta)
 
 
 def lane_score_rows_composed(local_scores, lanes: int, cache_rows: int, blocks: int):
@@ -1318,7 +1405,17 @@ def score_merge(gathered, mask):
         fp.accessor_args(out),
         [(w.core, [out.buffer_address(), rows, w.start, w.count]) for w in work],
     )
-    return fp.run_program([gathered, mask, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+    meta = fp.program_meta(  # the four devices' score pages and the rows' mask in, the merged rows out; 3 adds + mask
+        "qsa_score_merge",
+        "score_merge",
+        rows,
+        reads=(gathered,),
+        writes=(out,),
+        partial=((mask, rows * width * 2),),
+        flops=DEVICES * rows * width,
+        cores=len(work),
+    )
+    return fp.run_program([gathered, mask, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta)
 
 
 def score_merge_work(width: int, grid) -> list[fp.CoreWork]:

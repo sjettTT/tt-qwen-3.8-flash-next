@@ -26,6 +26,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t CB_STAGE = get_named_compile_time_arg_val("cb_stage");
 constexpr uint32_t LANES = get_named_compile_time_arg_val("lanes_per_tile");
@@ -68,6 +69,7 @@ void kernel_main() {
     const uint32_t base = stage.get_write_ptr();
     volatile tt_l1_ptr uint16_t* halves = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(base);
     if constexpr (ROWS == 1 || LANE_SPLIT) {
+        FUSED_ZONE("fz_gt_scan_row");
         // tile t of this core: the two 64-byte grains holding row `row` of faces (row >> 4) * 2 and + 1 land at 128 t
         // and 128 t + 64 (row 0 of faces 0 and 1 for the one-row step); an odd row sits 32 bytes into its grain
         const uint32_t row = LANE_SPLIT ? get_arg_val<uint32_t>(6) : 0;
@@ -75,21 +77,24 @@ void kernel_main() {
         const uint32_t row_bytes = (row & 15) * ROW_BYTES;
         const uint32_t grain_off = row_bytes & ~(GRAIN - 1);
         const uint32_t in_grain = (row_bytes & (GRAIN - 1)) / 2;  // half-words into the grain: 0 or 16
-        for (uint32_t t = 0; t < count; ++t) {
-            noc.async_read(
-                logits,
-                stage,
-                GRAIN,
-                {.page_id = first + t, .offset_bytes = face_lo + grain_off},
-                {.offset_bytes = 128 * t});
-            noc.async_read(
-                logits,
-                stage,
-                GRAIN,
-                {.page_id = first + t, .offset_bytes = face_lo + FACE_BYTES + grain_off},
-                {.offset_bytes = 128 * t + 64});
+        {
+            FUSED_ZONE("fz_gt_scan_read");
+            for (uint32_t t = 0; t < count; ++t) {
+                noc.async_read(
+                    logits,
+                    stage,
+                    GRAIN,
+                    {.page_id = first + t, .offset_bytes = face_lo + grain_off},
+                    {.offset_bytes = 128 * t});
+                noc.async_read(
+                    logits,
+                    stage,
+                    GRAIN,
+                    {.page_id = first + t, .offset_bytes = face_lo + FACE_BYTES + grain_off},
+                    {.offset_bytes = 128 * t + 64});
+            }
+            noc.async_read_barrier();
         }
-        noc.async_read_barrier();
 
         const uint32_t out_offset = ((128 * count) + 15) & ~15u;
         volatile tt_l1_ptr uint32_t* out = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(base + out_offset);
@@ -172,21 +177,41 @@ void kernel_main() {
 #endif
         noc.async_write_barrier();
     } else {
+        FUSED_ZONE("fz_gt_scan_rows");
         // tile t at slot 2048 t: rows 0..15 of faces 0 and 1 (their first LO_BYTES), rows 16.. of faces 2 and 3
         constexpr uint32_t LO_ROWS = ROWS < 16 ? ROWS : 16;
         constexpr uint32_t HI_ROWS = ROWS > 16 ? ROWS - 16 : 0;
         constexpr uint32_t LO_BYTES = (LO_ROWS * ROW_BYTES + GRAIN - 1) & ~(GRAIN - 1);
         constexpr uint32_t HI_BYTES = (HI_ROWS * ROW_BYTES + GRAIN - 1) & ~(GRAIN - 1);
-        for (uint32_t t = 0; t < count; ++t) {
-            const uint32_t slot = TILE_BYTES * t;
-            noc.async_read(logits, stage, LO_BYTES, {.page_id = first + t, .offset_bytes = 0}, {.offset_bytes = slot});
-            noc.async_read(logits, stage, LO_BYTES, {.page_id = first + t, .offset_bytes = FACE_BYTES}, {.offset_bytes = slot + FACE_BYTES});
-            if constexpr (HI_ROWS > 0) {
-                noc.async_read(logits, stage, HI_BYTES, {.page_id = first + t, .offset_bytes = 2 * FACE_BYTES}, {.offset_bytes = slot + 2 * FACE_BYTES});
-                noc.async_read(logits, stage, HI_BYTES, {.page_id = first + t, .offset_bytes = 3 * FACE_BYTES}, {.offset_bytes = slot + 3 * FACE_BYTES});
+        {
+            FUSED_ZONE("fz_gt_scan_read_rows");
+            for (uint32_t t = 0; t < count; ++t) {
+                const uint32_t slot = TILE_BYTES * t;
+                noc.async_read(
+                    logits, stage, LO_BYTES, {.page_id = first + t, .offset_bytes = 0}, {.offset_bytes = slot});
+                noc.async_read(
+                    logits,
+                    stage,
+                    LO_BYTES,
+                    {.page_id = first + t, .offset_bytes = FACE_BYTES},
+                    {.offset_bytes = slot + FACE_BYTES});
+                if constexpr (HI_ROWS > 0) {
+                    noc.async_read(
+                        logits,
+                        stage,
+                        HI_BYTES,
+                        {.page_id = first + t, .offset_bytes = 2 * FACE_BYTES},
+                        {.offset_bytes = slot + 2 * FACE_BYTES});
+                    noc.async_read(
+                        logits,
+                        stage,
+                        HI_BYTES,
+                        {.page_id = first + t, .offset_bytes = 3 * FACE_BYTES},
+                        {.offset_bytes = slot + 3 * FACE_BYTES});
+                }
             }
+            noc.async_read_barrier();
         }
-        noc.async_read_barrier();
 
         const uint32_t out_offset = TILE_BYTES * count;  // 16-byte aligned
         volatile tt_l1_ptr uint32_t* out = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(base + out_offset);

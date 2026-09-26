@@ -29,7 +29,10 @@ def test_registered_bitwise_with_a_gate():
     assert entry.default_on and fused.resolve("router_tail", {}) is rt.router_tail  # the foundation test pins the set
     assert fused.resolve("router_tail", {fused.OFF_ENV: "router_tail"}) is rt.router_tail_composed
     assert fused.resolve("router_tail", {fused.ENV: "router_tail", fused.OFF_ENV: "all"}) is rt.router_tail_composed
-    assert inspect.signature(rt.router_tail).parameters.keys() == inspect.signature(rt.router_tail_composed).parameters.keys()
+    assert (
+        inspect.signature(rt.router_tail).parameters.keys()
+        == inspect.signature(rt.router_tail_composed).parameters.keys()
+    )
 
 
 def test_cb_table_is_consistent():
@@ -66,17 +69,27 @@ def test_runtime_arg_layout_matches_the_python_side():
 def test_compute_kernel_pins_the_replaced_ops_instruction_sequences():
     compute = SOURCES["compute"]
     # softmax.cpp numeric stable: MAX reduce, sub bcast cols + precise exp, SUM reduce with recip, mul bcast cols
-    assert "PoolType::MAX,\n        ReduceDim::REDUCE_ROW" in compute
+    assert "PoolType::MAX,\n            ReduceDim::REDUCE_ROW" in compute
     assert "exp_tile_init<false>()" in compute and "exp_tile<false>(wt8)" in compute
-    assert "sub_tiles_bcast_cols(cb_in0, cb_max" in compute and "mul_tiles_bcast<BroadcastType::COL>(cb_exps, cb_recip" in compute
-    assert "recip_tile_init();\n            recip_tile(0);" in compute
+    assert (
+        "sub_tiles_bcast_cols(cb_in0, cb_max" in compute
+        and "mul_tiles_bcast<BroadcastType::COL>(cb_exps, cb_recip" in compute
+    )
+    assert "recip_tile_init();\n                recip_tile(0);" in compute
     # topk.cpp single core: unstable network, largest, end phase 5, values DST 0/1, indices DST 2/3
     assert "topk_local_sort<false>(0, 0 /* largest */, 5 /* end_phase */)" in compute
     assert "transpose_tile(cb_probs, w, slot)" in compute and "copy_tile(cb_index, w, slot + 2)" in compute
     # reduce.cpp: ttnn.sum on fp32 takes the accurate SFPU path (input to dest); binary_ng SFPU div; typecast fp32 -> bf16
-    assert "ReduceFp32Mode::Accurate" in compute and "cb_vals" in rt.UNPACK_TO_DEST_FP32 and "cb_vals,\n        cb_norm_scaler,\n        cb_sums" in compute
+    assert (
+        "ReduceFp32Mode::Accurate" in compute
+        and "cb_vals" in rt.UNPACK_TO_DEST_FP32
+        and "cb_vals,\n            cb_norm_scaler,\n            cb_sums" in compute
+    )
     assert "div_binary_tile(0, 1, 0)" in compute
-    assert "typecast_tile<static_cast<uint32_t>(DataFormat::Float32), static_cast<uint32_t>(DataFormat::Float16_b)>(0)" in compute
+    assert (
+        "typecast_tile<static_cast<uint32_t>(DataFormat::Float32), static_cast<uint32_t>(DataFormat::Float16_b)>(0)"
+        in compute
+    )
     assert "stable_sort" not in compute.replace("stable_sort false", "")
     # the lane form: the same network, masked to the live tokens' passes; the LLK call stays for pass_mask 0
     assert "topk_local_sort_lanes<false>(0, 0 /* largest */, 5 /* end_phase */, pass_mask)" in compute
@@ -88,12 +101,16 @@ def _llk_sort_with_pass_guard() -> str:
     """The LLK's _bitonic_topk_phases_steps with `if (pass_mask & (1u << (face * 2 + col)))` around each pass's phase
     loop -- what kernels/topk_lanes.h must contain, regenerated from the LLK source of this tree."""
 
-    llk = (fp.REPO_ROOT / "tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h").read_text().splitlines()
+    llk = (
+        (fp.REPO_ROOT / "tt_metal/tt-llk/tt_llk_blackhole/common/inc/sfpu/ckernel_sfpu_topk.h").read_text().splitlines()
+    )
     start = next(i for i, l in enumerate(llk) if "inline void _bitonic_topk_phases_steps(" in l) - 1
     end = next(i for i in range(start, len(llk)) if llk[i].startswith("}") and "topk_replay_init = -1;" in llk[i - 1])
     body = llk[start : end + 1]
-    body[1] = body[1].replace("_bitonic_topk_phases_steps(", "_bitonic_topk_phases_steps_lanes(").replace(
-        "const int i_start_step)", "const int i_start_step, const std::uint32_t pass_mask)"
+    body[1] = (
+        body[1]
+        .replace("_bitonic_topk_phases_steps(", "_bitonic_topk_phases_steps_lanes(")
+        .replace("const int i_start_step)", "const int i_start_step, const std::uint32_t pass_mask)")
     )
     col_open = next(i for i, l in enumerate(body) if l == "        for (int col = 0; col < 2; col++)") + 1
     close = next(i for i, l in enumerate(body) if l == "            dst_addr_offset += 2;")
@@ -113,13 +130,15 @@ def test_masked_sort_is_the_llk_sort_with_a_pass_guard():
     assert "VectorMode::RC_custom" in header and "calculate_bitonic_topk_phases_steps_lanes" in header
 
 
-def test_lanes_plan_one_core_per_live_pass():
-    fake = tuple(frozenset(range(8 * p, 8 * p + 8)) for p in range(4))  # a stand-in map; the pinned one comes from the probe
+def test_lanes_plan_one_core_per_live_pass(expect_error):
+    fake = tuple(
+        frozenset(range(8 * p, 8 * p + 8)) for p in range(4)
+    )  # a stand-in map; the pinned one comes from the probe
     assert rt.lanes_plan(1, fake) == [(1, 0b1)]
     assert rt.lanes_plan(8, fake) == [(1, 0xFF)]
     assert rt.lanes_plan(9, fake) == [(1, 0xFF), (2, 0x100)]
     assert rt.lanes_plan(32, fake) == [(1, 0xFF), (2, 0xFF00), (4, 0xFF0000), (8, 0xFF000000)]
-    with pytest.raises(ValueError):
+    with expect_error(ValueError):
         rt.lanes_plan(33, fake)
     # the pinned map (device probe 2026-09-18): pass = (row half, row parity)
     assert rt.PASS_TOKENS == (
@@ -176,7 +195,9 @@ def test_reader_zero_fill_and_column_broadcast_match_the_tile_layout():
     for row in range(32):
         left_face = (row >> 4) * 2
         assert flat[left_face * 256 + (row & 15) * 16] == tile[row, 0]
-    assert torch.equal(flat[256:512].reshape(16, 16), tile[:16, 16:]) and torch.equal(flat[768:].reshape(16, 16), tile[16:, 16:])
+    assert torch.equal(flat[256:512].reshape(16, 16), tile[:16, 16:]) and torch.equal(
+        flat[768:].reshape(16, 16), tile[16:, 16:]
+    )
 
 
 def test_index_template_is_the_transposed_topk_index_tile():

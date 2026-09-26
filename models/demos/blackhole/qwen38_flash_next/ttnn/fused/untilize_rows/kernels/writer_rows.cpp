@@ -10,6 +10,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t dst_addr = get_arg_val<uint32_t>(0);
@@ -31,6 +32,7 @@ void kernel_main() {
     DataflowBuffer dfb(cb_id);
 
     for (uint32_t tile = start; tile < start + count; ++tile) {
+        FUSED_ZONE("fz_ur_w_tile");
         dfb.wait_front(1);
         const uint32_t col_bytes = tile * tile_row_bytes;
         for (uint32_t r = 0; r < rows; ++r) {

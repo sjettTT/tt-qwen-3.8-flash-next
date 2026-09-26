@@ -10,13 +10,7 @@
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
 
-// Per-phase device profiler zones (study build: QWEN38_MOE_POST_ZONES=1 defines FMP_ZONES); the served build has none.
-#ifdef FMP_ZONES
-#include "tools/profiler/kernel_profiler.hpp"
-#define FMP_ZONE(name) DeviceZoneScopedN(name)
-#else
-#define FMP_ZONE(name)
-#endif
+#include "../../kernels/zones.h"
 
 void kernel_main() {
     const uint32_t out_addr = get_arg_val<uint32_t>(0);
@@ -28,7 +22,7 @@ void kernel_main() {
 
     DataflowBuffer out_tile(cb_out);
     {
-        FMP_ZONE("fmp_w_write");
+        FUSED_ZONE("fz_mp_w_write");
         out_tile.wait_front(1);
         noc_async_write(out_tile.get_read_ptr(), out.get_noc_addr(tile_col), tile_bytes);
         noc_async_write_barrier();

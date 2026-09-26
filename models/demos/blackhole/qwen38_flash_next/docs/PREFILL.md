@@ -35,7 +35,11 @@ The slab is **tolerance-class** against the chunk bodies: a 2D-multicast matmul 
 than the per-tile DRAM-sharded program, so each linear's output differs from the chunk form by up to one bf16 ULP of its
 scale (58 % of the elements one step apart, measured on 4x p150 at 2048 rows); the GDN kernel over the slab is bitwise
 the chained 128-row calls, and the slab's other ops (the KV writes, `sparse_sdpa`, the block selection, the head sum)
-are bitwise per row.  The acceptance mechanism is the same as for the other prefill modes (`NUMERICS.md`): `json` must
+are bitwise per row.  With the block-shared attention (`QWEN38_FUSED=sparse_sdpa_tiled`, below) the slab's attention
+leaves that list: the attended set per query is the chain's exactly, the scores are the same bf16 numbers, but the
+flash loop visits each query's keys in the tile union's order and in 256-key chunks instead of the query's own top-k
+order in 32-key chunks, so the running max / sum / out round at other points (tolerance class against `sparse_sdpa`,
+bit-exact run to run).  The acceptance mechanism is the same as for the other prefill modes (`NUMERICS.md`): `json` must
 reproduce the CPU record 96/96 and the eleven divergence indices are reported against the pinned table.  The twelve
 acceptance prompts are shorter than one slab, so the slab body itself is exercised by prompts of 2048 tokens and more
 (the agreement corpus's long items, a long system prompt).
@@ -118,6 +122,21 @@ finite expert outputs, which the reduce multiplies by an exact 0 where unowned. 
 128-row blocks: on 4x p150 the twelve acceptance records, the 3232 agreement rows and the four long-prompt completions
 are identical at three heads.  `QWEN38_MOE_SLAB_ONE_CALL=0` restores the blocks.
 
+Since 2026-09-26 that weighted reduce runs as one program per layer instead of the 21 (four times a
+k-strided slice, a tilize, two routing slices and the fused reduce, then a concat): `ttnn/fused/moe_combine` reads the
+page's owned rows straight into tiles, weights them with the fused reduce's own multiply-accumulate in its slot order
+and packs once, so it is bitwise the blocks by construction; measured on one Blackhole die at 2048 rows, 0 of
+5,242,880 output elements differ from the blocks, 2.66 ms -> 0.14 ms of kernel per layer (128 -> 6.5 ms per 2048-row
+slab).  On the 4x p150 line (the gate of 2026-09-26, 32k context) the twelve acceptance records, the 3232 agreement
+columns and the four probes are identical to the blocks', the 31,716-token prompt reaches its first token in 12.38 s
+against 14.30 (0.389 against 0.450 ms per prompt token), and under the device profiler the combine of one 2048-row
+slab takes 6.33 ms over its 48 layers against 128.3 ms for the blocks (the slab's kernel time 816.5 -> 695.6 ms,
+2,484 -> 2,913 tok/s over the slab; against the chain before the block-shared attention, 899.5 ms / 2,257 tok/s, the stack
+is -22.7 percent).
+`QWEN38_FUSED_OFF=moe_combine` restores the 512-row blocks; `QWEN38_MOE_COMBINE_COLS` (the column tiles per
+work unit, 16 by default; 8 measured equal within 0.5 percent on the 130-core dies of the 4x p150 line, 2026-09-26) is the one
+knob worth a sweep on a new die class.
+
 Per device, per layer, per 2048-row slab on one p150 with a captured natural-text routing, the expert stream takes
 3.25 ms in one call against 13.45 ms in the 16 calls.  Under the device profiler on the 4-chip line (P = 0, a 2048-row
 slab of a 32k record, one chip) the slab's kernel time falls from 1425.3 ms (`moe_compute` 510.1 ms over 768 calls,
@@ -163,10 +182,60 @@ backpressure credit landed the same day); `QWEN38_MOE_SLAB_RINGS=0` restores one
 The README's prefill row, served through the chat server on 4x p150 at the 2026-09-25 head (the routed experts in one
 call on two rings by default): the 32-row chunk trace at 2.4 ms per prompt token (413 / 418 prompt tokens per second in
 two runs: about 410), flat from 2k to 261k tokens; `--long-chunks` at 1.27-1.33 ms (750-790); `--prefill-slab 2048` at
-0.53 ms (1,870: TTFT 17.0 s for a 31,716-token prompt, 1.53 s for 2,118 tokens; the table above).  The release's
+0.39 ms (2,562: TTFT 12.38 s for a 31,716-token prompt with the block-shared attention kernel and the one-pass MoE
+combine, both defaults since 2026-09-26; 14.25 s with the attention kernel alone, 17.0 s with the chains; 1.228 s for
+2,118 tokens; the table above and the rows below).  The release's
 long-context figures of 2026-09-04, through the 32-row chunk trace alone at about 3.2-3.5 ms per prompt token: a 40k
 prompt reached its first token in 125 s and a 200k prompt in 671 s, and decode stayed at 17-19 tokens/s to 256k (the
 decode of that day; the README's decode rows are the current step).
+
+The one-pass combine's served rows (4x p150, 32k context, `--prefill-slab 2048`, 2026-09-26, the block-shared
+attention on in both arms; TTFT the request's time to its first token):
+
+| prompt tokens | default (one-pass combine) | `QWEN38_FUSED_OFF=moe_combine` (the 512-row blocks) |
+|---|---|---|
+| 2,118 | 1.228 s | 1.345 s |
+| 2,764 | 2.011 s | 2.130 s |
+| 25,546 | 10.16 s | 11.65 s |
+| 31,716 | 12.38 s (0.389 ms per prompt token) | 14.30 s (0.450 ms) |
+
+## Block-shared attention (`QWEN38_FUSED=sparse_sdpa_tiled`)
+
+The slab's QSA attention today expands every query's 512 selected blocks to 2048 token ids (five ops over a
+`[rows, 2080]` uint32 tensor per layer), pads the six local heads to 32 with a zero V half and runs `sparse_sdpa`,
+which gathers each query's own 2048 K/V rows: about 51 GB of cache traffic per 2048-row slab and 81 / 129 ms per slab
+at P = 0 / 28672 on the 4x p150 line.  Consecutive queries select overlapping blocks (a tile of 16 queries needs 1.0 /
+1.3 / 1.9 / 2.3 / 3.4x one query's blocks in union at P = 0 / 2k / 4k / 6k / 28k, measured on captured slab
+selections), so `ttnn/fused/sparse_sdpa_tiled` runs the attention per tile of 16 consecutive queries x the six local
+heads on one core: the reader builds the tile's block union (a seed block per row first, then ascending) and one
+membership word per block, the union's K/V rows stream once per tile in 64-block chunks through `sparse_sdpa`'s
+dual-NoC gather, the writer turns the membership words into an additive bf16 mask band per chunk, and compute runs
+`sparse_sdpa`'s streaming flash loop with the band added before the running max.  The selection ends at the block
+ids (no expansion, no zero half, no head pad, no output slice); the tile size follows the grid (16 queries where the
+tiles fit one per core, else 32).  The kernel is the slab's default since 2026-09-26 at the op family's HiFi2 /
+bf16-destination compute config (`QWEN38_SPARSE_SDPA_TILED_FIDELITY=hifi4` restores the slab's HiFi4 / fp32-DEST
+form, `QWEN38_FUSED_OFF=sparse_sdpa_tiled` the chain): on the 4-chip line at a 32k context the 31,716-token prompt
+reached its first token in 14.25 s against 15.92 with the chain (-10 %, 2026-09-26; under the device profiler the attention of one 2048-row slab takes 16.28 ms over its
+12 layers against 89.77 ms for the chain's `sparse_sdpa` and expansion ops, on the prompt's first slab, whose kernel
+time went 899.5 -> 816.6 ms, 2,257 -> 2,484 tok/s; the arm table in `NUMERICS.md`).  The chain is the fallback whenever the kernel's shape contract does not
+hold.
+
+Measured on one die of a QuietBox 2 (2x p300c, an 11x10 compute grid; a 32k context, the captured layer-3
+selections, 2026-09-25) against the chain on the same die: at P = 28672 the chain takes 14.2 ms per QSA layer; the
+kernel 4.65 ms with 16-query tiles (18 of the 128 tiles double up on the 110 cores) and 4.8 ms with the 32-query /
+32-block-chunk tiling the model picks on this grid (64 tiles, one per core; measured before the mask-band rewrite that
+took the 16-query figure from 5.5 to 4.65) -- 3x, 170 against 56 ms per slab; at P = 0 0.89 against 10.3 ms (11.6x).
+Against the chain on the same inputs PCC 0.99954 / 0.99988; against an fp32 oracle no farther than the chain (PCC
+0.99979 both, row rel_err p50 0.021).  The layer is bound by its dataflow side (the K/V gather plus the union and
+band work on the RISCs, 3.8 ms) and its compute side (4.1 ms) alike.  `QWEN38_SPARSE_SDPA_TILED_FIDELITY=hifi2`
+runs the kernel at the op family's own compute config (HiFi2, approximate correction exp, bf16 destination): 4.1 ms
+with 16-query tiles and 3.6 with 32 on this die, PCC 0.99965 against the chain; the served default since the line
+gate of 2026-09-26 (`NUMERICS.md`).  The one-tile-per-core layer time on the 13x10 grid of a p150
+is the slowest single tile: the per-core kernel zones on this die read 1.5-2.6 ms per single tile at 28k (median
+2.4) and 0.2-0.6 ms at P = 0, so about 2.6-2.9 ms and 0.6 ms per layer there at HiFi4 (less at HiFi2).
+The running state's format is a switch (`fp32_state`): fp32 keeps the normalization to 0.4 % (the ones-V column)
+against 1.2 % in bf16 but lands no closer to the oracle (the approximate probability exp shapes the row), so bf16 --
+the chain's format class -- is the default.
 
 ## Glue forms (`QWEN38_PREFILL_GLUE`)
 

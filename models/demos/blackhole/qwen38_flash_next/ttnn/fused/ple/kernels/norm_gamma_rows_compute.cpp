@@ -25,6 +25,7 @@
 #include "api/compute/eltwise_unary/rsqrt.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.hpp"
+#include "../../kernels/zones.h"
 
 ALWI void ACQ() {
     tile_regs_acquire();
@@ -59,62 +60,71 @@ void kernel_main() {
     DataflowBuffer unit(c_unit);
     DataflowBuffer out(c_out);
 
-    scaler.wait_front(1);
-    eps.wait_front(1);
+    {
+        FUSED_ZONE("fz_pl_norm_c_stats");
+        scaler.wait_front(1);
+        eps.wait_front(1);
 
-    compute_kernel_lib::reduce<PoolType::AVG, ReduceDim::REDUCE_ROW, c_stats, c_scaler, c_var>(
-        compute_kernel_lib::ReduceInputBlockShape::row(S));
+        compute_kernel_lib::reduce<PoolType::AVG, ReduceDim::REDUCE_ROW, c_stats, c_scaler, c_var>(
+            compute_kernel_lib::ReduceInputBlockShape::row(S));
 
-    var.wait_front(1);
-    recip.reserve_back(1);
-    reconfig_data_format(c_var, c_eps);
-    pack_reconfig_data_format(c_recip);
-    add_init(c_var, c_eps);
-    ACQ();
-    add_tiles(c_var, c_eps, 0, 0, 0);
-    rsqrt_tile_init<false>();
-    rsqrt_tile<false>(0);
-    pack_tile(0, c_recip);
-    REL();
-    recip.push_back(1);
-    var.pop_front(1);
-
-    reconfig_data_format(c_res, c_recip);
-    pack_reconfig_data_format(c_unit);
-    mul_bcast_cols_init(c_res, c_recip);
-    recip.wait_front(1);
-    for (uint32_t wt = 0; wt < Wt; wt += blk) {
-        res.wait_front(blk);
-        unit.reserve_back(blk);
+        var.wait_front(1);
+        recip.reserve_back(1);
+        reconfig_data_format(c_var, c_eps);
+        pack_reconfig_data_format(c_recip);
+        add_init(c_var, c_eps);
         ACQ();
-        for (uint32_t wtr = 0; wtr < blk; ++wtr) {
-            mul_tiles_bcast_cols(c_res, c_recip, wtr, 0, wtr);
-            pack_tile(wtr, c_unit);
-        }
+        add_tiles(c_var, c_eps, 0, 0, 0);
+        rsqrt_tile_init<false>();
+        rsqrt_tile<false>(0);
+        pack_tile(0, c_recip);
         REL();
-        unit.push_back(blk);
-        res.pop_front(blk);
+        recip.push_back(1);
+        var.pop_front(1);
     }
-    recip.pop_front(1);
 
-    // the chain's FUSE_GAMMA stage: unit (bf16, SrcA) x gamma (fp32, SrcB) on the FPU, gamma's row 0 broadcast
-    unit.wait_front(Wt);
-    gamma.wait_front(Wt);
-    reconfig_data_format(c_unit, c_gamma);
-    pack_reconfig_data_format(c_out);
-    mul_bcast_rows_init(c_unit, c_gamma);
-    for (uint32_t wt = 0; wt < Wt; wt += blk) {
-        out.reserve_back(blk);
-        ACQ();
-        for (uint32_t wtr = 0; wtr < blk; ++wtr) {
-            mul_tiles_bcast_rows(c_unit, c_gamma, wt + wtr, wt + wtr, wtr);
-            pack_tile(wtr, c_out);
+    {
+        FUSED_ZONE("fz_pl_norm_c_unit");
+        reconfig_data_format(c_res, c_recip);
+        pack_reconfig_data_format(c_unit);
+        mul_bcast_cols_init(c_res, c_recip);
+        recip.wait_front(1);
+        for (uint32_t wt = 0; wt < Wt; wt += blk) {
+            res.wait_front(blk);
+            unit.reserve_back(blk);
+            ACQ();
+            for (uint32_t wtr = 0; wtr < blk; ++wtr) {
+                mul_tiles_bcast_cols(c_res, c_recip, wtr, 0, wtr);
+                pack_tile(wtr, c_unit);
+            }
+            REL();
+            unit.push_back(blk);
+            res.pop_front(blk);
         }
-        REL();
-        out.push_back(blk);
+        recip.pop_front(1);
     }
-    unit.pop_front(Wt);
-    gamma.pop_front(Wt);
-    scaler.pop_front(1);
-    eps.pop_front(1);
+
+    {
+        FUSED_ZONE("fz_pl_norm_c_gamma");
+        // the chain's FUSE_GAMMA stage: unit (bf16, SrcA) x gamma (fp32, SrcB) on the FPU, gamma's row 0 broadcast
+        unit.wait_front(Wt);
+        gamma.wait_front(Wt);
+        reconfig_data_format(c_unit, c_gamma);
+        pack_reconfig_data_format(c_out);
+        mul_bcast_rows_init(c_unit, c_gamma);
+        for (uint32_t wt = 0; wt < Wt; wt += blk) {
+            out.reserve_back(blk);
+            ACQ();
+            for (uint32_t wtr = 0; wtr < blk; ++wtr) {
+                mul_tiles_bcast_rows(c_unit, c_gamma, wt + wtr, wt + wtr, wtr);
+                pack_tile(wtr, c_out);
+            }
+            REL();
+            out.push_back(blk);
+        }
+        unit.pop_front(Wt);
+        gamma.pop_front(Wt);
+        scaler.pop_front(1);
+        eps.pop_front(1);
+    }
 }

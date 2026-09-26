@@ -142,7 +142,20 @@ def down(normalized, weight):
     )
     compute = fp.compute_kernel(gr.DOWN, cores, [FLAT_TILES, blk, 0, 1, 16, DOWN_SPILL, 2], fp32_dest=True)
     writer = gr._writer(cores, [(out, 16)], [(w.core, [(1, w.start, 1, 1)]) for w in work])
-    return fp.run_program([normalized, weight, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+    # the weight once (each core its column), the normalized row once per core, the fp32 partial out; the matmul
+    meta = fp.program_meta(
+        NAME,
+        "down",
+        rows,
+        reads=(weight,),
+        writes=(out,),
+        dram_bytes=len(work) * fp.tensor_bytes(normalized),
+        flops=2 * rows * FLAT_WIDTH * RANK,
+        cores=len(work),
+    )
+    return fp.run_program(
+        [normalized, weight, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta
+    )
 
 
 def low_rank(gathered_partials):
@@ -178,7 +191,13 @@ def low_rank(gathered_partials):
     writer = fp.writer_kernel(
         LOWRANK_WRITER, one, [RANK_TILES] + fp.accessor_args(out), [(core, [out.buffer_address()])]
     )
-    return fp.run_program([gathered_partials, zero, out], fp.program_descriptor([reader, compute, writer], cbs=cbs))
+    # the four partial rows and the zero pad in, the bf16 row out; the fold over the devices, the typecast, the silu
+    meta = fp.program_meta(
+        NAME, "low_rank", 1, reads=(gathered_partials, zero), writes=(out,), flops=(TP_SIZE + 2) * RANK, cores=1
+    )
+    return fp.run_program(
+        [gathered_partials, zero, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta
+    )
 
 
 def gate(low_rank_row, normalized, up):
@@ -232,8 +251,20 @@ def gate(low_rank_row, normalized, up):
         unpack_to_dest_fp32=(2, 4, 5),
     )
     writer = gr._writer(cores, [(out, 16)], [(w.core, [(1, w.start, 1, 1)]) for w in work])
+    # the up weight and the normalized row once (each core its columns), the low-rank row once per core, the block
+    # out; the up matmul, then sigmoid, gate multiply and branch sum per element
+    meta = fp.program_meta(
+        NAME,
+        "gate",
+        rows,
+        reads=(up, normalized),
+        writes=(out,),
+        dram_bytes=len(work) * fp.tensor_bytes(low_rank_row),
+        flops=2 * rows * RANK * FLAT_WIDTH + 3 * rows * FLAT_WIDTH,
+        cores=len(work),
+    )
     return fp.run_program(
-        [low_rank_row, normalized, up, out], fp.program_descriptor([reader, compute, writer], cbs=cbs)
+        [low_rank_row, normalized, up, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta
     )
 
 
@@ -316,11 +347,24 @@ def normalize_down(residual, gathered_stats, norm_scale, weight):
     )
     down_k = fp.compute_kernel(gr.DOWN, w_set, [FLAT_TILES, 8, 8, 9, 17, DOWN_SPILL, 10], fp32_dest=True)
     writer = gr._writer(w_set, [(partial, 17)], [(core, [(1, w, 1, 1)]) for w, core in enumerate(workers)])
+    # the norm operands and the weight once, the normalized row and the partial out; the normalized row multicast
+    # into the down cores' CB (L1); the norm's four passes per element, then the down matmul
+    meta = fp.program_meta(
+        NAME,
+        "normalize_down",
+        rows,
+        reads=(residual, gathered_stats, norm_scale, weight),
+        writes=(normalized, partial),
+        l1_bytes=len(workers) * fp.tensor_bytes(normalized),
+        flops=4 * rows * FLAT_WIDTH + 2 * rows * FLAT_WIDTH * RANK,
+        cores=len(workers) + len(producers),
+    )
     fp.run_program(
         [residual, gathered_stats, norm_scale, weight, normalized, partial],
         fp.program_descriptor(
             [reader, norm, sender, receiver, down_k, writer], cbs=cbs, semaphores=[fp.semaphore_descriptor(0, all_set)]
         ),
+        meta=meta,
     )
     return normalized, partial
 
@@ -408,11 +452,24 @@ def low_rank_gate(gathered_partials, normalized, up):
         unpack_to_dest_fp32=(10, 12, 13),
     )
     writer = gr._writer(w_set, [(block, 18)], [(core, [(1, j, 1, 1)]) for j, core in enumerate(workers)])
+    # the partials, the pad, the normalized row and the up weight once, the block out; the low-rank row multicast
+    # into the gate cores' CB (L1); the fold, typecast and silu, the up matmul, sigmoid, gate multiply and branch sum
+    meta = fp.program_meta(
+        NAME,
+        "low_rank_gate",
+        rows,
+        reads=(gathered_partials, zero, normalized, up),
+        writes=(block,),
+        l1_bytes=len(workers) * RANK_TILES * TILE_BF16,
+        flops=(TP_SIZE + 2) * RANK + 2 * rows * RANK * FLAT_WIDTH + 3 * rows * FLAT_WIDTH,
+        cores=len(workers) + len(producers),
+    )
     fp.run_program(
         [gathered_partials, zero, normalized, up, block],
         fp.program_descriptor(
             [reader, fold, sender, receiver, gate_k, writer], cbs=cbs, semaphores=[fp.semaphore_descriptor(0, all_set)]
         ),
+        meta=meta,
     )
     return block
 

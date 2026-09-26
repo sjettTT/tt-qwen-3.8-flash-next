@@ -9,6 +9,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t T = get_compile_time_arg_val(0);
 constexpr uint32_t BF16_TILE_BYTES = 2048;
@@ -19,10 +20,14 @@ void kernel_main() {
     const auto out = TensorAccessor(a_o, get_arg_val<uint32_t>(0));
     Noc noc;
     DataflowBuffer lr(c_lr);
-    lr.wait_front(T);
-    for (uint32_t t = 0; t < T; ++t) {
-        noc.async_write(lr, out, BF16_TILE_BYTES, {.offset_bytes = t * BF16_TILE_BYTES}, {.page_id = t, .offset_bytes = 0});
+    {
+        FUSED_ZONE("fz_fm_lr_w_main");
+        lr.wait_front(T);
+        for (uint32_t t = 0; t < T; ++t) {
+            noc.async_write(
+                lr, out, BF16_TILE_BYTES, {.offset_bytes = t * BF16_TILE_BYTES}, {.page_id = t, .offset_bytes = 0});
+        }
+        noc.async_write_barrier();
+        lr.pop_front(T);
     }
-    noc.async_write_barrier();
-    lr.pop_front(T);
 }

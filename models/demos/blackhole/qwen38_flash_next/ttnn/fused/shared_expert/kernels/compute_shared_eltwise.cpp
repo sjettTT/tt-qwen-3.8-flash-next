@@ -20,8 +20,10 @@
 #include "api/compute/reconfig_data_format.h"
 #include "api/compute/pack.h"
 #include "api/dataflow/dataflow_buffer.h"
+#include "../../kernels/zones.h"
 
 void kernel_main() {
+    FUSED_ZONE("fz_se_c_main");
     const uint32_t has_scalar = get_arg_val<uint32_t>(0);
     constexpr uint32_t cb_gate = get_named_compile_time_arg_val("cb_gate");
     constexpr uint32_t cb_up = get_named_compile_time_arg_val("cb_up");
@@ -78,6 +80,7 @@ void kernel_main() {
     inter.push_back(1);
 
     if (has_scalar) {
+        FUSED_ZONE("fz_se_c_sigmoid");
         // ---- eltwise_sfpu.cpp, SFPU_OP_CHAIN_0 = sigmoid (vector mode RC, accurate) ----
         scalar.wait_front(1);
         sig.reserve_back(1);

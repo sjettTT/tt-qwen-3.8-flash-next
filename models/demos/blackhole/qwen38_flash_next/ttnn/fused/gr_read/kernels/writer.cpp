@@ -10,6 +10,7 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/dataflow_buffer.h"
 #include "api/tensor/noc_traits.h"
+#include "../../kernels/zones.h"
 
 constexpr uint32_t NUM_STREAMS = get_compile_time_arg_val(0);
 constexpr uint32_t ACCESSOR_BASE = 4;
@@ -41,11 +42,14 @@ void kernel_main() {
     constexpr auto args0 = TensorAccessorArgs<ACCESSOR_BASE>();
     constexpr auto args1 = TensorAccessorArgs<args0.next_compile_time_args_offset()>();
     constexpr auto args2 = TensorAccessorArgs<args1.next_compile_time_args_offset()>();
-    write_stream(args0, get_compile_time_arg_val(1), 0);
-    if constexpr (NUM_STREAMS > 1) {
-        write_stream(args1, get_compile_time_arg_val(2), STREAM_RT_ARGS);
-    }
-    if constexpr (NUM_STREAMS > 2) {
-        write_stream(args2, get_compile_time_arg_val(3), 2 * STREAM_RT_ARGS);
+    {
+        FUSED_ZONE("fz_gr_wr_main");
+        write_stream(args0, get_compile_time_arg_val(1), 0);
+        if constexpr (NUM_STREAMS > 1) {
+            write_stream(args1, get_compile_time_arg_val(2), STREAM_RT_ARGS);
+        }
+        if constexpr (NUM_STREAMS > 2) {
+            write_stream(args2, get_compile_time_arg_val(3), 2 * STREAM_RT_ARGS);
+        }
     }
 }
