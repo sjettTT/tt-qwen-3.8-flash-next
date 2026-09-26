@@ -65,15 +65,15 @@ LOCAL_COMBINE_AXIS = 0
 MOE_LOCAL_OUTPUT_ENV = "QWEN38_MOE_LOCAL_OUTPUT"
 MOE_SLAB_ONE_CALL_ENV = "QWEN38_MOE_SLAB_ONE_CALL"
 MOE_SLAB_RINGS_ENV = "QWEN38_MOE_SLAB_RINGS"
-# The one-call slab's weight stream: 2 = two rings of cores splitting the chunks, each reading the slices of the
-# experts it owns (the default since 2026-09-25: bitwise on the 4-chip line three times, the last with the ring
-# exchange's credit in place; 6 percent less time per prompt token than one ring at 32k); 0 = the op's one-ring
-# three-slot stream (opt-in: `QWEN38_MOE_SLAB_RINGS=0`); 1 = the replay ring (one ring, each expert's slice read once
-# per slab; bitwise on one die, opt-in). Three rings are refused at this switch: the op implements them, but on the
-# 4-chip line their output was nondeterministic (2026-09-25) before the exchange's credit; a line arm is owed.
-MOE_SLAB_RINGS_DEFAULT = 2
-MOE_SLAB_RINGS_ADMITTED = (0, 1, 2)
-MOE_SLAB_RINGS_REFUSED = {3: "nondeterministic on the 4-chip line (2026-09-25); under investigation"}
+# The one-call slab's weight stream: 3 = three rings of cores splitting the chunks, each reading the slices of the
+# experts it owns (the default since 2026-09-26: bitwise on the 4-chip line with the ring exchange's backpressure
+# credit in place, twice, and about 42,500 device-checked calls bitwise on one die; 2.2 percent less TTFT than two
+# rings at 32k); 2 = two rings (the default of 2026-09-25); 0 = the op's one-ring three-slot stream; 1 = the replay
+# ring (one ring, each expert's slice read once per slab). Nothing is refused: the three-ring nondeterminism of
+# 2026-09-25 was the ring exchange's missing backpressure, fixed the same day.
+MOE_SLAB_RINGS_DEFAULT = 3
+MOE_SLAB_RINGS_ADMITTED = (0, 1, 2, 3)
+MOE_SLAB_RINGS_REFUSED: dict[int, str] = {}
 # The one-call slab's weighted reduce runs in blocks of this many rows: the fused reduce keeps one score table per
 # row tile in L1 (512 rows admitted bitwise the 128-row form, 1024 refused) and the whole [10, rows, 2560] page set
 # tilized at once would not fit L1.
@@ -122,11 +122,11 @@ def moe_slab_one_call_enabled() -> bool:
 
 
 def moe_slab_prefill_rings() -> int:
-    """``QWEN38_MOE_SLAB_RINGS``: the one-call slab's ``prefill_rings`` (2 = two rings of cores splitting the chunks,
-    each ring reading the slices of the experts it owns -- the default when unset; 0 = the op's one-ring 3-slot
-    weight stream; 1 = the replay ring, one ring with each expert's weight slice read from DRAM once per slab;
-    ``MOE_SLAB_RINGS_ADMITTED``). A count in ``MOE_SLAB_RINGS_REFUSED`` (three rings) is refused with its reason even
-    though the op implements it. Only the one-call slab reads the switch; the chunk forms and decode never do."""
+    """``QWEN38_MOE_SLAB_RINGS``: the one-call slab's ``prefill_rings`` (3 = three rings of cores splitting the
+    chunks, each ring reading the slices of the experts it owns -- the default when unset; 2 = two rings; 0 = the
+    op's one-ring 3-slot weight stream; 1 = the replay ring, one ring with each expert's weight slice read from DRAM
+    once per slab; ``MOE_SLAB_RINGS_ADMITTED``). A count in ``MOE_SLAB_RINGS_REFUSED`` (none today) is refused with
+    its reason. Only the one-call slab reads the switch; the chunk forms and decode never do."""
 
     value = os.environ.get(MOE_SLAB_RINGS_ENV, str(MOE_SLAB_RINGS_DEFAULT))
     for refused, reason in MOE_SLAB_RINGS_REFUSED.items():

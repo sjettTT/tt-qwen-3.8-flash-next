@@ -86,20 +86,15 @@ def test_slab_one_call_switch(monkeypatch) -> None:
     assert not moe_module.moe_slab_one_call_enabled() and moe_module.routed_tokens_per_call_for(SLAB) == 128
     assert moe_module.routed_tokens_per_call_for(128) == 128 and moe_module.routed_tokens_per_call_for(32) == 32
     monkeypatch.delenv(moe_module.MOE_SLAB_ONE_CALL_ENV)
-    # the one-call slab's ring mode: unset = 2 (two rings, the default since 2026-09-25), 0 and 1 admitted (one
-    # ring), 3 refused with the line's reason (the op implements it), anything else refused as unknown
+    # the one-call slab's ring mode: unset = 3 (three rings, the default since 2026-09-26), 0 / 1 / 2 admitted,
+    # nothing refused, anything else refused as unknown
     monkeypatch.delenv(moe_module.MOE_SLAB_RINGS_ENV, raising=False)
-    assert moe_module.moe_slab_prefill_rings() == 2 == moe_module.MOE_SLAB_RINGS_DEFAULT
-    assert moe_module.MOE_SLAB_RINGS_ADMITTED == (0, 1, 2)
-    for value in ("0", "1", "2"):
+    assert moe_module.moe_slab_prefill_rings() == 3 == moe_module.MOE_SLAB_RINGS_DEFAULT
+    assert moe_module.MOE_SLAB_RINGS_ADMITTED == (0, 1, 2, 3)
+    for value in ("0", "1", "2", "3"):
         monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, value)
         assert moe_module.moe_slab_prefill_rings() == int(value)
-    monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "3")
-    with pytest.raises(ValueError, match="nondeterministic on the 4-chip line"):  # allow-pytest.raises: contract
-        moe_module.moe_slab_prefill_rings()
-    assert moe_module.MOE_SLAB_RINGS_REFUSED == {
-        3: "nondeterministic on the 4-chip line (2026-09-25); under investigation"
-    }
+    assert moe_module.MOE_SLAB_RINGS_REFUSED == {}
     monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "4")
     with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
         moe_module.moe_slab_prefill_rings()
@@ -247,13 +242,13 @@ def test_slab_moe_defaults_when_nothing_is_set(monkeypatch) -> None:
     default stream)."""
     monkeypatch.delenv(moe_module.MOE_SLAB_ONE_CALL_ENV, raising=False)
     monkeypatch.delenv(moe_module.MOE_SLAB_RINGS_ENV, raising=False)
-    assert moe_module.moe_slab_one_call_enabled() and moe_module.moe_slab_prefill_rings() == 2
+    assert moe_module.moe_slab_one_call_enabled() and moe_module.moe_slab_prefill_rings() == 3
     assert moe_module.routed_tokens_per_call_for(SLAB) == SLAB
     assert moe_module.routed_tokens_per_call_for(LONG_CHUNK_ROWS) == LONG_CHUNK_ROWS
     assert moe_module.routed_tokens_per_call_for(CHUNK_ROWS) == CHUNK_ROWS
     one_call = SimpleNamespace(slab_one_call=True)
     blocks = SimpleNamespace(slab_one_call=False)
-    assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(one_call) == 2
+    assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(one_call) == 3
     assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(blocks) is None  # only the one-call slab reads the switch
     assert moe_module.Qwen38TTNNMoE.zero_fill_non_owned_rows.fget(one_call) is False
     assert moe_module.Qwen38TTNNMoE.zero_fill_non_owned_rows.fget(blocks) is True
@@ -262,9 +257,8 @@ def test_slab_moe_defaults_when_nothing_is_set(monkeypatch) -> None:
     assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(blocks) is None
     monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "1")
     assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(one_call) == 1
-    monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "3")
-    with pytest.raises(ValueError, match="under investigation"):  # allow-pytest.raises: pure contract test
-        moe_module.Qwen38TTNNMoE.prefill_rings.fget(one_call)
+    monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "2")
+    assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(one_call) == 2
     assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(blocks) is None
 
 
@@ -283,7 +277,9 @@ def test_slab_moe_switches_are_admitted_before_the_device(monkeypatch) -> None:
     monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "3")  # the blocks never read the ring switch
     assert moe_module.admit_slab_moe_switches() == (False, 0)
     monkeypatch.setenv(moe_module.MOE_SLAB_ONE_CALL_ENV, "1")
-    with pytest.raises(ValueError, match="under investigation"):  # allow-pytest.raises: pure contract test
+    assert moe_module.admit_slab_moe_switches() == (True, 3)
+    monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "4")
+    with pytest.raises(ValueError, match="must be one of"):  # allow-pytest.raises: pure contract test
         moe_module.admit_slab_moe_switches()
     main = inspect.getsource(server_module.main)
     admit = main.index("admit_slab_moe_switches()")

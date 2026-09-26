@@ -19,7 +19,7 @@ No prebuilt archive, no pinned binary, no host-specific configuration.
 
 | path | measured | notes |
 |---|---|---|
-| prompt prefill | 410 tok/s; 750-790 tok/s with `--long-chunks`; 2,562 tok/s with `--prefill-slab 2048` | 2026-09-26 (block-shared attention + one-pass combine defaults: 31,716 tokens in 12.38 s; the chunk rates 2026-09-25); the slab is tolerance-class against the chunk bodies (`docs/PREFILL.md`: the ms per prompt token, the TTFTs, the one-call expert stream) |
+| prompt prefill | 410 tok/s; 750-790 tok/s with `--long-chunks`; 2,604 tok/s with `--prefill-slab 2048` | 2026-09-26 (block-shared attention + one-pass combine + three-ring expert stream defaults: 31,716 tokens in 12.18 s; the chunk rates 2026-09-25); the slab is tolerance-class against the chunk bodies (`docs/PREFILL.md`: the ms per prompt token, the TTFTs, the one-call expert stream) |
 | decode, one stream | 38.6 tok/s greedy, 36.5 tok/s sampled | 25.9 ms per token greedy (2026-09-26: the router tail's live-row exp and the MoE dense composite, bitwise: `docs/NUMERICS.md`), flat with depth; the sampled figure is the 2026-09-25 measurement; the defaults are listed below the table |
 | decode, 4 / 8 streams | 28.9 / 23.4 tok/s per user (116 / 187 aggregate) | the batched-decode lane body measured directly, 34.6 / 42.7 ms per step; the chat server serves one stream (2026-09-25, component class: `docs/NUMERICS.md`) |
 | decode with MTP (`--mtp 4`) | greedy 50.3 tok/s on a 560-token chat prompt, 47.2 on a 177-token multi-turn chat, 75.3 json, 75.4 code, 37.2 prose (3.12 / 2.83 / 4.55 / 4.57 / 2.20 tokens per pass; json and prose end naturally at 153 / 196 tokens) against 35.4-36.3 plain greedy; `--mtp 3` (2026-09-25) 45.5 / 55.4 / 60.6 / 30.7; `--mtp 5` opt-in (`docs/NUMERICS.md`); sampled 42.0 / 41.8 tok/s at 23.8 / 23.9 ms per token (the card profiles, non-thinking / thinking) against 33.5 / 33.9 plain | 256-token answers measured client-side on the 4-chip p150 line (2026-09-26, the MTP stack on the prefill landing's runtime); speculative drafting with exact acceptance for greedy requests and, by default on an `--mtp --sampling` server, sampled ones; the pass costs 60-62 ms whatever it accepts (section 6, `docs/NUMERICS.md`) |
@@ -135,7 +135,7 @@ that leaves earlier than the pinned table is a regression (`docs/NUMERICS.md`).
 | `--acceptance`, `--require-json-96` | replay the twelve CPU greedy records at start; refuse to serve unless `json` matches 96/96 |
 | `--prepare-only --bf4-stage-limit N` | convert at most N missing expert layers into the BF4 cache and stop |
 | `--long-chunks` | 128-row prefill chunks where the prompt allows (section 6); off by default, not combined with `--mtp` |
-| `--prefill-slab 2048` | prefill slabs of 2048 rows ahead of the 128-row chunks: one matmul per dense linear, the routed experts in one `moe_compute` call on two rings, tolerance-class against the chunk bodies (`docs/PREFILL.md`); off by default, not combined with `--mtp` |
+| `--prefill-slab 2048` | prefill slabs of 2048 rows ahead of the 128-row chunks: one matmul per dense linear, the routed experts in one `moe_compute` call on three rings, tolerance-class against the chunk bodies (`docs/PREFILL.md`); off by default, not combined with `--mtp` |
 | `--mtp 3\|4\|5` | speculative drafting on greedy requests (section 6); off by default |
 | `--port`, `--host` | the listening port; `--host` default `0.0.0.0`: the QuietBox and p150-line profiles serve the LAN |
 | `--serve-seconds N` | stop after N seconds (a drain: the request in flight gets its reply) |

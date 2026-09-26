@@ -164,18 +164,23 @@ the profiler, 1041.7 ms of kernel time on one ring (1,951 prompt tokens per seco
 one ring and the two rings, and the decode after the prefill identical to the lineage's own run.
 
 `QWEN38_MOE_SLAB_RINGS` selects how the one call streams the expert weights; only the one-call slab reads it, the
-32- and 128-row chunks and decode never do.  Two rings are the default since 2026-09-25 (the ring exchange's
-backpressure credit landed the same day); `QWEN38_MOE_SLAB_RINGS=0` restores one ring:
+32- and 128-row chunks and decode never do.  Three rings are the default since 2026-09-26; `QWEN38_MOE_SLAB_RINGS=2`
+restores two rings (the default of 2026-09-25) and `=0` one ring:
 
-- `2` (unset): the chunks are split over two rings of cores, each reading the slices of the experts it owns.
-  Bitwise on the 4-chip line at 32k in three runs (the acceptance records, agreement rows and completions identical
-  to the one-ring form's); 73.5 ms less kernel time per slab under the profiler (971.4 against 1044.9 ms);
+- `3` (unset): the chunks are split over three rings of cores, each reading the slices of the experts it owns.
+  Bitwise on the 4-chip line at 32k (the acceptance records, the 3232 agreement columns and the four completions
+  identical to the two-ring form's, two runs) and on one die over about 42,500 device-checked calls (captured and
+  adversarial routings, every replay compared); TTFT 12.18 s at 31,716 tokens against 12.45 with two rings
+  (-2.1 percent; 10.01 against 10.18 s at 25,546 tokens); per 2048-row slab under the profiler 681.1 ms of kernel
+  time (2,974 prompt tokens per second) against 695.5 (2,914), the 48 `moe_compute` calls 1.84 against 2.08 ms each
+  (88.2 against 99.6 ms per slab).  Three rings were refused on 2026-09-25, when two runs of
+  the same prompts differed: the cause was the ring exchange's missing backpressure (a core's partial could be
+  overwritten by its predecessor's next chunk), fixed the same day; the fix is what made two and three rings bitwise;
+- `2`: two rings; bitwise on the 4-chip line in three runs; 73.5 ms less kernel time per slab under the profiler than
+  one ring (971.4 against 1044.9 ms);
 - `0`: the op's one-ring, three-slot weight stream (the form the one call was first gated with);
 - `1`: one ring with each expert's weight slice read from DRAM once per slab (a replay ring); bitwise the one-ring
-  stream on one die, not measured on the 4-chip line;
-- `3`: refused by the switch.  The op implements three rings, but on the 4-chip line their output was
-  nondeterministic (2026-09-25: two runs of the same prompts differed from each other and from the default in
-  different places while every other form was identical); the cause is under investigation.
+  stream on one die, not measured on the 4-chip line.
 
 ## Served rates
 
@@ -297,8 +302,8 @@ models/demos/blackhole/qwen38_flash_next/tools/run_qwen38_chat_server.sh --profi
 
 The first start compiles the slab body's programs in the warm pass (an eager slab from the reset state) and captures
 its trace after the 128-row chunk trace; `/health` reports `prefill_slab_rows`.  `QWEN38_MOE_SLAB_ONE_CALL=0` in the
-server's environment restores the 16 x 128-row expert calls, `QWEN38_MOE_SLAB_RINGS=0` restores one ring for the
-one call; both are read when the slab's layer instances are built, so they take effect at the next start.
+server's environment restores the 16 x 128-row expert calls, `QWEN38_MOE_SLAB_RINGS=2` (or `0`) restores two (one)
+rings for the one call; both are read when the slab's layer instances are built, so they take effect at the next start.
 
 ### The dense-linear switches
 

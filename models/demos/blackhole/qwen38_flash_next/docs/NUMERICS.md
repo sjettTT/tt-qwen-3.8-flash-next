@@ -104,7 +104,9 @@ The slab's one-pass MoE combine (`moe_combine`, the default since 2026-09-26; `Q
 512-row blocks) is bitwise class: it issues the fused reduce's own multiply-accumulate in its slot order on the
 page's owned rows, and the line gate of 2026-09-26 (4x p150, 32k context, `--prefill-slab 2048`) read the twelve
 acceptance records, the 3232 agreement columns and the four probes identical to the blocks', with the attention
-identity through the stack unchanged; TTFT at 31,716 tokens 14.30 -> 12.38 s (`PREFILL.md`).
+identity through the stack unchanged; TTFT at 31,716 tokens 14.30 -> 12.38 s (`PREFILL.md`).  The one call's three
+rings (`QWEN38_MOE_SLAB_RINGS` unset, the default since 2026-09-26) are bitwise the two rings on the same gate: records
+12/12, columns 3232/3232, probes 4/4, in two runs (`PREFILL.md`).
 
 ## The slab's block-shared attention (`QWEN38_FUSED=sparse_sdpa_tiled`, 2026-09-25)
 
