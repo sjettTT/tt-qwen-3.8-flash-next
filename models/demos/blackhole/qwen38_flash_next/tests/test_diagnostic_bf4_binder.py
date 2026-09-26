@@ -1,8 +1,10 @@
 """The CPU-staged BF4 corpus binder on a synthetic 49-slot corpus: the producer identity is read from the verification
 record (and pinned when the caller passes one), the physical order is adopted from the evidence, every tensorbin is
 hashed, and a missing file, a digest, a shape or a slot that differs refuses."""
+
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
@@ -173,8 +175,9 @@ def test_public_binder_reads_the_producer_identity_from_the_record_and_pins_a_gi
     other = {**PRODUCER, "source_head": "b" * 40}
     with pytest.raises(diagnostic_bf4.DiagnosticBF4BindingError, match="producer identity differs"):
         diagnostic_bf4.binding_contract(contract.artifact_root, contract.verification_result, producer=other)
-    # the synthetic corpus is not the real one: the public binder refuses it at the byte total
-    with pytest.raises(diagnostic_bf4.DiagnosticBF4BindingError, match="verification corpus differs"):
+    # the synthetic corpus is not the real one: its record matches its disk, so the public binder refuses it at the
+    # first artifact whose size is not the compact pin
+    with pytest.raises(diagnostic_bf4.DiagnosticBF4BindingError, match="not the compact layout"):
         diagnostic_bf4.bind_diagnostic_bf4_corpus(contract.artifact_root, contract.verification_result)
     with pytest.raises(diagnostic_bf4.DiagnosticBF4BindingError, match="absolute"):
         diagnostic_bf4.bind_diagnostic_bf4_corpus("relative/corpus", contract.verification_result)
@@ -223,4 +226,33 @@ def test_rejects_slot_mismatch_and_a_second_physical_order(tmp_path):
     evidence["ownership"]["physical_ids"] = [0, 2, 1, 3]
     _write_json(evidence_path, evidence)
     with pytest.raises(diagnostic_bf4.DiagnosticBF4BindingError, match="physical_ids"):
+        diagnostic_bf4._bind(contract.artifact_root, contract.verification_result, contract=contract)
+
+
+def test_summary_reports_disk_bytes_and_the_contract_total_apart(tmp_path):
+    contract, _, _ = _fixture(tmp_path)
+    corpus = diagnostic_bf4._bind(contract.artifact_root, contract.verification_result, contract=contract)
+    assert corpus.summary()["bytes"] == 49 * 24 == corpus.disk_bytes
+    assert corpus.summary()["contract_bytes"] == contract.total_bytes == 49 * 24
+
+
+def test_record_is_compared_to_the_disk_and_a_pre_compact_corpus_is_named(tmp_path):
+    """2026-09-26: the retained Aug-27 corpus (its record's bytes = its on-disk sum, 106,819,608,000) against the compact
+    pins (ddd4e99e2f, 49 x 1,415,580,096) read "verification corpus differs: {... 'bytes': 106819608000} != {... 'bytes':
+    69363424704}" -- the record was compared to the contract total instead of the disk. The record now compares to the
+    disk and the first artifact names the layout; a record that disagrees with the disk still differs, before any
+    artifact is read."""
+    contract, results, summary_paths = _fixture(tmp_path)
+    compact = dataclasses.replace(
+        contract,
+        artifact_specs=MappingProxyType(
+            {name: dataclasses.replace(spec, bytes=spec.bytes - 2) for name, spec in contract.artifact_specs.items()}
+        ),
+        total_bytes=49 * 20,
+    )
+    with pytest.raises(diagnostic_bf4.DiagnosticBF4BindingError, match="not the compact layout") as caught:
+        diagnostic_bf4._bind(compact.artifact_root, compact.verification_result, contract=compact)
+    assert "w0_w1 is 11 bytes on disk against the contract's 9" in str(caught.value)
+    _write_summaries(results, summary_paths, contract.verification_result, contract.artifact_root, 49 * 20, create=True)
+    with pytest.raises(diagnostic_bf4.DiagnosticBF4BindingError, match="verification corpus differs"):
         diagnostic_bf4._bind(contract.artifact_root, contract.verification_result, contract=contract)

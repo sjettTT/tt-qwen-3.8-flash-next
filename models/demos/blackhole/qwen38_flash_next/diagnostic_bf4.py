@@ -60,6 +60,8 @@ ARTIFACT_SPECS = MappingProxyType(
     }
 )
 # The corpus total follows the per-artifact pins: 49 slots x (w0_w1 + w2) = 69,363,424,704 bytes in the compact layout.
+# The verification record's corpus.bytes is the on-disk sum the producer saw (the Aug-27 record: 106,819,608,000, its
+# pre-compact layout); the binder compares the record to the disk and the pins to every artifact (2026-09-26).
 EXPECTED_TOTAL_BYTES = len(EXPECTED_SLOTS) * sum(spec.bytes for spec in ARTIFACT_SPECS.values())
 
 
@@ -145,7 +147,8 @@ class DiagnosticBF4Corpus:
     verification_result: Path
     identity: DiagnosticBF4Identity
     records: Mapping[tuple[str, int], DiagnosticBF4Record]
-    total_bytes: int
+    total_bytes: int  # the contract's total (the per-artifact pins)
+    disk_bytes: int  # what the bound artifacts occupy on disk
 
     def get(self, namespace: str, layer_index: int) -> DiagnosticBF4Record:
         try:
@@ -165,7 +168,8 @@ class DiagnosticBF4Corpus:
             "backbone_layers": [index for namespace, index in self.records if namespace == "backbone"],
             "mtp_layers": [index for namespace, index in self.records if namespace == "mtp"],
             "tensorbins": 2 * len(self.records),
-            "bytes": self.total_bytes,
+            "bytes": self.disk_bytes,
+            "contract_bytes": self.total_bytes,
             "all_payload_sha256_verified": True,
         }
 
@@ -333,7 +337,20 @@ def _validate_tree(root: Path, expected_files: set[Path]) -> None:
         )
 
 
-def _source_results(verification: dict[str, Any], contract: _BindingContract) -> list[dict[str, Any]]:
+def _disk_bytes(artifact_root: Path, contract: _BindingContract) -> int:
+    """The bytes the contract's artifacts occupy on disk (canonical regular files; a missing one refuses here). The
+    verification record's ``corpus.bytes`` is this sum as the producer saw it; the contract's own total (the compact
+    pins) is checked per artifact, not against the record."""
+    total = 0
+    for slot in contract.slots:
+        namespace, layer_index = slot
+        for name, spec in contract.artifact_specs.items():
+            path = artifact_root / namespace / f"layer-{layer_index:02d}" / spec.filename
+            total += _canonical_file(path, label=f"{slot} artifact {name}").st_size
+    return total
+
+
+def _source_results(verification: dict[str, Any], contract: _BindingContract, disk_bytes: int) -> list[dict[str, Any]]:
     _require_equal(verification.get("mode"), VERIFICATION_MODE, "verification mode")
     for key, expected in (
         ("status", "pass"),
@@ -348,7 +365,7 @@ def _source_results(verification: dict[str, Any], contract: _BindingContract) ->
                 "backbone_layers": list(range(48)),
                 "mtp_layers": [0],
                 "tensorbins": 2 * len(contract.slots),
-                "bytes": contract.total_bytes,
+                "bytes": disk_bytes,
             },
         ),
     ):
@@ -401,7 +418,8 @@ def _bind(
         raise DiagnosticBF4BindingError(f"artifact root must be a canonical directory: {artifact_root}")
     _canonical_file(verification_result, label="corpus verification result")
     verification = _load_json(verification_result, label="corpus verification result")
-    results = _source_results(verification, contract)
+    disk_bytes = _disk_bytes(artifact_root, contract)
+    results = _source_results(verification, contract, disk_bytes)
 
     result_by_slot: dict[tuple[str, int], dict[str, Any]] = {}
     for result in results:
@@ -489,6 +507,15 @@ def _bind(
             if type(raw) is not dict:
                 raise DiagnosticBF4BindingError(f"{slot} artifact {name} schema differs")
             path = artifact_root / namespace / f"layer-{layer_index:02d}" / spec.filename
+            # the on-disk size against the pin first: a corpus of another layout is named as such, before its staging
+            # evidence (which describes that other layout) is compared field by field
+            on_disk = _canonical_file(path, label=f"{slot} artifact {name}").st_size
+            if on_disk != spec.bytes:
+                raise DiagnosticBF4BindingError(
+                    f"{slot} artifact {name} is {on_disk} bytes on disk against the contract's {spec.bytes}: the retained "
+                    "corpus is not the compact layout the contract pins (the Aug-27 corpus predates it, 2026-09-24) -- "
+                    "pack a compact corpus or run corpus-free"
+                )
             expected = {
                 "bytes": spec.bytes,
                 "dtype": "BFLOAT4_B",
@@ -553,6 +580,7 @@ def _bind(
         identity=identity,
         records=MappingProxyType(records),
         total_bytes=total_bytes,
+        disk_bytes=disk_bytes,
     )
 
 
