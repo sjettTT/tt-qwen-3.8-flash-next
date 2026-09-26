@@ -182,7 +182,7 @@ def test_the_mtp_verify_rows_run_the_same_one_tile_row_linears() -> None:
     above, so two readers per bank need no separate MTP form (gated at the model level by the --mtp acceptance)."""
 
     assert gdn_module.CHUNK_SIZE == qsa_module.CHUNK_ROWS == TILE == 32
-    project = inspect.getsource(gdn_module.Qwen38TTNNGDN._project_rows)
+    project = inspect.getsource(gdn_module.Qwen38TTNNGDN._project_rows_linear)
     assert project.count("ttnn.linear(") == 2 and project.count("program_config=self.in_proj_program_config") == 2
     rows = inspect.getsource(qsa_module.Qwen38TTNNQSA._linear_rows)
     assert rows.count("ttnn.linear(") == 2 and rows.count("program_config=program_config") == 2

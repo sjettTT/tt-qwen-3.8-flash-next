@@ -34,6 +34,10 @@ from .registry import (
 )
 from . import (
     final_mixer,
+    gdn_post_rows,
+    gdn_pre_rows,
+    gdn_rows_prims_direct,
+    gdn_rows_wrap,
     gdn_step,
     gr_read,
     gr_write,
@@ -51,6 +55,7 @@ from . import (
 )
 from . import gr_fold  # after gr_read: it composes gr_read's programs
 from . import moe_dense  # after router_tail, shared_expert, untilize_rows and gr_read: it hosts their kernels
+from . import gdn_prefill_rows  # after the two rows programs: it wires them together for the prefill slab
 
 __all__ = [
     "ALL",
@@ -67,6 +72,11 @@ __all__ = [
     "enabled",
     "enabled_names",
     "final_mixer",
+    "gdn_post_rows",
+    "gdn_pre_rows",
+    "gdn_prefill_rows",
+    "gdn_rows_prims_direct",
+    "gdn_rows_wrap",
     "gdn_step",
     "gr_read",
     "gr_write",

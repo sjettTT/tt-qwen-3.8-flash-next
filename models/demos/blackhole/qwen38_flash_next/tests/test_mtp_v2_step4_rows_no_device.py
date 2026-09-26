@@ -35,6 +35,7 @@ from models.demos.blackhole.qwen38_flash_next.tt.gdn import (
 )
 from models.demos.blackhole.qwen38_flash_next.tt.ple import Qwen38PLEWeights
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
+from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_rows_wrap
 from models.demos.blackhole.qwen38_flash_next.ttnn import layer as layer_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2
 from models.demos.blackhole.qwen38_flash_next.ttnn import ple as ple_module
@@ -1006,7 +1007,11 @@ def test_rows_paths_never_upload_or_take_per_pass_host_ints() -> None:
         "_causal_conv_rows",
         "_make_chunk_inputs",
         "_chunk_rows",
+        "_chunk_rows_composite",
+        "_project_rows_linear",
+        "_land_rows_qkv",
         "_gate_and_project_rows",
+        "_rows_output_tile",
         "_advance_history_rows",
     ]
     calls = {
@@ -1027,9 +1032,29 @@ def test_rows_paths_never_upload_or_take_per_pass_host_ints() -> None:
         for argument in methods[name].args.args:
             annotation = ast.unparse(argument.annotation) if argument.annotation is not None else ""
             assert annotation != "int", f"{name} takes a per-call host int {argument.arg}"
-    chunk_call = next(
+    # _chunk_rows builds the kernel's views and hands them to the resolved recurrence (the composite by default; the
+    # two prims called directly under QWEN38_FUSED=gdn_rows_prims_direct, test_fused_gdn_rows_prims_direct_static);
+    # the composite call itself lives in _chunk_rows_composite, the registry's composed chain.
+    dispatch = [
         node
         for node in ast.walk(methods["_chunk_rows"])
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "kernel"
+    ]
+    assert len(dispatch) == 1 and [ast.unparse(argument) for argument in dispatch[0].args] == [
+        "self",
+        "q_rows",
+        "k_rows",
+        "v_rows",
+        "g_rows",
+        "beta_rows",
+        "initial_state",
+        "constants",
+    ]
+    assert calls["_chunk_rows"].count("self._chunk_rows_kernel") == 1
+    assert calls["_chunk_rows"].count("ttnn.transformer.chunk_gated_delta_rule") == 0
+    chunk_call = next(
+        node
+        for node in ast.walk(methods["_chunk_rows_composite"])
         if isinstance(node, ast.Call) and ast.unparse(node.func) == "ttnn.transformer.chunk_gated_delta_rule"
     )
     keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in chunk_call.keywords}
@@ -1046,7 +1071,7 @@ def test_rows_paths_never_upload_or_take_per_pass_host_ints() -> None:
         "g_rows",
         "beta_rows",
     ]
-    assert calls["_chunk_rows"].count("ttnn.transformer.chunk_gated_delta_rule") == 1
+    assert calls["_chunk_rows_composite"] == ["ttnn.transformer.chunk_gated_delta_rule"]
     # The forward pass reads the committed state and writes only rows buffers; the commit is the only writer.
     assert "output_tensor=state.recurrent" not in ast.get_source_segment(
         GDN_SOURCE.read_text(), methods["forward_rows"]
@@ -1169,16 +1194,33 @@ def test_rows_bodies_are_the_pinned_walk() -> None:
             if ast.unparse(node.func).startswith("self._")
         ]
 
+    # forward_rows gathers and hands the body to the resolved rows form; the chain's own order moved verbatim into
+    # the registry's composed body (ttnn/fused/gdn_rows_wrap.rows_body_composed), which is walked right below.
     assert walk("forward_rows") == [
         "_validate_state",
         "_validate_rows_state",
         "_all_gather_rows",
+        # the slab body, resolved once: the fused gdn_prefill_rows pair, or the chain's four calls below (which are
+        # what the composed callable runs); the 32-row and 128-row bodies take those four directly
+        "_gdn_prefill_rows",
+        "_rows_body",
+    ]
+    composed = ast.parse(inspect.getsource(gdn_rows_wrap.rows_body_composed))
+    assert [
+        ast.unparse(node.func).removeprefix("gdn.")
+        for node in sorted(
+            (n for n in ast.walk(composed) if isinstance(n, ast.Call)), key=lambda n: (n.lineno, n.col_offset)
+        )
+        if ast.unparse(node.func).startswith("gdn._")
+    ] == [
         "_project_rows",
         "_causal_conv_rows",
         "_make_chunk_inputs",
         "_chunk_rows",
         "_gate_and_project_rows",
     ]
+    assert walk("_project_rows") == ["_project_rows_linear", "_land_rows_qkv"]
+    assert walk("_gate_and_project_rows")[-1] == "_rows_output_tile"
     assert walk("commit_rows") == [
         "_validate_state",
         "_validate_rows_state",
@@ -1189,6 +1231,11 @@ def test_rows_bodies_are_the_pinned_walk() -> None:
         "_advance_history_rows",
     ]
     assert walk("_step_committed_rows_state") == ["_step_row_state"]
+    # the recurrence: the wrap's prim-layout form when it owns the rows state, else the resolved composite / prims
+    # direct call; both return through the one validation
+    assert walk("_chunk_rows") == ["_validate_chunk_rows", "_chunk_rows_kernel", "_validate_chunk_rows"]
+    assert walk("_validate_chunk_rows") == []
+    assert walk("_chunk_rows_composite") == []
     assert walk("_causal_conv_rows") == ["_shifted_rows_slab", "_conv_window_rows", "_select_rows"]
     assert walk("_advance_history_rows") == ["_conv_window_rows", "_select_rows"]
 

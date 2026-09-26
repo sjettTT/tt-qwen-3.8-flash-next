@@ -17,8 +17,8 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.fused import program as fp
 
 FUSED = Path(fp.__file__).parent
 MODULES = sorted(FUSED.glob("*/__init__.py"))
-KERNELS = 17  # sub-packages under ttnn/fused
-LAUNCHES = 54  # run_program call sites over them (every one passes its meta)
+KERNELS = 19  # sub-packages under ttnn/fused
+LAUNCHES = 57  # run_program call sites over them (every one passes its meta)
 # a program's ``kernel`` is a registered name; the QSA block's mirrors and probes that are not a kernel of their own say
 # ``qsa_block``; the names bound in the modules that hold a kernel name
 KERNEL_NAMES = set(fused.kernels()) | {"qsa_block"}
@@ -97,6 +97,9 @@ def test_every_meta_names_a_kernel_and_a_distinct_variant():
     ]
     assert {"lanes", "single_core"} <= seen["router_tail"] and seen["gdn_step"] == {"step"}
     assert seen["moe_dense"] == {"composite", "composed_eltwise"}
+    # the prefill slab's rows programs (opt-in): the slab and the one-tile-row verify form of each
+    assert seen["gdn_pre_rows"] == {"slab", "verify_rows"}
+    assert seen["gdn_post_rows"] == {"cast", "cast_verify", "norm", "norm_verify"}
 
 
 def _fake(shape, dtype, *, l1=False, padded=None):

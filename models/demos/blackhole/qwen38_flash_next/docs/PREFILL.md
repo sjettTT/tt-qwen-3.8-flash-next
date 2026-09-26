@@ -25,6 +25,13 @@ Inside a slab every layer runs its ROWS rows in one pass:
   its blocks in 512-row blocks (the indexer, the score all-reduce, a broadcast causal block mask, `topk_large_indices`),
   and runs `sparse_sdpa` over all ROWS query rows in one call.
 
+The two phases of that GDN kernel are bound to Python as well, `ttnn.prim.chunk_gdn_prep` and
+`ttnn.prim.chunk_gdn_scan`, for a caller that lays the per-chunk inputs out itself; the composite
+`chunk_gated_delta_rule` the slab calls is unchanged.  The MTP verify rows' GDN runs the same two programs around
+those prims since 2026-09-25 (`gdn_rows_wrap`, a default at the 32-row verify tile; `QWEN38_FUSED_OFF=gdn_rows_wrap`
+restores the chain): 6 programs where the chain ran 53 per GDN layer, bitwise, the slab keeping `gdn_prefill_rows`
+(`docs/NUMERICS.md`).
+
 The remainder of a prompt after the slabs runs through the 128-row chunks, then the 32-row chunks and the padded tail,
 then the ordinary hand-off from the 32-row state.  `--prefill-slab` implies `--long-chunks`; like `--long-chunks` it is
 not combined with `--mtp` (the MTP chain prefills in 32-row chunks).  The 32-row and 128-row bodies are unchanged.
@@ -292,6 +299,23 @@ refuses to start.
   value heads to key heads and l2-normalizes them itself, in fp32 with the scale folded in, in place of the model's
   0/1 expand, bf16 `rms_norm` and bf16 scale (about 66 ms per slab of the model's and the kernel adapter's glue).  The
   normalized values differ by bf16 rounding and the recurrent state carries the difference into the decode.
+
+`QWEN38_FUSED=gdn_prefill_rows` (bitwise, off; a fused kernel, not a glue form) replaces the slab's whole GDN glue --
+the projection's landing slices, the FIR row shifts, the causal convolution and SiLU, the q/k expand, both `rms_norm`s
+and scales, the v row mask, the beta and log-decay gates, the chunk adapter's head-major relayout and q scale, the
+gated epilogue's typecast, weighted norm, head fold and sigmoid gate, and the next pass's history tile -- with two
+`generic_op` programs, `gdn_pre_rows` before the recurrence and `gdn_post_rows` after it.  Between them the two phases
+of the GDN kernel are called directly as `ttnn.prim.chunk_gdn_prep` and `ttnn.prim.chunk_gdn_scan` on the pad-free
+per-chunk pages the first program writes, with the arguments the composite passes, so the recurrence itself is
+unchanged.  Every arithmetic step is the chain op's own kernel call sequence in the chain op's destination width with
+one pack per op, and the row shifts, the head expand, the page maps and the gate column transposes are data movement,
+so the gated rows, the recurrent state and the history tile are the chain's bits.  Measured on one p150 die at 2048
+rows, traced: 332 us per call for the pre program and 115 for the post pair, 447.6 us per layer for the three
+together, against 3,270 us per layer for the ops they replace -- about 102 ms per 2048-row slab over the 36 GDN
+layers.  The form is slab-only: the 32-row, 128-row,
+verify-lane and decode bodies never reach it, and it allocates its own pass buffers (the prims' `[12, NC, 32, 128]`
+q/k pages, the `[12, NC, 32, 1]` gate columns and the four hand-off buffers) in place of the chain's, shared by the
+GDN layers as the rest of the slab body is.
 
 ## Running it
 
