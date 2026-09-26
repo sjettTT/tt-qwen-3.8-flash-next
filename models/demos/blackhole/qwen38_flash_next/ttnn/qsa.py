@@ -5871,6 +5871,16 @@ class Qwen38TTNNQSA:
             raise RuntimeError(
                 f"topk_large_indices must return UINT32 ROW_MAJOR block IDs, got {tensor_metadata(block_ids)}"
             )
+        if self._rows_fused is not None and rows == CHUNK_ROWS:
+            # program 3 of the verify rows family: the integer chain below as the decode selection program on the tile
+            sparse_indices = self._rows_fused.selection_rows(
+                block_ids, self.sentinel_pad, constants.block_offsets_rows, chunk.row_keep_bits, chunk.row_fill
+            )
+            _deallocate(block_ids)
+            _require_shape(sparse_indices, (1, 1, rows, SPARSE_INDEX_CAPACITY), "fused QSA verify sparse indices")
+            _retag_tensor(sparse_indices, reference=self.sentinel_pad, shard_dim=None)
+            self.mesh_contract.validate_tensor(sparse_indices, placement=TensorPlacement.REPLICATED)
+            return sparse_indices
         starts = ttnn.bitwise_left_shift(block_ids, 2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(block_ids)
         repeated = ttnn.repeat_interleave(starts, repeats=COMPRESS_RATIO, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG)
@@ -6639,8 +6649,10 @@ class Qwen38TTNNQSA:
         :meth:`_sparse_value_attention_rows`: the norm / RoPE / head-split / query kernels of the decode program on the
         tile's 32 rows, the KV write of rows P .. P + R - 1 (P and R read on the core from ``verify.position`` and
         ``verify.rows_u32``; the current block's rows past them zeroed, the next block written unless ``single_row``,
-        as the chain does).  The gate keeps the chain's head slices of qg (program 5 folds them).  Returns the sparse
-        query ``[1,32,32,512]`` ROW_MAJOR and the gate ``[1,6,32,256]`` TILE."""
+        as the chain does).  The gate keeps the chain's head slices of qg: the decode post-attention program on the
+        tile (six cores, one per head) measured slower than the chain's full-grid ops at 32 rows (0.087 against 0.059 ms
+        per call, 2026-09-26), so the tail stays the chain's.  Returns the sparse query ``[1,32,32,512]`` ROW_MAJOR and
+        the gate ``[1,6,32,256]`` TILE."""
 
         rows = constants.rows
         qg_ws = ttnn.linear(

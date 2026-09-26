@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ttnn
 
+from .. import program as fp
 from .. import qsa_block
 from ..registry import BITWISE, FusedKernel, register
 
@@ -85,12 +86,43 @@ def score_blocks_rows_composed(score_rows, mask, *, cluster_axis: int, topology=
     return masked
 
 
+def selection_rows(block_ids, sentinel_pad, block_offsets_rows, row_keep_bits, row_fill):
+    """Program 3: the verify tile's sparse-attention rows of token ids [1, 1, 32, 2080] uint32 from the top-k block ids
+    [1, 1, 32, 512] and the pass's keep / fill rows -- the decode ``qsa_selection_row`` program on the 32 rows (its
+    per-row integer chain: shift, repeat, offset add, sentinel concat, keep and, fill or, exact), with the module's
+    one-row ``sentinel_pad`` and the chunk constants' per-row ``block_offsets_rows`` [1, 1, 32, 2048]."""
+
+    shape = tuple(block_ids.shape)
+    if shape != (1, 1, fp.TILE, qsa_block.BLOCK_IDS):
+        raise ValueError(
+            f"the verify selection takes the 32-row block ids [1, 1, 32, {qsa_block.BLOCK_IDS}], got {shape}"
+        )
+    return qsa_block.selection_row(block_ids, sentinel_pad, block_offsets_rows, row_keep_bits, row_fill)
+
+
+def selection_rows_composed(block_ids, sentinel_pad_rows, block_offsets_rows, row_keep_bits, row_fill):
+    """The chain (ttnn/qsa.py ``_materialize_rows_chunk`` after ``topk_large_indices``) on the 32-row tile, with the
+    chunk constants' per-row ``sentinel_pad_rows`` [1, 1, 32, 32]."""
+
+    dram = ttnn.DRAM_MEMORY_CONFIG
+    starts = ttnn.bitwise_left_shift(block_ids, 2, memory_config=dram)
+    repeated = ttnn.repeat_interleave(starts, repeats=qsa_block.COMPRESS_RATIO, dim=3, memory_config=dram)
+    expanded = ttnn.add(repeated, block_offsets_rows, memory_config=dram)
+    template = ttnn.concat([expanded, sentinel_pad_rows], dim=3, memory_config=dram)
+    kept = ttnn.bitwise_and(template, row_keep_bits, memory_config=dram)
+    out = ttnn.bitwise_or(kept, row_fill, memory_config=dram)
+    for t in (starts, repeated, expanded, template, kept):
+        ttnn.deallocate(t)
+    return out
+
+
 register(
     FusedKernel(
         name=NAME,
         replaces=(
             "the QSA verify-form glue on the 32-row tile: program 1 the indexer scores' all-reduce composite + mask add "
-            "(6 programs/layer) as one all-gather + the fused score merge over the rows"
+            "(6 programs/layer) as one all-gather + the fused score merge over the rows; program 2 the main tail with the "
+            "rows' KV stage; program 3 the selection's integer chain (6 programs/layer) as the decode selection program"
         ),
         tolerance=BITWISE,
         fused=score_blocks_rows,
@@ -110,4 +142,6 @@ __all__ = [
     "main_tail_rows_composed",
     "score_blocks_rows",
     "score_blocks_rows_composed",
+    "selection_rows",
+    "selection_rows_composed",
 ]

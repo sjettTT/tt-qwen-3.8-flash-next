@@ -16,7 +16,9 @@ from models.demos.blackhole.qwen38_flash_next.ttnn import qsa as qsa_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import qsa_block, qsa_rows
 
 # the package rebinds its ``main_tail_rows`` attribute to the function; the module is reached through sys.modules
-main_tail_rows_module = importlib.import_module("models.demos.blackhole.qwen38_flash_next.ttnn.fused.qsa_rows.main_tail_rows")
+main_tail_rows_module = importlib.import_module(
+    "models.demos.blackhole.qwen38_flash_next.ttnn.fused.qsa_rows.main_tail_rows"
+)
 
 MODEL_DIR = Path(__file__).resolve().parents[1]
 
@@ -24,7 +26,9 @@ MODEL_DIR = Path(__file__).resolve().parents[1]
 def test_qsa_rows_is_registered_bitwise_and_default_on() -> None:
     kernel = fused.kernel("qsa_rows")
     assert kernel.tolerance == fused.BITWISE
-    assert kernel.default_on, "qsa_rows serves by default since its pass pair, A3 pins and D1 band read clean (2026-09-26)"
+    assert (
+        kernel.default_on
+    ), "qsa_rows serves by default since its pass pair, A3 pins and D1 band read clean (2026-09-26)"
     assert kernel.fused is qsa_rows.score_blocks_rows
     assert kernel.composed is qsa_rows.score_blocks_rows_composed
     assert "qsa_rows" in fused.__all__ and fused.qsa_rows is qsa_rows
@@ -90,6 +94,28 @@ def test_the_verify_path_takes_program_two_when_the_pass_carries_its_scalars() -
     assert constants["rows_u32"].default is None
     host = qsa_module.qsa_verify_constant_rows(5, 512)
     assert tuple(host["rows_u32"].shape) == (1, 1, 1, 1) and int(host["rows_u32"]) == 5
+
+
+def test_selection_rows_is_the_decode_selection_program_on_the_tile() -> None:
+    """Program 3 runs qsa_block.selection_row (device-proven per row at rows 1..32) on the verify tile's 32 rows; the
+    verify path takes it after topk_large_indices when the family is on; the chain stays as the fallback."""
+
+    source = inspect.getsource(qsa_rows.selection_rows)
+    assert "qsa_block.selection_row(block_ids, sentinel_pad, block_offsets_rows, row_keep_bits, row_fill)" in source
+    composed = inspect.getsource(qsa_rows.selection_rows_composed)
+    for op in ("bitwise_left_shift", "repeat_interleave", "ttnn.add(", "ttnn.concat(", "bitwise_and", "bitwise_or"):
+        assert op in composed, op
+    from types import SimpleNamespace
+
+    import pytest
+
+    with pytest.raises(ValueError, match="32-row block ids"):  # the shape check runs before any device call
+        qsa_rows.selection_rows(SimpleNamespace(shape=(1, 1, 5, 512)), None, None, None, None)
+    hook = inspect.getsource(qsa_module.Qwen38TTNNQSA._materialize_rows_chunk)
+    guard = "if self._rows_fused is not None and rows == CHUNK_ROWS:"
+    assert guard in hook and "self._rows_fused.selection_rows(" in hook
+    assert hook.index("topk_large_indices") < hook.index(guard) < hook.index("starts = ttnn.bitwise_left_shift(")
+    assert "constants.block_offsets_rows, chunk.row_keep_bits, chunk.row_fill" in hook
 
 
 def test_the_manifest_lists_the_family() -> None:
