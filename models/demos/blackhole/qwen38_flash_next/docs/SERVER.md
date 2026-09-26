@@ -222,3 +222,88 @@ served (no CORS headers); a body needs `Content-Length`.
 | device DRAM free per bank, 64k | 419,440,704 bytes | QuietBox 2026-09-06, before the compact expert layout (which frees a further 1,146,621,952 bytes per bank at 32k) |
 | device DRAM free, 256k | about 750 MB per device | QuietBox 2026-09-06, before the compact expert layout; single-user; MTP did not fit then (94 MB free per bank against the 128 MiB contiguous it needs) |
 | the prompt-end snapshot | ~53 MB per device | resident; the recurrent part of the device state (above) |
+
+## Serving under vLLM
+
+`tools/qwen38_vllm.py` is the model class vllm-tt-plugin drives (`Qwen38ForCausalLM`): the same traced chain as this
+server, opened with the sampling epilogue, one resident slot, every token's full-vocabulary logits read back for vLLM's
+sampler.  The plugin owns the mesh, the scheduler, the tokenizer and the OpenAI API; the adapter owns the device:
+`prefill_forward` resets the state and runs the chunk driver over the prompt, `decode_forward` teacher-forces the token
+vLLM sampled, both return CPU fp32 `[1, 1, 248320]` logits with the 243 LM-head padding rows at `-inf` (under the
+plugin's device-sampling contract, below, a sampled decode step returns the token instead).  The venv is the plugin's
+`docs/install-vllm-tt.sh` over this checkout's `python_env` (vLLM 0.26.0 built with `VLLM_TARGET_DEVICE=empty`, the
+plugin editable), then `transformers==5.16.1` (the `qwen4_exp` config class).  From a built checkout `$REPO`:
+
+    export TT_METAL_HOME=$REPO PYTHONPATH=$REPO:$REPO/ttnn:$REPO/tools PYTHONNOUSERSITE=1 HF_HUB_OFFLINE=1
+    export TT_VISIBLE_DEVICES=0,1,2,3 MESH_DEVICE="(1, 4)" TT_METAL_TRACE_ALLOC_TRACKING=1
+    export MODEL_WEIGHTS_DIR=$CKPT QWEN38_CACHE_ROOT=<cache-root> TT_METAL_CACHE=<cache-root>/jit-cache
+    export EXTRA_MODELS_DIR=$REPO/models/demos/blackhole/qwen38_flash_next/tools/vllm_bundle
+    python -m models.demos.blackhole.qwen38_flash_next.tools.prewarm_ple_table --checkpoint $CKPT
+    python <plugin>/examples/server_example_tt.py --model $CKPT --served-model-name Qwen/Qwen3.8-Flash-Next \
+        --max_num_seqs 1 --block_size 64 --max-model-len 32704 \
+        --hf-overrides '{"architectures": ["TTQwen4ExpForConditionalGeneration"]}' \
+        --default-chat-template-kwargs '{"enable_thinking": false}' \
+        --additional-config '{"tt": {"fabric_config": "FABRIC_1D", "l1_small_size": 24576, "trace_region_size": 0,
+                                     "sample_on_device_mode": "decode_only"}}'
+
+`$REPO/tools` on `PYTHONPATH` is the `tracy` package the extension imports at start (`import ttnn` fails without it).
+`--max-model-len` picks the smallest resident context whose limit (the capacity less 64) holds it, 8128 to 262080;
+unset, vLLM resolves 262144 and the adapter refuses.  `--max_num_seqs` is the underscore spelling (`server_example_tt.py`
+parses only that form).  The tt block reproduces this server's mesh parameters; `"sample_on_device_mode": "decode_only"`
+is the plugin's device-sampling contract (the sampling row of the table below; without it vLLM's full-row sampler runs
+on the host).  `/health` answers 3-5 minutes after the launch from warm caches.  The adapter's own settings come from
+the environment, every one checked before the device is touched:
+
+| variable | default | meaning |
+|---|---|---|
+| `MODEL_WEIGHTS_DIR` | unset | the checkpoint directory; unset, `--model` is taken as a directory, else as a repo id (default `Qwen/Qwen3.8-Flash-Next`, `QWEN38_HF_REPO` overrides it) whose pinned revision must already be in the Hugging Face hub cache under `HF_HOME`: no download happens at start |
+| `QWEN38_CACHE_ROOT` | required | this server's cache layout: `caches/<label>/{components,model-io}` and `caches/bf4-experts` |
+| `QWEN38_CACHE_LABEL` | `c<context>-vllm` | the component / model-io cache label, one per resident context |
+| `QWEN38_BF4_CORPUS`, `QWEN38_BF4_CORPUS_VERIFICATION` | unset | a CPU-staged BF4 expert corpus in place of the cache under `caches/bf4-experts`, which must otherwise exist: its first-start conversion runs inside vLLM start-up only with `QWEN38_VLLM_ALLOW_BF4_CONVERSION=1` |
+| `QWEN38_PREFILL_SLAB` | `2048` | the prefill slab's rows, a multiple of 128 in 256..4096: a prompt runs as `N // rows` slabs, then 128-row chunks, then 32-row chunks (`docs/PREFILL.md`); `0` or `off` serves without the slab; any other value is refused by name |
+| `QWEN38_LONG_CHUNKS` | unset | with the slab off, `1` keeps the 128-row chunks ahead of the 32-row ones (a slab implies them) |
+| `QWEN38_TT_METAL_SHA` | unset | the cache identity's tt-metal sha (40 lowercase hex); unset, the checkout head, else the runtime extension's digest prefix, so a checkout without `.git` or `git` serves |
+
+The slab's resident dense weights are admitted against the free DRAM when the chain opens (`ttnn/prefill_dense.py`):
+a refusal ends the start-up with the admission's numbers and the sentence `QWEN38_PREFILL_SLAB=0 serves this context
+without the slab`, never a silent fallback (the serving profile decides per context).  The adapter logs the form it
+opened (`prefill form: 2048-row slabs, then 128-row chunks, then 32-row chunks`), so a served number is attributable
+to it.  Numerics: the slab body is tolerance-class against the 32-row chunk bodies (`docs/PREFILL.md`, "Numerics
+class": each dense linear's output within one bf16 ULP of its scale, top-1 moving at a handful of positions on prompts
+longer than a slab), the 128-row chunks give the 32-row chunks' tokens (`docs/NUMERICS.md`), and the `json` acceptance
+record (85 prompt tokens, shorter than one 128-row chunk) stays bitwise in every form.  Prefill rates measured on the
+standalone server (README, 2026-09-25): 3.0-3.5 ms per prompt token in 32-row chunks, 1.45-1.56 with the 128-row
+chunks, 0.74-0.90 with 2,048-row slabs (a 31,716-token prompt in 23.6 s, 2,118 tokens in 1.91 s).
+
+| capability | under vLLM | note |
+|---|---|---|
+| batch | 1 | one resident slot: `--max_num_seqs 1`, no data parallelism |
+| contexts | 8k, 32k, 64k, 128k, 256k | by `--max-model-len`; 256k is single-user |
+| sampling | vLLM's host sampler over the full row; or, with `"sample_on_device_mode": "decode_only"` in the `tt` block of `--additional-config`, the adapter's host sampler over the row's top 1024 candidates | temperature, top-p, top-k, min-p, penalties, `logit_bias`, logprobs, structured output; a greedy request reproduces this server's greedy stream (the `json` acceptance record matches the CPU reference 96/96; the other records diverge at the pinned A3 indices). vLLM's `Sampler` sorts the 248,320-wide row on every sampled (non-greedy) decode step, about 22 ms per token; under `decode_only` the plugin hands the request's temperature / top-k / top-p / seed / penalties to `decode_forward` and the adapter draws the token itself from the same row with vLLM's sampler semantics (same distribution, not the same token stream per seed), well under a millisecond; greedy stays the argmax. Requests with min-p, `logit_bias`, `bad_words`, `allowed_token_ids`, `min_tokens`, logprobs or structured output keep vLLM's full-row sampler (the plugin decides per step); prefill stays on it too (`"all"` is refused) |
+| prefill | the slab and chunk traces over the whole prompt | `QWEN38_PREFILL_SLAB` above; vLLM's chunked prefill and prefix caching are declared unsupported (the plugin disables them) |
+| decode | one traced step per token | `trace_mode` other than `all` is not honoured |
+| follow-up turns | re-prefilled | the prompt-end snapshot and prefix reuse are not used |
+| KV | the chain's resident caches | vLLM's block table and KV cache are accepted and ignored |
+| MTP, the on-device sampler (`--device-sampler`), async decode | no | `--mtp` and the on-device sampler stay on this server; under vLLM the sampled token is drawn on the host (`decode_only`, above) |
+
+The tt-model container package of this tree (`sjettTT/qwen3.8-flash-next_p150x4`) runs this path with one profile per
+box: `c32k`, `c64k`, `c128k` (no mesh graph descriptor: ttnn's auto-discovery, a 1x4 line on a 4x p150 host and, on a
+QuietBox 2, the four dies in the fabric's order), `c32k-quietbox` (the 4x p150 TT-QuietBox: exports
+`tools/qb_p150_x4_1x4_line_mesh_graph_descriptor.textproto`, 4 ethernet channels per link, so it refuses a QuietBox 2
+at fabric init with `Expected 4 eth links`) and `c32k-quietbox2` (a TT-QuietBox 2, 2x p300c: `hardware p300x2`,
+`MESH_DEVICE=P300x2`, exports `tools/qb2_p300_1x4_line_mesh_graph_descriptor.textproto`, 2 channels per link).  Under
+the plugin the mesh is opened without a physical order, so the 1x4 order is the fabric's embedding (a QuietBox 2 on
+2026-09-21: devices [1, 0, 3, 2], an ethernet path) and no route is derived.  Measured on a QuietBox 2 on 2026-09-21
+through `tt-model serve` with `c32k-quietbox2` and with the default `c32k` (the same results): ready in about 100 s from
+warm caches (241 s with cold component caches); sampled decode under the serving default (the checkpoint's
+generation_config profile, temperature 1.0, top_k 20, top_p 0.95) 44 to 46 ms per token on streamed 128-, 200- and
+256-token requests, about 22 tokens/s, TTFT 0.21 s on a 17-token prompt; one DRAM reader per bank on the mixed-harvest
+dies.
+
+Cost: this server's greedy loop is 50 ms per token; under vLLM every step adds the full-vocabulary gather, vLLM's
+sampler and its step overhead: 56.7 ms per token greedy and 79 ms sampled, measured on 4x p150 (2026-09-09).  The
+plugin's own host suite with the bundle set, in the serving venv (expected: 368 passed with transformers 5.16.1, and the
+line `Registered TT model TTQwen4ExpForConditionalGeneration`):
+
+    EXTRA_MODELS_DIR=$REPO/models/demos/blackhole/qwen38_flash_next/tools/vllm_bundle PYTHONPATH=<plugin>/ci/host-stubs \
+        python -m pytest <plugin>/tests --ignore=<plugin>/tests/tt --log-cli-level=INFO
