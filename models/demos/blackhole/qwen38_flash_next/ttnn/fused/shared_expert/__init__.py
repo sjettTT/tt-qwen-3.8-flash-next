@@ -130,12 +130,10 @@ def shared_expert(
         raise RuntimeError(
             f"concatenated shared linear produced {list(gate_up_scalar_ws.shape)}, expected [1, 1, {rows}, {CAT_WIDTH}]"
         )
-    intermediate = fp.stamp_topology(
-        fp.allocate((1, 1, rows, LOCAL_INTERMEDIATE), BF16, ttnn.TILE_LAYOUT, mesh, intermediate_memory_config), hidden
+    intermediate = fp.allocate(
+        (1, 1, rows, LOCAL_INTERMEDIATE), BF16, ttnn.TILE_LAYOUT, mesh, intermediate_memory_config
     )
-    sigmoid = fp.stamp_topology(
-        fp.allocate((1, 1, fp.TILE, fp.TILE), BF16, ttnn.TILE_LAYOUT, mesh, ttnn.DRAM_MEMORY_CONFIG), hidden
-    )
+    sigmoid = fp.allocate((1, 1, fp.TILE, fp.TILE), BF16, ttnn.TILE_LAYOUT, mesh, ttnn.DRAM_MEMORY_CONFIG)
     # the concatenated linear's L1 shard in, the intermediate shard (L1) and the sigmoid tile out; silu and product
     # per element of the rows x 160 intermediate, the sigmoid on the scalar column and its broadcast
     meta = fp.program_meta(
@@ -146,6 +144,7 @@ def shared_expert(
         writes=(intermediate, sigmoid),
         flops=rows * LOCAL_INTERMEDIATE * 3 + rows * fp.TILE,
         cores=STORAGE_CORES,
+        outputs=((intermediate, None), (sigmoid, None)),
     )
     fp.run_program(
         [gate_up_scalar_ws, intermediate, sigmoid],

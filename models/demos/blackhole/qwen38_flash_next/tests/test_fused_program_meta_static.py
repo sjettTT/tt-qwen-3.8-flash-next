@@ -81,7 +81,7 @@ def test_every_meta_names_a_kernel_and_a_distinct_variant():
                 assert isinstance(kernel, ast.Name) and kernel.id in KERNEL_NAME_BINDINGS, ast.dump(kernel)
             variants.extend(sorted(_variant_names(variant)))
             assert all(
-                k.arg in {"reads", "writes", "partial", "flops", "dram_bytes", "l1_bytes", "cores"}
+                k.arg in {"reads", "writes", "partial", "flops", "dram_bytes", "l1_bytes", "cores", "outputs"}
                 for k in call.keywords
             )
         assert len(variants) == len(set(variants)), f"{path.parent.name}: a variant name is used twice: {variants}"

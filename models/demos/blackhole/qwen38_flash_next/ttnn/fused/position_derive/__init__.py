@@ -200,11 +200,9 @@ def position_derive(position, cos_table, sin_table, *, blocks: int, memory_confi
         writes=tuple(outs.values()),
         dram_bytes=4 * ROPE_DIM * 2,
         cores=1,
+        outputs=tuple((tensor, position) for tensor in outs.values()),  # replicated, as the position is
     )
     fp.run_program(tensors, fp.program_descriptor([reader], cbs=cbs), meta=meta)
-    topology = position.tensor_topology()
-    for tensor in outs.values():
-        tensor.update_tensor_topology(topology)  # generic_op leaves the allocation's placement; these are replicated
     return outs
 
 
@@ -300,11 +298,9 @@ def position_derive_lanes(
             + 4 * ROPE_DIM * 2
         ),
         cores=TILE,
+        outputs=tuple((tensor, position_row) for tensor in outs.values()),  # replicated, as the position row is
     )
     fp.run_program(tensors, fp.program_descriptor([reader], cbs=cbs), meta=meta)
-    topology = position_row.tensor_topology()
-    for tensor in outs.values():
-        tensor.update_tensor_topology(topology)  # generic_op leaves the allocation's placement; these are replicated
     return outs
 
 

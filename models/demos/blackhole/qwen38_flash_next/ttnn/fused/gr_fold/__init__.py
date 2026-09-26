@@ -281,9 +281,11 @@ def transport_mesh_program(
             for i in range(links)
         ]
         forward = [
-            ttnn.setup_fabric_connection(node, geometry.nodes[rank + 1], i, seed, cores[i])
-            if rank + 1 < TP_SIZE
-            else []
+            (
+                ttnn.setup_fabric_connection(node, geometry.nodes[rank + 1], i, seed, cores[i])
+                if rank + 1 < TP_SIZE
+                else []
+            )
             for i in range(links)
         ]
         mesh_program[ttnn.MeshCoordinateRange(coordinate, coordinate)] = ttnn.ProgramDescriptor(
@@ -337,6 +339,7 @@ def gather_line(local, *, links: int = 1, delays=None, dim: int = 3):
         dram_bytes=TP_SIZE * tiles * tile_bytes,
         l1_bytes=tiles * tile_bytes,
         cores=links,
+        outputs=((out, None),),  # every device holds every device's tiles
     )
     fp.run_program(
         [local, out], transport_mesh_program(mesh, [spec], semaphores=semaphores, cbs=cbs, links=links), meta=meta
@@ -445,6 +448,7 @@ def stats_gather(residual, *, links: int | None = None):
         l1_bytes=gr_read.BRANCHES * gr_read.TILE_BF16,
         flops=2 * rows * gr_read.FLAT_WIDTH,
         cores=len(work) + links,
+        outputs=((out, None),),
     )
     fp.run_program(
         [residual, out],
@@ -586,6 +590,7 @@ def normalize_down_gather(residual, gathered_stats, norm_scale, down_inject, *, 
         l1_bytes=len(workers) * fp.tensor_bytes(normalized) + PT * T_FP32,
         flops=4 * rows * gr_read.FLAT_WIDTH + 2 * rows * gr_read.FLAT_WIDTH * gr_read.PARTIAL_WIDTH,
         cores=len(workers) + len(producers) + links,
+        outputs=((normalized, 3), (gathered, None)),
     )
     fp.run_program(
         [residual, gathered_stats, norm_scale, down_inject, normalized, gathered],
@@ -773,6 +778,7 @@ def stats_normalize_down_gather(residual, norm_scale, down_inject, *, links: int
         l1_bytes=len(workers) * fp.tensor_bytes(normalized) + gr_read.BRANCHES * T_BF16 + PT * T_FP32,
         flops=6 * rows * gr_read.FLAT_WIDTH + 2 * rows * gr_read.FLAT_WIDTH * gr_read.PARTIAL_WIDTH,
         cores=len(workers) + len(producers) + links,
+        outputs=((gathered_stats, None), (normalized, 3), (gathered, None)),
     )
     fp.run_program(
         [residual, norm_scale, down_inject, gathered_stats, normalized, gathered],

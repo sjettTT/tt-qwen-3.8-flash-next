@@ -314,6 +314,11 @@ class FusedProgramMeta:
     l1_bytes: int
     flops: int
     cores: int = 0  # the cores the program runs on (0 = not stated)
+    # the buffers the launch writes with their declared mesh placement, ``(tensor, placement)`` pairs: ``None`` replicated,
+    # an int the sharded dim (the second axis of the 1x4 mesh), a tensor "as that tensor's".  ``run_program`` stamps them
+    # after the launch (``generic_op`` leaves the allocation's default placement: PlacementShard(0) on the line, which
+    # a collective or a mesh-contract check downstream misreads; a 1x1 device test cannot see it -- 2026-09-26).
+    outputs: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -365,12 +370,22 @@ def program_meta(
     dram_bytes: int = 0,
     l1_bytes: int = 0,
     cores: int = 0,
+    outputs: Iterable = (),
 ) -> FusedProgramMeta:
     """The meta of one program: every tensor of ``reads`` and ``writes`` once and every ``(tensor, bytes)`` of
     ``partial`` (a window of a tensor) at those bytes, to ``dram_bytes`` or ``l1_bytes`` by where the tensor's buffer
-    lives, plus the explicit bytes (per-core re-reads of an operand, multicasts) and the FLOPs the builder states."""
+    lives, plus the explicit bytes (per-core re-reads of an operand, multicasts) and the FLOPs the builder states;
+    ``outputs`` the written buffers' declared placements (``FusedProgramMeta.outputs``), stamped after the launch."""
 
     dram, l1 = int(dram_bytes), int(l1_bytes)
+    declared = []
+    for entry in outputs:
+        tensor, placement = entry
+        if not (placement is None or isinstance(placement, int) or hasattr(placement, "tensor_topology")):
+            raise ValueError(
+                f"program meta of {kernel}/{variant}: an output placement is None, a shard dim or a tensor"
+            )
+        declared.append((tensor, placement))
     for tensor, count in [*((t, None) for t in (*reads, *writes)), *partial]:
         size = tensor_bytes(tensor) if count is None else int(count)
         if in_l1(tensor):
@@ -379,7 +394,7 @@ def program_meta(
             dram += size
     if dram < 0 or l1 < 0 or int(flops) < 0 or int(rows) < 1:
         raise ValueError(f"program meta of {kernel}/{variant}: bytes and flops must be >= 0 and rows >= 1")
-    return FusedProgramMeta(str(kernel), str(variant), int(rows), dram, l1, int(flops), int(cores))
+    return FusedProgramMeta(str(kernel), str(variant), int(rows), dram, l1, int(flops), int(cores), tuple(declared))
 
 
 def record_program_meta(enabled: bool = True) -> None:
@@ -407,16 +422,39 @@ def _device_operation_id() -> int:
     return int(ttnn._ttnn.get_device_operation_id())
 
 
+def restamp_outputs(outputs, io_tensors: Sequence, result=None) -> None:
+    """Give the launch's written buffers their declared placements (``FusedProgramMeta.outputs``): the mesh (its
+    distribution shape and coordinates) is the first io tensor's; ``result`` (the launch's returned handle) is stamped
+    with the output it shares a buffer with."""
+
+    if not outputs:
+        return
+    reference = next(t for t in io_tensors if hasattr(t, "tensor_topology"))
+    for tensor, placement in outputs:
+        targets = [tensor]
+        if result is not None and result is not tensor and hasattr(result, "buffer_address"):
+            if result.buffer_address() == tensor.buffer_address():
+                targets.append(result)
+        for target in targets:
+            if placement is None or isinstance(placement, int):
+                stamp_topology(target, reference, placement)
+            else:
+                target.update_tensor_topology(placement.tensor_topology())
+
+
 def run_program(io_tensors: Sequence, descriptor, *, meta: FusedProgramMeta | None = None):
     """Inputs first, pre-allocated outputs last; returns the last tensor.  ``descriptor`` is a ProgramDescriptor or a
     MeshProgramDescriptor; ``meta`` (``program_meta``) is recorded with the launch's device operation ids while
-    recording is on."""
+    recording is on, and its ``outputs`` are stamped with their declared placements after the launch."""
 
     if not _META_RECORDING or meta is None:
-        return ttnn.generic_op(list(io_tensors), descriptor)
-    first = _device_operation_id()
-    result = ttnn.generic_op(list(io_tensors), descriptor)
-    _META_RECORDS.append(FusedProgramRecord(first, max(first + 1, _device_operation_id()), meta))
+        result = ttnn.generic_op(list(io_tensors), descriptor)
+    else:
+        first = _device_operation_id()
+        result = ttnn.generic_op(list(io_tensors), descriptor)
+        _META_RECORDS.append(FusedProgramRecord(first, max(first + 1, _device_operation_id()), meta))
+    if meta is not None:
+        restamp_outputs(meta.outputs, io_tensors, result)
     return result
 
 

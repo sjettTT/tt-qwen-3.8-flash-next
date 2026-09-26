@@ -288,7 +288,7 @@ def moe_combine(combine, scores, indices, owner, *, memory_config=DRAM):
     rows = _check_inputs(combine, scores, indices, owner)
     cfg = settings()
     mesh = combine.device()
-    out = fp.stamp_topology(fp.allocate((1, 1, rows, HIDDEN), BF16, ttnn.TILE_LAYOUT, mesh, memory_config), combine)
+    out = fp.allocate((1, 1, rows, HIDDEN), BF16, ttnn.TILE_LAYOUT, mesh, memory_config)
     fp.run_program(
         [combine, scores, indices, owner, out],
         moe_combine_program(combine, scores, indices, owner, out, rows=rows, cfg=cfg),
@@ -316,6 +316,7 @@ def moe_combine_meta(combine, scores, indices, owner, out, *, rows: int, cfg: Se
         dram_bytes=per_core,
         flops=rows * HIDDEN * 2 * TOP_K,
         cores=len(work),
+        outputs=((out, None),),
     )
 
 

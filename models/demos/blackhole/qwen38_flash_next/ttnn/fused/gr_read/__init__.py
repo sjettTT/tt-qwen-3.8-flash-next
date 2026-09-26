@@ -197,7 +197,14 @@ def stats(residual):
     compute = fp.compute_kernel(STATS, cores, [HIDDEN_TILES], fp32_dest=True)
     writer = _writer(cores, [(out, 16)], [(w.core, [(1, w.start, 1, 1)]) for w in work])
     meta = fp.program_meta(  # the residual in (each core its branch), the stats tiles out; square and sum per element
-        NAME, "stats", rows, reads=(residual,), writes=(out,), flops=2 * rows * FLAT_WIDTH, cores=len(work)
+        NAME,
+        "stats",
+        rows,
+        reads=(residual,),
+        writes=(out,),
+        flops=2 * rows * FLAT_WIDTH,
+        cores=len(work),
+        outputs=((out, 3),),
     )
     return fp.run_program([residual, out], fp.program_descriptor([reader, compute, writer], cbs=cbs), meta=meta)
 
@@ -257,6 +264,7 @@ def normalize(residual, gathered_stats, norm_scale, *, scaler_mode: str = "chain
         writes=(out,),
         flops=4 * rows * FLAT_WIDTH,
         cores=len(work),
+        outputs=((out, 3),),
     )
     return fp.run_program(
         [residual, gathered_stats, norm_scale, out],
@@ -373,6 +381,7 @@ def low_rank(gathered_partials):
         writes=(out, injection),
         flops=(TP_SIZE + 3) * rows * PARTIAL_WIDTH,
         cores=len(work),
+        outputs=((out, None), (injection, None)),
     )
     fp.run_program(
         [gathered_partials, out, injection], fp.program_descriptor([reader, *computes, *writers], cbs=cbs), meta=meta
@@ -444,6 +453,7 @@ def gate(low_rank_row, normalized, up, *, matmul: str = "chain", debug: bool = F
             dram_bytes=len(work) * fp.tensor_bytes(low_rank_row),
             flops=2 * rows * PARTIAL_WIDTH * FLAT_WIDTH + 3 * rows * FLAT_WIDTH,
             cores=len(work),
+            outputs=((out, 3),),
         )
 
     if not debug:
@@ -675,6 +685,7 @@ def normalize_down(
         l1_bytes=len(workers) * fp.tensor_bytes(normalized),
         flops=4 * rows * FLAT_WIDTH + 2 * rows * FLAT_WIDTH * PARTIAL_WIDTH,
         cores=len(workers) + len(producers),
+        outputs=((normalized, 3),),  # the partial is a partial sum the caller hands to its gather
     )
     fp.run_program(
         [residual, gathered_stats, norm_scale, down_inject, normalized, partial],
@@ -794,6 +805,7 @@ def low_rank_gate(gathered_partials, normalized, up, *, matmul: str = "chain"):
         l1_bytes=len(workers) * PARTIAL_TILES * TILE_BF16,
         flops=(TP_SIZE + 3) * rows * PARTIAL_WIDTH + 2 * rows * PARTIAL_WIDTH * FLAT_WIDTH + 3 * rows * FLAT_WIDTH,
         cores=len(workers) + len(producers),
+        outputs=((block, 3), (injection, None)),
     )
     fp.run_program(
         [gathered_partials, normalized, up, block, injection],
@@ -819,7 +831,8 @@ def merged_enabled(environ=None) -> bool:
 
 
 def _topology(module, tensor, shard_dim: int | None) -> None:
-    """Record the placement the chain's ops would have given ``tensor`` (generic_op leaves the allocation's)."""
+    """Record the placement the chain's ops would have given ``tensor`` (a stock op's output the module re-reads; the
+    fused launches declare their outputs' placements in their program meta and ``fp.run_program`` stamps them)."""
 
     reference = module.weights.replicated_anchor.tensor_topology()
     placements = [
@@ -867,27 +880,21 @@ def gr_read_fused(
         )
     if read_front is not None:
         normalized, gathered_partials = read_front(residual, gamma_rows, module.weights.down_inject)
-        _topology(module, normalized, 3)
-        _topology(module, gathered_partials, None)
     else:
         if stats_gather is None:
             stats_local = stats(residual)
-            _topology(module, stats_local, 3)
             gathered_stats = ttnn.all_gather(
                 stats_local, dim=3, cluster_axis=TP_AXIS, memory_config=ttnn.DRAM_MEMORY_CONFIG
             )
             ttnn.deallocate(stats_local)
         else:
             gathered_stats = stats_gather(residual)
-            _topology(module, gathered_stats, None)
         module.mesh_contract.validate_tensor(gathered_stats, placement=TensorPlacement.REPLICATED)
     if read_front is not None:
         pass
     elif partial_gather is not None:
         normalized, gathered_partials = partial_gather(residual, gathered_stats, gamma_rows, module.weights.down_inject)
         ttnn.deallocate(gathered_stats)
-        _topology(module, normalized, 3)
-        _topology(module, gathered_partials, None)
     else:
         if merged:
             normalized, partial = normalize_down(
@@ -897,7 +904,6 @@ def gr_read_fused(
             normalized = normalize(residual, gathered_stats, gamma_rows, scaler_mode=scaler_mode)
             partial = down_project(normalized, module.weights.down_inject, matmul=matmul)
         ttnn.deallocate(gathered_stats)
-        _topology(module, normalized, 3)
         module._mark_partial(partial, (1, 1, rows, PARTIAL_WIDTH))
         if module.collective_topology != ttnn.Topology.Linear or module.tt_ccl is None:
             raise RuntimeError("GR partial gather requires the TP4 Linear topology and the TT-CCL manager")
@@ -920,13 +926,10 @@ def gr_read_fused(
         block, injection = low_rank_gate(gathered_partials, normalized, module.weights.up, matmul=matmul)
     else:
         low_rank_row, injection = low_rank(gathered_partials)
-        _topology(module, low_rank_row, None)
         block = gate(low_rank_row, normalized, module.weights.up, matmul=matmul)
         ttnn.deallocate(low_rank_row)
     ttnn.deallocate(gathered_partials)
-    _topology(module, injection, None)
     ttnn.deallocate(normalized)
-    _topology(module, block, 3)
     module.mesh_contract.validate_tensor(block, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
     module.mesh_contract.validate_tensor(injection, placement=TensorPlacement.REPLICATED)
     return block, Qwen38TTNNGatedResidualState(residual=residual, injection=injection)

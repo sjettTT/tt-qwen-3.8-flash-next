@@ -328,15 +328,9 @@ def moe_dense(
     mesh = logits.device()
     plan = plan_for(mesh)
     index_template = rt.router_tail_prepare(mesh)
-    partial = fp.stamp_topology(
-        fp.allocate((1, 1, rows, HIDDEN), BF16, ttnn.TILE_LAYOUT, mesh, partial_memory_config), full_hidden
-    )
-    sigmoid = fp.stamp_topology(
-        fp.allocate((1, 1, fp.TILE, fp.TILE), BF16, ttnn.TILE_LAYOUT, mesh, ttnn.DRAM_MEMORY_CONFIG), full_hidden
-    )
-    sparse_rows = fp.stamp_topology(
-        fp.allocate((1, 1, rows, HIDDEN), BF16, ttnn.ROW_MAJOR_LAYOUT, mesh, ttnn.DRAM_MEMORY_CONFIG), full_hidden
-    )
+    partial = fp.allocate((1, 1, rows, HIDDEN), BF16, ttnn.TILE_LAYOUT, mesh, partial_memory_config)
+    sigmoid = fp.allocate((1, 1, fp.TILE, fp.TILE), BF16, ttnn.TILE_LAYOUT, mesh, ttnn.DRAM_MEMORY_CONFIG)
+    sparse_rows = fp.allocate((1, 1, rows, HIDDEN), BF16, ttnn.ROW_MAJOR_LAYOUT, mesh, ttnn.DRAM_MEMORY_CONFIG)
     fidelity = _fidelity_of(compute_kernel_config)
     lanes = len(rt.lane_cores(plan.topk, len(rt._core_plan(rows)[0])))
     # G1 as router_tail states it (every lane core streams the logits and the index template); G2 the [gate | up |
@@ -357,6 +351,8 @@ def moe_dense(
         + rows * fp.TILE
         + 2 * rows * se.LOCAL_INTERMEDIATE * HIDDEN,
         cores=lanes + se.STORAGE_CORES + DOWN_WORKERS + len(plan.untilize_cores()),
+        # every output is per device the same shape as the chain's (replicated placements, as the caller stamped them)
+        outputs=((scores, None), (indices, None), (partial, None), (sigmoid, None), (sparse_rows, None)),
     )
     fp.run_program(
         [logits, index_template, gate_up_scalar_ws, down, full_hidden, scores, indices, partial, sigmoid, sparse_rows],
@@ -424,6 +420,7 @@ def moe_dense_composed(
             writes=(intermediate, sigmoid),
             flops=rows * se.LOCAL_INTERMEDIATE * 3 + rows * fp.TILE,
             cores=se.STORAGE_CORES,
+            outputs=((intermediate, None), (sigmoid, None)),
         ),
     )
     partial = ttnn.linear(
