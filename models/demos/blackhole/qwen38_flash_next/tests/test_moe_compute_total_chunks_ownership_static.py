@@ -94,13 +94,29 @@ def test_a2a_exchange_has_backpressure_and_never_writes_a_core_s_own_buffer() ->
     assert "noc_async_write_one_packet_with_state" in a2a[guard:increment]
     assert "noc_async_write_one_packet_with_state" not in a2a[increment:]
     assert "noc1_obj.async_writes_flushed<NocOptions::POSTED>();" in a2a[increment:]
-    # the wait precedes the chunk's first write; the credit follows the W2 output wait (every buffer read)
-    assert dm1.index("a2a_free_sem.wait_min(a2a_chunks_exchanged);") < dm1.index(step_loop)
+    # the wait precedes the chunk's first write; under the a2a pipeline one chunk's credit may be outstanding (the
+    # chunk's buffers are the parity slot the successor read two chunks ago)
+    assert "constexpr uint32_t credit_lag = a2a_pipeline ? 1u : 0u;" in dm1
+    assert dm1.index("a2a_free_sem.wait_min(a2a_chunks_exchanged - credit_lag);") < dm1.index(step_loop)
     credit = re.compile(r"noc_semaphore_inc</\*posted=\*/false>\(\s*predecessor_a2a_free_noc_addr,")
     credits = [m.start() for m in credit.finditer(dm1)]
     assert len(credits) == 1
-    output_wait = dm1.index("cb_c2s_out.wait_front(num_w0_w1_tiles_h);", dm1.index("++a2a_chunks_exchanged;"))
-    assert dm1.index("++a2a_chunks_exchanged;") < output_wait < credits[0]
+    # the credit follows the W2 output wait (every buffer read) inside finish_chunk, which the serial form runs right
+    # after the chunk's exchange and the a2a pipeline after the NEXT chunk's exchange (the pending record), before a
+    # foreign chunk's empty pop and at the end of the loop
+    finish_start = dm1.index("auto finish_chunk = [&](const PendingChunk& p) {")
+    loop_start = dm1.index("for (uint32_t expert_id = 0; expert_id < num_experts; ++expert_id) {", finish_start)
+    output_wait = dm1.index("cb_c2s_out.wait_front(num_w0_w1_tiles_h);", finish_start)
+    assert finish_start < output_wait < credits[0] < loop_start
+    exchanged = dm1.index("++a2a_chunks_exchanged;")
+    assert loop_start < exchanged
+    pipelined = dm1.index("if constexpr (a2a_pipeline) {", exchanged)
+    pending_set = dm1.index("pending = this_chunk;", pipelined)
+    assert "finish_chunk(pending);" in dm1[pipelined:pending_set]
+    assert "finish_chunk(this_chunk);" in dm1[pending_set : dm1.index("}\n        }\n", pending_set) + 400]
+    foreign_pop = dm1.index("cb_c2s_out.pop_front(num_w0_w1_tiles_h);\n                continue;")
+    assert loop_start < dm1.index("finish_chunk(pending);", loop_start) < foreign_pop
+    assert exchanged < dm1.rindex("finish_chunk(pending);") < dm1.rindex("if constexpr (!has_combine) {")
     # every exit path barriers the credits' responses: the local-output / compute-only branch through the full
     # barrier, the combine branch through an atomic barrier (each branch of the exit `if constexpr (!has_combine)`)
     exit_if = dm1.rindex("if constexpr (!has_combine) {")
@@ -152,3 +168,46 @@ def test_a2a_exchange_has_backpressure_and_never_writes_a_core_s_own_buffer() ->
     # the bank table)
     assert ".matmul_runtime_args_size = static_cast<uint32_t>(matmul_runtime_args.size())" in factory
     assert "matmul_runtime_args.size() == shared_variables.matmul_runtime_args_size" in factory
+
+
+def test_a2a_pipeline_is_a_constant_of_the_streaming_decode_ring() -> None:
+    """The a2a pipeline (2026-09-26): compute runs W0/W1 of the next owned chunk while dm1 exchanges the current chunk's
+    partials (two parity slots of a2a buffers), dm1 exchanges the next chunk before it finishes this one's output, the
+    feed carries three chunk slots. A constant of the launch, in the kernel hash through the `a2a_pipeline` named arg: on
+    for the streaming decode ring, off for every prefill ring form (their foreign-chunk order is not carried); no knob.
+    """
+    factory = (KERNELS.parent / "moe_compute_program_factory.cpp").read_text(encoding="utf-8")
+    common = _source("moe_ring_common.h")
+    form = factory[factory.index("uint32_t a2a_pipeline_form(uint32_t prefill_rings) {") :]
+    form = form[: form.index("\n}\n")]
+    assert "return prefill_rings >= 1 ? 0u : 1u;" in form
+    assert "getenv" not in form and "TT_MOE_A2A_PIPELINE" not in factory
+    assert "const uint32_t a2a_parity_slots = a2a_pipeline ? 2u : 1u;" in factory
+    assert '{"a2a_pipeline", a2a_pipeline},' in factory
+    assert "moe_ring::rings::feed_halves(args.prefill_rings, a2a_pipeline != 0)" in factory
+    assert "return a2a_pipeline ? 3u : chunk_halves(rings);" in common
+    for name in ("compute.cpp", "dm0.cpp", "dm1.cpp"):
+        assert 'get_named_compile_time_arg_val("a2a_pipeline")' in _source(name), name
+    compute = _source("compute.cpp")
+    assert "w2_phase(pending_in2_base, pending_zone_on);" in compute  # W2 of the previous owned chunk after W0/W1
+    assert "static_assert(!(a2a_pipeline && replay_slice)" in _source("dm0.cpp")
+
+
+def test_streaming_decode_ring_gets_one_more_weight_cb_block() -> None:
+    """The weight-stream study (2026-09-26): the streaming decode ring's weight CB holds one block more than the shape's
+    rule (four for the 20-tile transaction: three blocks in flight; 10.88 -> 10.68 us per distinct local expert on the 1x4
+    line, five and six no better); the prefill ring forms keep the rule, their L1 has no room for it (measured: the slab
+    form's static CBs clash with the L1 buffers at four). The factory sizes the CB and passes the count to dm0."""
+    common = _source("moe_ring_common.h")
+    factory = (KERNELS.parent / "moe_compute_program_factory.cpp").read_text(encoding="utf-8")
+    rule = common[common.index("constexpr uint32_t weight_cb_slots(uint32_t tiles_per_txn) {") :]
+    rule = rule[: rule.index("\n}\n")]
+    assert "return fit < 3 ? 3 : fit;" in rule and "ALT_TILES_PER_TXN" not in rule
+    assert (
+        "const uint32_t weight_slots =\n        a2a_pipeline ? moe_ring::weight_cb_slots(weight_tiles_per_txn) + 1 :"
+        " moe_ring::weight_cb_slots(weight_tiles_per_txn);"
+    ) in factory
+    assert "weight_cb_config(weight_slots * weight_tiles_per_block)" in factory
+    assert '{"weight_slots", weight_slots},' in factory
+    assert '#define NUM_SLOTS (get_named_compile_time_arg_val("weight_slots"))' in _source("dm0.cpp")
+    assert "TT_MOE_WEIGHT_SLOTS" not in factory and "TT_MOE_WEIGHT_NOCS" not in factory  # the study knobs did not land

@@ -34,6 +34,12 @@ constexpr uint32_t admitted_prefill_rings(uint32_t prefill_rings) {
     return prefill_rings <= ADMITTED_PREFILL_RINGS ? prefill_rings : 0;
 }
 
+// The feed's chunk slots of this launch: two, or three under the a2a pipeline (moe_ring::rings::feed_halves).
+uint32_t feed_halves_for(uint32_t prefill_rings) {
+    const uint32_t rings = admitted_prefill_rings(prefill_rings);
+    return moe_ring::rings::feed_halves(rings, a2a_pipeline_form(rings) != 0);
+}
+
 // LocalOutput: dm1 addresses the [k, T, H] output through a TensorAccessor built from the actual
 // buffer, one page per token row (2 x H bytes) plus the column offset of its slice. A row-major
 // tensor has one-row pages when it is INTERLEAVED or HEIGHT_SHARDED (tt_metal page_config.cpp,
@@ -504,16 +510,12 @@ MoEComputeDeviceOperation::spec_return_value_t MoEComputeDeviceOperation::comput
         tt::tt_metal::BufferType::L1,
         tt::tt_metal::ShardSpec(
             shard_cores,
-            {moe_ring::rings::chunk_halves(detail::admitted_prefill_rings(args.prefill_rings)) * detail::TOKEN_SIZE,
-             hidden_size},
+            {detail::feed_halves_for(args.prefill_rings) * detail::TOKEN_SIZE, hidden_size},
             tt::tt_metal::ShardOrientation::ROW_MAJOR),
     };
 
     auto tilize_output_shape = ttnn::Shape(
-        {shard_cores.num_cores(),
-         moe_ring::rings::chunk_halves(detail::admitted_prefill_rings(args.prefill_rings)),
-         detail::TOKEN_SIZE,
-         hidden_size});
+        {shard_cores.num_cores(), detail::feed_halves_for(args.prefill_rings), detail::TOKEN_SIZE, hidden_size});
     auto tilize_output_spec = tt::tt_metal::TensorSpec(
         Shape(tilize_output_shape),
         tt::tt_metal::TensorLayout(

@@ -344,7 +344,9 @@ constexpr uint32_t tiles_per_txn_for_shape(uint32_t Ht, uint32_t Nt, bool has_bi
 
 // Blocks the weight CB (c_3) holds: as many as fit in the 3-block budget of 14-tile transactions (84 tiles), and at
 // least 3 (3 for 14-tile and for 20-tile transactions, 4 for 10). dm0 keeps all but one of them in flight as DRAM
-// reads, so smaller transactions keep about the same bytes in flight.
+// reads, so smaller transactions keep about the same bytes in flight. The streaming decode ring adds a fourth block
+// (the factory's "weight_slots" named arg, moe_compute_program_factory.cpp): the prefill ring forms' L1 has no room
+// for it (their feed halves are larger), the decode ring's has.
 constexpr uint32_t weight_cb_slots(uint32_t tiles_per_txn) {
     const uint32_t fit = (3 * W0_W1_TXNS_PER_BLOCK * DEFAULT_TILES_PER_TXN) / (W0_W1_TXNS_PER_BLOCK * tiles_per_txn);
     return fit < 3 ? 3 : fit;
@@ -532,6 +534,14 @@ namespace rings {
 constexpr uint32_t MAX_CHUNK_HALVES = 5;
 constexpr uint32_t MAX_RINGS = MAX_CHUNK_HALVES - 1;
 constexpr uint32_t chunk_halves(uint32_t rings) { return rings < 2 ? 2u : rings + 1; }
+// The feed's chunk slots under the a2a pipeline (the streaming ring, rings < 2): the compute holds chunk c's input
+// until W2(c) runs after W0/W1(c + 1), so chunk c + 2 must land in a third slot while c and c + 1 are in flight (with
+// two, the feed of c + 2 waited for the rows of c: the pipeline's first measurement, 13.8 us per expert against the
+// serial 12.9, 2026-09-26).
+// Three under the pipeline: the fourth half (160 KB) does not fit beside the slab-mode server's L1 buffers (measured:
+// its chunked prefill's static CBs clash with them by 46 KB), and after dm1's exchange-ahead order the third half
+// already keeps the feed off the critical path.
+constexpr uint32_t feed_halves(uint32_t rings, bool a2a_pipeline) { return a2a_pipeline ? 3u : chunk_halves(rings); }
 
 template <uint32_t R>
 struct ChunkOwners {

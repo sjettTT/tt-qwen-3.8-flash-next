@@ -8,9 +8,10 @@
 #include "api/dataflow/noc_semaphore.h"
 #include "moe_ring_common.h"
 
-// Weight CB slots (blocks): Cfg::weight_cb_slots -- 3 for 14- and 20-tile transactions (4 for 10-tile); all but one
-// slot hold blocks whose DRAM reads are in flight.
-#define NUM_SLOTS Cfg::weight_cb_slots
+// Weight CB slots (blocks): the factory's "weight_slots" named arg -- Cfg::weight_cb_slots (3 for 14- and 20-tile
+// transactions, 4 for 10-tile) on the prefill ring forms, one more on the streaming decode ring; all but one slot
+// hold blocks whose DRAM reads are in flight.
+#define NUM_SLOTS (get_named_compile_time_arg_val("weight_slots"))
 
 // Helper macros for counter advancement (avoids modulo on RISC-V)
 #define ADVANCE_SLOT(s)       \
@@ -320,6 +321,73 @@ void kernel_main() {
 
     moe_ring::rings::ChunkOwners<num_rings> owners;
     [[maybe_unused]] uint32_t chunk_g_counter = 0;  // chunks in feed order over all experts (the study zones' window)
+    // The expert's W2 blocks from its first global page (function scope: the a2a pipeline issues the previous
+    // chunk's W2 from the next expert's loop body and the last chunk's after the loop).
+    auto issue_w2 = [&](uint32_t w2_first_global_page) {
+        uint32_t w2_global_page = w2_first_global_page;
+
+        // Read the FULL Nt-tall W2 for every expert, including shared experts. Shared-expert W2
+        // is zero-padded to full Nt height (add_shared_expert_weights); the zero rows are inert
+        // under the full contraction the compute kernel performs.
+        for (uint32_t block_id = 0; block_id < Cfg::w2_blocks_per_expert; ++block_id) {
+            noc_async_read_set_trid(trid_to_issue);
+
+            // First transaction:
+            {
+                const uint32_t shard_idx = w2_global_page / w2_pages_per_bank_total;
+                const uint32_t in_bank_page = w2_global_page - shard_idx * w2_pages_per_bank_total;
+                const uint32_t in_bank_byte_offset = in_bank_page * w2_tile_size + w2_addr;
+                const uint32_t bank_id = shard_to_bank[shard_idx];
+                if (shard_idx != cur_shard_idx) {
+                    const uint64_t bank_base = get_noc_addr_from_bank_id<true>(bank_id, 0);
+                    noc_async_read_one_packet_set_state<true>(bank_base, w2_bytes_per_txn, vchannel);
+                    cur_shard_idx = shard_idx;
+                }
+                noc_async_read_one_packet_with_state_with_trid<
+                    /*skip_ptr_update=*/false,
+                    /*skip_cmdbuf_chk=*/false>(
+                    get_noc_addr_from_bank_id<true>(bank_id, 0), in_bank_byte_offset, issue_addr(), trid_to_issue);
+                w2_global_page += w2_tiles_per_txn;
+            }
+            // Second transaction (may cross a bank boundary):
+            {
+                const uint32_t shard_idx = w2_global_page / w2_pages_per_bank_total;
+                const uint32_t in_bank_page = w2_global_page - shard_idx * w2_pages_per_bank_total;
+                const uint32_t in_bank_byte_offset = in_bank_page * w2_tile_size + w2_addr;
+                const uint32_t bank_id = shard_to_bank[shard_idx];
+                if (shard_idx != cur_shard_idx) {
+                    const uint64_t bank_base = get_noc_addr_from_bank_id<true>(bank_id, 0);
+                    noc_async_read_one_packet_set_state<true>(bank_base, w2_bytes_per_txn, vchannel);
+                    cur_shard_idx = shard_idx;
+                }
+                noc_async_read_one_packet_with_state_with_trid<
+                    /*skip_ptr_update=*/false,
+                    /*skip_cmdbuf_chk=*/false>(
+                    get_noc_addr_from_bank_id<true>(bank_id, 0),
+                    in_bank_byte_offset,
+                    issue_addr() + w2_bytes_per_txn,
+                    trid_to_issue);
+                w2_global_page += w2_tiles_per_txn;
+            }
+
+            advance_issue_slot();
+            ADVANCE_TRID(trid_to_issue);
+
+            if (++blocks_pending == blocks_in_flight) {
+                land_block();
+                // Reserve for next block (the blocks in flight and the next one)
+                if constexpr (!replay_slice) {
+                    cb_r2c_w2.reserve_back(w2_tiles_per_block * blocks_in_flight);
+                }
+            }
+        }
+
+    };
+    // a2a pipeline (the factory's a2a_pipeline named arg, streaming weights only): W0/W1(c) then W2(c-1) in the stream
+    constexpr uint32_t a2a_pipeline = get_named_compile_time_arg_val("a2a_pipeline");
+    static_assert(!(a2a_pipeline && replay_slice), "the a2a pipeline is the streaming ring's form");
+    bool w2_pending = false;
+    uint32_t pending_w2_first_global_page = 0;
     for (uint32_t expert_id = 0; expert_id < num_experts; ++expert_id) {
         uint32_t num_expert_chunks = NUM_CHUNKS_PER_EXPERT[expert_id];
         owners.begin_expert(num_expert_chunks);
@@ -358,18 +426,11 @@ void kernel_main() {
         }
         // Read this core's slice of the expert once: W0/W1 blocks then W2 blocks, two DRAM transactions per block,
         // blocks_in_flight reads outstanding; every completed block goes through land_block (the push to compute).
-        auto issue_slice = [&]() {
-            //-------------------------------------------------------------------------
-            // Pipelined reading of W0/W1 -- bank-run loop
-            //-------------------------------------------------------------------------
-            // Walk this core's slice of the expert stream txn by txn, batching reads within each
-            // bank piece. Each block issues 2 transactions of `tiles_per_txn` contiguous tiles.
-            // The static_asserts above guarantee piece boundaries land on txn boundaries, so we
-            // never split a single transaction across two banks. We may re-set_state
-            // mid-block though if the SECOND txn of a block lands in the next piece.
-            //
-            // shard_idx is the placement-order index in [0, num_banks); we translate to the chip
-            // bank id via shard_to_bank[].
+        // The expert's W0/W1 blocks (this core's columns); with issue_w2 above the two issues: the replay ring issues both
+        // per owned chunk as one slice; the streaming ring under the a2a pipeline issues W0/W1 of the chunk, then the
+        // W2 of the PREVIOUS owned chunk (the compute's order: W0/W1(c), W2(c-1)), the W2 of the last chunk after the
+        // loop.  The W2 issue takes its expert's first global page (a chunk of another expert may sit between).
+        auto issue_w0_w1 = [&]() {
             uint32_t w0_w1_shard_idx = w0_w1_core_first_shard_idx;
             uint32_t w0_w1_piece_page = w0_w1_core_first_piece_page;
 
@@ -440,64 +501,10 @@ void kernel_main() {
             //-------------------------------------------------------------------------
             // Pipelined reading of W2 -- bank-run loop
             //-------------------------------------------------------------------------
-            uint32_t w2_global_page = w2_slice_first_global_page;
-
-            // Read the FULL Nt-tall W2 for every expert, including shared experts. Shared-expert W2
-            // is zero-padded to full Nt height (add_shared_expert_weights); the zero rows are inert
-            // under the full contraction the compute kernel performs.
-            for (uint32_t block_id = 0; block_id < Cfg::w2_blocks_per_expert; ++block_id) {
-                noc_async_read_set_trid(trid_to_issue);
-
-                // First transaction:
-                {
-                    const uint32_t shard_idx = w2_global_page / w2_pages_per_bank_total;
-                    const uint32_t in_bank_page = w2_global_page - shard_idx * w2_pages_per_bank_total;
-                    const uint32_t in_bank_byte_offset = in_bank_page * w2_tile_size + w2_addr;
-                    const uint32_t bank_id = shard_to_bank[shard_idx];
-                    if (shard_idx != cur_shard_idx) {
-                        const uint64_t bank_base = get_noc_addr_from_bank_id<true>(bank_id, 0);
-                        noc_async_read_one_packet_set_state<true>(bank_base, w2_bytes_per_txn, vchannel);
-                        cur_shard_idx = shard_idx;
-                    }
-                    noc_async_read_one_packet_with_state_with_trid<
-                        /*skip_ptr_update=*/false,
-                        /*skip_cmdbuf_chk=*/false>(
-                        get_noc_addr_from_bank_id<true>(bank_id, 0), in_bank_byte_offset, issue_addr(), trid_to_issue);
-                    w2_global_page += w2_tiles_per_txn;
-                }
-                // Second transaction (may cross a bank boundary):
-                {
-                    const uint32_t shard_idx = w2_global_page / w2_pages_per_bank_total;
-                    const uint32_t in_bank_page = w2_global_page - shard_idx * w2_pages_per_bank_total;
-                    const uint32_t in_bank_byte_offset = in_bank_page * w2_tile_size + w2_addr;
-                    const uint32_t bank_id = shard_to_bank[shard_idx];
-                    if (shard_idx != cur_shard_idx) {
-                        const uint64_t bank_base = get_noc_addr_from_bank_id<true>(bank_id, 0);
-                        noc_async_read_one_packet_set_state<true>(bank_base, w2_bytes_per_txn, vchannel);
-                        cur_shard_idx = shard_idx;
-                    }
-                    noc_async_read_one_packet_with_state_with_trid<
-                        /*skip_ptr_update=*/false,
-                        /*skip_cmdbuf_chk=*/false>(
-                        get_noc_addr_from_bank_id<true>(bank_id, 0),
-                        in_bank_byte_offset,
-                        issue_addr() + w2_bytes_per_txn,
-                        trid_to_issue);
-                    w2_global_page += w2_tiles_per_txn;
-                }
-
-                advance_issue_slot();
-                ADVANCE_TRID(trid_to_issue);
-
-                if (++blocks_pending == blocks_in_flight) {
-                    land_block();
-                    // Reserve for next block (the blocks in flight and the next one)
-                    if constexpr (!replay_slice) {
-                        cb_r2c_w2.reserve_back(w2_tiles_per_block * blocks_in_flight);
-                    }
-                }
-            }
-
+        };
+        auto issue_slice = [&]() {
+            issue_w0_w1();
+            issue_w2(w2_slice_first_global_page);
             if constexpr (replay_slice) {
                 // The whole slice is resident before it can be replayed: land the blocks still in flight.
                 while (blocks_pending > 0) {
@@ -532,7 +539,21 @@ void kernel_main() {
             }
             MOE_ZONE_IF(zone_on, "mz_d_issue_slice");
             MOE_STUDY_DELAY(D_BEFORE_SLICE);
-            issue_slice();
+            if constexpr (a2a_pipeline) {
+                issue_w0_w1();
+                if (w2_pending) {
+                    issue_w2(pending_w2_first_global_page);
+                }
+                pending_w2_first_global_page = w2_slice_first_global_page;
+                w2_pending = true;
+            } else {
+                issue_slice();
+            }
+        }
+    }
+    if constexpr (a2a_pipeline) {
+        if (w2_pending) {  // the last owned chunk's W2 blocks close the stream
+            issue_w2(pending_w2_first_global_page);
         }
     }
 

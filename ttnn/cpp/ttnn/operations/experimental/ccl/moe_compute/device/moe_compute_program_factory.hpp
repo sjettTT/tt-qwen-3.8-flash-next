@@ -14,6 +14,13 @@
 
 namespace ttnn::experimental::prim {
 
+// The moe_compute ring's a2a pipeline form (moe_ring_common.h / the kernels' `a2a_pipeline` named arg): W0/W1 of the
+// next owned chunk under the exchange of the current one's partials, dm1's exchange of the next chunk ahead of this
+// one's output. The streaming decode ring's form; every prefill ring form (prefill_rings >= 1) keeps the serial
+// order. A constant of the launch (the value is in the kernel hash and sizes the feed's chunk slots and the in2
+// parity slots, so the op's output specs and the factory read it through this one function).
+uint32_t a2a_pipeline_form(uint32_t prefill_rings);
+
 struct MoEComputeMeshWorkloadFactory {
     struct shared_variables_t {
         // Tilize kernel handles

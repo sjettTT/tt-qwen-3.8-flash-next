@@ -116,6 +116,12 @@ std::string serialize_physical_core_coords(const std::vector<ttnn::CoreCoord>& c
 
 namespace ttnn::experimental::prim {
 
+uint32_t a2a_pipeline_form(uint32_t prefill_rings) {
+    // The streaming decode ring runs the a2a pipeline; every prefill ring form (prefill_rings >= 1: the replay slice,
+    // the multi-ring feed) keeps the serial order -- their foreign-chunk order is not carried by the pipeline.
+    return prefill_rings >= 1 ? 0u : 1u;
+}
+
 // expose a helper function so callers know what cores are available for subsequently running a2a combine.
 // Combine cores are selected dynamically based on hidden_size (for tilize core count) and mux_core_range_set
 // (for core avoidance). Layout overlap (tilize/matmul/combine bboxes) is checked in get_cores() at program
@@ -397,12 +403,25 @@ MoEComputeMeshWorkloadFactory::create_at(
         expected_matmul_n,
         matmul_num_cores);
     const uint32_t a2a_cb_pages = moe_ring::a2a_exchange_tiles(intermediate_tiles, matmul_num_cores);
+    // The a2a pipeline (2026-09-26): the ring cores run W0/W1 of their next owned chunk while dm1 exchanges the
+    // current chunk's in2 partials, so the in2 buffers (the core's own partial and the landed shards) come in two
+    // parity slots and the ready credits hold two chunks; dm1 exchanges the next chunk before it finishes this one's
+    // output rows and the feed carries three chunk slots. The streaming decode ring only (a2a_pipeline_form: the
+    // replay ring's whole-slice CB and the multi-ring chunk owners assume one chunk in flight); the named arg is in
+    // the kernel hash.
+    const uint32_t a2a_pipeline = a2a_pipeline_form(args.prefill_rings);
+    const uint32_t a2a_parity_slots = a2a_pipeline ? 2u : 1u;
 
     // Per-shape DRAM transaction size of both weight streams (moe_ring::tiles_per_txn_for_shape: 14 tiles, or 20
     // for the 2560/640 expert on the 8-bank ring), passed to the kernels as the "tiles_per_txn" compile arg.
     const uint32_t weight_tiles_per_txn =
         moe_ring::tiles_per_txn_for_shape(hidden_tiles, intermediate_tiles, args.has_bias, matmul_num_cores);
     const uint32_t weight_tiles_per_block = moe_ring::W0_W1_TXNS_PER_BLOCK * weight_tiles_per_txn;
+    // The weight CB's blocks: the shape's rule, plus one on the streaming decode ring (2026-09-26: three blocks = 69 KB of
+    // DRAM reads in flight per ring core, 10.88 -> 10.68 us per distinct local expert on the 1x4 line; five and six no
+    // better). The prefill ring forms keep the rule: their larger feed halves leave no L1 for a fourth block.
+    const uint32_t weight_slots =
+        a2a_pipeline ? moe_ring::weight_cb_slots(weight_tiles_per_txn) + 1 : moe_ring::weight_cb_slots(weight_tiles_per_txn);
 
     const uint32_t tilize_bounding_box_num_cores = tilize_bounding_box.size();
     const uint32_t matmul_bounding_box_num_cores = matmul_bounding_box.size();
@@ -501,7 +520,7 @@ MoEComputeMeshWorkloadFactory::create_at(
     // g % chunk_halves on the drain after consuming chunk g; the drain multicasts into a half only when every ring
     // core has credited the chunk that last used it. Ids are passed one by one: consecutive CreateSemaphore calls
     // need not give consecutive ids.
-    const uint32_t chunk_halves = moe_ring::rings::chunk_halves(args.prefill_rings);
+    const uint32_t chunk_halves = moe_ring::rings::feed_halves(args.prefill_rings, a2a_pipeline != 0);
     std::array<uint32_t, moe_ring::rings::MAX_CHUNK_HALVES> half_free_semaphore_ids{};
     for (uint32_t h = 0; h < chunk_halves; ++h) {
         half_free_semaphore_ids[h] = tt::tt_metal::CreateSemaphore(program, tilize_matmul_core_range_set, INVALID);
@@ -950,17 +969,17 @@ MoEComputeMeshWorkloadFactory::create_at(
         tt::tt_metal::CreateCircularBuffer(
             program,
             ring_core_range_set,
-            weight_cb_config(moe_ring::weight_cb_slots(weight_tiles_per_txn) * weight_tiles_per_block));
+            weight_cb_config(weight_slots * weight_tiles_per_block));
     }
 
     // Define the CB configuration as a tuple: name, CBIndex, DataFormat, tiles_per_cb
     // Note: cb_s2c_in and cb_c2s_out are handled separately as it is allocated on Tilize, Matmul, and Combine cores
     std::vector<std::tuple<std::string, tt::CBIndex, tt::DataFormat, bool, uint32_t>> matmul_cb_specs0 = {
-        {"cb_c2w_rdy", tt::CBIndex::c_4, tt::DataFormat::Float32, false, 1},
+        {"cb_c2w_rdy", tt::CBIndex::c_4, tt::DataFormat::Float32, false, a2a_parity_slots},
         // one ready credit per ring step of the handshake iteration (moe_ring::a2a_handshake_iters): dm1 pushes them
         // as the shards land and the compute pops them as it consumes each shard, neither waiting on the other
-        {"cb_w2c_rdy", tt::CBIndex::c_5, tt::DataFormat::Float32, false, matmul_num_cores},
-        {"cb_s2c_in2", tt::CBIndex::c_6, tt::DataFormat::Float16_b, true, a2a_cb_pages * matmul_num_cores},
+        {"cb_w2c_rdy", tt::CBIndex::c_5, tt::DataFormat::Float32, false, matmul_num_cores * a2a_parity_slots},
+        {"cb_s2c_in2", tt::CBIndex::c_6, tt::DataFormat::Float16_b, true, a2a_cb_pages * matmul_num_cores * a2a_parity_slots},
         {"cb_w2c_md", tt::CBIndex::c_7, tt::DataFormat::UInt32, false, 2},
     };
     if (args.has_bias) {
@@ -984,8 +1003,10 @@ MoEComputeMeshWorkloadFactory::create_at(
     // free on the matmul cores (c_8 is the bias ones tile).
     constexpr uint32_t local_output_map_cb_id = tt::CBIndex::c_9;
     if (local_output) {
+        // two chunk slots under the a2a pipeline (dm1 reads chunk c+1's map while chunk c's rows read theirs)
         const uint32_t map_bytes =
-            tt::align(tokens_per_chunk * moe_ring::token_list::ENTRY_BYTES, dram_alignment) + dram_alignment;
+            tt::align(tokens_per_chunk * moe_ring::token_list::ENTRY_BYTES, dram_alignment) * (a2a_pipeline ? 2u : 1u) +
+            dram_alignment;
         tt::tt_metal::CreateCircularBuffer(
             program,
             ring_core_range_set,
@@ -1637,6 +1658,7 @@ MoEComputeMeshWorkloadFactory::create_at(
         {"width_shard_dim", combine_data_parallel_cores},
         {"hidden_tiles", hidden_tiles},
         {"tiles_per_txn", weight_tiles_per_txn},
+        {"weight_slots", weight_slots},
         {"intermediate_tiles", intermediate_tiles},
         {"noc_max_burst_bytes", noc_max_burst_bytes},
         // Matmul -> combine: dm1 increments this on combine cores when data is written
@@ -1654,6 +1676,7 @@ MoEComputeMeshWorkloadFactory::create_at(
         {"zero_fill", local_output && args.zero_fill_non_owned_rows ? 1u : 0u},
         // The replay ring (dm0): the weight CB holds one expert slice, read once per expert, replayed per chunk.
         {"replay_slice", replay_slice ? 1u : 0u},
+        {"a2a_pipeline", a2a_pipeline},
         {"local_output_zero_cb_id", local_output_zero_cb_id},
         {"local_output_num_rows", local_output_num_rows},
     };

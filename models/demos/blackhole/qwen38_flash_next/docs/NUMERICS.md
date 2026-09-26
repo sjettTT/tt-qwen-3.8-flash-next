@@ -159,6 +159,17 @@ per pass, a 41-routing soak of the combine pages), 12.98 -> 11.6 us per distinct
 line (-10 %), the B=1 step 27.14 -> 26.89 ms on the 200-step pin recipe, the sampled `--mtp 4` pass -0.84 ms per token
 served, the slab's one call 2.09 -> 1.94 ms per layer (-7 %) on one die.
 
+`moe_compute`'s a2a pipeline (2026-09-26, a runtime patch, the streaming decode ring only): compute runs W0/W1 of the
+next owned chunk while dm1 exchanges the current chunk's partials (two parity slots of a2a buffers; one chunk's credit
+may be outstanding), dm1 exchanges the next chunk before it writes this one's output rows, and the feed carries three
+chunk slots (a fourth does not fit the slab-mode server's L1); the prefill ring forms keep the serial order. The same matmuls in the same order: the combine pages are
+bitwise on the rows bench (11 cases, three builds); 11.42 -> 10.91 us per distinct local expert per launch on the 1x4
+line (-4.5 %); the ring core is now paced by its DRAM weight stream (9.7-9.9 us per expert, about 285 GB/s of the
+die's 512). The served numbers follow with the rebuild that carries it. The streaming decode ring's weight CB holds
+four blocks instead of three (2026-09-26): 10.88 -> 10.68 us per distinct local expert on the same bench, bitwise;
+five and six blocks and dual-NoC reads are no better -- the ring core's stream is paced by its one DRAM bank (about
+36 GB/s of the channel's 64); the prefill ring forms keep three (their L1 has no room for a fourth).
+
 ## The slab's block-shared attention (`QWEN38_FUSED=sparse_sdpa_tiled`, 2026-09-25)
 
 A tolerance-class fused kernel, opt-in: `sparse_sdpa_tiled` replaces the prefill slab's block-id expansion, zero V
