@@ -32,6 +32,8 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.builder import RESIDENT_MAX_Q
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 SEAL_MODULE_VARIABLE = "QWEN38_RUNTIME_SEAL_MODULE"
+# The head of a tree without git history (a container image); the vLLM adapter reads the same variable first.
+DECLARED_HEAD_VARIABLE = "QWEN38_TT_METAL_SHA"
 SCHEMA = "qwen38-runtime-identity/v1"
 # Expected values a launcher may pass; the admitted identity must match each one given.
 EXPECTATIONS = (
@@ -71,7 +73,21 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def git_identity(root: Path = REPO_ROOT) -> dict[str, Any]:
-    """Head, tree and cleanliness of the checkout; a tree without git history is refused."""
+    """Head, tree and cleanliness of the checkout.  A tree without git history (a container image ships the tree
+    without ``.git``) is admitted only when ``QWEN38_TT_METAL_SHA`` names its head, the 40-hex commit the image was
+    built from (recorded as ``source`` ``declared``, no tree, not dirty); a checkout with history is its own identity,
+    and the variable, if set there, must agree with the head (a disagreement is refused, never overridden)."""
+
+    declared = os.environ.get(DECLARED_HEAD_VARIABLE)
+    if declared is not None and (len(declared) != 40 or any(c not in "0123456789abcdef" for c in declared)):
+        raise RuntimeAdmissionError(f"{DECLARED_HEAD_VARIABLE} must be lowercase 40-hex, got {declared!r}")
+    if not (root / ".git").exists():
+        if declared is None:
+            raise RuntimeAdmissionError(
+                f"{root} is not a git checkout and {DECLARED_HEAD_VARIABLE} is unset: a tree without git history "
+                "serves only with the commit it was built from declared in that variable"
+            )
+        return {"repo": str(root), "head": declared, "tree": None, "dirty": False, "source": "declared"}
 
     def git(*arguments: str) -> str:
         completed = subprocess.run(
@@ -82,12 +98,17 @@ def git_identity(root: Path = REPO_ROOT) -> dict[str, Any]:
         return completed.stdout.strip()
 
     dirty = git("status", "--porcelain=v1", "--untracked-files=no")
-    return {
+    identity = {
         "repo": str(root),
         "head": git("rev-parse", "HEAD"),
         "tree": git("rev-parse", "HEAD^{tree}"),
         "dirty": bool(dirty),
     }
+    if declared is not None and declared != identity["head"]:
+        raise RuntimeAdmissionError(
+            f"{DECLARED_HEAD_VARIABLE} {declared} differs from the checkout head {identity['head']}"
+        )
+    return identity
 
 
 def source_proof(expected_head: str, expected_tree: str) -> dict[str, Any]:

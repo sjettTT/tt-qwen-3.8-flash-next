@@ -245,6 +245,46 @@ served (no CORS headers); a body needs `Content-Length`.
 | device DRAM free, 256k | about 750 MB per device | QuietBox 2026-09-06, before the compact expert layout; single-user; MTP did not fit then (94 MB free per bank against the 128 MiB contiguous it needs) |
 | the prompt-end snapshot | ~53 MB per device | resident; the recurrent part of the device state (above) |
 
+## The server behind uvicorn (the container form)
+
+`tools/qwen38_asgi.py` is this server as an ASGI application, the form a container that starts its model with uvicorn
+runs:
+
+    python -m uvicorn --lifespan on models.demos.blackhole.qwen38_flash_next.tools.qwen38_asgi:app
+
+The lifespan startup composes the server's arguments from the environment, starts `qwen38_chat_server` as a child
+process (`python -m`, the composed arguments and environment: the server keeps its own main thread, signal handlers and
+device teardown exactly as the shell launcher runs it, and the uvicorn process never touches a device) and returns only
+once the server has written `READY` (the mesh open, the chain captured, the acceptance records replayed with
+`--require-json-96` in the default flags), so uvicorn's `Application startup complete` line means what `READY` means; a
+server that ends before the record fails the startup with its status.  The shutdown sends the server SIGTERM (its drain,
+then the chain's release and the mesh close in the server's order) and waits for its exit, logged with its status; a
+server that ends on its own (the stall watchdog's exit 1) ends the uvicorn process with the same status, so the container
+exits as the server did.  The server is a child rather than a thread because tt-metal's teardown at process exit must run
+in the process and thread that opened the devices: with the server in a thread of the uvicorn process the exit unlocked
+the UMD chip lock from the wrong thread and the process died with status 139 after an otherwise clean close, and a
+container that exits 139 is what `tt-model stop` answers with a board reset; as a child the container exits 0 after
+SIGTERM (a gate of the package).  Requests are forwarded byte for byte over the loopback
+(`QWEN38_INNER_PORT`, 18000): nothing of a request or a reply is parsed there, so the rules above apply unchanged (what
+the server cannot honour it refuses with HTTP 400; nothing is dropped), a streamed reply reaches the client as the
+server writes it, and a client's hang-up closes the server's connection too.  Before `READY` and after the stop every
+request gets HTTP 503 in the server's error shape.  The environment: `QWEN38_HARDWARE_PROFILE` (`p150-line` default;
+`tt-quietbox`, `tt-quietbox-2`), `QWEN38_ALLOCATED_CONTEXT` (32768 default, 65536, 131072, 262144),
+`QWEN38_SERVER_ARGS` (further server flags, shell-split; default `--mtp 4 --sampling --stall-seconds 300
+--require-json-96`; a flag the server does not know is refused by its parser), `QWEN38_CACHE_ROOT` (`/tensor-cache`
+default; the launcher's layout under it), `QWEN38_CHECKPOINT` (unset: the pinned revision of `HF_MODEL` in the local
+Hugging Face hub cache), `QWEN38_STOP_SECONDS` (300).  The device nodes are the four `/dev/tenstorrent` entries the
+container was given (`--device-nodes` when they are not the profile's own); `TT_VISIBLE_DEVICES`, the mesh graph
+descriptor, `QWEN38_HARDWARE_MODE` and `TT_METAL_TRACE_ALLOC_TRACKING` are set before the server starts, as the shell
+launcher sets them.  A tree without git history (an image ships none) is admitted by `tools/runtime_admission.py` only
+with `QWEN38_TT_METAL_SHA` naming the commit it was built from (`source` `declared` in the identity); a checkout with
+history refuses a declared sha that differs from its head.
+
+The tt-model container package of this tree (`sjettTT/qwen3.8-flash-next_p150x4`) serves this form since 2026-09-26
+(kind `tt-dit-server`: uvicorn starts the application above; the profiles `c32k`, `c64k`, `c128k`, `c32k-quietbox`,
+`c32k-quietbox2` set the context and the hardware profile, every one with `--mtp 4 --sampling`); the package's vLLM
+form (below) is its previous revision.
+
 ## Serving under vLLM
 
 `tools/qwen38_vllm.py` is the model class vllm-tt-plugin drives (`Qwen38ForCausalLM`): the same traced chain as this
@@ -308,7 +348,8 @@ chunks, 0.74-0.90 with 2,048-row slabs (a 31,716-token prompt in 23.6 s, 2,118 t
 | KV | the chain's resident caches | vLLM's block table and KV cache are accepted and ignored |
 | MTP, the on-device sampler (`--device-sampler`), async decode | no | `--mtp` and the on-device sampler stay on this server; under vLLM the sampled token is drawn on the host (`decode_only`, above) |
 
-The tt-model container package of this tree (`sjettTT/qwen3.8-flash-next_p150x4`) runs this path with one profile per
+The tt-model container package of this tree (`sjettTT/qwen3.8-flash-next_p150x4`) ran this path until 2026-09-26
+(its revision `484576b04b11` on the Hub; the current package serves the chat server through uvicorn, above) with one profile per
 box: `c32k`, `c64k`, `c128k` (no mesh graph descriptor: ttnn's auto-discovery, a 1x4 line on a 4x p150 host and, on a
 QuietBox 2, the four dies in the fabric's order), `c32k-quietbox` (the 4x p150 TT-QuietBox: exports
 `tools/qb_p150_x4_1x4_line_mesh_graph_descriptor.textproto`, 4 ethernet channels per link, so it refuses a QuietBox 2

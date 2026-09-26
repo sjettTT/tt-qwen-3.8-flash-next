@@ -223,6 +223,7 @@ a fresh clone on 2026-09-07 (`docs/PROOFS.md`).
 | `ttnn/` | the device model: builder, layers, GDN, QSA, MoE/BF4, embedding, sampling, MTP |
 | `tools/run_qwen38_chat_server.sh`, `qwen38_chat_cli.py`, `qb_mesh_smoke.py` | the launcher; the client; open the mesh and check the route without the model |
 | `tools/qwen38_chat_server.py`, `qwen38_chat_session.py`, `qwen38_chat_protocol.py`, `qwen38_sampling_step.py` | the HTTP server; the traced decode chain and the mesh open; the request/reply protocol; the sampling step |
+| `tools/qwen38_asgi.py` | the server behind uvicorn: the container form the tt-model package serves (`docs/SERVER.md`) |
 | `tools/runtime_admission.py`, `live_decode_diagnostic.py` | the runtime identity (this checkout's build); the CPU preparation and the live construction (the BF4 conversion on the first start) |
 | `tools/hardware_profiles.py`, `physical_route.py`, `resident_decode.py`, `evidence_records.py` | the profiles (tt-quietbox, p150-line, tt-quietbox-2); the route derivation; the chain's fixed points; the run records |
 | `tools/download_checkpoint.py`, `prewarm_ple_table.py`, `verify_checkpoint_files.py`, `checkpoint_budget.py`, `safetensors_metadata.py` | the ModelScope download with SHA-256 verification; the n-gram pre-warm and the checkpoint tools of sections 3 and 4 |

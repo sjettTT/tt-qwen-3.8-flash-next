@@ -13,7 +13,7 @@ import re
 import socket
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Sequence, Any, Mapping
 
 import ttnn
 
@@ -61,18 +61,38 @@ class ResidentHardwareProfile:
     def lane(self) -> str:
         return f"{self.host} partition-{self.partition.upper()}"
 
-    def with_device_nodes(self, nodes: tuple[int, int, int, int]) -> "ResidentHardwareProfile":
+    def with_device_nodes(
+        self, nodes: tuple[int, int, int, int], *, present: Sequence[int] | None = None
+    ) -> "ResidentHardwareProfile":
         """The same profile on other KMD nodes (four chips of a larger host)."""
 
         if len(nodes) != 4 or len(set(nodes)) != 4 or any(type(node) is not int or node < 0 for node in nodes):
             raise HardwareProfileError(f"device nodes must be four distinct non-negative ints, got {nodes!r}")
-        return replace(self, device_nodes=nodes, visible_devices=",".join(str(node) for node in nodes))
+        # ``TT_VISIBLE_DEVICES`` takes UMD's device indices, 0..N-1 over the nodes present under /dev/tenstorrent (the cluster
+        # descriptor keeps naming the chips by their node numbers).  Four nodes that are all the host presents (a container
+        # holding four nodes of a larger host) are the indices 0, 1, 2, 3 whatever their names; on a host that presents more,
+        # the node numbers (the hosts these profiles run on number their nodes 0..N-1 without gaps, so the two agree there).
+        present_nodes = tuple(sorted(present)) if present is not None else present_device_nodes()
+        visible = tuple(range(len(nodes))) if present_nodes == tuple(sorted(nodes)) else nodes
+        return replace(self, device_nodes=nodes, visible_devices=",".join(str(value) for value in visible))
 
     @property
     def default_lane(self) -> bool:
         """The lane a host runs when ``TT_VISIBLE_DEVICES`` names none: the whole box, partition B, instance 0."""
 
         return self.partition in ("qb", "b", "0")
+
+
+DEVICE_ROOT = Path("/dev/tenstorrent")
+
+
+def present_device_nodes(device_root: Path = DEVICE_ROOT) -> tuple[int, ...]:
+    """The ``/dev/tenstorrent/<N>`` nodes this process can see, sorted; empty when the directory is absent."""
+
+    try:
+        return tuple(sorted(int(entry.name) for entry in device_root.iterdir() if entry.name.isdigit()))
+    except OSError:
+        return ()
 
 
 # QuietBox: 4x p150b, KMD nodes 0-3 on one NUMA node, chips in an ethernet ring; the 1x4 LINE mesh graph
