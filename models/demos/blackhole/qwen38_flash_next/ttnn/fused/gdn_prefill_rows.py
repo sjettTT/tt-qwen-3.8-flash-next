@@ -192,6 +192,29 @@ def chunk_prims(q_c, k_c, v, beta_c, g_c, initial_state, chunk_tiles, *, rows_to
 # -------------------------------------------------------------------------------------------- the slab body
 
 
+def restamp_written(buffers, reference, names: tuple[str, ...]) -> None:
+    """Give back their declared distributed topology to the persistent buffers a program has just written.
+
+    ``ttnn.generic_op`` leaves its output tensors with the allocation's default topology (``PlacementShard(0)`` on
+    the four-die line) instead of the buffer's declared one, exactly as ``fp.allocate`` does; the chain's ops with an
+    ``output_tensor`` keep the target's topology, so the rows state's placement checks (``validate``, the mesh contract)
+    hold for the chain and, on one die where every check is vacuous, for the programs too.  On the line they failed on
+    the first buffer declared on dim 3 that a program wrote (``sig``: "head_sharded tensor shards dim 0, expected 3").
+    Every buffer a program writes is re-stamped after that program from ``buffer_layouts`` (``v`` keeps the chain's
+    token-major dim 3), the way the other fused kernels stamp their outputs.
+    """
+
+    layouts = buffer_layouts(int(reference.shape[-2]))
+    for name in names:
+        dim = 3 if name == "v" else layouts[name][2]
+        fp.stamp_topology(getattr(buffers, name), reference, dim)
+
+
+PRE_WRITES = ("q", "k", "v", "beta", "g", "sig")
+CAST_WRITES = ("o16",)
+NORM_WRITES = ("gated", "history_next")
+
+
 def slab_body(projected, history, taps, norm, chunk_tiles, tiles: RowsConstants, buffers, initial_state, *, rows: int):
     """The fused body on explicit tensors: projection -> gated rows, history tile and final recurrent state.
 
@@ -224,10 +247,12 @@ def slab_body(projected, history, taps, norm, chunk_tiles, tiles: RowsConstants,
         buffers.sig,
         rows=rows,
     )
+    restamp_written(buffers, projected, PRE_WRITES)
     o, final_state = chunk_prims(
         buffers.q, buffers.k, buffers.v, buffers.beta, buffers.g, initial_state, chunk_tiles, rows_total=rows_total
     )
     gdn_post_rows.post_cast(o, buffers.o16)
+    restamp_written(buffers, projected, CAST_WRITES)
     ttnn.deallocate(o)
     gated, history_next = gdn_post_rows.post_norm(
         buffers.o16,
@@ -240,6 +265,7 @@ def slab_body(projected, history, taps, norm, chunk_tiles, tiles: RowsConstants,
         rows=rows,
         history=True,
     )
+    restamp_written(buffers, projected, NORM_WRITES)
     return gated, final_state, history_next
 
 

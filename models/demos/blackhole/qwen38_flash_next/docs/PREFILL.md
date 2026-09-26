@@ -300,7 +300,8 @@ refuses to start.
   0/1 expand, bf16 `rms_norm` and bf16 scale (about 66 ms per slab of the model's and the kernel adapter's glue).  The
   normalized values differ by bf16 rounding and the recurrent state carries the difference into the decode.
 
-`QWEN38_FUSED=gdn_prefill_rows` (bitwise, off; a fused kernel, not a glue form) replaces the slab's whole GDN glue --
+`gdn_prefill_rows` (bitwise, on by default; `QWEN38_FUSED_OFF=gdn_prefill_rows` restores the chain and
+`QWEN38_FUSED=gdn_prefill_rows` names it explicitly; a fused kernel, not a glue form) replaces the slab's whole GDN glue --
 the projection's landing slices, the FIR row shifts, the causal convolution and SiLU, the q/k expand, both `rms_norm`s
 and scales, the v row mask, the beta and log-decay gates, the chunk adapter's head-major relayout and q scale, the
 gated epilogue's typecast, weighted norm, head fold and sigmoid gate, and the next pass's history tile -- with two
@@ -315,7 +316,18 @@ together, against 3,270 us per layer for the ops they replace -- about 102 ms pe
 layers.  The form is slab-only: the 32-row, 128-row,
 verify-lane and decode bodies never reach it, and it allocates its own pass buffers (the prims' `[12, NC, 32, 128]`
 q/k pages, the `[12, NC, 32, 1]` gate columns and the four hand-off buffers) in place of the chain's, shared by the
-GDN layers as the rest of the slab body is.
+GDN layers as the rest of the slab body is.  On by default since 2026-09-26, measured on the 4x p150 line against `QWEN38_FUSED_OFF=gdn_prefill_rows` in two
+independent runs, both bitwise the chain and identical to each other (acceptance pins 12/12, records 12/12, the 3,232
+agreement columns including the 160-position long window, the four probes): per 2048-row slab at P = 0 the kernel time
+681.24 -> 576.03 ms (-105.2 ms, -15.4 %; 2,973 -> 3,518 prompt tokens per second on the kernel basis), 12,030 -> 9,438
+programs (-216 per layer);
+the three rows programs are 108 `GenericOp` calls and 15.84 ms per slab where the chain's glue took 110.5 (ReshapeView
+35.95, Transpose 13.01, BinaryNg 11.98, Tilize 11.89, Slice 10.50, Matmul 7.80, Concat 7.02, Unary 3.43, Typecast 2.60,
+UntilizeCodegen 2.26, FillPad 2.14, Copy 1.89), while `ChunkGdnScan` 19.55, `ChunkGdnPrep` 10.99 and `MoECompute` 88.19 ms
+are unchanged;
+DRAM per bank unchanged, 2.1 MB more free per bank at READY; the time to the first token at 31,716 tokens 12.15 -> 10.56 and 10.59 s
+in the two runs (-13.1 %; 0.382 -> 0.332 ms per prompt token), 25,546 tokens 9.99 -> 8.72 s, 2,764 tokens 1.966 -> 1.873 s, 2,118
+tokens 1.201 -> 1.086 s.
 
 ## Running it
 

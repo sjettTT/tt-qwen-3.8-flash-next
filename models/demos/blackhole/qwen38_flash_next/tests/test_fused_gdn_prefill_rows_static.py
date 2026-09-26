@@ -41,10 +41,15 @@ def _squash(text: str) -> str:
 # ------------------------------------------------------------------------------------------- the registry entry
 
 
-def test_the_entry_is_bitwise_and_opt_in():
+def test_the_entry_is_bitwise_and_serves_by_default():
     entry = registry.kernel(NAME)
     assert entry.tolerance == registry.BITWISE
-    assert entry.name not in registry.DEFAULT_ON and not entry.default_on
+    # the one list decides: on by default after the line gate (identity chain vs kernel on the 4-chip line); a
+    # QWEN38_FUSED_OFF=gdn_prefill_rows server runs the composed chain, and the admission keeps every non-slab call there
+    assert entry.name in registry.DEFAULT_ON and entry.default_on
+    assert registry.enabled(NAME, {}) is True
+    assert registry.enabled(NAME, {registry.OFF_ENV: NAME}) is False
+    assert registry.resolve(NAME, {registry.OFF_ENV: NAME}) is module.gdn_prefill_rows_composed
     assert entry.fused is module.gdn_prefill_rows
     assert entry.composed is module.gdn_prefill_rows_composed
     assert entry.admits is module.admits
@@ -54,18 +59,20 @@ def test_the_entry_is_bitwise_and_opt_in():
     assert "slab" in entry.replaces
 
 
-def test_the_switch_picks_the_chain_by_default_and_the_pair_when_named():
-    assert not registry.enabled(NAME, {})
-    assert registry.resolve(NAME, {}) is module.gdn_prefill_rows_composed
-    assert registry.resolve_admitted(NAME, {}) is module.gdn_prefill_rows_composed
-    on = {registry.ENV: NAME}
-    assert registry.enabled(NAME, on)
-    assert registry.resolve(NAME, on) is module.gdn_prefill_rows
-    admitted = registry.resolve_admitted(NAME, on)
-    assert isinstance(admitted, registry.AdmittedStep)
-    assert admitted.fused is module.gdn_prefill_rows and admitted.composed is module.gdn_prefill_rows_composed
-    # and QWEN38_FUSED_OFF takes it back off even when both name it
-    assert registry.resolve(NAME, {registry.ENV: NAME, registry.OFF_ENV: NAME}) is module.gdn_prefill_rows_composed
+def test_the_switch_picks_the_pair_by_default_and_the_chain_when_switched_off():
+    # on by default (the one list), the production site resolving to the admitted step: the fused pair on a slab rows
+    # state with the fused buffers, the composed chain on every other call
+    for environ in ({}, {registry.ENV: NAME}):
+        assert registry.enabled(NAME, environ)
+        assert registry.resolve(NAME, environ) is module.gdn_prefill_rows
+        admitted = registry.resolve_admitted(NAME, environ)
+        assert isinstance(admitted, registry.AdmittedStep)
+        assert admitted.fused is module.gdn_prefill_rows and admitted.composed is module.gdn_prefill_rows_composed
+    # QWEN38_FUSED_OFF takes it off, even when QWEN38_FUSED names it too
+    for environ in ({registry.OFF_ENV: NAME}, {registry.ENV: NAME, registry.OFF_ENV: NAME}):
+        assert not registry.enabled(NAME, environ)
+        assert registry.resolve(NAME, environ) is module.gdn_prefill_rows_composed
+        assert registry.resolve_admitted(NAME, environ) is module.gdn_prefill_rows_composed
 
 
 def test_the_name_is_reachable_from_the_package():
@@ -447,3 +454,36 @@ def test_the_note_names_the_switch_and_the_class():
     # chain's 3,270 us per layer (a retune moves the first two; the pair sum and the chain's figure stay pinned)
     for number in ("332", "115", "447", "3,270"):
         assert number in text, number
+
+
+def test_every_buffer_a_program_writes_is_restamped_with_its_declared_topology():
+    """The four-die line's placement seam: ttnn.generic_op leaves an output with the allocation's default topology
+    (shard dim 0), so slab_body must give every buffer a program wrote its declared topology back before the rows
+    state is validated again -- the pre program's six, post_cast's one, post_norm's two -- from buffer_layouts (v on
+    the chain's dim 3)."""
+
+    written = set(module.PRE_WRITES) | set(module.CAST_WRITES) | set(module.NORM_WRITES)
+    assert written == {"q", "k", "v", "beta", "g", "sig", "o16", "gated", "history_next"}
+    layouts = module.buffer_layouts(64)
+    assert {name: layouts[name][2] for name in written - {"v"}} == {
+        "q": 0,
+        "k": 0,
+        "beta": 0,
+        "g": 0,
+        "sig": 3,
+        "o16": 0,
+        "gated": 3,
+        "history_next": 3,
+    }
+    source = inspect.getsource(module.slab_body)
+    calls = [m.group(1) for m in re.finditer(r"restamp_written\(buffers, projected, ([A-Z_]+)\)", source)]
+    assert calls == ["PRE_WRITES", "CAST_WRITES", "NORM_WRITES"]
+    assert source.index("gdn_pre_rows.run(") < source.index("PRE_WRITES)") < source.index("chunk_prims(")
+    assert source.index("post_cast(") < source.index("CAST_WRITES)") < source.index("post_norm(")
+    assert (
+        source.index("post_norm(")
+        < source.index("NORM_WRITES)")
+        < source.index("return gated, final_state, history_next")
+    )
+    helper = inspect.getsource(module.restamp_written)
+    assert 'dim = 3 if name == "v" else layouts[name][2]' in helper and "fp.stamp_topology(" in helper

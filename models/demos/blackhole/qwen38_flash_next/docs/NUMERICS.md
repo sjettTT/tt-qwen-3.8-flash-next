@@ -82,14 +82,16 @@ code 82.79 vs 73.33 (+12.9 %), prose 40.99 vs 36.10 (+13.5 %), tokens per pass i
 2.8333 / 4.5536 / 4.5714 / 2.1983, the same pass counts); `A3-mtp4-32k` with the wrap on 12/12 with the sha, every
 pinned divergence index identical (chat 43, code 32, list 56, math 63, ...), json 96/96 at 85.3 tok/s, the hand-offs
 matched in both orders.  `QWEN38_FUSED_OFF=gdn_rows_wrap` restores the chain, and the prefill slab keeps its own form
-(`gdn_prefill_rows`, opt-in).
+(`gdn_prefill_rows`, on by default after its line gate).
 Opt-in through `QWEN38_FUSED=<name>`: `final_mixer`, `position_advance`, `gdn_rows_prims_direct` (the MTP
 verify rows' chunk recurrence as the composite's two phase prims called directly with the composite's own relayout ops
 in its order, bitwise by construction and on the line 2026-09-25: the seam the wrap's programs were proven against, a
 diagnostic beside the default). The kernels cover rows 1..32 (decode, the MTP verify rows); the 128-row prefill chunk
 and the slab keep their chains.
-Since 2026-09-26 the slab has an opt-in form of its own, `QWEN38_FUSED=gdn_prefill_rows`: the GDN body from the
-projection to the gated output as two rows-form programs around the unchanged chunk prims (called directly through
+Since 2026-09-26 the slab has a fused form of its own, `gdn_prefill_rows` (on by default: bitwise the chain on the 4x p150
+line in two independent runs -- pins 12/12, records 12/12, 3,232 agreement columns, 4/4 probes -- with the time to the first
+token at 32k -13.1 %; a four-die device test guards the mesh-topology seam the one-die tests cannot see;
+`QWEN38_FUSED_OFF=gdn_prefill_rows` restores the chain): the GDN body from the projection to the gated output as two rows-form programs around the unchanged chunk prims (called directly through
 `ttnn.prim.chunk_gdn_prep` / `chunk_gdn_scan`), bitwise the chain's on one p150 die at 64 and 2048 rows, the recurrent
 state and the FIR history included (PREFILL.md has the measured per-call figures).
 `QWEN38_FUSED_OFF=<name>[,...]` (or `all`) in the server's environment falls back to the composed
