@@ -130,6 +130,14 @@ identity through the stack unchanged; TTFT at 31,716 tokens 14.30 -> 12.38 s (`P
 rings (`QWEN38_MOE_SLAB_RINGS` unset, the default since 2026-09-26) are bitwise the two rings on the same gate: records
 12/12, columns 3232/3232, probes 4/4, in two runs (`PREFILL.md`).
 
+`moe_compute`'s W2 ring exchange runs its handshake in the first a2a iteration only (2026-09-26, a runtime patch: the
+partials travel once per chunk and the compute's later iterations read the resident buffers; the dropped iterations'
+wait / increment pairs disappear on every core alike): bitwise on every form the op serves here (the decode rows, the
+128-token chunk, the 2048-row slab: the 12-prompt pins and their token-stream digests, the `--mtp 4` pins and tokens
+per pass, a 41-routing soak of the combine pages), 12.98 -> 11.6 us per distinct local expert per launch on the 1x4
+line (-10 %), the B=1 step 27.14 -> 26.89 ms on the 200-step pin recipe, the sampled `--mtp 4` pass -0.84 ms per token
+served, the slab's one call 2.09 -> 1.94 ms per layer (-7 %) on one die.
+
 ## The slab's block-shared attention (`QWEN38_FUSED=sparse_sdpa_tiled`, 2026-09-25)
 
 A tolerance-class fused kernel, opt-in: `sparse_sdpa_tiled` replaces the prefill slab's block-id expansion, zero V

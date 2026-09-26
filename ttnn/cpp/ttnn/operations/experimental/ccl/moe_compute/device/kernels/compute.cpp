@@ -601,7 +601,14 @@ void kernel_main() {
                 }
                 uint32_t src_core = ring_core_id;
                 uint32_t dm1_tiles_remaining = shard_tiles_lut[ring_core_id];
-                cb_w2c_rdy.wait_front(1);
+                // The shards arrive during the ring's handshake iterations and stay resident for the chunk (the
+                // a2a_free credit follows this chunk's W2 output): the per-shard rendezvous over cb_w2c_rdy runs in
+                // those iterations only and the later ones read the buffers as they are (dm1.cpp runs the ring for
+                // the same count).
+                const bool a2a_handshake = iter < moe_ring::a2a_handshake_iters;
+                if (a2a_handshake) {
+                    cb_w2c_rdy.wait_front(1);
+                }
 
                 uint32_t in2_offset = 0, in2_index = 0;
 
@@ -632,8 +639,10 @@ void kernel_main() {
                             continue;  // skip padding K slots (bias: after bias tile; no_bias: at/past logical K)
                         }
                         if (dm1_tiles_remaining == 0) {
-                            cb_w2c_rdy.pop_front(1);
-                            cb_w2c_rdy.wait_front(1);
+                            if (a2a_handshake) {
+                                cb_w2c_rdy.pop_front(1);
+                                cb_w2c_rdy.wait_front(1);
+                            }
                             src_core = (src_core == 0) ? num_cores - 1 : src_core - 1;
                             dm1_tiles_remaining = shard_tiles_lut[src_core];
                             in2_offset += tiles_per_step;
@@ -655,7 +664,9 @@ void kernel_main() {
                     }
                     cb_r2c_w2.pop_front(w2_tiles_per_block);
                 }
-                cb_w2c_rdy.pop_front(1);
+                if (a2a_handshake) {
+                    cb_w2c_rdy.pop_front(1);
+                }
 
                 tile_regs_commit();
 

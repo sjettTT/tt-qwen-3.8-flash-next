@@ -256,6 +256,16 @@ constexpr uint32_t w0_w1_stored_cols(uint32_t Nt, uint32_t core_id, uint32_t n_c
                                                 : even_stride_at_least_a2a_width((Nt + n_cores - 1) / n_cores);
 }
 
+// The W2 exchange's handshake iterations: dm1 runs the ring (one rendezvous over cb_w2c_rdy and one ring-semaphore
+// step per shard) for this many of Cfg::num_a2a_iters. The partials travel in iteration 0 only: it fills a2a buffers
+// 1..num_cores-1 once per chunk, every later W2 iteration of the compute reads the same resident buffers, and the
+// credit that frees them follows the chunk's W2 output. One iteration is therefore the whole exchange: the later
+// iterations' wait / increment pairs are dropped on every core alike (the ring semaphore accounting stays
+// consistent) and the compute reads the resident buffers without a rendezvous. Bitwise on every form (decode rows,
+// the 128-token chunk, the 2048-row slab); -10 % per moe_compute launch on the 1x4 p150 line (2026-09-26). Part of
+// every moe_compute kernel's compile through this header, so the form is in the kernel hash.
+constexpr uint32_t a2a_handshake_iters = 1;
+
 // Width in tiles of the in2 slice every ring core hands to the a2a ring: with the compact layout the largest per-core
 // column count (at least 2), else the uniform stride.
 constexpr uint32_t a2a_exchange_tiles(uint32_t Nt, uint32_t n_cores) {

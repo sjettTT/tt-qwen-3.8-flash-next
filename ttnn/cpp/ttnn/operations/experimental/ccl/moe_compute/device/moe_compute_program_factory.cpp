@@ -852,7 +852,7 @@ MoEComputeMeshWorkloadFactory::create_at(
         |                |              |           |       |           |     |     | 14 tiles; 20 -> 3 x 40);   |
         |                |              |           |       |           |     |     | replay ring: one slice     |
         | cb_c2w_rdy     | CBIndex::c_4 | Float32   | false | 1         |   — |   — | Compute->writer ready      |
-        | cb_w2c_rdy     | CBIndex::c_5 | Float32   | false | 1         |   — |   — | Writer->compute ready      |
+        | cb_w2c_rdy     | CBIndex::c_5 | Float32   | false | num_cores |   — |   — | Writer->compute ready      |
         | cb_s2c_in2     | CBIndex::c_6 | Float16_b | true  | a2a*cores |  72 |  96 | Ring A2A activation        |
         | cb_w2c_md      | CBIndex::c_7 | UInt32    | false | 2         |   — |   — | Metadata (token counts)    |
         ----------------------------------------------------------------------------------------------------------
@@ -957,7 +957,9 @@ MoEComputeMeshWorkloadFactory::create_at(
     // Note: cb_s2c_in and cb_c2s_out are handled separately as it is allocated on Tilize, Matmul, and Combine cores
     std::vector<std::tuple<std::string, tt::CBIndex, tt::DataFormat, bool, uint32_t>> matmul_cb_specs0 = {
         {"cb_c2w_rdy", tt::CBIndex::c_4, tt::DataFormat::Float32, false, 1},
-        {"cb_w2c_rdy", tt::CBIndex::c_5, tt::DataFormat::Float32, false, 1},
+        // one ready credit per ring step of the handshake iteration (moe_ring::a2a_handshake_iters): dm1 pushes them
+        // as the shards land and the compute pops them as it consumes each shard, neither waiting on the other
+        {"cb_w2c_rdy", tt::CBIndex::c_5, tt::DataFormat::Float32, false, matmul_num_cores},
         {"cb_s2c_in2", tt::CBIndex::c_6, tt::DataFormat::Float16_b, true, a2a_cb_pages * matmul_num_cores},
         {"cb_w2c_md", tt::CBIndex::c_7, tt::DataFormat::UInt32, false, 2},
     };

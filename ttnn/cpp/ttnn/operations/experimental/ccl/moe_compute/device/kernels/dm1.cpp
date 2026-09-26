@@ -455,8 +455,10 @@ void kernel_main() {
             }
 
             // Take the data in cb_s2c_in2 and send it to the next core in the ring
-            // Ring synchronization: all cores participate regardless of whether they had CB work
-            for (uint32_t i = 0; i < Cfg::num_a2a_iters; ++i) {
+            // Ring synchronization: all cores participate regardless of whether they had CB work. The ring runs
+            // moe_ring::a2a_handshake_iters of the compute's Cfg::num_a2a_iters W2 iterations: the partials travel
+            // once per chunk (below), so the compute's later iterations read the resident buffers without it.
+            for (uint32_t i = 0; i < moe_ring::a2a_handshake_iters; ++i) {
                 for (uint32_t step = 0; step < num_a2a_steps_per_iter; ++step) {
                     if constexpr (MOE_STUDY_FAULT(O_A2A_LAG)) {
                         if (ring_core_id == MOE_STUDY_PARAM(O_A2A_LAG_POS)) {
@@ -474,12 +476,12 @@ void kernel_main() {
                     // core `step` hops back) into the neighbour's buffer `step + 1`. The last step would send the
                     // neighbour its OWN partial back into its buffer 0: that buffer is the neighbour's compute's
                     // alone (see the exchange's backpressure above), so the last step sends only its increment. The
-                    // partials travel once per chunk: the first iteration fills buffers 1..num_cores-1 (buffer s at
-                    // step s - 1 of the predecessor; buffer 0 is the core's own, its compute's), and the later W2
-                    // iterations read the same buffers again, so they send only their increments -- the increments
-                    // keep the rdy cadence and the ring semaphore accounting of every iteration unchanged. The
-                    // per-step posted-writes flush below stays on every step: the credit rests on it (the first
-                    // iteration's forwards have left the core before the chunk's credit is sent).
+                    // partials travel once per chunk: this first iteration fills buffers 1..num_cores-1 (buffer s at
+                    // step s - 1 of the predecessor; buffer 0 is the core's own, its compute's), and the compute's
+                    // later W2 iterations read the same buffers again. A further handshake iteration would send
+                    // only its increments (the rdy cadence and the ring semaphore accounting of a dropped iteration
+                    // disappear on every core alike). The per-step posted-writes flush below stays on every step:
+                    // the credit rests on it (the forwards have left the core before the chunk's credit is sent).
                     if (i == 0 && step != num_cores - 1) {
                         if constexpr (a2a_full_packets > 0 && a2a_remainder_tiles > 0) {
                             // Resetting required as both full and partial packets exist (only the data-carrying
