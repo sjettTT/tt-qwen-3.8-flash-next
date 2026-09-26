@@ -20,8 +20,8 @@ BUILDERS = sorted(FUSED.glob("**/*.py"))
 INCLUDE = '#include "../../kernels/zones.h"'
 ZONE = re.compile(r'FUSED_ZONE\("([^"]+)"\)')
 NAME = re.compile(r"^fz_[a-z0-9_]+$")
-KERNEL_FILES = 79
-ZONES = 153
+KERNEL_FILES = 80
+ZONES = 154
 # every kernel's zone names carry its prefix (the census table's phase column reads them)
 PREFIX = {
     "final_mixer": "fz_fm_",
@@ -31,6 +31,7 @@ PREFIX = {
     "gr_write": "fz_gw_",
     "greedy_tail": "fz_gt_",
     "moe_combine": "fz_mc_",
+    "moe_dense": "fz_md_",
     "moe_post": "fz_mp_",
     "ple": "fz_pl_",
     "position_derive": "fz_pd_",
@@ -97,7 +98,7 @@ def test_zone_defines_follow_the_environment_switch():
     assert fp.zone_defines({"QWEN38_FUSED_ZONES": "1"}) == [("QWEN38_FUSED_ZONES", "1")]
     source = inspect.getsource(fp._kernel)
     assert "defines=[*defines, *zone_defines()]" in source
-    builder = inspect.getsource(router_tail.router_tail_program)
+    builder = inspect.getsource(router_tail.program_parts)  # the descriptors' builder (router_tail_program wraps it)
     assert "defines=fp.zone_defines()," in builder and "compute.defines = _dev_defines() + fp.zone_defines()" in builder
 
 

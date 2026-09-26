@@ -54,6 +54,7 @@ DEFAULT_ON: frozenset[str] = frozenset(
         "sampler_tail",
         "candidate_row",
         "shared_expert",
+        "moe_dense",
         "sparse_sdpa_tiled",
     }
 )

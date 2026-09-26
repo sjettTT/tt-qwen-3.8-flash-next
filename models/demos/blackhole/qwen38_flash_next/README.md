@@ -20,14 +20,15 @@ No prebuilt archive, no pinned binary, no host-specific configuration.
 | path | measured | notes |
 |---|---|---|
 | prompt prefill | 410 tok/s; 750-790 tok/s with `--long-chunks`; 2,562 tok/s with `--prefill-slab 2048` | 2026-09-26 (block-shared attention + one-pass combine defaults: 31,716 tokens in 12.38 s; the chunk rates 2026-09-25); the slab is tolerance-class against the chunk bodies (`docs/PREFILL.md`: the ms per prompt token, the TTFTs, the one-call expert stream) |
-| decode, one stream | 36.8 tok/s greedy, 36.5 tok/s sampled | 27.2 ms per token, flat with depth (2026-09-25, bitwise: `docs/NUMERICS.md`); the defaults are listed below the table |
+| decode, one stream | 38.6 tok/s greedy, 36.5 tok/s sampled | 25.9 ms per token greedy (2026-09-26: the router tail's live-row exp and the MoE dense composite, bitwise: `docs/NUMERICS.md`), flat with depth; the sampled figure is the 2026-09-25 measurement; the defaults are listed below the table |
 | decode, 4 / 8 streams | 28.9 / 23.4 tok/s per user (116 / 187 aggregate) | the batched-decode lane body measured directly, 34.6 / 42.7 ms per step; the chat server serves one stream (2026-09-25, component class: `docs/NUMERICS.md`) |
 | decode with MTP (`--mtp 4`) | greedy 50.3 tok/s on a 560-token chat prompt, 47.2 on a 177-token multi-turn chat, 75.3 json, 75.4 code, 37.2 prose (3.12 / 2.83 / 4.55 / 4.57 / 2.20 tokens per pass; json and prose end naturally at 153 / 196 tokens) against 35.4-36.3 plain greedy; `--mtp 3` (2026-09-25) 45.5 / 55.4 / 60.6 / 30.7; `--mtp 5` opt-in (`docs/NUMERICS.md`); sampled 42.0 / 41.8 tok/s at 23.8 / 23.9 ms per token (the card profiles, non-thinking / thinking) against 33.5 / 33.9 plain | 256-token answers measured client-side on the 4-chip p150 line (2026-09-26, the MTP stack on the prefill landing's runtime); speculative drafting with exact acceptance for greedy requests and, by default on an `--mtp --sampling` server, sampled ones; the pass costs 60-62 ms whatever it accepts (section 6, `docs/NUMERICS.md`) |
 | contexts | 32k, 64k, 128k, 256k | 256k is single-user; MTP fits at 32k, 64k and 128k |
 | correctness | bitwise repeatable; 96/96 greedy token match against the CPU reference on the acceptance prompt | chunked prefill is tolerance-class against the CPU reference on all 48 layers (`docs/NUMERICS.md`) |
 
 The decode defaults since 2026-09-25 (each one's measurement and switch: `docs/NUMERICS.md`): BF8 dense weights, the
-fused GDN step, the compact expert layout, the MoE post program's one-read routing; 9 decode chains as fused programs,
+fused GDN step, the compact expert layout, the MoE post program's one-read routing, the MoE dense composite (the router
+top-k beside the shared expert's eltwise, down linear and dispatch untilize as one program); 9 decode chains as fused programs,
 the gated-residual read as two programs with its gathers inside them, the router tail's top-k on one core per token
 group, two cores reading each DRAM bank in the decode linears.  A sampled request draws on the device after the top-32
 candidate row (27.4 ms per token on both model cards; the host sampler's law, gated in `docs/NUMERICS.md`) on one-stream

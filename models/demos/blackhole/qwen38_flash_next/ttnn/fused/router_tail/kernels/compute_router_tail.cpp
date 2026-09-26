@@ -16,6 +16,8 @@
 // Runtime arg 0, pass_mask: 0 runs the LLK's four-pass local sort (the single-core form); bits 0..3 run only those
 // passes of the same network (topk_lanes.h), each pass being the complete sort of eight token columns.  The lane
 // form gives every core one pass and the eight tokens it holds; the other columns are left unsorted and never read.
+// Runtime arg 1, token_mask: the token rows this core produces; the precise exp runs over the SFPU vector pairs that
+// hold them only (exp_live.h; the other rows' exps are never read), unless FRT_EXP_LIVE is 0 (the full exp_tile, A/B).
 
 #include <cstdint>
 
@@ -35,6 +37,7 @@
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_compute.hpp"
 #include "topk_lanes.h"
 #include "../../kernels/zones.h"
+#include "exp_live.h"
 
 // One tile of the insertion chain into DST: the probabilities tile transposed into value slot `slot`, its
 // pre-transposed index tile copied into slot + 2 (topk.cpp loads both the same way).
@@ -47,20 +50,49 @@ FORCE_INLINE void frt_load_tile(uint32_t cb_probs, uint32_t cb_index, uint32_t w
     copy_tile(cb_index, w, slot + 2);
 }
 
+// Dev knobs (timing only; every one of them breaks the output): FRT_SORT_PHASE_START..FRT_SORT_PHASE_END runs that
+// window of the network's phases (0..5; a single phase runs all its steps), FRT_EXP_ITERATIONS runs N of the 8 SFPU
+// vectors per face of the precise exp (0 skips the exp).
+#ifndef FRT_SORT_PHASE_START
+#define FRT_SORT_PHASE_START 0
+#endif
+#ifndef FRT_SORT_PHASE_END
+#define FRT_SORT_PHASE_END 5
+#endif
+#ifndef FRT_EXP_ITERATIONS
+#define FRT_EXP_ITERATIONS 8
+#endif
+#ifndef FRT_EXP_LIVE
+#define FRT_EXP_LIVE 1
+#endif
+
 // The chain's sort of the 64 values in DST 0/1 (indices 2/3): topk.cpp's local sort call (unstable network, largest,
 // end phase 5); pass_mask != 0 sorts only those token passes of the same network (topk_lanes.h).
 FORCE_INLINE void frt_sort64(uint32_t pass_mask) {
 #ifndef FRT_TOPK_SORT_SKIP  // dev knob (timing): transposes and copies only, no sort
+#if FRT_SORT_PHASE_START == 0 && FRT_SORT_PHASE_END == 5
     if (pass_mask == 0) {
         ckernel::topk_local_sort<false>(0, 0 /* largest */, 5 /* end_phase */);
     } else {
         topk_local_sort_lanes<false>(0, 0 /* largest */, 5 /* end_phase */, pass_mask);
     }
+#else
+    // the phase window: a single phase (start == end) runs its steps num_steps..4 down to 1 as the full network does
+    if (pass_mask == 0) {
+        ckernel::topk_local_sort<false>(
+            0, 0 /* largest */, FRT_SORT_PHASE_END, FRT_SORT_PHASE_START, 4, FRT_SORT_PHASE_END + 1);
+    } else {
+        topk_local_sort_lanes<false>(
+            0, 0 /* largest */, FRT_SORT_PHASE_END, pass_mask, FRT_SORT_PHASE_START, 4, FRT_SORT_PHASE_END + 1);
+    }
+#endif
 #endif
 }
 
 void kernel_main() {
     const uint32_t pass_mask = get_arg_val<uint32_t>(0);
+    const uint32_t token_mask = get_arg_val<uint32_t>(1);
+    const uint32_t live_pairs = exp_live_pairs(token_mask);
     constexpr uint32_t cb_in0 = get_named_compile_time_arg_val("cb_in0");
     constexpr uint32_t cb_max_scaler = get_named_compile_time_arg_val("cb_max_scaler");
     constexpr uint32_t cb_sum_scaler = get_named_compile_time_arg_val("cb_sum_scaler");
@@ -150,7 +182,13 @@ void kernel_main() {
             }
             exps.reserve_back(ndst);
             for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
+#if FRT_EXP_ITERATIONS == 8 && FRT_EXP_LIVE
+                exp_tile_live(wt8, live_pairs);  // the full precise exp's instructions, on the live vector pairs only
+#elif FRT_EXP_ITERATIONS == 8
                 exp_tile<false>(wt8);
+#elif FRT_EXP_ITERATIONS > 0
+                exp_tile<false, false, ckernel::InputClamping::ClampToNegative, FRT_EXP_ITERATIONS>(wt8);  // dev knob
+#endif
             }
             tile_regs_commit();
             tile_regs_wait();

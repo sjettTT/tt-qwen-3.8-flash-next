@@ -242,9 +242,12 @@ inline void calculate_bitonic_topk_phases_steps_lanes(
 }  // namespace ckernel
 #endif  // TRISC_MATH
 
-// topk_local_sort (compute_kernel_api.h) with the pass mask: bit p sorts pass p's eight token columns.
+// topk_local_sort (compute_kernel_api.h) with the pass mask: bit p sorts pass p's eight token columns.  The phase /
+// step window (i_start_phase, i_end_step, i_start_step) is the LLK's, defaulted as topk_local_sort defaults it; the
+// kernel's timing knob narrows it.
 template <bool stable_sort = false, bool is_fp32_dest_acc_en = DST_ACCUM_MODE>
-ALWI void topk_local_sort_lanes(uint32_t idst, int idir, int i_end_phase, uint32_t pass_mask) {
+ALWI void topk_local_sort_lanes(
+    uint32_t idst, int idir, int i_end_phase, uint32_t pass_mask, int i_start_phase = 0, int i_end_step = 0, int i_start_step = 0) {
     MATH(SFPU_UNARY_CALL(
         DST_SYNC_MODE,
         is_fp32_dest_acc_en,
@@ -254,8 +257,8 @@ ALWI void topk_local_sort_lanes(uint32_t idst, int idir, int i_end_phase, uint32
         VectorMode::RC_custom,
         idir,
         i_end_phase,
-        0,
-        0,
-        0,
+        i_start_phase,
+        i_end_step,
+        i_start_step,
         pass_mask));
 }

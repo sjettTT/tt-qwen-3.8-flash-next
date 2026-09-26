@@ -28,6 +28,7 @@ import torch
 
 import ttnn
 
+from .. import placement
 from .. import program as fp
 from ..registry import BITWISE, FusedKernel, GateSpec, register
 
@@ -38,7 +39,14 @@ TOP_K = 10
 STAGE_PAGES = 4  # 8 KB of bf16 tile pages for the writer's two 2 KB row stages plus alignment
 KERNELS = {name: fp.kernel_source(NAME, f"{name}_router_tail.cpp") for name in ("reader", "compute", "writer")}
 LANES_HEADER = fp.kernel_source(NAME, "topk_lanes.h")
+EXP_LIVE_HEADER = fp.kernel_source(NAME, "exp_live.h")
+EXP_LIVE_ENV = "QWEN38_ROUTER_TAIL_EXP_LIVE"
 LANES_ENV = "QWEN38_ROUTER_TAIL_LANES"
+# The core rectangle the top-k asks the placement helper for (placement.free_rectangle): 4 x 5 = the exact multi-core
+# form's 16 worker cores plus up to four lane cores (q38-router-topk-exact); the lane form takes the rectangle's first
+# row, so the top-k lands on the same cores standalone and hosted by the MoE dense composite.  Off row 0: today's
+# lane core (0, 0) was storage core 0 of the dense linears, which serialized the shared expert chain behind the top-k.
+RECTANGLE = (4, 5)
 PASSES = 4  # the LLK local sort's (face, col) passes; pass p = bit p of the compute kernel's pass_mask
 ALL_TOKENS = (1 << fp.TILE) - 1
 # The eight token rows (of the untransposed tile) each sort pass covers: pass (face, col) = tokens of face `face`
@@ -76,7 +84,7 @@ TOKEN_PAGE_BYTES = 32
 UNPACK_TO_DEST_FP32 = ("cb_probs", "cb_vals_t", "cb_vals", "cb_pad_div", "cb_sums")
 CB_INDEX = {name: index for name, index, _dtype, _pages in CBS}
 READER_ARGS = ("logits_addr", "index_addr", "tile_row", "rows_in_tile", "token_mask")
-COMPUTE_ARGS = ("pass_mask",)
+COMPUTE_ARGS = ("pass_mask", "token_mask")
 WRITER_ARGS = ("scores_addr", "indices_addr", "tile_row", "rows_in_tile", "token_mask")
 
 
@@ -115,6 +123,7 @@ def router_tail_prepare(mesh):
 
     key = id(mesh)
     if key not in _INDEX_TEMPLATES:
+        placement.free_rectangle(mesh, *RECTANGLE)  # the placement's device reads, memoized before any capture
         k = torch.arange(fp.TILE, dtype=torch.int32).reshape(fp.TILE, 1)
         tile_base = (torch.arange(EXPERTS, dtype=torch.int32) // fp.TILE * fp.TILE).reshape(1, EXPERTS)
         template = (tile_base + k).reshape(1, 1, fp.TILE, EXPERTS)
@@ -126,7 +135,8 @@ def router_tail_prepare(mesh):
 
 def lanes_enabled(environ=os.environ) -> bool:
     """The lane form serves by default; ``QWEN38_ROUTER_TAIL_LANES=0`` is the single-core form (the same kernels, one
-    core per tile, the LLK's own four-pass sort)."""
+    core per tile, the LLK's own four-pass sort; its token_mask is every row, so its exp runs over every vector pair).
+    """
 
     return environ.get(LANES_ENV, "1") != "0"
 
@@ -157,9 +167,33 @@ def _core_plan(rows: int) -> tuple[list[tuple[int, int, int]], bool]:
     return [(t, _dev_pass_mask(), ALL_TOKENS) for t in range(tile_rows)], False
 
 
-def router_tail_program(logits, index_template, scores, indices, *, rows: int, top_k: int) -> "ttnn.ProgramDescriptor":
+def lane_cores(rectangle: "ttnn.CoreRange", count: int) -> list["ttnn.CoreCoord"]:
+    """The ``count`` lane cores of the form: the first ``count`` cores of the rectangle's first row."""
+
+    width = rectangle.end.x - rectangle.start.x + 1
+    if not 1 <= count <= width:
+        raise ValueError(f"router tail needs {count} lane cores, the rectangle is {width} wide")
+    return [ttnn.CoreCoord(rectangle.start.x + i, rectangle.start.y) for i in range(count)]
+
+
+def program_parts(
+    logits, index_template, scores, indices, *, rows: int, top_k: int, rectangle=None, sem_base: int = 0
+) -> tuple[list, list, list]:
+    """``(kernels, cbs, semaphores)`` of the top-k program on the lane cores of ``rectangle`` (default: the placement
+    helper's ``RECTANGLE`` for the logits' mesh), for a program that hosts them beside other kernel groups; the
+    standalone program is ``fp.program_descriptor(*program_parts(...))``.  ``sem_base`` offsets the program-local
+    semaphore ids this form declares (none today; the multi-core form reserves five)."""
+
     plan, _lanes = _core_plan(rows)
-    cores = [ttnn.CoreCoord(0, y) for y in range(len(plan))]
+    if rectangle is None:
+        rectangle = placement.free_rectangle(logits.device(), *RECTANGLE)
+    replicas = _dev_replicas()
+    if replicas == 1:
+        cores = lane_cores(rectangle, len(plan))
+    else:  # dev knob: the plan's first core plus silent replicas over the rectangle in row-major order
+        tile_row, pass_mask, _token_mask = plan[0]
+        plan = plan[:1] + [(tile_row, pass_mask, 0)] * (replicas - 1)
+        cores = placement.cores_of(rectangle)[:replicas]
     grid = ttnn.CoreRangeSet([ttnn.CoreRange(cores[0], cores[-1])])
     named = [(name, index) for name, index, _dtype, _pages in CBS] + [
         ("Wt", WIDTH_TILES),
@@ -215,16 +249,28 @@ def router_tail_program(logits, index_template, scores, indices, *, rows: int, t
         per_core(lambda t, r, _p, m: [scores.buffer_address(), indices.buffer_address(), t, r, m]),
         ttnn.WriterConfigDescriptor(),
     )
-    compute = kernel(KERNELS["compute"], [], per_core(lambda _t, _r, p, _m: [p]), compute_config)
+    compute = kernel(KERNELS["compute"], [], per_core(lambda _t, _r, p, m: [p, m]), compute_config)
     compute.defines = _dev_defines() + fp.zone_defines()
-    return fp.program_descriptor([reader, writer, compute], cbs=cbs)
+    del sem_base  # no program-local semaphores in this form
+    return [reader, writer, compute], cbs, []
+
+
+def router_tail_program(
+    logits, index_template, scores, indices, *, rows: int, top_k: int, rectangle=None
+) -> "ttnn.ProgramDescriptor":
+    kernels, cbs, semaphores = program_parts(
+        logits, index_template, scores, indices, rows=rows, top_k=top_k, rectangle=rectangle
+    )
+    return fp.program_descriptor(kernels, cbs=cbs, semaphores=semaphores)
 
 
 def _dev_defines() -> list[tuple[str, str]]:
     """Study knobs (dev only; every one of them breaks the output): QWEN38_ROUTER_TAIL_TOPK_TILES=N sorts only the
     first N width tiles, QWEN38_ROUTER_TAIL_SOFTMAX_COPY_ONLY=1 skips the softmax math, QWEN38_ROUTER_TAIL_TOPK_SORT_SKIP=1
     keeps the transposes and copies but skips the sorts, QWEN38_ROUTER_TAIL_TOPK_SPLIT=2 emulates a two-core width
-    split on one core (the study's tie-order counter-example)."""
+    split on one core (the study's tie-order counter-example), QWEN38_ROUTER_TAIL_EXP_ITERATIONS / _SORT_PHASES time the
+    exact form's anchors.  QWEN38_ROUTER_TAIL_EXP_LIVE=0 is the bitwise A/B switch back to the full exp_tile (not a
+    study knob: the output is the same)."""
 
     defines = []
     tiles = os.environ.get("QWEN38_ROUTER_TAIL_TOPK_TILES")
@@ -237,7 +283,37 @@ def _dev_defines() -> list[tuple[str, str]]:
     split = os.environ.get("QWEN38_ROUTER_TAIL_TOPK_SPLIT")
     if split:
         defines.append(("FRT_TOPK_SPLIT", str(int(split))))
+    if os.environ.get(EXP_LIVE_ENV, "1") == "0":
+        defines.append(
+            ("FRT_EXP_LIVE", "0")
+        )  # A/B switch: the full exp_tile over all 32 vectors (today's instruction stream)
+    exp_iterations = os.environ.get("QWEN38_ROUTER_TAIL_EXP_ITERATIONS")
+    if exp_iterations:
+        if not 0 <= int(exp_iterations) <= 8:
+            raise ValueError(f"QWEN38_ROUTER_TAIL_EXP_ITERATIONS must be 0..8, got {exp_iterations}")
+        defines.append(("FRT_EXP_ITERATIONS", str(int(exp_iterations))))
+    phases = os.environ.get("QWEN38_ROUTER_TAIL_SORT_PHASES")
+    if phases:
+        start, end = (int(v) for v in phases.split(":"))
+        if not 0 <= start <= end <= 5:
+            raise ValueError(f"QWEN38_ROUTER_TAIL_SORT_PHASES must be start:end within 0..5, got {phases}")
+        defines.append(("FRT_SORT_PHASE_START", str(start)))
+        defines.append(("FRT_SORT_PHASE_END", str(end)))
     return defines
+
+
+def _dev_replicas() -> int:
+    """Study knob (dev only): QWEN38_ROUTER_TAIL_DEV_REPLICAS=N runs the program on N cores of one rectangle, the
+    extra cores reading and sorting everything and writing nothing (token_mask 0, so with the live exp they skip the
+    exp too): the concurrent-read timing of a multi-core form.  N must be 1 (off) or a multiple of 4 up to 20 (the
+    placement rectangle's cores; more would truncate silently against it)."""
+
+    replicas = int(os.environ.get("QWEN38_ROUTER_TAIL_DEV_REPLICAS", "1"))
+    if replicas != 1 and not (replicas % 4 == 0 and 4 <= replicas <= 20):
+        raise ValueError(
+            f"QWEN38_ROUTER_TAIL_DEV_REPLICAS must be 1 or a multiple of 4 up to 20 (the rectangle), got {replicas}"
+        )
+    return replicas
 
 
 def _dev_pass_mask() -> int:

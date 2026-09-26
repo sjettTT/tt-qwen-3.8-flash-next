@@ -50,6 +50,7 @@ from . import (
     untilize_rows,
 )
 from . import gr_fold  # after gr_read: it composes gr_read's programs
+from . import moe_dense  # after router_tail, shared_expert, untilize_rows and gr_read: it hosts their kernels
 
 __all__ = [
     "ALL",
@@ -73,6 +74,7 @@ __all__ = [
     "kernel",
     "kernels",
     "moe_combine",
+    "moe_dense",
     "moe_post",
     "ple",
     "position_derive",

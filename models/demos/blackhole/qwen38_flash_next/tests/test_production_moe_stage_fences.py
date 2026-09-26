@@ -20,6 +20,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.moe import (
     Qwen38TTNNMoERowContract,
     Qwen38TTNNMoESyncPolicy,
     Qwen38TTNNRouting,
+    Qwen38TTNNSharedPartial,
 )
 
 
@@ -309,6 +310,89 @@ def test_forward_phase_observer_brackets_exact_moe_mechanics_without_tensors(mon
     ]
 
 
+def test_forward_with_the_dense_composite_brackets_one_program_and_releases_its_rows(monkeypatch) -> None:
+    """With the MoE dense composite on (moe_dense_fused), forward takes _dense_composite instead of _route and
+    _shared_partial (the router linear, the shared linear and ONE program for the top-k, the shared eltwise + down
+    linear and the routed dispatch untilize), hands the composite's rows to the fused local sum and releases them
+    right after it, before the combine collective; the phase observer sees the shared-partial pair bracketing the
+    top-k pair (the shared work runs under the top-k), the six fences stay six."""
+
+    module = _bare_moe()
+    tensors, routing = _forward_fixture(module)
+    events = []
+    _install_forward_mocks(module, tensors, routing, events, monkeypatch)
+    module.moe_dense_fused = True
+    module.moe_post_fused = True  # the fused local sum owns the expert-owner rows too
+    module.expert_owner = _FakeTensor("expert_owner", (1, ROUTED_EXPERTS))
+    shared = Qwen38TTNNSharedPartial(tensors["shared_partial"], _FakeTensor("sigmoid", (1, 1, 32, 32)))
+    sparse_rows = _FakeTensor("sparse_rows", module.row_contract.full_hidden)
+    composite_phases = (
+        "before-router-logits",
+        "after-router-logits",
+        "before-shared-partial",
+        "before-router-topk",
+        "after-router-topk",
+        "after-shared-partial",
+    )
+
+    def composite(full, observe):
+        for phase in composite_phases:
+            observe(phase)
+        events.append(("composite", full.name))
+        return routing, shared, sparse_rows
+
+    def local_sum(full, route_result, w01, w2, shared_arg, *, phase_observer, sparse_rows=None):
+        for phase in (
+            "before-routed-dispatch",
+            "after-routed-dispatch",
+            "before-moe-compute-launch",
+            "after-moe-compute-launch",
+            "before-selective-reduce",
+            "after-selective-reduce",
+        ):
+            phase_observer(phase)
+        events.append(("local-sum", full.name, route_result is routing, shared_arg is shared, sparse_rows.name))
+        return tensors["local_sum"]
+
+    module._dense_composite = composite
+    module._routed_local_sum = local_sum
+    phases = []
+    result = module.forward(
+        tensors["hidden_sharded"], tensors["packed_w0_w1"], tensors["packed_w2"], phase_observer=phases.append
+    )
+    assert result.hidden_sharded is tensors["output"]
+    module._route.assert_not_called()
+    module._shared_partial.assert_not_called()
+    module._routed_partial.assert_not_called()
+    assert phases == [
+        "before-hidden-all-gather",
+        "after-hidden-all-gather",
+        *composite_phases,
+        "before-routed-dispatch",
+        "after-routed-dispatch",
+        "before-moe-compute-launch",
+        "after-moe-compute-launch",
+        "before-selective-reduce",
+        "after-selective-reduce",
+        "before-partial-combine",
+        "after-partial-combine",
+        "before-output-reduce-scatter",
+        "after-output-reduce-scatter",
+        "before-output-release",
+        "after-output-release",
+    ]
+    fences = [event[1] for event in events if event[0] == "fence"]
+    assert fences == list(MOE_STAGE_FENCES)
+    order = [event for event in events if event[0] in ("composite", "local-sum", "deallocate", "all-reduce")]
+    local = next(i for i, event in enumerate(order) if event[0] == "local-sum")
+    assert order[local] == ("local-sum", "full_hidden", True, True, "sparse_rows")
+    released = order.index(("deallocate", "sparse_rows"))
+    assert local < released < order.index(("all-reduce", "local_sum"))
+    assert order.index(("deallocate", "shared_partial")) < order.index(("all-reduce", "local_sum"))
+    assert order.index(("deallocate", "sigmoid")) < order.index(("all-reduce", "local_sum"))
+    assert not any(event[0] == "add" for event in events)
+
+
 def test_forward_phase_observer_failure_defers_until_routed_partial_has_cleanup_ownership(monkeypatch) -> None:
     module = _bare_moe()
     tensors, routing = _forward_fixture(module)
@@ -487,6 +571,7 @@ def test_diagnostic_failure_hook_drains_before_first_exception_cleanup_release(m
             "routing_indices",
             "routing_tiles",
             "shared_partial",
+            "sparse_rows",
             "routed_partial",
             "local_sum",
             "output",

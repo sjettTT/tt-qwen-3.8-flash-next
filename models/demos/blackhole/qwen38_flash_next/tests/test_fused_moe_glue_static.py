@@ -157,7 +157,7 @@ def test_shared_eltwise_contract_and_pins():
 
 def test_router_tail_accepts_the_bf16_shard_and_preallocated_outputs():
     assert "fp32 or bf16 TILE" in inspect.getsource(rt._rows_of)
-    assert 'logits.dtype if name == "cb_in0" else dtype' in inspect.getsource(rt.router_tail_program)
+    assert 'logits.dtype if name == "cb_in0" else dtype' in inspect.getsource(rt.program_parts)
     assert inspect.signature(rt.router_tail_into).parameters.keys() == {"logits", "scores", "indices", "top_k"}
     assert "return router_tail_into(logits, scores, indices, top_k=top_k)" in inspect.getsource(rt.router_tail)
 

@@ -159,12 +159,14 @@ def test_qsa_projection_linears_run_the_weight_fidelity() -> None:
 
 
 def test_shared_expert_linears_run_the_weight_fidelity_and_the_router_keeps_hifi4() -> None:
+    # 9 chain / slab / fused-shared-expert sites + the MoE dense composite's two (its [gate | up | scalar] linear and
+    # the composite program, which runs the down linear at the config's fidelity)
     source = _check_module(
         moe_module,
         ("self.weights.shared_",),
         "shared_compute_config",
-        9,
-        calls=("ttnn.linear", "prefill_linear", "fused.shared_expert.shared_expert"),
+        11,
+        calls=("ttnn.linear", "prefill_linear", "fused.shared_expert.shared_expert", "fused.moe_dense.moe_dense"),
     )
     router = [b for b in _call_blocks(source, ("ttnn.linear", "prefill_linear")) if "self.weights.router" in b]
     assert router and all("compute_kernel_config=self.compute_config" in b for b in router)

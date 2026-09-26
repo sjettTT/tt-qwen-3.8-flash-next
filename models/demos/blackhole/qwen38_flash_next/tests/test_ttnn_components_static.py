@@ -697,12 +697,14 @@ def test_moe_dense_linears_share_one_width_sharded_hidden() -> None:
     forward = inspect.getsource(moe_module.Qwen38TTNNMoE.forward)
     assert not _calls_named(ast.parse(textwrap.dedent(forward)), "to_memory_config")
     assert "hidden_ws" not in forward
+    # the composed route and shared partial keep the gathered shard as their input (the else branch of the MoE dense
+    # composite's switch, one indentation level in since 2026-09-26)
     assert (
-        'self._route(\n                temporaries["full_hidden"], hidden_tiles=temporaries["hidden_tiles"], phase_observer=observe\n            )'
+        'self._route(\n                    temporaries["full_hidden"], hidden_tiles=temporaries["hidden_tiles"], phase_observer=observe\n                )'
         in forward
     )
     assert (
-        'self._shared_partial(\n                hidden_sharded, temporaries["full_hidden"], temporaries["hidden_tiles"]\n            )'
+        'self._shared_partial(\n                    hidden_sharded, temporaries["full_hidden"], temporaries["hidden_tiles"]\n                )'
         in forward
     )
     # The gathered shard is also the routed untilize's input, so it is released

@@ -40,7 +40,9 @@ routed dispatch untilizes the sharded hidden directly and takes the rows view of
 position derivation (40 programs as 1); the sparse-attention block's decode glue as six programs (index tail, main tail,
 post-attention, partial widen, selection row, score merge); the MoE router tail (softmax, top-10, sum, div, casts and
 layouts: 12 programs per layer as one, its top-k on one core per eight-token group: the LLK sort's four independent
-passes, so every token sees the chain's instructions, bitwise, 88 -> 52 us per layer at one row, 2026-09-18); the shared
+passes, so every token sees the chain's instructions, bitwise, 88 -> 52 us per layer at one row, 2026-09-18; its precise
+exp runs over the vector pairs that hold the core's live rows only -- a dead row's exp is never read -- 52 -> 39 us
+at one row and 53 -> 42 at the MTP verify's five, bitwise, 2026-09-26); the shared
 expert as three programs (one DRAM-sharded linear over the concatenated [gate | up | scalar] weight, one silu / product
 / sigmoid program, the down linear); the layer-1 PLE (stats, group norm, gate, conv with the state shift and the layer's
 permute + add: 56 programs as 9, the SFPU `mac_tile` of `ttnn.mac`, the accurate fp32 reduce of the gate's sum); and,
@@ -56,13 +58,24 @@ the fused GDN step is not admitted, differs from the one-row fused body at one n
 at 4 and 8 lanes); the fused lanes form matches 225/225.  The lanes' greedy tail scans (row, tile-group) items since
 2026-09-25, one lane row per core on up to 128 cores (the scan program 164 -> 86 us at 4 lanes and 322 -> 173 at 8, the
 step 34.7 -> 34.6 and 42.8 -> 42.7 ms at 4 and 8 lanes on the 200-replay lane sweep), bitwise the per-core all-rows scan
-it replaces (`QWEN38_FUSED_GREEDY_TAIL_LANE_SPLIT=0`).  Opt-in through `QWEN38_FUSED=<name>`: `final_mixer`,
+it replaces (`QWEN38_FUSED_GREEDY_TAIL_LANE_SPLIT=0`).  Since 2026-09-26 the MoE block's router top-k, the shared
+expert's eltwise and down linear and the routed dispatch untilize run as ONE program (`moe_dense`: four kernel groups on
+disjoint cores, the top-k's lane cores on a placement rectangle off the dense linears' storage cores, the eltwise on
+those five storage cores multicasting its intermediate into 16 worker cores that run the down linear as a streaming
+matmul with the DRAM-sharded matmul's spill and reload after every K tile, the untilize on eight cores), so the 13.5 us
+of shared work per layer run under the 51 us top-k instead of after it: 144 programs per step fewer, the composite 51.2
+us where the four programs took 64.9, the one-row step 26.50 -> 25.89 ms per token on the landed head beside the live-row exp (37.7 -> 38.6 tok/s, the greedy
+request of the sampling server, 200 traced steps in one hold; alone on the previous head 27.24 -> 26.65), the MTP verify pass 59.3 -> 58.6 ms (json) and 57.9 -> 57.5 (prose)
+with identical committed streams; bitwise the four programs on every row 1..32 at both down-weight formats and both
+routing placements (the device test and the audit-capture microtest), the acceptance table unchanged (12/12);
+`QWEN38_FUSED_OFF=moe_dense` restores the four programs.  Opt-in through `QWEN38_FUSED=<name>`: `final_mixer`,
 `position_advance`. The kernels cover rows 1..32 (decode, the MTP verify rows); the 128-row prefill chunk and the slab
 keep their chains. `QWEN38_FUSED_OFF=<name>[,...]` (or `all`) in the server's environment falls back to the composed
 chains; an unknown name in either variable refuses to start; `QWEN38_FUSED_OFF=gr_fold` runs the GR read's merged
 three-program form with the stock collectives (5 programs per read); `QWEN38_FUSED_GR_READ_MERGED=0` runs the GR read's
 split form (7 programs per read); `QWEN38_ROUTER_TAIL_LANES=0` runs the router tail's top-k on one core per tile (the
-same program, the LLK's four passes on that core).
+same program, the LLK's four passes on that core); `QWEN38_ROUTER_TAIL_EXP_LIVE=0` runs the router tail's exp over every
+vector of every tile (the same bits, the full cost).
 
 The DRAM-sharded decode linears of the GDN input and output projections, the sparse attention's query-gate and output
 projections and the LM-head chunks read each DRAM bank with two worker cores (`num_workers_per_dram_bank=2`; the K/V and

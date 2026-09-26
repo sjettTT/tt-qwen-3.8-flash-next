@@ -20,6 +20,7 @@ import ttnn
 from models.demos.blackhole.qwen38_flash_next.ttnn import qsa
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gr_fold, gr_read, gr_write
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import program as fp
+from models.demos.blackhole.qwen38_flash_next.ttnn.fused import placement
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import qsa_block, router_tail
 
 SUPPORTED_CONTEXTS = (32768, 65536, 131072, 262144)  # the launchers' admitted --allocated-context values
@@ -133,7 +134,14 @@ def test_fixed_layout_fused_programs_fit_the_smaller_grid():
         ]
         + [ttnn.CoreCoord(x, 4) for x in range(gr_read.LOW_RANK_CORES)],
         "gr_fold transports": list(gr_fold.TRANSPORT["stats"]) + list(gr_fold.TRANSPORT["partials"]),
-        "router_tail lanes": [ttnn.CoreCoord(0, y) for y in range(router_tail.PASSES)],
+        # the top-k asks placement.free_rectangle for its 4 x 5 rectangle (its lane cores = the first row); on the
+        # smaller grid with the storage cores reserved it lands in the far corner
+        "router_tail lanes": router_tail.lane_cores(
+            placement.core_range(
+                placement.free_rectangle_in(*min(GRIDS.values()), placement.STORAGE_CORES, *router_tail.RECTANGLE)
+            ),
+            router_tail.PASSES,
+        ),
     }
     for name, cores in fixed.items():
         assert _inside(cores, small), name
