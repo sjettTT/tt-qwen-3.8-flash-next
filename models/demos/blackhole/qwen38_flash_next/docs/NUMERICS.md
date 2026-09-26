@@ -79,11 +79,18 @@ chains and one reader per bank (`QWEN38_FUSED_OFF=all QWEN38_DRAM_WORKERS=1`), 3
 step on chip 0 under the device profiler (38.9 ms span).  The 2026-09-15 numbers (13 kernels, one reader per
 bank): 42.14 ms, 4,618 programs, 37.9 ms of kernel time.
 
+Measured 2026-09-25 on 4x p150 with the defaults of that day (BF8 dense weights, the fused GDN step, the compact expert
+layout, the MoE post program's one-read routing, two readers per bank), the README's decode rows: one stream 27.2 ms per
+token on the 200-step pin recipe (36.8 tokens/s greedy), flat with depth; the device sampler's step 27.4 ms (36.5
+tokens/s sampled) on both model cards (thinking; instruct with its presence penalty); the batched-decode lane body at
+4 / 8 lanes 34.6 / 42.7 ms per step, 28.9 / 23.4 tokens/s per user and 116 / 187 aggregate (the chat server serves one
+stream; the lane sweep measures the lane body directly).
+
 ## The acceptance mechanism
 
 `--acceptance` replays the twelve shipped CPU greedy records under `tools/acceptance/greedy-prompts/` against the CPU
 before the server listens.  `--require-json-96` refuses to serve unless the `json` record matches the CPU 96/96 (the
-other records diverge from the CPU after 6-75 tokens, the known greedy-prompt pattern; their first divergence index is
+other records diverge from the CPU after 2-75 tokens, the known greedy-prompt pattern; their first divergence index is
 in `acceptance.json` in the run directory).  The records were rendered by the CPU study with the system prompt
 `You are a helpful assistant.`; that system turn is inside their recorded prompt ids, which the replay feeds to the
 device as they are.  The server itself adds no system prompt to a client's request (`SERVER.md`).
@@ -136,7 +143,9 @@ is the 1-row gate bitwise on the same row; the pinned MTP table is `tools/ci/bas
 Before the gate fix the two paths differed on `code` (44 against 24) and `fact` (16 against 15) only.  Throughput
 on the 2026-09-16 body (14 fused kernels, two DRAM readers per bank; quiet host, the acceptance replay of the 12
 prompts, both tables as pinned): `--mtp 4` 39.0 tokens/s median over the prompts and 67.9 on `json` (4.80 tokens per
-pass, 70.7 ms per pass); `--mtp 3` 38.0 median, 55.6 on `json`.
+pass, 70.7 ms per pass); `--mtp 3` 38.0 median, 55.6 on `json`.  Sampled drafting (2026-09-25, `--mtp 4` on the
+27.7 ms D1 step, the card profiles non-thinking / thinking): 40.8 / 40.7 tokens/s at 24.5 / 24.6 ms per token against
+33.5 / 33.9 plain sampled, 2.64 / 2.68 tokens per pass, 0 fallbacks.
 
 | | json | chat | code | fact | list | math | multilingual | prose | refactor | sky | story | summary |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|

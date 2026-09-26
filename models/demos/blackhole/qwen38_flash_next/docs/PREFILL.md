@@ -158,6 +158,16 @@ backpressure credit landed the same day); `QWEN38_MOE_SLAB_RINGS=0` restores one
   nondeterministic (2026-09-25: two runs of the same prompts differed from each other and from the default in
   different places while every other form was identical); the cause is under investigation.
 
+## Served rates
+
+The README's prefill row, served through the chat server on 4x p150 at the 2026-09-25 head (the routed experts in one
+call on two rings by default): the 32-row chunk trace at 2.4 ms per prompt token (413 / 418 prompt tokens per second in
+two runs: about 410), flat from 2k to 261k tokens; `--long-chunks` at 1.27-1.33 ms (750-790); `--prefill-slab 2048` at
+0.53 ms (1,870: TTFT 17.0 s for a 31,716-token prompt, 1.53 s for 2,118 tokens; the table above).  The release's
+long-context figures of 2026-09-04, through the 32-row chunk trace alone at about 3.2-3.5 ms per prompt token: a 40k
+prompt reached its first token in 125 s and a 200k prompt in 671 s, and decode stayed at 17-19 tokens/s to 256k (the
+decode of that day; the README's decode rows are the current step).
+
 ## Glue forms (`QWEN38_PREFILL_GLUE`)
 
 Read program by program, the slab body's non-MoE time is glue around a few kernels: the gated-residual read's

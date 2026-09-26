@@ -141,6 +141,7 @@ A `seed` reproduces a stream against the same `system_fingerprint`, which carrie
 on, the pass loop consumes the request's draws in the pass's order, so the seed reproduces the drafting stream, not
 the 1-row loop's stream (the 1-row stream is the `QWEN38_MTP_SAMPLED=0` server's).  With drafting on a greedy request
 runs the same split pass with the device's own verdict written back and is bitwise the fused pass's stream.
+`--mtp-gdn-anchor layer0` (a server flag) re-anchors the layer-0 GDN state from the 1-row recurrence.
 
 ## The prompt, follow-up turns and the prompt-end snapshot
 
