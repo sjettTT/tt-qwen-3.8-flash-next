@@ -14,7 +14,7 @@
 #                           directories (about 23 GB for 32k plus 107 GB of BF4 experts on the first start)
 #   --allocated-context N   32768 (default) | 65536 | 131072 | 262144
 #   --mtp K                 multi-token-prediction drafting depth, 3, 4 or 5 (off by default; greedy chunked-mode requests draft)
-#   --long-chunks           prefill in 128-row chunks where the prompt allows (off by default; not with --mtp)
+#   --long-chunks           prefill in 128-row chunks where the prompt allows (off by default; combines with --mtp)
 #   --prefill-slab ROWS     prefill in slabs of ROWS rows (a multiple of 128, 256..4096; 2048 is the measured form)
 #                           ahead of the 128-row chunks (off by default; implies --long-chunks; not with --mtp)
 #   --no-sampling           serve greedy requests only (the default server takes --sampling: a request naming no
@@ -173,7 +173,6 @@ if [[ -n "$mtp" ]]; then
     [[ "$mtp" == 3 || "$mtp" == 4 || "$mtp" == 5 ]] || die "--mtp takes 3, 4 or 5, got $mtp"
     args+=(--mtp "$mtp")
 fi
-[[ -z "$long_chunks" || -z "$mtp" ]] || die "--long-chunks and --mtp are alternatives (the MTP chain prefills in 32-row chunks)"
 [[ -z "$long_chunks" ]] || args+=(--long-chunks)
 if [[ -n "$prefill_slab" ]]; then
     [[ "$prefill_slab" =~ ^[0-9]+$ && $((prefill_slab % 128)) == 0 && "$prefill_slab" -ge 256 && "$prefill_slab" -le 4096 ]] \

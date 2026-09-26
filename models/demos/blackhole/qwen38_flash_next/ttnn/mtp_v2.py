@@ -54,6 +54,7 @@ import ttnn
 from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import qsa as qsa_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
+    CHUNK_ROW_COUNTS,
     CHUNK_ROWS,
     MESH_SHAPE,
     Qwen38MeshContract,
@@ -2610,29 +2611,63 @@ def forward_mtp_step_row(
 
 @dataclass(frozen=True)
 class Qwen38TTNNMTPChunkExtension:
-    """The MTP layer's 32 rows of a prefill chunk (the model's ``mtp`` keyword): its own chunk state over the
-    alignment layer and ``token_row`` FP32 TILE ``[1,1,1,32]`` (lane j = the token at P + j + 1, host-written per
-    chunk); the rows take the chunk's layer-47 residual rows as roots.  ``reset_chunk`` / ``finish_chunk`` are the per-layer
-    chunk seed and hand-off of the MTP layer's generic state."""
+    """The MTP layer's rows of a prefill chunk (the model's ``mtp`` keyword) in the chunk state's form, 32 or 128
+    rows: its own chunk state over the alignment layer and ``token_row`` FP32 TILE ``[1,1,rows / 32,32]`` (lane j =
+    the token at P + j + 1, host-written per chunk); the rows take the chunk's layer-47 residual rows as roots.
+
+    The 32-row twin owns the MTP layer's chunk buffers and is the hand-off form (``reset_chunk`` / ``finish_chunk``:
+    the per-layer chunk seed and hand-off of the MTP layer's generic state).  The 128-row twin of a ``--long-chunks``
+    chain is allocated ``base=`` the 32-row one and runs inside the 128-row chunk body the way the backbone's QSA layers
+    do at 128 rows: its layer chunk state is allocated beside the 32-row one (the QSA form shares nothing but the
+    rule; its kept buffers are its own) and its MoE instance borrows the 128-row chunk state's shared combine buffer
+    (the MTP layer runs after layer 47 in the same body, so the buffer is free).  Its ``finish_chunk`` is refused:
+    the hand-off reads the 32-row twin, whose kept buffers a long chunk never wrote, which is the closed-block
+    hand-off the backbone's 128-row chunks already make."""
 
     alignment: Qwen38TTNNVerifyAlignment
     layer_chunk_state: Any
     token_row: Any
+    rows: int = CHUNK_ROWS
 
     @classmethod
     def allocate(
-        cls, model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState, chunk_state
+        cls,
+        model: Qwen38TTNNTextModel,
+        verify: Qwen38TTNNVerifyState,
+        chunk_state,
+        *,
+        base: "Qwen38TTNNMTPChunkExtension | None" = None,
     ) -> "Qwen38TTNNMTPChunkExtension":
+        """The extension of ``chunk_state``'s form: the 32-row chunk state takes no ``base``; the 128-row chunk state
+        needs ``base``, the chain's 32-row extension (the hand-off form), and lends its shared MoE combine buffer."""
+
         _validate_verify_state(model, verify)
         if verify.alignment is None:
             raise ValueError("the MTP chunk extension needs the verify state's MTP alignment components")
-        layer_chunk_state = verify.alignment.layer.allocate_chunk_state(chunk_state.rows_constants)
+        rows = int(chunk_state.rows)
+        if rows not in CHUNK_ROW_COUNTS:
+            raise ValueError(f"the MTP chunk extension takes a {CHUNK_ROW_COUNTS}-row chunk state, got {rows} rows")
+        if (base is None) != (rows == CHUNK_ROWS):
+            raise ValueError(
+                f"the {rows}-row MTP chunk extension {'needs' if rows != CHUNK_ROWS else 'takes no'} base 32-row extension"
+            )
+        if base is not None and (base.rows != CHUNK_ROWS or base.alignment is not verify.alignment):
+            raise ValueError("the base must be this verify state's 32-row MTP chunk extension")
+        if (chunk_state.local_combine_output is None) != (rows == CHUNK_ROWS):
+            raise ValueError(
+                f"the {rows}-row chunk state's shared MoE combine buffer is {chunk_state.local_combine_output}"
+            )
+        layer_chunk_state = verify.alignment.layer.allocate_chunk_state(
+            chunk_state.rows_constants,
+            base=None if base is None else base.layer_chunk_state,
+            local_combine_output=chunk_state.local_combine_output,
+        )
         try:
-            token_row = model.model_io.embedding.upload_token_row(0)
+            token_row = model.model_io.embedding.upload_token_rows(rows)
         except BaseException:
             verify.alignment.layer.release_chunk_state(layer_chunk_state)
             raise
-        return cls(verify.alignment, layer_chunk_state, token_row)
+        return cls(verify.alignment, layer_chunk_state, token_row, rows)
 
     def release(self) -> None:
         _run_cleanup(
@@ -2647,11 +2682,11 @@ class Qwen38TTNNMTPChunkExtension:
         self.alignment.layer.reset_chunk_state_inplace(self.layer_chunk_state, self.alignment.generic_state)
 
     def write_tokens(self, model: Qwen38TTNNTextModel, token_ids: Sequence[int]) -> None:
-        """Host write of the chunk's 32 MTP tokens (the tokens at P + 1 .. P + 32) into the token row."""
+        """Host write of the chunk's ``rows`` MTP tokens (the tokens at P + 1 .. P + rows) into the token row."""
 
         token_ids = [int(token) for token in token_ids]
-        if len(token_ids) != CHUNK_ROWS:
-            raise ValueError(f"an MTP chunk takes {CHUNK_ROWS} tokens, got {len(token_ids)}")
+        if len(token_ids) != self.rows:
+            raise ValueError(f"a {self.rows}-row MTP chunk takes {self.rows} tokens, got {len(token_ids)}")
         ttnn.copy_host_to_device_tensor(
             ttnn.from_torch(
                 model.model_io.embedding.host_token_rows(token_ids),
@@ -2666,13 +2701,17 @@ class Qwen38TTNNMTPChunkExtension:
         self, model: Qwen38TTNNTextModel, residual_rows, *, rope_rows, qsa_chunk, qsa_chunk_constants, selectors
     ):
         """The MTP layer's rows at the chunk's positions: the token rows' embedding mixed with the chunk's layer-47
-        residual rows (not consumed), through the layer's chunk body on the MTP generic and chunk states."""
+        residual rows (not consumed), through the layer's chunk body on the MTP generic and chunk states.  The roots
+        are ``[1,4,rows,640]`` and the embedding ``[1,1,rows,640]`` for this extension's ``rows``; ``selectors`` is
+        the chunk's (the 32-row form's accept selectors, None at 128 rows), as the backbone's layers receive it."""
 
-        if _shape(residual_rows) != RESIDUAL_ROWS_SHAPE:
-            raise RuntimeError(f"MTP chunk roots must be {RESIDUAL_ROWS_SHAPE}, got {tensor_metadata(residual_rows)}")
+        residual_shape = (1, RESIDUAL_BRANCHES, self.rows, LOCAL_HIDDEN_SIZE)
+        embedding_shape = (1, 1, self.rows, LOCAL_HIDDEN_SIZE)
+        if _shape(residual_rows) != residual_shape:
+            raise RuntimeError(f"MTP chunk roots must be {residual_shape}, got {tensor_metadata(residual_rows)}")
         embedding_rows = model.model_io.embedding.embed_device_token_rows(self.token_row)
-        if _shape(embedding_rows) != BLOCK_ROWS_SHAPE:
-            raise RuntimeError(f"MTP chunk embedding rows must be {BLOCK_ROWS_SHAPE}, got {_shape(embedding_rows)}")
+        if _shape(embedding_rows) != embedding_shape:
+            raise RuntimeError(f"MTP chunk embedding rows must be {embedding_shape}, got {_shape(embedding_rows)}")
         mixed = self.alignment.input_mixer.rows(embedding_rows, residual_rows)
         _deallocate(embedding_rows)
         out = self.alignment.layer.forward_chunk_generic(
@@ -2688,8 +2727,11 @@ class Qwen38TTNNMTPChunkExtension:
         _deallocate(out)
 
     def finish_chunk(self, model: Qwen38TTNNTextModel, *, prefilled: int) -> None:
-        """The MTP layer's hand-off after the last chunk (the model's ``finish_prefill`` form for one layer)."""
+        """The MTP layer's hand-off after the last chunk (the model's ``finish_prefill`` form for one layer): the
+        32-row twin's, whatever chunk forms the prefill ran."""
 
+        if self.rows != CHUNK_ROWS:
+            raise ValueError(f"the MTP hand-off reads the {CHUNK_ROWS}-row chunk extension, got {self.rows} rows")
         ring_select = ttnn.from_torch(
             qsa_module.chunk_handoff_ring_select_rows(prefilled),
             dtype=ttnn.bfloat16,

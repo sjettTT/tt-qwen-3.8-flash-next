@@ -28,6 +28,12 @@ keyword: the committed GDN state through the 1-row FP32 step arithmetic instead 
 captured trace the driver replays what the capture baked in, so the chain owner passes the flag its capture carried;
 without one (``chunk_trace_id=None``, the eager form of the micro-tests) the driver runs the chunk body itself and
 passes the flag per chunk.  The 128-row form has no anchor: a chain with the anchor on runs 32-row chunks only.
+
+``mtp`` / ``long_mtp`` are the MTP-drafting chain's chunk extensions (``mtp_v2.Qwen38TTNNMTPChunkExtension``, the
+32-row and the 128-row twin): the chunk traces were captured with them, so every chunk also takes its MTP tokens (the
+chunk's rows one position ahead, ``following_token`` after the last) through the extension of its form, and the
+hand-off includes the MTP layer (the 32-row twin's ``finish_chunk``).  A chain with the 128-row chunk state and MTP
+drafting needs both twins; a slab has no MTP form.
 """
 
 from __future__ import annotations
@@ -126,6 +132,7 @@ class Qwen38ChunkPrefill:
         mtp: Any = None,
         slab_state: Any | None = None,
         slab_trace_id: Any | None = None,
+        long_mtp: Any = None,
     ) -> None:
         if isinstance(event_interval, bool) or type(event_interval) is not int or event_interval <= 0:
             raise ValueError(f"event interval must be a positive int, got {event_interval!r}")
@@ -138,12 +145,16 @@ class Qwen38ChunkPrefill:
             raise ValueError("the GDN step anchor is a 32-row chunk option: no long chunks with the anchor on")
         if (long_chunk_trace_id is not None) and (long_chunk_state is None or chunk_trace_id is None):
             raise ValueError("a long chunk trace needs the long chunk state and the 32-row chunk trace")
-        if long_chunk_state is not None and mtp is not None:
-            raise ValueError("the MTP chunk extension is a 32-row chunk option: no long chunks with MTP drafting")
+        if long_chunk_state is not None and mtp is not None and long_mtp is None:
+            raise ValueError("a long chunk state with MTP drafting needs the 128-row MTP chunk extension (long_mtp)")
+        if long_mtp is not None and (mtp is None or long_chunk_state is None):
+            raise ValueError("the 128-row MTP chunk extension needs the 32-row extension and the long chunk state")
         if slab_state is not None and (long_chunk_state is None or not is_slab_rows(getattr(slab_state, "rows", None))):
             raise ValueError("a slab needs the 128-row chunk state (its remainder) and a slab row count")
         if slab_trace_id is not None and (slab_state is None or long_chunk_trace_id is None):
             raise ValueError("a slab trace needs the slab state and the long chunk trace")
+        if slab_state is not None and mtp is not None:
+            raise ValueError("the MTP chunk extension has no slab form: no slabs with MTP drafting")
         self.model = model
         self.mesh = mesh
         self.state = state
@@ -159,15 +170,16 @@ class Qwen38ChunkPrefill:
         self.event_interval = event_interval
         self.verify_allocations = verify_allocations
         self.gdn_step_anchor = gdn_step_anchor
-        # The MTP-drafting chain's chunk extension (mtp_v2.Qwen38TTNNMTPChunkExtension): the chunk trace was captured
-        # with it, so every chunk also takes its 32 MTP tokens (the tokens one position ahead) and the hand-off
-        # includes the MTP layer.
+        # The MTP-drafting chain's chunk extensions (mtp_v2.Qwen38TTNNMTPChunkExtension): the 32-row chunk trace was
+        # captured with ``mtp`` and the 128-row one with ``long_mtp``, so every chunk also takes its MTP tokens (the
+        # tokens one position ahead) through the extension of its form, and the hand-off includes the MTP layer.
         self.mtp = mtp
+        self.long_mtp = long_mtp
 
     def _run_chunk(self, *, blocking: bool, kind: str = "short") -> None:
         """One chunk at the device position: the captured trace's replay, or the eager chunk body with the
-        re-anchor flag and the MTP extension passed per chunk (a blocking eager chunk synchronizes so its wall is
-        the chunk's).  ``kind`` is ``slab``, ``long`` (128 rows) or ``short`` (32 rows)."""
+        re-anchor flag and the MTP extension of the chunk's form passed per chunk (a blocking eager chunk
+        synchronizes so its wall is the chunk's).  ``kind`` is ``slab``, ``long`` (128 rows) or ``short`` (32 rows)."""
 
         chunk_state, trace_id = {
             "slab": (self.slab_state, self.slab_trace_id),
@@ -179,10 +191,16 @@ class Qwen38ChunkPrefill:
             return
         short = kind == "short"
         self.model.forward_prefill_chunk_generic(
-            chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor and short, mtp=self.mtp if short else None
+            chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor and short, mtp=self._extension(kind)
         )
         if blocking:
             ttnn.synchronize_device(self.mesh)
+
+    def _extension(self, kind: str) -> Any:
+        """The MTP chunk extension of a chunk kind: the 32-row one for ``short``, the 128-row twin for ``long``, none
+        for a slab (and none at all on a plain chain)."""
+
+        return {"short": self.mtp, "long": self.long_mtp, "slab": None}[kind]
 
     def run(
         self,
@@ -278,6 +296,8 @@ class Qwen38ChunkPrefill:
                 self.model.reset_chunk_state_inplace(self.state, self.slab_state)
             if self.mtp is not None:
                 self.mtp.reset_chunk()
+                if long_chunks and self.long_mtp is not None:
+                    self.long_mtp.reset_chunk()
             if self.verify_allocations and self.chunk_trace_id is not None:
                 verify_started_ns = time.perf_counter_ns()
                 for trace_id in (
@@ -309,9 +329,13 @@ class Qwen38ChunkPrefill:
                 ple_context = prepared.contexts[real_rows]
                 upload_started_ns = time.perf_counter_ns()
                 self.model.upload_chunk_inputs(chunk_state, prepared)
-                if self.mtp is not None:
-                    ahead = following[start : start + CHUNK_ROWS]
-                    self.mtp.write_tokens(self.model, ahead + [self.pad_token_id] * (CHUNK_ROWS - len(ahead)))
+                extension = self._extension(kind)
+                if extension is not None:
+                    # The extension of the chunk's form takes the chunk's rows one position ahead (a long chunk is
+                    # always full; the padded 32-row tail pads its MTP tokens too).
+                    width = CHUNK_ROWS if kind == "short" else LONG_CHUNK_ROWS
+                    ahead = following[start : start + width]
+                    extension.write_tokens(self.model, ahead + [self.pad_token_id] * (width - len(ahead)))
                 replay_started_ns = time.perf_counter_ns()
                 if kind == "slab":
                     slab_prepare_ms.append((upload_started_ns - host_started_ns) / 1_000_000)

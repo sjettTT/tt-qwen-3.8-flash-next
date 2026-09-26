@@ -817,8 +817,9 @@ def test_open_captures_the_fused_verify_always_and_the_split_form_beside_it_unde
     assert "capture_verify(" not in split and "capture_commit(" not in split
     # Both forms' bytes per bank are recorded; the MTP total keeps its key (the admission gate reads it).
     after = opened[opened.index('marker("after-chat-mtp-captures")') :]
-    assert '"mtp_fused_traces": dram_after_fused - dram_after_chunk' in after
-    assert '"mtp_traces": dram_after_mtp - dram_after_chunk' in after
+    # the MTP traces are measured from the last prefill capture (the 32-row, 128-row and slab traces are their own terms)
+    assert '"mtp_fused_traces": dram_after_fused - dram_after_prefill_captures' in after
+    assert '"mtp_traces": dram_after_mtp - dram_after_prefill_captures' in after
     assert 'trace_dram_bytes_per_bank["mtp_split_traces"] = dram_after_mtp - dram_after_fused' in after
     assert 'chain_mtp.dram_bytes_per_bank["traces"] = chain_mtp.trace_dram_bytes_per_bank["mtp_traces"]' in after
     # The warm rounds under the switch are the split form's four (the warm the split captures were proven with):

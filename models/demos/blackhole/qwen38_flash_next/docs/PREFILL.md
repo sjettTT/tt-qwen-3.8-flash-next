@@ -33,8 +33,15 @@ restores the chain): 6 programs where the chain ran 53 per GDN layer, bitwise, t
 (`docs/NUMERICS.md`).
 
 The remainder of a prompt after the slabs runs through the 128-row chunks, then the 32-row chunks and the padded tail,
-then the ordinary hand-off from the 32-row state.  `--prefill-slab` implies `--long-chunks`; like `--long-chunks` it is
-not combined with `--mtp` (the MTP chain prefills in 32-row chunks).  The 32-row and 128-row bodies are unchanged.
+then the ordinary hand-off from the 32-row state.  `--prefill-slab` implies `--long-chunks` and is not combined with
+`--mtp` (the MTP chunk extension has no slab form).  `--long-chunks` combines with `--mtp`: the MTP layer's rows run
+inside the 128-row chunk body as they do inside the 32-row one (a 128-row twin of the chunk extension; its input mixer
+projects per 32-row tile, so every row keeps the 32-row form's matmul program), and the hand-off stays the 32-row
+state's.  The 32-row and 128-row bodies are unchanged.  Measured 2026-09-26 on the 4-chip p150 line with `--mtp 4`
+(server-side, the cold first request of each class): the 560-token chat prompt prefills in 0.896 s (1.60 ms per
+prompt token; 1.309 s, 2.34 ms, with the 32-row chunks alone), a 513-token prompt in 0.764 s (1.49; 1.173 s, 2.29,
+in 32-row chunks); the served decode after either prefill is the same to 0.2 tok/s, and the MTP DRAM admission adds
+the 128-row twin's 25,600 bytes per bank (`docs/SERVER.md`).
 
 ## Numerics class
 

@@ -134,7 +134,7 @@ that leaves earlier than the pinned table is a regression (`docs/NUMERICS.md`).
 | `--allocated-context 32768\|65536\|131072\|262144` | the resident build (KV caches, RoPE tables and the context limit; the limit is the context minus 64 for the consumed EOS step); default 32768 |
 | `--acceptance`, `--require-json-96` | replay the twelve CPU greedy records at start; refuse to serve unless `json` matches 96/96 |
 | `--prepare-only --bf4-stage-limit N` | convert at most N missing expert layers into the BF4 cache and stop |
-| `--long-chunks` | 128-row prefill chunks where the prompt allows (section 6); off by default, not combined with `--mtp` |
+| `--long-chunks` | 128-row prefill chunks where the prompt allows (section 6); off by default; with `--mtp` the MTP layer's rows run inside the 128-row chunks too |
 | `--prefill-slab 2048` | prefill slabs of 2048 rows ahead of the 128-row chunks: one matmul per dense linear, the routed experts in one `moe_compute` call on three rings, tolerance-class against the chunk bodies (`docs/PREFILL.md`); off by default, not combined with `--mtp` |
 | `--mtp 3\|4\|5` | speculative drafting on greedy requests (section 6); off by default |
 | `--port`, `--host` | the listening port; `--host` default `0.0.0.0`: the QuietBox and p150-line profiles serve the LAN |
@@ -186,7 +186,12 @@ readers, deadlines, the stall watchdog and the `/health` fields: `docs/SERVER.md
   device free and is single-user (`docs/PREFILL.md` has the long prompts' times to the first token).
 - `--long-chunks` prefills in 128-row chunks where the prompt allows (the remainder in 32-row chunks): 1.55 ms per
   prompt token through the server (a 6942-token prompt in 10.8 s) against 3.3 with 32-row chunks alone, the same
-  tokens bitwise on all 48 layers; off by default, not combined with `--mtp` (whose chain prefills in 32-row chunks).
+  tokens bitwise on all 48 layers; off by default.  With `--mtp` the MTP layer's rows run inside the 128-row chunks
+  as they do inside the 32-row ones (the remainder keeps its 32-row chunks); the gate is the MTP stream after either
+  prefill being the same (`docs/NUMERICS.md`).  Measured 2026-09-26 with `--mtp 4` on the 4-chip p150 line: a cold
+  560-token chat prompt 0.92 s to the first token (1.60 ms per prompt token) against 1.34 s (2.34) with 32-row chunks
+  alone, a 513-token prompt 0.79 s against 1.20 s; decode unchanged (58.2 tok/s greedy on the 560-token prompt,
+  the acceptance table 12/12, the served classes within 0.2 tok/s of the 32-row form's).
 - `--mtp 3|4|5` drafts K tokens per pass with exact acceptance; off by default.  It fits at 32k, 64k and 128k at any k,
   not at 256k (94 MB free per bank against the pair's 128 MiB contiguous).  The committed stream is not bitwise with plain decode
   on 3 of the 12 acceptance prompts: near-ties within one bf16 step, not a defect (`docs/NUMERICS.md` has the indices

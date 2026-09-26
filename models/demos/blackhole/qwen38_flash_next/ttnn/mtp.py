@@ -37,7 +37,12 @@ from models.demos.blackhole.qwen38_flash_next.checkpoint import (
     Qwen38Checkpoint,
 )
 from models.demos.blackhole.qwen38_flash_next.config import CONFIG_SHA256, Qwen38Placement
-from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE, Qwen38MeshContract, TensorPlacement
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
+    CHUNK_ROW_COUNTS,
+    MESH_SHAPE,
+    Qwen38MeshContract,
+    TensorPlacement,
+)
 
 TP_AXIS = 1
 TP_SIZE = 4
@@ -662,17 +667,25 @@ class Qwen38TTNNMTPInput:
         return output
 
     def rows(self, input_embedding_rows, hidden_residual_rows):
-        """:meth:`__call__` for 32 token rows (the MTP alignment rows of an MTP v2 verify pass).
+        """:meth:`__call__` for a chunk of token rows: 32 (the MTP alignment rows of an MTP v2 verify pass, the MTP
+        rows of a 32-row prefill chunk) or 128 (the MTP rows of a 128-row prefill chunk).
 
-        ``input_embedding_rows`` ``[1,1,32,640]`` and the branch-major ``hidden_residual_rows`` ``[1,4,32,640]``
-        give the fused ``[1,4,32,640]`` rows.  The hidden norm keeps its 10,240-wide per-token contract: the
-        rows go token-major and flat (``[1,1,32,2560]`` local, the GR rows walk), are normalized with the same
-        flattened scale, and go back to branch-major for the per-branch projection.  Row j depends only on row j.
+        ``input_embedding_rows`` ``[1,1,rows,640]`` and the branch-major ``hidden_residual_rows`` ``[1,4,rows,640]``
+        give the fused ``[1,4,rows,640]`` rows; the row count is the inputs' (one of :data:`CHUNK_ROW_COUNTS`).  The
+        hidden norm keeps its 10,240-wide per-token contract: the rows go token-major and flat (``[1,1,rows,2560]``
+        local, the GR rows walk), are normalized with the same flattened scale, and go back to branch-major for the
+        per-branch projection.  Row j depends only on row j: the norms are per row, and at 128 rows the two
+        projections run once per 32-row tile of the gathered rows (:meth:`_project_rows`), so every row's result is
+        the 32-row form's bitwise.
         """
 
         if self.weights.released:
             raise RuntimeError("cannot run MTP input fusion after its weights were deallocated")
-        rows = ttnn.TILE_SIZE
+        rows = _shape(input_embedding_rows)[2]
+        if rows not in CHUNK_ROW_COUNTS:
+            raise ValueError(
+                f"MTP input rows take {CHUNK_ROW_COUNTS} token rows, got embedding rows {_shape(input_embedding_rows)}"
+            )
         embedding_shape = (1, 1, rows, LOCAL_HIDDEN_SIZE)
         residual_shape = (1, RESIDUAL_BRANCHES, rows, LOCAL_HIDDEN_SIZE)
         flat_shape = (1, 1, rows, RESIDUAL_BRANCHES * LOCAL_HIDDEN_SIZE)
@@ -711,20 +724,8 @@ class Qwen38TTNNMTPInput:
         )
         ttnn.deallocate(normalized_embedding)
         ttnn.deallocate(normalized_hidden)
-        projected_embedding = ttnn.linear(
-            full_embedding,
-            self.weights.fc_embedding,
-            memory_config=dram,
-            dtype=ttnn.bfloat16,
-            compute_kernel_config=self.projection_compute_config,
-        )
-        projected_hidden = ttnn.linear(
-            full_hidden,
-            self.weights.fc_hidden,
-            memory_config=dram,
-            dtype=ttnn.bfloat16,
-            compute_kernel_config=self.projection_compute_config,
-        )
+        projected_embedding = self._project_rows(full_embedding, self.weights.fc_embedding, rows=rows)
+        projected_hidden = self._project_rows(full_hidden, self.weights.fc_hidden, rows=rows)
         ttnn.deallocate(full_embedding)
         ttnn.deallocate(full_hidden)
         self._validate_input(projected_embedding, label="projected embedding rows", shape=embedding_shape)
@@ -736,6 +737,42 @@ class Qwen38TTNNMTPInput:
         ttnn.deallocate(projected_hidden)
         ttnn.deallocate(broadcast_embedding)
         self._validate_input(output, label="fused output rows", shape=residual_shape)
+        return output
+
+    def _project_rows(self, gathered, weight, *, rows: int):
+        """``ttnn.linear`` of the gathered rows ``[1,B,rows,2560]`` by ``weight`` in the 32-row form's program: one
+        call at 32 rows; at 128 rows one call per 32-row tile (the tiles sliced along the rows, projected with the
+        32-row call's shapes, the outputs concatenated).  A 128-row ``ttnn.linear`` would pick its own matmul program,
+        and another K block order rounds the sums differently; per tile every row keeps the 32-row program and its
+        result."""
+
+        dram = ttnn.DRAM_MEMORY_CONFIG
+
+        def project(tile):
+            return ttnn.linear(
+                tile,
+                weight,
+                memory_config=dram,
+                dtype=ttnn.bfloat16,
+                compute_kernel_config=self.projection_compute_config,
+            )
+
+        if rows == ttnn.TILE_SIZE:
+            return project(gathered)
+        shape = _shape(gathered)
+        projected = []
+        for tile in range(rows // ttnn.TILE_SIZE):
+            rows_tile = ttnn.slice(
+                gathered,
+                (0, 0, tile * ttnn.TILE_SIZE, 0),
+                (shape[0], shape[1], (tile + 1) * ttnn.TILE_SIZE, shape[3]),
+                memory_config=dram,
+            )
+            projected.append(project(rows_tile))
+            ttnn.deallocate(rows_tile)
+        output = ttnn.concat(projected, dim=2, memory_config=dram)
+        for tile in projected:
+            ttnn.deallocate(tile)
         return output
 
 

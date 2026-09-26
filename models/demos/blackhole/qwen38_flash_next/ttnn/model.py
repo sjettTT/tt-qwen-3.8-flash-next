@@ -2708,12 +2708,13 @@ class Qwen38TTNNTextModel:
         rows-lane embedding, 48 layers in place, ``P += rows``.  No final mixer or LM head: the first decode
         replay after the prefill consumes the last prompt token.  ``gdn_step_anchor`` is every GDN layer's state
         re-anchor (the layer commits through ``commit_rows(step_committed_rows=True)``; a 32-row option).  ``mtp``
-        (the MTP-drafting server's chunk extension) runs the MTP layer's rows on the layer-47 residual rows before
-        they are released.  Any failure poisons this owner."""
+        (the MTP-drafting server's chunk extension of this chunk state's form, 32 or 128 rows) runs the MTP layer's
+        rows on the layer-47 residual rows before they are released.  Any failure poisons this owner."""
 
-        if mtp is not None and chunk_state.rows != CHUNK_ROWS:
+        if mtp is not None and mtp.rows != chunk_state.rows:
             raise ValueError(
-                f"the MTP chunk extension is the 32-row chunk's option, got a {chunk_state.rows}-row chunk"
+                f"the MTP chunk extension holds {mtp.rows} rows, the chunk state {chunk_state.rows}: the extension "
+                "of the chunk's form runs in its body"
             )
 
         self._validate_generic_state(state)

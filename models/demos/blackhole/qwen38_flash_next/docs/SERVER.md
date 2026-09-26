@@ -218,7 +218,7 @@ served (no CORS headers); a body needs `Content-Length`.
 | JIT kernel cache | about 1.3 GB | fills during the warm pass, two to four minutes cold |
 | host memory, first start | about 10 GB in flight | one MoE layer at a time; 64 GB is comfortable |
 | host memory, CPU reference (`tools/run_full_cpu_oracle.py`) | 170-240 GB | not a user step |
-| device DRAM free per bank after the captures, 32k | 1,603,483,392 bytes | QuietBox 2026-09-25 with the compact expert layout (largest contiguous 1,602,833,984); 1,531,678,912 with `--mtp 4` (71.8 MB less), 1,569,890,816 with `--long-chunks` (33.6 MB less); 474,261,568 / 375,594,496 / 439,384,896 before it (2026-09-06) |
+| device DRAM free per bank after the captures, 32k | 1,603,483,392 bytes | QuietBox 2026-09-25 with the compact expert layout (largest contiguous 1,602,833,984); 1,531,678,912 with `--mtp 4` (71.8 MB less), 1,569,890,816 with `--long-chunks` (33.6 MB less); with both, the MTP admission takes the 33.6 MB off the free bytes and adds the MTP layer's 128-row chunk extension (measured by the first `--mtp --long-chunks` open); 474,261,568 / 375,594,496 / 439,384,896 before it (2026-09-06) |
 | device DRAM free per bank, 64k | 419,440,704 bytes | QuietBox 2026-09-06, before the compact expert layout (which frees a further 1,146,621,952 bytes per bank at 32k) |
 | device DRAM free, 256k | about 750 MB per device | QuietBox 2026-09-06, before the compact expert layout; single-user; MTP did not fit then (94 MB free per bank against the 128 MiB contiguous it needs) |
 | the prompt-end snapshot | ~53 MB per device | resident; the recurrent part of the device state (above) |

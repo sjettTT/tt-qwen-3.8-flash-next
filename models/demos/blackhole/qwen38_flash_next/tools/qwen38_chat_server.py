@@ -1738,7 +1738,12 @@ def main() -> int:
     mtp_admission_table = (
         None
         if args.mtp is None
-        else mtp_capacity_admission(resident_context.allocated_context, drafts=args.mtp, verify_forms=len(forms))
+        else mtp_capacity_admission(
+            resident_context.allocated_context,
+            drafts=args.mtp,
+            verify_forms=len(forms),
+            long_chunks=bool(args.long_chunks),
+        )
     )
     if mtp_admission_table is not None:
         mtp_admission_table["verify_forms_captured"] = list(forms)
@@ -1952,6 +1957,7 @@ def main() -> int:
                     "anchor": chain.mtp.anchor,
                     "sampled": chain.mtp.sampled,
                     "traces": len(chain.mtp.captured_trace_ids()),
+                    "long_chunk_extension": chain.mtp.long_chunk_extension is not None,
                     "capture_ms": chain.mtp.capture_ms,
                     "trace_dram_bytes_per_bank": chain.mtp.trace_dram_bytes_per_bank,
                     "dram_bytes_per_bank": chain.mtp.dram_bytes_per_bank,

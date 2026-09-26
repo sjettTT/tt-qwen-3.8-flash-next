@@ -269,8 +269,10 @@ def test_driver_source_pins() -> None:
     assert "ttnn._ttnn_execute_trace(self.mesh, trace_id, cq_id=0, blocking=blocking)" in chunk
     assert (
         "self.model.forward_prefill_chunk_generic(\n"
-        "            chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor and short, mtp=self.mtp if short else None\n"
+        "            chunk_state, self.state, gdn_step_anchor=self.gdn_step_anchor and short, mtp=self._extension(kind)\n"
         "        )"
     ) in chunk
+    extension = inspect.getsource(Qwen38ChunkPrefill._extension)
+    assert 'return {"short": self.mtp, "long": self.long_mtp, "slab": None}[kind]' in extension
     assert 'short = kind == "short"' in chunk
     assert CHUNK_PAD_TOKEN_ID == 0 and driver_module.CHUNK_EVENT_INTERVAL == 4

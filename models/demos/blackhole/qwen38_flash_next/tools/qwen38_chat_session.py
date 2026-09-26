@@ -205,6 +205,17 @@ MTP_TRACES_BYTES_PER_BANK_PER_ADDITIONAL_VERIFY_FORM = 4_717_760
 MTP_VERIFY_FORMS_MAX = 3
 MTP_GROWTH_ESTIMATE_MARGIN_PERCENT = 10
 RESIDENT_POST_BUILD_BYTES_PER_BANK_UPPER_BOUND = 64 << 20
+# A --long-chunks build's 128-row chunk state and trace beyond the build the table and the post-build bound describe
+# (measured 2026-09-25 on the QuietBox at 32,768 with the compact expert layout: 1,603,483,392 bytes free per bank
+# without, 1,569,890,816 with --long-chunks): taken off the free side when the admission is for a --long-chunks chain
+# (the table's build had none; the live after-build read precedes their allocation).  And the MTP layer's own 128-row
+# chunk extension (its QSA chunk state, its rows-128 MoE instance without a combine buffer of its own, a [1,1,4,32]
+# token row) beyond the states remainder, a remainder of the states term with the same margin, measured 2026-09-26 on
+# the 4-chip p150 line at 32,768 with k = 4 and two verify forms as the states term of the --mtp --long-chunks chain's
+# DRAM growth record less the plain --mtp chain's (15,339,392 - 15,313,792 bytes per bank; components and traces
+# identical, 50,468,032 and 7,118,400 in both records).
+LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES = 1_603_483_392 - 1_569_890_816
+MTP_LONG_CHUNK_EXTENSION_BYTES_PER_BANK = 15_339_392 - 15_313_792
 RESIDENT_DRAM_BANKS = 8
 RESIDENT_MIN_CONTIGUOUS_BYTES_PER_BANK = 128 << 20
 RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES = {
@@ -232,6 +243,7 @@ def mtp_capacity_admission(
     ring_size: int = max(BLACKHOLE_RING_SIZES),
     live: Mapping[str, Any] | None = None,
     live_point: str = "after_build",
+    long_chunks: bool = False,
 ) -> dict[str, Any]:
     """Whether the MTP chain fits beside the resident build at ``allocated_context`` with ``drafts`` drafts per pass
     and ``verify_forms`` captured verify forms (1..:data:`MTP_VERIFY_FORMS_MAX`).  The required side is the estimate
@@ -250,7 +262,12 @@ def mtp_capacity_admission(
     them as they are.  Without ``live`` the 2026-09-04 table :data:`RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES`
     stands in (no device: the no-device tests).  Every byte count is in the record, the estimate by part beside the
     measured remainders it adds and ``decided_by`` naming the free side read and the required side's parts, with
-    the shortfalls of a refusal; ``fits`` decides."""
+    the shortfalls of a refusal; ``fits`` decides.
+
+    ``long_chunks`` (an ``--mtp --long-chunks`` chain) takes the 128-row chunk state and trace
+    (:data:`LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES`) off the free side where they are not yet in the reading (the
+    table, the live ``after_build`` read) and adds the MTP layer's 128-row extension
+    (:data:`MTP_LONG_CHUNK_EXTENSION_BYTES_PER_BANK`) to the states remainder."""
 
     if isinstance(drafts, bool) or type(drafts) is not int or not 1 <= drafts < CHUNK_ROWS:
         raise ValueError(f"MTP drafts must be an int in [1, {CHUNK_ROWS - 1}], got {drafts!r}")
@@ -260,6 +277,9 @@ def mtp_capacity_admission(
     context = Qwen38ResidentContext(allocated_context).allocated_context
     if live_point not in ("after_build", "after_captures"):
         raise ValueError(f"live_point must be after_build or after_captures, got {live_point!r}")
+    if type(long_chunks) is not bool:
+        raise ValueError(f"long_chunks must be a bool, got {long_chunks!r}")
+    long_chunks_bytes = LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES if long_chunks else 0
     if live is None:
         # A context below the smallest measured one (8,192: the batched lanes' small context) is admitted against the
         # smallest measured context's readings: its resident build leaves more room, so the admission is conservative.
@@ -267,6 +287,9 @@ def mtp_capacity_admission(
         if not measured_at:
             raise ValueError(f"no free-bytes-after-captures measurement at or above {context} tokens")
         free, largest = RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES[measured_at[0]]
+        # The table's build had no 128-row chunk state or trace: they come off its free bytes and, as an upper bound
+        # on what they take from the largest contiguous block, off that block too.
+        free, largest = free - long_chunks_bytes, max(largest - long_chunks_bytes, 0)
         source: dict[str, Any] = {
             "free_bytes_source": "table_2026-09-04",
             "free_bytes_measured_at_context": measured_at[0],
@@ -281,7 +304,11 @@ def mtp_capacity_admission(
         live_largest = int(live["largest_contiguous_bytes_free_per_bank"])
         if live_free < 0 or live_largest < 0 or live_largest > live_free:
             raise ValueError(f"inconsistent live DRAM view: free {live_free}, largest contiguous {live_largest}")
-        remaining = resident_post_build_bytes_per_bank(context) if live_point == "after_build" else 0
+        # After the build the 128-row chunk state and trace are still to come (they are allocated with the chunk
+        # states and captured after the chunk trace): with the resident's own remaining allocations, off both readings.
+        remaining = (
+            resident_post_build_bytes_per_bank(context) + long_chunks_bytes if live_point == "after_build" else 0
+        )
         free, largest = live_free - remaining, max(live_largest - remaining, 0)
         source = {
             "free_bytes_source": f"measured_{live_point}",
@@ -294,9 +321,11 @@ def mtp_capacity_admission(
     w01_per_bank = -(-(w01_bytes // BF4_TILE_BYTES) // RESIDENT_DRAM_BANKS) * BF4_TILE_BYTES
     w2_per_bank = -(-(w2_bytes // BF4_TILE_BYTES) // RESIDENT_DRAM_BANKS) * BF4_TILE_BYTES
     qsa_state = -(-Qwen38ResidentContext(allocated_context).qsa_generic_state_bytes // RESIDENT_DRAM_BANKS)
+    extension = MTP_LONG_CHUNK_EXTENSION_BYTES_PER_BANK if long_chunks else 0
     remainders = {
         "components_beyond_pair": MTP_COMPONENTS_BEYOND_PAIR_BYTES_PER_BANK,
         "states_beyond_qsa_state": MTP_STATES_BEYOND_QSA_STATE_BYTES_PER_BANK_BY_MOE_ROWS[moe_rows],
+        "long_chunk_extension": extension,
         "traces": MTP_TRACES_BYTES_PER_BANK_ONE_VERIFY_FORM
         + (verify_forms - 1) * MTP_TRACES_BYTES_PER_BANK_PER_ADDITIONAL_VERIFY_FORM,
         "traces_per_additional_verify_form": MTP_TRACES_BYTES_PER_BANK_PER_ADDITIONAL_VERIFY_FORM,
@@ -307,7 +336,7 @@ def mtp_capacity_admission(
 
     estimate = {
         "components": w01_per_bank + w2_per_bank + with_margin(remainders["components_beyond_pair"]),
-        "states": qsa_state + with_margin(remainders["states_beyond_qsa_state"]),
+        "states": qsa_state + with_margin(remainders["states_beyond_qsa_state"] + remainders["long_chunk_extension"]),
         "traces": with_margin(remainders["traces"]),
     }
     required = sum(estimate.values())
@@ -326,8 +355,11 @@ def mtp_capacity_admission(
         "mtp_moe_rows": moe_rows,
         "verify_forms": verify_forms,
         "ring_size": ring_size,
+        "long_chunks": long_chunks,
         "num_banks": RESIDENT_DRAM_BANKS,
         **source,
+        "long_chunks_bytes_per_bank_after_captures": long_chunks_bytes,
+        "mtp_long_chunk_extension_bytes_per_bank": extension,
         "free_bytes_per_bank_after_captures": free,
         "largest_contiguous_bytes_free_per_bank_after_captures": largest,
         "resident_pair_bytes_per_bank": w01_per_bank + w2_per_bank,
@@ -1500,8 +1532,9 @@ def open_partition_b_mesh(marker: Marker, hardware_profile: ResidentHardwareProf
 class Qwen38ChainMTP:
     """What an MTP-drafting chain adds (``mtp_v2``): the MTP components, the verify / draft states and their traces
     (``traces``: the fused verify, the commit and the draft; with ``sampled`` also ``split_traces``: the verify head
-    and tail with a draft of their own, the commit shared), the TAIL rows' step inputs, the chunk extension, the live
-    pass loop and the cumulative counters.
+    and tail with a draft of their own, the commit shared), the TAIL rows' step inputs, the chunk extension (and, on
+    a ``--long-chunks`` chain, its 128-row twin ``long_chunk_extension``), the live pass loop and the cumulative
+    counters.
 
     ``step_written`` tracks the TAIL contract: every TAIL reads the step inputs written for its step (a forced step
     writes the next prompt token; a device-token step selects the resolved argmax).
@@ -1514,6 +1547,7 @@ class Qwen38ChainMTP:
     draft: mtp_v2.Qwen38TTNNDraftState
     step_inputs: mtp_v2.Qwen38TTNNMTPStepInputs
     chunk_extension: mtp_v2.Qwen38TTNNMTPChunkExtension | None
+    long_chunk_extension: mtp_v2.Qwen38TTNNMTPChunkExtension | None = None
     traces: mtp_v2.Qwen38TTNNMTPTraces | None = None
     verify_output: mtp_v2.Qwen38TTNNVerifyOutput | None = None
     chain: mtp_v2.Qwen38TTNNMTPChain | None = None
@@ -1795,6 +1829,7 @@ class Qwen38TracedChain:
             mtp=None if self.mtp is None else self.mtp.chunk_extension,
             slab_state=self.slab_state,
             slab_trace_id=self.slab_trace_id,
+            long_mtp=None if self.mtp is None else self.mtp.long_chunk_extension,
         ).run(
             token_ids,
             start_position=start_position,
@@ -1917,9 +1952,10 @@ class Qwen38TracedChain:
         and the greedy row).  ``warm_hook`` runs after the warm pass, misses still allowed, on
         the open chain: a caller with an eager path of its own (the long-context chain's hidden windows) compiles
         its programs there.  ``mtp`` (off by default) builds the MTP components and allocates the verify / draft
-        states, the TAIL step inputs and the chunk extension before the warm pass, adds the MTP layer's row to
-        every TAIL and its rows to the chunk body, warms the pass loop and both mode switches at every position
-        residue, and captures the verify, commit and draft traces after the chunk trace.  ``mtp_sampled`` (needs
+        states, the TAIL step inputs and the chunk extension (with ``long_chunks`` its 128-row twin too) before the
+        warm pass, adds the MTP layer's row to every TAIL and its rows to the chunk bodies, warms the pass loop and
+        both mode switches at every position residue, and captures the verify, commit and draft traces after the
+        chunk traces.  ``mtp_sampled`` (needs
         ``mtp`` and ``sampling``) allocates the split verify's buffers beside the verify state, warms the split
         form in every round (the head, the greedy decision checked against the device lanes, the rows candidates
         against the eager rows gather, the tail; every op of the fused body runs in the head or the tail on tensors
@@ -1942,12 +1978,12 @@ class Qwen38TracedChain:
             raise ValueError(f"mtp drafts must be one of {MTP_DRAFTS} or None, got {mtp!r}")
         if mtp_gdn_anchor not in MTP_GDN_ANCHORS:
             raise ValueError(f"mtp_gdn_anchor must be one of {MTP_GDN_ANCHORS}, got {mtp_gdn_anchor!r}")
-        if long_chunks and mtp is not None:
-            raise ValueError(
-                "long chunks and MTP drafting are alternatives: the MTP chunk extension is a 32-row chunk option"
-            )
         if slab_rows is not None and (not is_slab_rows(slab_rows) or not long_chunks):
             raise ValueError(f"a prefill slab needs a slab row count and the long chunks, got {slab_rows!r}")
+        if slab_rows is not None and mtp is not None:
+            raise ValueError(
+                "a prefill slab and MTP drafting are alternatives: the MTP chunk extension has no slab form"
+            )
         if type(mtp_sampled) is not bool:
             raise ValueError(f"mtp_sampled must be a bool, got {mtp_sampled!r}")
         if mtp_sampled and (mtp is None or not sampling):
@@ -2016,6 +2052,7 @@ class Qwen38TracedChain:
                 ring_size=builder.identity.ring_size,
                 live=dram_free_view(),
                 verify_forms=len(forms),
+                long_chunks=long_chunks,
             )
             mtp_admission["verify_forms_captured"] = list(forms)
             # the record at the decision, admitted or not (READY carries it again; a refused or crashed open has only
@@ -2089,6 +2126,12 @@ class Qwen38TracedChain:
                 dram_bytes_per_bank=mtp_dram_bytes_per_bank,
                 sampled=mtp_sampled,
             )
+            if long_chunk_state is not None:
+                # The 128-row twin runs the MTP layer's rows inside the 128-row chunk body (base= the 32-row extension,
+                # the 128-row chunk state's shared combine buffer); it is part of the states term measured below.
+                chain_mtp.long_chunk_extension = mtp_v2.Qwen38TTNNMTPChunkExtension.allocate(
+                    model, verify, long_chunk_state, base=chain_mtp.chunk_extension
+                )
             synchronize()
             mtp_dram_bytes_per_bank["states"] = dram_allocated_per_bank() - allocated_before_mtp_states
         # The prompt-end snapshot buffers beside the states, before any capture (the tracker's post-capture check
@@ -2295,14 +2338,22 @@ class Qwen38TracedChain:
                 raise Qwen38ChatChainError(f"warm slab position counter {actual} vs expected {slab_rows}")
             marker("after-chat-slab-warm-pass")
         if long_chunks:
-            # One eager 128-row chunk from the reset state: its programs compile here, before the miss guard.
+            # One eager 128-row chunk from the reset state: its programs compile here, before the miss guard (with
+            # MTP the 128-row twin's too: the MTP layer's 128-row body, the mixer's 128-row form, the 128-row token
+            # rows' embedding; a program the capture asks for that no warm compiled is a miss under the guard).
             marker("before-chat-long-chunk-warm-pass")
+            long_chunk_extension = None if chain_mtp is None else chain_mtp.long_chunk_extension
             model.reset_generic_state_inplace(state)
             model.reset_chunk_state_inplace(state, chunk_state)
             model.reset_chunk_state_inplace(state, long_chunk_state)
             model.write_chunk_inputs(long_chunk_state, list(WARM_LONG_CHUNK_TOKEN_IDS), ple_context=None)
+            if long_chunk_extension is not None:
+                chain_mtp.alignment.layer.reset_generic_state_inplace(chain_mtp.alignment.generic_state)
+                chain_mtp.chunk_extension.reset_chunk()
+                long_chunk_extension.reset_chunk()
+                long_chunk_extension.write_tokens(model, [*WARM_LONG_CHUNK_TOKEN_IDS[1:], WARM_LONG_CHUNK_TOKEN_IDS[0]])
             synchronize()
-            model.forward_prefill_chunk_generic(long_chunk_state, state)
+            model.forward_prefill_chunk_generic(long_chunk_state, state, mtp=long_chunk_extension)
             synchronize()
             actual = state.position.read()
             if actual != LONG_CHUNK_ROWS:
@@ -2397,6 +2448,9 @@ class Qwen38TracedChain:
             if chain_mtp.chunk_extension is not None:
                 chain_mtp.chunk_extension.reset_chunk()
                 ttnn.mark_corruptible(chain_mtp.chunk_extension.token_row)
+            if chain_mtp.long_chunk_extension is not None:
+                chain_mtp.long_chunk_extension.reset_chunk()
+                ttnn.mark_corruptible(chain_mtp.long_chunk_extension.token_row)
         chain.program_cache_entries = resident_decode.program_cache_count(mesh)
         if chain.program_cache_entries <= 0:
             raise Qwen38ChatChainError("program cache is empty after the warm pass")
@@ -2524,10 +2578,12 @@ class Qwen38TracedChain:
                 state,
                 guard=lambda label: resident_decode.forbid_trace_body_host_io_and_sync(phase=f"chat long {label}"),
                 cq_id=0,
+                mtp=None if chain_mtp is None else chain_mtp.long_chunk_extension,
             )
             chain.long_chunk_capture_ms = (clock_ns() - long_chunk_capture_started_ns) / 1e6
             synchronize()
             marker("after-chat-long-chunk-capture")
+        dram_after_long_chunk = dram_allocated_per_bank()
         if slab_rows is not None:
             marker("before-chat-slab-capture")
             slab_capture_started_ns = clock_ns()
@@ -2541,6 +2597,10 @@ class Qwen38TracedChain:
             chain.slab_capture_ms = (clock_ns() - slab_capture_started_ns) / 1e6
             synchronize()
             marker("after-chat-slab-capture")
+        # Every prefill chunk trace is booked before the MTP captures: the MTP traces term of the growth record is what
+        # the verify / commit / draft captures add after the last prefill capture (the 128-row trace, MTP rows
+        # included, is its own term, as the 32-row chunk trace with the extension's rows always was).
+        dram_after_prefill_captures = dram_allocated_per_bank()
         if chain_mtp is not None:
             # The verify (first pass), commit and draft traces after the chunk trace, the fused form under both
             # switch values (a greedy request's traces: the QWEN38_MTP_SAMPLED=0 server's exactly); the draft body
@@ -2611,8 +2671,9 @@ class Qwen38TracedChain:
             chain_mtp.trace_dram_bytes_per_bank = {
                 "decode_traces": dram_after_decode - dram_before_captures,
                 "chunk_trace": dram_after_chunk - dram_after_decode,
-                "mtp_fused_traces": dram_after_fused - dram_after_chunk,
-                "mtp_traces": dram_after_mtp - dram_after_chunk,
+                "long_chunk_trace": dram_after_long_chunk - dram_after_chunk,
+                "mtp_fused_traces": dram_after_fused - dram_after_prefill_captures,
+                "mtp_traces": dram_after_mtp - dram_after_prefill_captures,
             }
             if chain_mtp.sampled:
                 chain_mtp.trace_dram_bytes_per_bank["mtp_split_traces"] = dram_after_mtp - dram_after_fused
@@ -2712,6 +2773,8 @@ class Qwen38TracedChain:
         if self.mtp is not None:
             # The MTP states before the chunk and generic states they sit beside.
             model = self.built_target.model
+            if self.mtp.long_chunk_extension is not None:  # before the 32-row twin it was allocated beside
+                self.mtp.long_chunk_extension.release()
             if self.mtp.chunk_extension is not None:
                 self.mtp.chunk_extension.release()
             self.mtp.step_inputs.deallocate()

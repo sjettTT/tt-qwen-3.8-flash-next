@@ -196,13 +196,21 @@ def test_final_mixer_lm_head_and_mtp_linears_run_the_weight_fidelity() -> None:
     assert (
         "dtype=ttnn.bfloat16,\n            layout=ttnn.ROW_MAJOR_LAYOUT" in io_loader
     )  # the embedding table stays BF16
+    # The one-row mixer's two direct linears; the rows form projects both weights through _project_rows (the 32-row
+    # call at 32 rows, per 32-row tile at 128), whose one linear carries the same fidelity.
     _check_module(
         mtp_module,
         ("self.weights.fc_embedding", "self.weights.fc_hidden"),
         "projection_compute_config",
-        4,
+        2,
         calls=("ttnn.linear",),
     )
+    rows = inspect.getsource(mtp_module.Qwen38TTNNMTPInput.rows)
+    assert "self._project_rows(full_embedding, self.weights.fc_embedding, rows=rows)" in rows
+    assert "self._project_rows(full_hidden, self.weights.fc_hidden, rows=rows)" in rows
+    project = inspect.getsource(mtp_module.Qwen38TTNNMTPInput._project_rows)
+    assert project.count("ttnn.linear(") == 1 and "compute_kernel_config=self.projection_compute_config" in project
+    assert "compute_kernel_config=self.compute_config" not in project
 
 
 def test_the_builder_hands_every_module_its_dtype() -> None:
