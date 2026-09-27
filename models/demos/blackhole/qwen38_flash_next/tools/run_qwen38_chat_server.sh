@@ -177,7 +177,6 @@ fi
 if [[ -n "$prefill_slab" ]]; then
     [[ "$prefill_slab" =~ ^[0-9]+$ && $((prefill_slab % 128)) == 0 && "$prefill_slab" -ge 256 && "$prefill_slab" -le 4096 ]] \
         || die "--prefill-slab takes a multiple of 128 in 256..4096, got $prefill_slab"
-    [[ -z "$mtp" ]] || die "--prefill-slab and --mtp are alternatives (the MTP chain prefills in 32-row chunks)"
     args+=(--prefill-slab "$prefill_slab")
 fi
 [[ -z "$sampling" ]] || args+=(--sampling)

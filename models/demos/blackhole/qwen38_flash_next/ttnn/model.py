@@ -55,6 +55,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn import qsa as qsa_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROW_COUNTS,
     CHUNK_ROWS,
+    LONG_CHUNK_ROWS,
     MESH_SHAPE,
     Qwen38MeshContract,
     Qwen38TTNNDevicePosition,
@@ -2708,10 +2709,18 @@ class Qwen38TTNNTextModel:
         rows-lane embedding, 48 layers in place, ``P += rows``.  No final mixer or LM head: the first decode
         replay after the prefill consumes the last prompt token.  ``gdn_step_anchor`` is every GDN layer's state
         re-anchor (the layer commits through ``commit_rows(step_committed_rows=True)``; a 32-row option).  ``mtp``
-        (the MTP-drafting server's chunk extension of this chunk state's form, 32 or 128 rows) runs the MTP layer's
-        rows on the layer-47 residual rows before they are released.  Any failure poisons this owner."""
+        (the MTP-drafting server's chunk extension of this chunk state's form, 32 or 128 rows; at slab rows the
+        128-row twin allocated with the slab form, which runs the slab as 128-row slices) runs the MTP layer's rows
+        on the layer-47 residual rows before they are released.  Any failure poisons this owner."""
 
-        if mtp is not None and mtp.rows != chunk_state.rows:
+        slab_mtp = mtp is not None and is_slab_rows(chunk_state.rows)
+        if slab_mtp and not (mtp.rows == LONG_CHUNK_ROWS and mtp.slab_rows == chunk_state.rows):
+            raise ValueError(
+                f"a {chunk_state.rows}-row slab with MTP drafting runs the {LONG_CHUNK_ROWS}-row twin's slab form "
+                f"(allocated with slab_rows={chunk_state.rows}), got a {mtp.rows}-row extension with slab_rows="
+                f"{mtp.slab_rows}"
+            )
+        if mtp is not None and not slab_mtp and mtp.rows != chunk_state.rows:
             raise ValueError(
                 f"the MTP chunk extension holds {mtp.rows} rows, the chunk state {chunk_state.rows}: the extension "
                 "of the chunk's form runs in its body"
@@ -2754,7 +2763,10 @@ class Qwen38TTNNTextModel:
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
             rope = self.rope_table.rows_chunk(index_rows, block_start_rows)
-            _deallocate_unique(index_row, index_tiles, block_index_tiles, index_rows, block_start_rows)
+            # The slab form of the MTP extension derives its slices' rows from the slab's index rows below.
+            _deallocate_unique(
+                index_row, index_tiles, block_index_tiles, *(() if slab_mtp else (index_rows, block_start_rows))
+            )
             qsa_chunk = qsa_module.derive_qsa_chunk_inputs(
                 state.position.scalar, self.qsa_position_constants, chunk_state.qsa_chunk_constants
             )
@@ -2773,7 +2785,17 @@ class Qwen38TTNNTextModel:
                     gdn_step_anchor=gdn_step_anchor,
                 )
                 processed_layers += 1
-            if mtp is not None:
+            if slab_mtp:
+                # The 128-row twin over the slab's layer-47 residual, slice by slice (mtp_v2: the slab form).
+                mtp.forward_slab_rows(
+                    self,
+                    residual,
+                    index_rows=index_rows,
+                    block_start_rows=block_start_rows,
+                    position_scalar=state.position.scalar,
+                )
+                _deallocate_unique(index_rows, block_start_rows)
+            elif mtp is not None:
                 mtp.forward_chunk_rows(
                     self,
                     residual,

@@ -662,6 +662,34 @@ def test_driver_rejects_a_slab_without_the_long_chunks_or_with_mtp(driver) -> No
             slab_state=states[SLAB],
             mtp=object(),
         )
+    # a slab with drafting needs the 128-row twin allocated with the slab form: the twin of another slab row count
+    # is refused, the matching one admitted (2026-09-26)
+    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
+        driver_module.Qwen38ChunkPrefill(
+            _FakeModel(),
+            object(),
+            object(),
+            states[32],
+            None,
+            forced_step=lambda t, c: c,
+            long_chunk_state=states[128],
+            slab_state=states[SLAB],
+            mtp=object(),
+            long_mtp=SimpleNamespace(rows=128, slab_rows=SLAB + 128),
+        )
+    admitted = driver_module.Qwen38ChunkPrefill(
+        _FakeModel(),
+        object(),
+        object(),
+        states[32],
+        None,
+        forced_step=lambda t, c: c,
+        long_chunk_state=states[128],
+        slab_state=states[SLAB],
+        mtp=object(),
+        long_mtp=SimpleNamespace(rows=128, slab_rows=SLAB),
+    )
+    assert admitted._extension("slab") is admitted.long_mtp and admitted._extension("long") is admitted.long_mtp
     assert driver_module.slab_count(5000, slab_rows=SLAB) == 2 and driver_module.slab_count(5000, slab_rows=None) == 0
 
 
@@ -846,3 +874,28 @@ def test_slab_chunk_state_allocates_the_combine_buffer_the_slab_writes(monkeypat
     )
     combine = inspect.getsource(moe_module.allocate_local_combine_output)
     assert "admitted_rows=SUPPORTED_ROWS + ((rows,) if is_slab_rows(rows) else ())" in combine
+
+
+def test_a_slab_record_replays_only_on_a_server_with_a_prefill_slab() -> None:
+    """An acceptance record of 2048 or more prompt tokens (the slab record) exists to run a slab: a server without
+    --prefill-slab skips it by name and keeps every other record in order; a server with a slab replays them all.
+    main() applies the rule right after loading the records."""
+
+    import inspect
+
+    from models.demos.blackhole.qwen38_flash_next.tools import qwen38_chat_server as chat_server
+
+    records = [
+        {"prompt": "json", "prompt_token_ids": [1] * 85},
+        {"prompt": "document", "prompt_token_ids": [1] * 2160},
+        {"prompt": "sky", "prompt_token_ids": [1] * 37},
+    ]
+    assert chat_server.ACCEPTANCE_SLAB_RECORD_TOKENS == 2048
+    assert [record["prompt"] for record in chat_server.slab_records_admitted(records, slab_rows=None)] == [
+        "json",
+        "sky",
+    ]
+    assert chat_server.slab_records_admitted(records, slab_rows=2048) == records
+    assert chat_server.slab_records_admitted(records, slab_rows=4096) == records
+    source = inspect.getsource(chat_server.main)
+    assert "records = slab_records_admitted(records, slab_rows=args.prefill_slab)" in source

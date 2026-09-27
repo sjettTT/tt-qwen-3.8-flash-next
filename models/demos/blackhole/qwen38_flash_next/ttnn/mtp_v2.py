@@ -57,8 +57,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn import qsa as qsa_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROW_COUNTS,
     CHUNK_ROWS,
+    LONG_CHUNK_ROWS,
     MESH_SHAPE,
     Qwen38MeshContract,
+    is_slab_rows,
     replicate_tensor_2d_mesh_mapper,
     same_buffer,
     tensor_metadata,
@@ -3097,6 +3099,17 @@ class Qwen38TTNNMTPChunkExtension:
     layer_chunk_state: Any
     token_row: Any
     rows: int = CHUNK_ROWS
+    # The slab form of the 128-row twin (a ``--prefill-slab`` chain under ``--mtp``, 2026-09-26): the twin runs the
+    # MTP layer's rows of a slab as ``slab_rows / 128`` slices of 128 inside the slab body, each slice the 128-row
+    # form exactly (its residual rows sliced from the slab's layer-47 residual, its RoPE and QSA chunk inputs derived
+    # at ``P + 128 i`` from the slab body's own index rows and the position scalar, its 128 MTP tokens from one of
+    # ``slab_token_rows``: one 128-lane tile per slice, host-written per slab).  ``qsa_chunk_constants`` are the
+    # 128-row chunk state's (the slices derive their QSA inputs with them); ``slab_position_offsets`` the UINT32
+    # ``[1,1,1,1]`` scalars 128 i for i >= 1.  Empty on the 32-row twin and on a chain without slabs.
+    slab_rows: int = 0
+    slab_token_rows: tuple = ()
+    slab_position_offsets: tuple = ()
+    qsa_chunk_constants: Any = None
 
     @classmethod
     def allocate(
@@ -3106,11 +3119,18 @@ class Qwen38TTNNMTPChunkExtension:
         chunk_state,
         *,
         base: "Qwen38TTNNMTPChunkExtension | None" = None,
+        slab_rows: int | None = None,
     ) -> "Qwen38TTNNMTPChunkExtension":
         """The extension of ``chunk_state``'s form: the 32-row chunk state takes no ``base``; the 128-row chunk state
-        needs ``base``, the chain's 32-row extension (the hand-off form), and lends its shared MoE combine buffer."""
+        needs ``base``, the chain's 32-row extension (the hand-off form), and lends its shared MoE combine buffer.
+        ``slab_rows`` (the 128-row twin only) adds the slab form: the slab's MTP token tiles and position offsets."""
 
         _validate_verify_state(model, verify)
+        if slab_rows is not None and (not is_slab_rows(slab_rows) or int(chunk_state.rows) != LONG_CHUNK_ROWS):
+            raise ValueError(
+                f"the slab form belongs to the {LONG_CHUNK_ROWS}-row twin and takes a slab row count, "
+                f"got {slab_rows!r} on a {chunk_state.rows}-row chunk state"
+            )
         if verify.alignment is None:
             raise ValueError("the MTP chunk extension needs the verify state's MTP alignment components")
         rows = int(chunk_state.rows)
@@ -3131,18 +3151,49 @@ class Qwen38TTNNMTPChunkExtension:
             base=None if base is None else base.layer_chunk_state,
             local_combine_output=chunk_state.local_combine_output,
         )
+        allocated: list[Any] = []
         try:
             token_row = model.model_io.embedding.upload_token_rows(rows)
+            allocated.append(token_row)
+            slab_token_rows: list[Any] = []
+            slab_position_offsets: list[Any] = []
+            if slab_rows is not None:
+                for index in range(slab_rows // LONG_CHUNK_ROWS):
+                    slab_token_rows.append(model.model_io.embedding.upload_token_rows(LONG_CHUNK_ROWS))
+                    allocated.append(slab_token_rows[-1])
+                    if index:
+                        offset = ttnn.from_torch(
+                            torch.full((1, 1, 1, 1), index * LONG_CHUNK_ROWS, dtype=torch.int64).to(torch.uint32),
+                            dtype=ttnn.uint32,
+                            layout=ttnn.ROW_MAJOR_LAYOUT,
+                            device=model.mesh_device,
+                            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                            mesh_mapper=replicate_tensor_2d_mesh_mapper(model.mesh_device),
+                        )
+                        slab_position_offsets.append(offset)
+                        allocated.append(offset)
         except BaseException:
+            _deallocate(*allocated)
             verify.alignment.layer.release_chunk_state(layer_chunk_state)
             raise
-        return cls(verify.alignment, layer_chunk_state, token_row, rows)
+        return cls(
+            verify.alignment,
+            layer_chunk_state,
+            token_row,
+            rows,
+            slab_rows=0 if slab_rows is None else int(slab_rows),
+            slab_token_rows=tuple(slab_token_rows),
+            slab_position_offsets=tuple(slab_position_offsets),
+            qsa_chunk_constants=chunk_state.qsa_chunk_constants if slab_rows is not None else None,
+        )
 
     def release(self) -> None:
         _run_cleanup(
             "MTP chunk extension",
             [
                 ("MTP chunk token row", lambda: _deallocate(self.token_row)),
+                ("MTP slab token rows", lambda: _deallocate(*self.slab_token_rows)),
+                ("MTP slab position offsets", lambda: _deallocate(*self.slab_position_offsets)),
                 ("MTP layer chunk state", lambda: self.alignment.layer.release_chunk_state(self.layer_chunk_state)),
             ],
         )
@@ -3166,19 +3217,119 @@ class Qwen38TTNNMTPChunkExtension:
             self.token_row,
         )
 
+    def write_slab_tokens(self, model: Qwen38TTNNTextModel, token_ids: Sequence[int]) -> None:
+        """Host write of a slab's ``slab_rows`` MTP tokens (the tokens at P + 1 .. P + slab_rows) into the slab token
+        tiles, 128 per slice (the slab form of :meth:`write_tokens`)."""
+
+        if not self.slab_rows:
+            raise ValueError("this MTP chunk extension has no slab form (allocate it with slab_rows)")
+        token_ids = [int(token) for token in token_ids]
+        if len(token_ids) != self.slab_rows:
+            raise ValueError(f"a {self.slab_rows}-row MTP slab takes {self.slab_rows} tokens, got {len(token_ids)}")
+        for index, tile in enumerate(self.slab_token_rows):
+            ttnn.copy_host_to_device_tensor(
+                ttnn.from_torch(
+                    model.model_io.embedding.host_token_rows(
+                        token_ids[index * LONG_CHUNK_ROWS : (index + 1) * LONG_CHUNK_ROWS]
+                    ),
+                    dtype=ttnn.float32,
+                    layout=ttnn.TILE_LAYOUT,
+                    mesh_mapper=replicate_tensor_2d_mesh_mapper(model.mesh_device),
+                ),
+                tile,
+            )
+
+    def forward_slab_rows(
+        self, model: Qwen38TTNNTextModel, residual_rows, *, index_rows, block_start_rows, position_scalar
+    ):
+        """The MTP layer's rows of a slab, inside the slab body after layer 47: ``slab_rows / 128`` slices, each the
+        128-row form of :meth:`forward_chunk_rows` exactly -- the slice's residual rows cut from the slab's ``[1,4,S,640]``
+        layer-47 residual (not consumed), its RoPE rows from the slab body's ``index_rows`` ``[1,1,S/32,32]`` and
+        ``block_start_rows`` ``[1,1,S/128,32]`` (the four index tiles and the one block-start tile of the slice: the
+        128-row body's own rows at ``P + 128 i``, exact UINT32), its QSA chunk inputs derived from the position scalar
+        plus ``128 i`` with the 128-row chunk constants, its MTP tokens from the slice's tile of ``slab_token_rows``.
+        The MTP layer's KV rows land at the same positions the 128-row chunks would write them."""
+
+        if self.rows != LONG_CHUNK_ROWS or not self.slab_rows:
+            raise ValueError("the slab form runs on the 128-row MTP chunk extension allocated with slab_rows")
+        residual_shape = (1, RESIDUAL_BRANCHES, self.slab_rows, LOCAL_HIDDEN_SIZE)
+        if _shape(residual_rows) != residual_shape:
+            raise RuntimeError(f"MTP slab roots must be {residual_shape}, got {tensor_metadata(residual_rows)}")
+        slices = self.slab_rows // LONG_CHUNK_ROWS
+        tiles_per_slice = LONG_CHUNK_ROWS // ttnn.TILE_SIZE
+        index_shape = (1, 1, slices * tiles_per_slice, ttnn.TILE_SIZE)
+        block_shape = (1, 1, slices, ttnn.TILE_SIZE)
+        if _shape(index_rows) != index_shape or _shape(block_start_rows) != block_shape:
+            raise RuntimeError(
+                f"MTP slab index rows must be {index_shape} and block starts {block_shape}, got "
+                f"{tensor_metadata(index_rows)} and {tensor_metadata(block_start_rows)}"
+            )
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        for index in range(slices):
+            first_row = index * LONG_CHUNK_ROWS
+            residual_slice = ttnn.slice(
+                residual_rows,
+                (0, 0, first_row, 0),
+                (1, RESIDUAL_BRANCHES, first_row + LONG_CHUNK_ROWS, LOCAL_HIDDEN_SIZE),
+                memory_config=dram,
+            )
+            index_slice = ttnn.slice(
+                index_rows,
+                (0, 0, index * tiles_per_slice, 0),
+                (1, 1, (index + 1) * tiles_per_slice, ttnn.TILE_SIZE),
+                memory_config=dram,
+            )
+            block_slice = ttnn.slice(
+                block_start_rows, (0, 0, index, 0), (1, 1, index + 1, ttnn.TILE_SIZE), memory_config=dram
+            )
+            scalar = (
+                position_scalar
+                if index == 0
+                else ttnn.add(position_scalar, self.slab_position_offsets[index - 1], memory_config=dram)
+            )
+            rope_rows = model.rope_table.rows_chunk(index_slice, block_slice)
+            qsa_chunk = qsa_module.derive_qsa_chunk_inputs(
+                scalar, model.qsa_position_constants, self.qsa_chunk_constants
+            )
+            self.forward_chunk_rows(
+                model,
+                residual_slice,
+                rope_rows=rope_rows,
+                qsa_chunk=qsa_chunk,
+                qsa_chunk_constants=self.qsa_chunk_constants,
+                selectors=None,
+                token_row=self.slab_token_rows[index],
+            )
+            qsa_chunk.deallocate()
+            rope_rows.deallocate()
+            _deallocate(residual_slice, index_slice, block_slice)
+            if index:
+                _deallocate(scalar)
+
     def forward_chunk_rows(
-        self, model: Qwen38TTNNTextModel, residual_rows, *, rope_rows, qsa_chunk, qsa_chunk_constants, selectors
+        self,
+        model: Qwen38TTNNTextModel,
+        residual_rows,
+        *,
+        rope_rows,
+        qsa_chunk,
+        qsa_chunk_constants,
+        selectors,
+        token_row=None,
     ):
         """The MTP layer's rows at the chunk's positions: the token rows' embedding mixed with the chunk's layer-47
         residual rows (not consumed), through the layer's chunk body on the MTP generic and chunk states.  The roots
         are ``[1,4,rows,640]`` and the embedding ``[1,1,rows,640]`` for this extension's ``rows``; ``selectors`` is
-        the chunk's (the 32-row form's accept selectors, None at 128 rows), as the backbone's layers receive it."""
+        the chunk's (the 32-row form's accept selectors, None at 128 rows), as the backbone's layers receive it.
+        ``token_row`` (the slab form) names the token tile to embed instead of this extension's own."""
 
         residual_shape = (1, RESIDUAL_BRANCHES, self.rows, LOCAL_HIDDEN_SIZE)
         embedding_shape = (1, 1, self.rows, LOCAL_HIDDEN_SIZE)
         if _shape(residual_rows) != residual_shape:
             raise RuntimeError(f"MTP chunk roots must be {residual_shape}, got {tensor_metadata(residual_rows)}")
-        embedding_rows = model.model_io.embedding.embed_device_token_rows(self.token_row)
+        embedding_rows = model.model_io.embedding.embed_device_token_rows(
+            self.token_row if token_row is None else token_row
+        )
         if _shape(embedding_rows) != embedding_shape:
             raise RuntimeError(f"MTP chunk embedding rows must be {embedding_shape}, got {_shape(embedding_rows)}")
         mixed = self.alignment.input_mixer.rows(embedding_rows, residual_rows)

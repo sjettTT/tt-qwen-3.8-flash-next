@@ -273,6 +273,6 @@ def test_driver_source_pins() -> None:
         "        )"
     ) in chunk
     extension = inspect.getsource(Qwen38ChunkPrefill._extension)
-    assert 'return {"short": self.mtp, "long": self.long_mtp, "slab": None}[kind]' in extension
+    assert 'return {"short": self.mtp, "long": self.long_mtp, "slab": self.long_mtp}[kind]' in extension
     assert 'short = kind == "short"' in chunk
     assert CHUNK_PAD_TOKEN_ID == 0 and driver_module.CHUNK_EVENT_INTERVAL == 4

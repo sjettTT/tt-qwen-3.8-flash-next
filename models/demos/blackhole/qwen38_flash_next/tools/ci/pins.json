@@ -65,6 +65,16 @@
     "sampling": true
    }
   },
+  "slab2048-mtp4-32k": {
+   "description": "chunked prefill with the 2048-row prefill slab and MTP drafting k=4 (--prefill-slab 2048 --mtp 4: the 128-row MTP chunk extension's slab form runs the slab's MTP rows inside the slab body), 32768 context",
+   "server": {
+    "allocated_context": 32768,
+    "mtp": 4,
+    "prefill_mode": "chunked",
+    "prefill_slab": 2048,
+    "sampling": true
+   }
+  },
   "thinking-medium": {
    "description": "eval rows at the shipped request defaults (thinking on, reasoning_effort=medium), greedy, max_tokens 1536",
    "request": {
@@ -432,6 +442,49 @@
    "target": true
   },
   "A3/slab2048-32k/requests_incomplete": {
+   "note": "every probe request finishes with stop or length",
+   "rule": "exact",
+   "status": "active",
+   "target": 0
+  },
+  "A3/slab2048-mtp4-32k/device_token_ids_sha256": {
+   "baseline": true,
+   "note": "a differing stream without an earlier index is a numerics-class change: A1 full before merge",
+   "rule": "exact",
+   "severity": "info",
+   "status": "todo"
+  },
+  "A3/slab2048-mtp4-32k/divergence_index": {
+   "baseline": true,
+   "note": "per record the first index where the device leaves the CPU greedy stream; null is the largest; never earlier than the baseline",
+   "rule": "not_earlier",
+   "status": "todo"
+  },
+  "A3/slab2048-mtp4-32k/echo_verbatim": {
+   "note": "the coherence guard: the sentence echoed verbatim at temperature 0",
+   "rule": "exact",
+   "status": "active",
+   "target": true
+  },
+  "A3/slab2048-mtp4-32k/gate_compared_tokens": {
+   "rule": "exact",
+   "status": "active",
+   "target": 96
+  },
+  "A3/slab2048-mtp4-32k/gate_pass": {
+   "note": "the json record replays 96/96 CPU greedy tokens (--require-json-96)",
+   "rule": "exact",
+   "status": "active",
+   "target": true
+  },
+  "A3/slab2048-mtp4-32k/handoff_pass": {
+   "note": "the split hand-off gate: MTP then 1-row and 1-row then MTP both reproduce the json stream",
+   "optional": true,
+   "rule": "exact",
+   "status": "active",
+   "target": true
+  },
+  "A3/slab2048-mtp4-32k/requests_incomplete": {
    "note": "every probe request finishes with stop or length",
    "rule": "exact",
    "status": "active",

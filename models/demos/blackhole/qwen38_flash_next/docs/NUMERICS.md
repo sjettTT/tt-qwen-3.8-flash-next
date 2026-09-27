@@ -218,6 +218,29 @@ four blocks instead of three (2026-09-26): 10.88 -> 10.68 us per distinct local 
 five and six blocks and dual-NoC reads are no better -- the ring core's stream is paced by its one DRAM bank (about
 36 GB/s of the channel's 64); the prefill ring forms keep three (their L1 has no room for a fourth).
 
+The MTP layer's rows after a slab prefill (`--prefill-slab` with `--mtp`, 2026-09-26) are the 128-row twin's slab form:
+every slice is the 128-row chunk extension's exact arithmetic (bitwise per row against the 128-row chunks given the same
+input rows), but its input is the slab body's layer-47 residual, which is tolerance-class against the chunk bodies, so
+the MTP layer's KV cache and the MTP stream after a slab prefill are tolerance-class against the chunked prefill's -- the
+same class as the target's own state after a slab.  They carry their own pinned table (`A3-slab2048-mtp4-32k`: the twelve study
+records' and the slab record's divergence indices and token-stream digests under `--mtp 4 --prefill-slab 2048`, generated
+at the landing head and asserted identical on every later run) beside the target's `A3-slab2048-32k`.  The 1x4 proof
+(a development tool, run 2026-09-27 on the fixed body): the slab body with the twin is bitwise run to run on the target's
+84 state buffers, its 97 hand-off buffers and the MTP layer's 4 (three runs, the process's first slab body among them) and
+bitwise to the body without the twin; the MTP layer's KV rows after the slab differ from the 16 x 128-row chunk bodies'
+by at most 10.20 where the target's own slab-vs-chunks difference in the same run is 17.22 (the class holds), the
+hand-off's integer fields are identical, and the slice form is bitwise to the 128-row form on identical residual rows.
+Measured 2026-09-27 on the 1x4 p150 line at the landing head (e60ad5151037), `--prefill-slab 2048 --mtp 4` against
+`--prefill-slab 2048` on the same build (one cold request per row as the server's first requests, 32 completion
+tokens, host-timed TTFT): 2,100 prompt tokens 1.093 against 0.983 s, 20,860 tokens 7.701 against 6.713 s, 31,714
+tokens 11.991 against 10.504 s -- +0.053 / +0.047 / +0.047 ms per prompt token, +110 / +99 / +99 ms per 2048-row slab
+for the twin's 16 traced slices (1 / 10 / 15 slabs; the slab's 3,019 tok/s becomes 2,645). The 560-token chat prompt
+decodes at 62.6 tok/s greedy (3.12 tokens per pass; 37.9 plain) and the sampled card profile at 19.74 ms per token
+(25.78 plain); the acceptance replay pins the twelve study records 12/12 to the `--mtp 4` table (they stay under 2048
+prompt tokens, so no slab fires on them) and the slab record (`document`, 2,228 prompt tokens, one slab) at divergence
+index 12 (stream sha 9beadb60...) under `--mtp 4`, against 12 (7d56a970...) for the plain slab: the only pin
+exercising a slab body under MTP.
+
 ## The slab's block-shared attention (`QWEN38_FUSED=sparse_sdpa_tiled`, 2026-09-25)
 
 A tolerance-class fused kernel, opt-in: `sparse_sdpa_tiled` replaces the prefill slab's block-id expansion, zero V
@@ -245,8 +268,10 @@ attention class of one slab is 5.5x shorter than the chain's (89.77 -> 16.28 ms)
 
 ## The acceptance mechanism
 
-`--acceptance` replays the twelve shipped CPU greedy records under `tools/acceptance/greedy-prompts/` against the CPU
-before the server listens.  `--require-json-96` refuses to serve unless the `json` record matches the CPU 96/96 (the
+`--acceptance` replays the shipped CPU greedy records under `tools/acceptance/greedy-prompts/` against the CPU before
+the server listens: the twelve study records, and on a server with a prefill slab the slab record
+(`prompt-document-greedy.json`, 2,228 prompt tokens, a document made of the twelve records' answers: the only record
+that runs a slab).  `--require-json-96` refuses to serve unless the `json` record matches the CPU 96/96 (the
 other records diverge from the CPU after 2-75 tokens, the known greedy-prompt pattern; their first divergence index is
 in `acceptance.json` in the run directory).  The records were rendered by the CPU study with the system prompt
 `You are a helpful assistant.`; that system turn is inside their recorded prompt ids, which the replay feeds to the

@@ -249,6 +249,21 @@ RESIDENT_POST_BUILD_BYTES_PER_BANK_UPPER_BOUND = 64 << 20
 # identical, 50,468,032 and 7,118,400 in both records).
 LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES = 1_603_483_392 - 1_569_890_816
 MTP_LONG_CHUNK_EXTENSION_BYTES_PER_BANK = 15_339_392 - 15_313_792
+# The 128-row twin's slab form (2026-09-26): per 128-row slice one FP32 TILE token tile ``[1,1,4,32]`` (one 32 x 32 tile
+# page of 4,096 bytes) and, after the first slice, one UINT32 ``[1,1,1,1]`` position offset (one 32-byte DRAM page).
+MTP_SLAB_TOKEN_TILE_BYTES = 32 * 32 * 4
+MTP_SLAB_OFFSET_PAGE_BYTES = 32
+
+
+def mtp_slab_form_bytes_per_bank(slab_rows: int) -> int:
+    """The slab form's DRAM per bank as an upper bound: every page on one bank (the pages are interleaved)."""
+
+    if not is_slab_rows(slab_rows):
+        raise ValueError(f"slab_rows must be a slab row count, got {slab_rows!r}")
+    slices = slab_rows // LONG_CHUNK_ROWS
+    return slices * MTP_SLAB_TOKEN_TILE_BYTES + (slices - 1) * MTP_SLAB_OFFSET_PAGE_BYTES
+
+
 RESIDENT_DRAM_BANKS = 8
 RESIDENT_MIN_CONTIGUOUS_BYTES_PER_BANK = 128 << 20
 RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES = {
@@ -306,6 +321,7 @@ def mtp_capacity_admission(
     moe_rows: int | None = None,
     components_shared: bool = False,
     gdn_rows_scan: bool = False,
+    slab_rows: int | None = None,
 ) -> dict[str, Any]:
     """Whether the MTP chain fits beside the resident build at ``allocated_context`` with ``drafts`` drafts per pass
     and ``verify_forms`` captured verify forms (1..:data:`MTP_VERIFY_FORMS_MAX`).  The required side is the estimate
@@ -351,6 +367,8 @@ def mtp_capacity_admission(
         raise ValueError(f"long_chunks must be a bool, got {long_chunks!r}")
     if type(gdn_rows_scan) is not bool:
         raise ValueError(f"gdn_rows_scan must be a bool, got {gdn_rows_scan!r}")
+    if slab_rows is not None and (not is_slab_rows(slab_rows) or not long_chunks):
+        raise ValueError(f"slab_rows takes a slab row count with long_chunks, got {slab_rows!r}")
     long_chunks_bytes = LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES if long_chunks else 0
     if live is None:
         # A context below the smallest measured one (8,192: the batched lanes' small context) is admitted against the
@@ -393,7 +411,11 @@ def mtp_capacity_admission(
     w01_per_bank = -(-(w01_bytes // BF4_TILE_BYTES) // RESIDENT_DRAM_BANKS) * BF4_TILE_BYTES
     w2_per_bank = -(-(w2_bytes // BF4_TILE_BYTES) // RESIDENT_DRAM_BANKS) * BF4_TILE_BYTES
     qsa_state = -(-Qwen38ResidentContext(allocated_context).qsa_generic_state_bytes // RESIDENT_DRAM_BANKS)
-    extension = MTP_LONG_CHUNK_EXTENSION_BYTES_PER_BANK if long_chunks else 0
+    # ``slab_rows`` (a ``--prefill-slab`` chain under ``--mtp``): the 128-row twin's slab form adds one 128-lane FP32
+    # token tile (one 32x32 tile page) per 128-row slice and one UINT32 position-offset page per slice after the first,
+    # charged whole to one bank (an upper bound: the pages are interleaved over the banks).
+    slab_form = mtp_slab_form_bytes_per_bank(slab_rows) if slab_rows is not None else 0
+    extension = (MTP_LONG_CHUNK_EXTENSION_BYTES_PER_BANK if long_chunks else 0) + slab_form
     prefix_states = fold_prefix_states_bytes_per_bank(drafts) if gdn_rows_scan else 0
     remainders = {
         "components_beyond_pair": MTP_COMPONENTS_BEYOND_PAIR_BYTES_PER_BANK,
@@ -453,6 +475,8 @@ def mtp_capacity_admission(
         **source,
         "long_chunks_bytes_per_bank_after_captures": long_chunks_bytes,
         "mtp_long_chunk_extension_bytes_per_bank": extension,
+        "mtp_slab_form_bytes_per_bank": slab_form,
+        "slab_rows": slab_rows,
         "mtp_gdn_prefix_states_bytes_per_bank": prefix_states,
         "free_bytes_per_bank_after_captures": free,
         "largest_contiguous_bytes_free_per_bank_after_captures": largest,
@@ -2258,10 +2282,8 @@ class Qwen38TracedChain:
             raise ValueError(f"mtp_gdn_anchor must be one of {MTP_GDN_ANCHORS}, got {mtp_gdn_anchor!r}")
         if slab_rows is not None and (not is_slab_rows(slab_rows) or not long_chunks):
             raise ValueError(f"a prefill slab needs a slab row count and the long chunks, got {slab_rows!r}")
-        if slab_rows is not None and mtp is not None:
-            raise ValueError(
-                "a prefill slab and MTP drafting are alternatives: the MTP chunk extension has no slab form"
-            )
+        # A prefill slab with MTP drafting runs the MTP layer's rows through the 128-row twin's slab form (2026-09-26:
+        # the slab as 128-row slices inside the slab body); the slab already requires the long chunks, so the twin exists.
         if type(mtp_sampled) is not bool:
             raise ValueError(f"mtp_sampled must be a bool, got {mtp_sampled!r}")
         if mtp_sampled and (mtp is None or not sampling):
@@ -2339,6 +2361,7 @@ class Qwen38TracedChain:
                 live=dram_free_view(),
                 verify_forms=len(forms),
                 long_chunks=long_chunks,
+                slab_rows=slab_rows,  # the twin's slab form under --prefill-slab: the default chain's
                 gdn_rows_scan=fused_module.enabled(gdn_rows_scan_module.NAME),
                 moe_rows=mtp_moe_rows,
             )
@@ -2424,7 +2447,7 @@ class Qwen38TracedChain:
                 # The 128-row twin runs the MTP layer's rows inside the 128-row chunk body (base= the 32-row extension,
                 # the 128-row chunk state's shared combine buffer); it is part of the states term measured below.
                 chain_mtp.long_chunk_extension = mtp_v2.Qwen38TTNNMTPChunkExtension.allocate(
-                    model, verify, long_chunk_state, base=chain_mtp.chunk_extension
+                    model, verify, long_chunk_state, base=chain_mtp.chunk_extension, slab_rows=slab_rows
                 )
             synchronize()
             mtp_dram_bytes_per_bank["states"] = dram_allocated_per_bank() - allocated_before_mtp_states
@@ -2756,14 +2779,20 @@ class Qwen38TracedChain:
         if slab_rows is not None:
             # One eager slab from the reset state: its programs compile here, before the miss guard.
             marker("before-chat-slab-warm-pass")
+            slab_extension = None if chain_mtp is None else chain_mtp.long_chunk_extension
             model.reset_generic_state_inplace(state)
             model.reset_chunk_state_inplace(state, chunk_state)
             model.reset_chunk_state_inplace(state, slab_state)
-            model.write_chunk_inputs(
-                slab_state, list(WARM_LONG_CHUNK_TOKEN_IDS) * (slab_rows // LONG_CHUNK_ROWS), ple_context=None
-            )
+            warm_slab_tokens = list(WARM_LONG_CHUNK_TOKEN_IDS) * (slab_rows // LONG_CHUNK_ROWS)
+            model.write_chunk_inputs(slab_state, warm_slab_tokens, ple_context=None)
+            if slab_extension is not None:
+                # With MTP the 128-row twin's slab form compiles here too (its slices' programs are the 128-row body's).
+                chain_mtp.alignment.layer.reset_generic_state_inplace(chain_mtp.alignment.generic_state)
+                chain_mtp.chunk_extension.reset_chunk()
+                slab_extension.reset_chunk()
+                slab_extension.write_slab_tokens(model, [*warm_slab_tokens[1:], warm_slab_tokens[0]])
             synchronize()
-            model.forward_prefill_chunk_generic(slab_state, state)
+            model.forward_prefill_chunk_generic(slab_state, state, mtp=slab_extension)
             synchronize()
             actual = state.position.read()
             if actual != slab_rows:
@@ -3025,6 +3054,7 @@ class Qwen38TracedChain:
                 state,
                 guard=lambda label: resident_decode.forbid_trace_body_host_io_and_sync(phase=f"chat slab {label}"),
                 cq_id=0,
+                mtp=None if chain_mtp is None else chain_mtp.long_chunk_extension,
             )
             chain.slab_capture_ms = (clock_ns() - slab_capture_started_ns) / 1e6
             synchronize()

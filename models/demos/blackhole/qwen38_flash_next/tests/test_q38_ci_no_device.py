@@ -1070,12 +1070,27 @@ def test_committed_baselines_belong_to_baseline_pins_and_carry_their_source():
         "story": 6,
         "summary": 75,
     }
-    mtp4 = ci.load_baseline("A3/mtp4-32k/divergence_index")["expected"]
+    mtp4_table = {
+        m: ci.load_baseline(f"A3/mtp4-32k/{m}")["expected"] for m in ("divergence_index", "device_token_ids_sha256")
+    }
+    mtp4 = mtp4_table["divergence_index"]
     assert set(mtp4) == set(chunked) and mtp4["json"] is None
     # the same replay through the MTP pass loop: later on chat and math, earlier on summary, where the device's own
     # logits hold the two candidates within one bf16 step (the verify row and the 1-row TAIL break the tie apart; the
     # fused GDN step serves the one-row step only)
     assert mtp4 == {**chunked, "chat": 43, "math": 63, "summary": 1}
+    # the slab tables (--prefill-slab 2048 with and without --mtp 4) carry a thirteenth row, the slab record: the one
+    # acceptance record long enough to run a 2048-row slab (tools/acceptance/greedy-prompts/prompt-document-greedy.json,
+    # replayed only under --prefill-slab).  The twelve study records stay under 2048 tokens (no slab fires), so on them
+    # the drafting slab table is the --mtp 4 table by construction, streams included; the slab record's row is the only
+    # pin exercising a slab body under MTP, tolerance-class against the chunked forms (docs/NUMERICS.md)
+    for metric in ("divergence_index", "device_token_ids_sha256"):
+        slab_mtp4 = ci.load_baseline(f"A3/slab2048-mtp4-32k/{metric}")
+        slab = ci.load_baseline(f"A3/slab2048-32k/{metric}")
+        assert set(slab_mtp4["expected"]) == set(slab["expected"]) == set(chunked) | {"document"}, metric
+        assert {k: v for k, v in slab_mtp4["expected"].items() if k != "document"} == mtp4_table[metric], metric
+        assert "the only pin exercising a slab body under MTP" in slab_mtp4["source"]["evidence"], metric
+        assert "slab record" in slab["source"]["evidence"], metric
     items = ci.load_baseline("C2/greedy-nothink/item_pass")["expected"]
     per_task = {}
     for key, flag in items.items():

@@ -238,10 +238,19 @@ def test_extension_128_row_twin_writes_128_tokens_runs_128_row_roots_and_refuses
 
 def test_model_chunk_body_takes_the_extension_of_the_chunk_state_form() -> None:
     body = inspect.getsource(model_module.Qwen38TTNNTextModel.forward_prefill_chunk_generic)
-    assert "if mtp is not None and mtp.rows != chunk_state.rows:" in body
+    assert "if mtp is not None and not slab_mtp and mtp.rows != chunk_state.rows:" in body
     assert "32-row chunk's option" not in body
     # the extension's rows run after layer 47 with the chunk's selectors (None at 128 rows), before the roots go
     assert body.index("mtp.forward_chunk_rows(") < body.index("_deallocate_unique(residual)")
+    # the slab form (2026-09-26): a slab with drafting takes the 128-row twin allocated with the slab's row count and
+    # runs it over the slab's residual from the slab body's own index rows, which stay alive until then
+    assert "slab_mtp = mtp is not None and is_slab_rows(chunk_state.rows)" in body
+    assert "if slab_mtp and not (mtp.rows == LONG_CHUNK_ROWS and mtp.slab_rows == chunk_state.rows):" in body
+    assert body.index("mtp.forward_slab_rows(") < body.index("_deallocate_unique(residual)")
+    assert "*(() if slab_mtp else (index_rows, block_start_rows))" in body
+    assert body.index("position_scalar=state.position.scalar,") < body.index(
+        "_deallocate_unique(index_rows, block_start_rows)"
+    )
     extension = inspect.getsource(mtp_v2.Qwen38TTNNMTPChunkExtension)
     assert "rows: int = CHUNK_ROWS" in extension
     assert "token_row = model.model_io.embedding.upload_token_rows(rows)" in extension
@@ -440,14 +449,24 @@ def _opened() -> str:
     return source[source.index("    def open(") : source.index("    def trace_ids(")]
 
 
-def test_chain_open_admits_long_chunks_with_mtp_and_refuses_a_slab_with_mtp() -> None:
+def test_chain_open_admits_long_chunks_and_a_slab_with_mtp() -> None:
     opened = _opened()
     assert "long chunks and MTP drafting are alternatives" not in opened
     assert "32-row chunk option" not in opened
+    assert "a prefill slab and MTP drafting are alternatives" not in opened
+    # the slab with drafting: the 128-row twin allocated with the slab form, warmed and captured with the slab body
+    assert "model, verify, long_chunk_state, base=chain_mtp.chunk_extension, slab_rows=slab_rows" in opened
+    # the chain's live admission (READY's record) counts the twin's slab form: the slab rows reach the call
     assert (
-        "if slab_rows is not None and mtp is not None:\n"
-        "            raise ValueError(\n"
-        '                "a prefill slab and MTP drafting are alternatives: the MTP chunk extension has no slab form"'
+        "                long_chunks=long_chunks,\n"
+        "                slab_rows=slab_rows,  # the twin's slab form under --prefill-slab: the default chain's\n"
+    ) in opened
+    assert "slab_extension.write_slab_tokens(model, [*warm_slab_tokens[1:], warm_slab_tokens[0]])" in opened
+    assert "model.forward_prefill_chunk_generic(slab_state, state, mtp=slab_extension)" in opened
+    assert (
+        'guard=lambda label: resident_decode.forbid_trace_body_host_io_and_sync(phase=f"chat slab {label}"),\n'
+        "                cq_id=0,\n"
+        "                mtp=None if chain_mtp is None else chain_mtp.long_chunk_extension,"
     ) in opened
     assert "long_chunk_extension" in {field.name for field in dataclasses.fields(session_module.Qwen38ChainMTP)}
     assert session_module.Qwen38ChainMTP.__dataclass_fields__["long_chunk_extension"].default is None
@@ -489,8 +508,25 @@ def test_chain_open_allocates_warms_captures_and_marks_the_128_row_twin_in_order
         'marker("before-chat-mtp-captures")',
         "dram_after_previous = capture_mtp_chain(chain_mtp, dram_after_prefill_captures)",
     )
-    positions = [opened.index(fragment) for fragment in order]
-    assert positions == sorted(positions), order
+    # in order: every fragment after the previous one (the slab warm block, earlier in open, reuses two of them)
+    position = -1
+    for fragment in order:
+        position = opened.index(fragment, position + 1)
+    # the slab warm pass and capture with the twin's slab form (2026-09-26), before the long-chunk warm
+    slab_order = (
+        'marker("before-chat-slab-warm-pass")',
+        "slab_extension = None if chain_mtp is None else chain_mtp.long_chunk_extension",
+        "slab_extension.write_slab_tokens(model, [*warm_slab_tokens[1:], warm_slab_tokens[0]])",
+        "model.forward_prefill_chunk_generic(slab_state, state, mtp=slab_extension)",
+        'marker("after-chat-slab-warm-pass")',
+        'marker("before-chat-long-chunk-warm-pass")',
+    )
+    position = -1
+    for fragment in slab_order:
+        position = opened.index(fragment, position + 1)
+    assert opened.index(
+        "model, verify, long_chunk_state, base=chain_mtp.chunk_extension, slab_rows=slab_rows"
+    ) < opened.index('marker("before-chat-slab-warm-pass")')
     # the growth gate no longer books the 128-row trace as MTP traces
     assert '"mtp_traces": dram_after_mtp - dram_after_chunk,' not in opened
     assert '"mtp_fused_traces": dram_after_fused - dram_after_chunk,' not in opened
@@ -567,21 +603,45 @@ def test_admission_carries_the_long_chunk_terms(monkeypatch) -> None:
         session_module.mtp_capacity_admission(32768, long_chunks=1)
 
 
+def test_admission_carries_the_slab_form_term(monkeypatch) -> None:
+    """A --prefill-slab chain under --mtp adds the twin's slab form to the states estimate: per 128-row slice one FP32
+    token tile (4,096 bytes per bank) and per slice after the first one 32-byte offset page (66,016 bytes per bank at
+    2048 rows); the form takes a slab row count with the long chunks and nothing else changes against the
+    --long-chunks record."""
+
+    monkeypatch.setattr(session_module, "packed_bf4_bytes_per_device", lambda *, ring_size: (80 << 20, 40 << 20))
+    assert session_module.MTP_SLAB_TOKEN_TILE_BYTES == 4_096 and session_module.MTP_SLAB_OFFSET_PAGE_BYTES == 32
+    assert session_module.mtp_slab_form_bytes_per_bank(2048) == 16 * 4_096 + 15 * 32 == 66_016
+    states = session_module.MTP_STATES_BEYOND_QSA_STATE_BYTES_PER_BANK_BY_MOE_ROWS[5]
+    extension = session_module.MTP_LONG_CHUNK_EXTENSION_BYTES_PER_BANK
+    for context in (32768, 65536):
+        long = session_module.mtp_capacity_admission(context, drafts=4, long_chunks=True)
+        slab = session_module.mtp_capacity_admission(context, drafts=4, long_chunks=True, slab_rows=2048)
+        assert (long["mtp_slab_form_bytes_per_bank"], long["slab_rows"]) == (0, None)
+        assert (slab["mtp_slab_form_bytes_per_bank"], slab["slab_rows"]) == (66_016, 2048)
+        assert slab["mtp_growth_remainders_bytes_per_bank"]["long_chunk_extension"] == extension + 66_016
+        delta = _with_margin(states + extension + 66_016) - _with_margin(states + extension)
+        assert slab["required_free_bytes_per_bank"] - long["required_free_bytes_per_bank"] == delta
+        assert slab["free_bytes_per_bank_after_captures"] == long["free_bytes_per_bank_after_captures"]
+        assert slab["fits"], context
+    for bad in ({"slab_rows": 2048}, {"long_chunks": True, "slab_rows": 128}):
+        with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
+            session_module.mtp_capacity_admission(32768, drafts=4, **bad)
+
+
 def test_server_admits_long_chunks_with_mtp_and_reports_the_twin() -> None:
     server = SERVER_SOURCE.read_text(encoding="utf-8")
     assert "--long-chunks and --mtp are alternatives" not in server
-    assert (
-        'raise SystemExit("--prefill-slab and --mtp are alternatives (the MTP chain prefills in 32-row chunks)")'
-        in server
-    )
+    assert "--prefill-slab and --mtp are alternatives" not in server  # the slab runs the twin's slab form (2026-09-26)
     assert (
         "        else mtp_capacity_admission(\n"
         "            resident_context.allocated_context,\n"
         "            drafts=args.mtp,\n"
         "            verify_forms=len(forms),\n"
-        "            long_chunks=bool(args.long_chunks),\n"
+        "            long_chunks=bool(args.long_chunks) or args.prefill_slab is not None,\n"
         "            moe_rows=mtp_moe_rows,\n"  # the verify MoE row count knob (QWEN38_MTP_MOE_ROWS) sits beside it
         "            gdn_rows_scan=fused_module.enabled(gdn_rows_scan_module.NAME),\n"
+        "            slab_rows=args.prefill_slab,\n"
         "        )"
     ) in server
     assert '"long_chunk_extension": chain.mtp.long_chunk_extension is not None,' in server

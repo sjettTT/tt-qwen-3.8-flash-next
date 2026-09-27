@@ -33,7 +33,8 @@ passes the flag per chunk.  The 128-row form has no anchor: a chain with the anc
 32-row and the 128-row twin): the chunk traces were captured with them, so every chunk also takes its MTP tokens (the
 chunk's rows one position ahead, ``following_token`` after the last) through the extension of its form, and the
 hand-off includes the MTP layer (the 32-row twin's ``finish_chunk``).  A chain with the 128-row chunk state and MTP
-drafting needs both twins; a slab has no MTP form.
+drafting needs both twins; a slab runs the 128-row twin's slab form (``forward_slab_rows``: the slab as 128-row slices
+inside the slab body), so a slab chain with drafting needs the twin allocated with ``slab_rows``.
 """
 
 from __future__ import annotations
@@ -154,7 +155,13 @@ class Qwen38ChunkPrefill:
         if slab_trace_id is not None and (slab_state is None or long_chunk_trace_id is None):
             raise ValueError("a slab trace needs the slab state and the long chunk trace")
         if slab_state is not None and mtp is not None:
-            raise ValueError("the MTP chunk extension has no slab form: no slabs with MTP drafting")
+            # The slab's MTP rows run through the 128-row twin's slab form (mtp_v2: forward_slab_rows), captured in
+            # the slab trace; a slab with drafting but without that form is refused.
+            if long_mtp is None or int(getattr(long_mtp, "slab_rows", 0)) != int(slab_state.rows):
+                raise ValueError(
+                    "a slab with MTP drafting needs the 128-row MTP chunk extension allocated with the slab form "
+                    f"(slab_rows={slab_state.rows}), got {None if long_mtp is None else getattr(long_mtp, 'slab_rows', None)!r}"
+                )
         self.model = model
         self.mesh = mesh
         self.state = state
@@ -197,10 +204,10 @@ class Qwen38ChunkPrefill:
             ttnn.synchronize_device(self.mesh)
 
     def _extension(self, kind: str) -> Any:
-        """The MTP chunk extension of a chunk kind: the 32-row one for ``short``, the 128-row twin for ``long``, none
-        for a slab (and none at all on a plain chain)."""
+        """The MTP chunk extension of a chunk kind: the 32-row one for ``short``, the 128-row twin for ``long`` and, in
+        its slab form, for ``slab`` (none at all on a plain chain)."""
 
-        return {"short": self.mtp, "long": self.long_mtp, "slab": None}[kind]
+        return {"short": self.mtp, "long": self.long_mtp, "slab": self.long_mtp}[kind]
 
     def run(
         self,
@@ -296,7 +303,7 @@ class Qwen38ChunkPrefill:
                 self.model.reset_chunk_state_inplace(self.state, self.slab_state)
             if self.mtp is not None:
                 self.mtp.reset_chunk()
-                if long_chunks and self.long_mtp is not None:
+                if (long_chunks or slabs) and self.long_mtp is not None:
                     self.long_mtp.reset_chunk()
             if self.verify_allocations and self.chunk_trace_id is not None:
                 verify_started_ns = time.perf_counter_ns()
@@ -331,11 +338,14 @@ class Qwen38ChunkPrefill:
                 self.model.upload_chunk_inputs(chunk_state, prepared)
                 extension = self._extension(kind)
                 if extension is not None:
-                    # The extension of the chunk's form takes the chunk's rows one position ahead (a long chunk is
-                    # always full; the padded 32-row tail pads its MTP tokens too).
-                    width = CHUNK_ROWS if kind == "short" else LONG_CHUNK_ROWS
-                    ahead = following[start : start + width]
-                    extension.write_tokens(self.model, ahead + [self.pad_token_id] * (width - len(ahead)))
+                    # The extension of the chunk's form takes the chunk's rows one position ahead (a long chunk and a
+                    # slab are always full; the padded 32-row tail pads its MTP tokens too).
+                    if kind == "slab":
+                        extension.write_slab_tokens(self.model, following[start : start + self.slab_rows])
+                    else:
+                        width = CHUNK_ROWS if kind == "short" else LONG_CHUNK_ROWS
+                        ahead = following[start : start + width]
+                        extension.write_tokens(self.model, ahead + [self.pad_token_id] * (width - len(ahead)))
                 replay_started_ns = time.perf_counter_ns()
                 if kind == "slab":
                     slab_prepare_ms.append((upload_started_ns - host_started_ns) / 1_000_000)

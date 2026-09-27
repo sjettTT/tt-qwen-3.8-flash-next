@@ -116,11 +116,12 @@ def test_a_flag_the_server_does_not_know_is_refused_by_its_parser_not_dropped(tm
     with pytest.raises(SystemExit) as refused:
         chat_server._parser().parse_args(list(server.argv))  # ... and refused where the server parses
     assert refused.value.code == 2 and "--no-such-flag" in capsys.readouterr().err
-    # the server's own admission rules stay: the slab and --mtp are alternatives, refused by main() before any device work
+    # the server's own admission rules stay at the parser: the slab and --mtp combine (the 128-row MTP chunk
+    # extension's slab form runs the slab's MTP rows inside the slab body; the chain admits the pair when it opens), so
+    # the pair parses with both values set and nothing dropped
     server = _settings(tmp_path, QWEN38_SERVER_ARGS="--mtp 4 --sampling --prefill-slab 2048")
-    monkeypatch.setattr(sys, "argv", ["qwen38_chat_server", *server.argv])
-    with pytest.raises(SystemExit, match="alternatives"):
-        chat_server.main()
+    args = chat_server._parser().parse_args(list(server.argv))
+    assert args.mtp == 4 and args.prefill_slab == 2048 and args.sampling
 
 
 def test_the_checkpoint_comes_from_the_hub_cache_or_the_explicit_directory(tmp_path, monkeypatch) -> None:

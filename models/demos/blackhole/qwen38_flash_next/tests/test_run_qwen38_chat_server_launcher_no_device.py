@@ -88,9 +88,9 @@ def test_validate_only_runs_the_interpreter_from_the_repository_root_wherever_it
     assert reports[0] == reports[1]
 
 
-def test_long_chunks_combine_with_mtp_and_a_slab_with_mtp_is_refused(tmp_path) -> None:
-    """The MTP chain prefills in 128-row chunks too (the extension's 128-row twin): both flags reach the server; a
-    prefill slab has no MTP form and the launcher still refuses the pair before any interpreter runs."""
+def test_long_chunks_and_a_slab_combine_with_mtp(tmp_path) -> None:
+    """The MTP chain prefills in 128-row chunks too (the extension's 128-row twin) and, since 2026-09-26, in slabs
+    (the twin's slab form): both flag pairs reach the server."""
 
     if subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], stdout=subprocess.DEVNULL).returncode:
         pytest.skip("the launcher records the checkout's head: not a git checkout")
@@ -113,11 +113,13 @@ def test_long_chunks_combine_with_mtp_and_a_slab_with_mtp_is_refused(tmp_path) -
     assert run.returncode == 0, run.stderr
     args = [line[len("arg=") :] for line in run.stdout.splitlines()[1:]]
     assert "--long-chunks" in args and args[args.index("--mtp") + 1] == "4"
-    refused = run_launcher(tmp_path, *common, "--prefill-slab", "256", "--mtp", "4", "--validate-only")
-    assert refused.returncode != 0 and "--prefill-slab and --mtp are alternatives" in refused.stderr
-    assert refused.stdout == ""  # no interpreter ran
+    slab = run_launcher(tmp_path, *common, "--prefill-slab", "256", "--mtp", "4", "--validate-only")
+    assert slab.returncode == 0, slab.stderr
+    args = [line[len("arg=") :] for line in slab.stdout.splitlines()[1:]]
+    assert args[args.index("--prefill-slab") + 1] == "256" and args[args.index("--mtp") + 1] == "4"
     launcher = LAUNCHER.read_text(encoding="utf-8")
     assert "--long-chunks and --mtp are alternatives" not in launcher
+    assert "--prefill-slab and --mtp are alternatives" not in launcher
     assert "prefill in 128-row chunks where the prompt allows (off by default; combines with --mtp)" in launcher
 
 

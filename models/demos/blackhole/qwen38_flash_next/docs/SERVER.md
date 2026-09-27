@@ -147,7 +147,10 @@ requests on, `["fused", "split"]`), every remainder
 carrying a 10 % margin (4x p150
 line, 2026-09-25: k = 4 with both verify forms 50,468,032 + 12,938,112 + 11,107,904, k = 5 with the split verify
 50,468,032 + 20,920,192 + 6,390,144), and `fits`; `/health.mtp.dram_bytes_per_bank` is the growth the open measured,
-refused above the estimate.
+refused above the estimate.  With `--prefill-slab` the admission also carries the 128-row MTP chunk extension's slab
+form (`mtp_slab_form_bytes_per_bank`, `slab_rows`): the slab's MTP token tiles and position offsets, `16 x 4,096 + 15 x
+32 = 66,016` bytes per bank at 2048 rows as an upper bound (every page counted on one bank); a chain that does not fit
+with the slab form is refused at open like the rest, never served as a slab without drafting.
 A `seed` reproduces a stream against the same `system_fingerprint`, which carries the switch and `k`: with drafting
 on, the pass loop consumes the request's draws in the pass's order, so the seed reproduces the drafting stream, not
 the 1-row loop's stream (the 1-row stream is the `QWEN38_MTP_SAMPLED=0` server's).  With drafting on the chain holds
@@ -341,7 +344,10 @@ opened (`prefill form: 2048-row slabs, then 128-row chunks, then 32-row chunks`)
 to it.  Numerics: the slab body is tolerance-class against the 32-row chunk bodies (`docs/PREFILL.md`, "Numerics
 class": each dense linear's output within one bf16 ULP of its scale, top-1 moving at a handful of positions on prompts
 longer than a slab), the 128-row chunks give the 32-row chunks' tokens (`docs/NUMERICS.md`), and the `json` acceptance
-record (85 prompt tokens, shorter than one 128-row chunk) stays bitwise in every form.  Prefill rates measured on the
+record (85 prompt tokens, shorter than one 128-row chunk) stays bitwise in every form.  A server with a prefill slab
+also replays the slab record (`prompt-document-greedy.json`, 2,228 prompt tokens: one slab, then the chunk forms); a
+server without one skips it by name (`acceptance_record_skipped`), so the chunked forms replay the twelve study records
+only.  Prefill rates measured on the
 standalone server (README, 2026-09-25): 3.0-3.5 ms per prompt token in 32-row chunks, 1.45-1.56 with the 128-row
 chunks, 0.74-0.90 with 2,048-row slabs (a 31,716-token prompt in 23.6 s, 2,118 tokens in 1.91 s).
 

@@ -35,8 +35,16 @@ restores the chain): 6 programs where the chain ran 53 per GDN layer, bitwise, t
 (`docs/NUMERICS.md`).
 
 The remainder of a prompt after the slabs runs through the 128-row chunks, then the 32-row chunks and the padded tail,
-then the ordinary hand-off from the 32-row state.  `--prefill-slab` implies `--long-chunks` and is not combined with
-`--mtp` (the MTP chunk extension has no slab form).  `--long-chunks` combines with `--mtp`: the MTP layer's rows run
+then the ordinary hand-off from the 32-row state.  `--prefill-slab` implies `--long-chunks`; with `--mtp` (since
+2026-09-26) the MTP layer's rows of a slab run inside the slab body through the 128-row twin's slab form -- the slab as
+`ROWS / 128` slices of 128 rows, each the 128-row form exactly (its residual rows cut from the slab's layer-47 residual,
+its RoPE and QSA chunk inputs at `P + 128 i` from the slab body's own index rows, its MTP tokens one tile per slice), so
+the MTP layer's KV rows land where the 128-row chunks would write them and the hand-off stays the 32-row twin's; the
+slab's residual is tolerance-class against the chunk bodies, so the MTP stream after a slab prefill is tolerance-class
+too, with its own pinned table (`A3-slab2048-mtp4-32k`, whose slab record runs one slab); in the served trace the
+slices cost +110 / +99 / +99 ms per 2048-row slab = +0.053 / +0.047 / +0.047 ms per prompt token
+of TTFT on the 1x4 line (2026-09-27: 2,100 / 20,860 / 31,714-token prompts, 1 / 10 / 15 slabs: 1.093 / 7.701 / 11.991 s
+against 0.983 / 6.713 / 10.504 s without `--mtp`; `docs/NUMERICS.md`).  `--long-chunks` combines with `--mtp`: the MTP layer's rows run
 inside the 128-row chunk body as they do inside the 32-row one (a 128-row twin of the chunk extension; its input mixer
 projects per 32-row tile, so every row keeps the 32-row form's matmul program), and the hand-off stays the 32-row
 state's.  The 32-row and 128-row bodies are unchanged.  Measured 2026-09-26 on the 4-chip p150 line with `--mtp 4`

@@ -1276,6 +1276,30 @@ def load_acceptance_records(directory: Path) -> list[dict[str, Any]]:
     return records
 
 
+# A record of ACCEPTANCE_SLAB_RECORD_TOKENS or more prompt tokens exists to run a prefill slab (the twelve records under
+# 2048 tokens never reach one); a server without --prefill-slab skips it, logged by name, so the chunked forms' start-up
+# stays the twelve records' replay.
+ACCEPTANCE_SLAB_RECORD_TOKENS = 2048
+
+
+def slab_records_admitted(records: list[dict[str, Any]], *, slab_rows: int | None) -> list[dict[str, Any]]:
+    """The records this server replays: every record with a prefill slab, else those under the slab record length."""
+
+    admitted = []
+    for record in records:
+        prompt_tokens = len(record["prompt_token_ids"])
+        if slab_rows is None and prompt_tokens >= ACCEPTANCE_SLAB_RECORD_TOKENS:
+            _log(
+                "acceptance_record_skipped",
+                prompt=record["prompt"],
+                prompt_tokens=prompt_tokens,
+                reason="a slab record (2048 or more prompt tokens) on a server without --prefill-slab",
+            )
+            continue
+        admitted.append(record)
+    return admitted
+
+
 def _divergence(actual: Sequence[int], expected: Sequence[int]) -> int | None:
     divergence = next((index for index, (a, b) in enumerate(zip(actual, expected)) if a != b), None)
     if divergence is None and len(actual) != len(expected):
@@ -1724,8 +1748,6 @@ def main() -> int:
     args = _parser().parse_args()
     if args.prefill_slab is not None and not is_slab_rows(args.prefill_slab):
         raise SystemExit(f"--prefill-slab takes a multiple of 128 in 256..4096, got {args.prefill_slab}")
-    if args.prefill_slab is not None and args.mtp is not None:
-        raise SystemExit("--prefill-slab and --mtp are alternatives (the MTP chain prefills in 32-row chunks)")
     if args.prefill_slab is not None:
         # the slab MoE switches (QWEN38_MOE_SLAB_ONE_CALL / QWEN38_MOE_SLAB_RINGS) are admitted here, before any
         # device is opened: a refused ring count is a start-up error, not a poisoned model 79 s into the warm pass
@@ -1817,6 +1839,7 @@ def main() -> int:
     )
     template = Qwen38OfficialChatTemplate(prepared.checkpoint.root)
     records = load_acceptance_records(args.acceptance_prompts) if args.acceptance_prompts is not None else []
+    records = slab_records_admitted(records, slab_rows=args.prefill_slab)
     resident_context = Qwen38ResidentContext(args.allocated_context)
     # The MTP admission decides on the live allocator once the resident weights are built (the chain's open,
     # Qwen38TracedChain.open); the 2026-09-04 table is the no-device fallback, logged here for the record, never a
@@ -1845,9 +1868,10 @@ def main() -> int:
             resident_context.allocated_context,
             drafts=args.mtp,
             verify_forms=len(forms),
-            long_chunks=bool(args.long_chunks),
+            long_chunks=bool(args.long_chunks) or args.prefill_slab is not None,
             moe_rows=mtp_moe_rows,
             gdn_rows_scan=fused_module.enabled(gdn_rows_scan_module.NAME),
+            slab_rows=args.prefill_slab,
         )
     )
     if mtp_admission_table is not None:
