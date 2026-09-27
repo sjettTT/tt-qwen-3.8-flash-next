@@ -177,6 +177,28 @@ identity through the stack unchanged; TTFT at 31,716 tokens 14.30 -> 12.38 s (`P
 rings (`QWEN38_MOE_SLAB_RINGS` unset, the default since 2026-09-26) are bitwise the two rings on the same gate: records
 12/12, columns 3232/3232, probes 4/4, in two runs (`PREFILL.md`).
 
+The slab's routed rows were freed under the op (2026-09-26, fixed the same day): `ttnn.reshape` of the untilized
+`[1, 1, T, 2560]` rows to the `[1, T, 2560]` moe_compute counts is a zero-cost view -- a new tensor id over the same
+buffer -- and the model freed the source on a tensor-id test, so the op's next DRAM allocation (its packed token-list
+page, 90 KB) landed on the freed input's first pages: DRAM bank 0's first six pages of the 8-bank interleave = token
+rows 0, 8, 16, 24, 32 and 40 (measured in the slab body: those six input rows change during the call, to the list's
+words; on one die the view and its source share the address and the next allocation lands exactly there, rows 0, 8,
+.., 120 of a 2048-row input overwritten).  Whether the page landed on the freed rows depended on the allocator's
+state: a fresh or cache-off launch, yes; a cached launch or a trace replay, no.  So the process's first slab body (the
+server's warm pass, whose output is discarded) and the cache-off diagnostic tools computed layer 0 on six corrupted
+rows (83 of 84 state buffers off from the second run on, first at layer 1's GDN recurrent state, worst 12.96 on a KV
+row), while every served slab (a trace replay) computed the correct rows.  The fix keeps the source alive across the
+call and frees a reshape's source only when the reshape copied (`ttnn/contracts.py` `same_buffer`, by buffer address;
+the rule applied at every reshape-then-free site of the model, the eight others being copies today).  Gate: a fresh
+process's slab body equals its second and third runs bitwise on all 84 state buffers, all three equal to the
+trace-replay result; the served completions of the fixed tree equal the unfixed tree's token for token (below).
+
+The 2048-row slab and the 128-row chunk form are tolerance class against each other (`PREFILL.md`), and on long
+chat-shaped prompts the class is visible in the greedy stream: the served completions of the two forms differ from
+token 30 on a 2,160-token document and from token 0 on a 20,612-token one (256 greedy tokens each, 2026-09-26, 4x
+p150, 32k context), while the twelve acceptance records (37-434 tokens, no slab fires) stay identical.  This is the
+forms' documented numerics, not the defect above (the defect never reached a served stream).
+
 `moe_compute`'s W2 ring exchange runs its handshake in the first a2a iteration only (2026-09-26, a runtime patch: the
 partials travel once per chunk and the compute's later iterations read the resident buffers; the dropped iterations'
 wait / increment pairs disappear on every core alike): bitwise on every form the op serves here (the decode rows, the

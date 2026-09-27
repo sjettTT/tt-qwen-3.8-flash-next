@@ -199,7 +199,7 @@ def test_model_switch_sites():
     assert "self.moe_dense_fused = False" in init  # a mesh the composite cannot be placed on keeps the four programs
     local_sum = MOE[MOE.index("    def _routed_local_sum(") : MOE.index("    def _dense_composite(")]
     assert "if sparse_rows is None:\n            sparse_input = ttnn.to_layout(" in local_sum
-    assert "if sparse_rows is None or _tensor_key(sparse_input) != _tensor_key(sparse_rows):" in local_sum
+    assert "if sparse_rows is None or not same_buffer(sparse_input, sparse_rows):" in local_sum  # a view's buffer is the caller's
     stamp = inspect.getsource(md.moe_dense)
     assert (
         "for tensor in (scores, indices, partial, sigmoid, sparse_rows):\n        fp.stamp_topology(tensor, full_hidden)"

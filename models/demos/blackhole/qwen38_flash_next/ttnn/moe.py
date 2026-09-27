@@ -36,13 +36,14 @@ from models.demos.blackhole.qwen38_flash_next.tt.moe import Qwen38MoEWeights
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROWS,
+    is_slab_rows,
     LONG_CHUNK_ROWS,
     MAX_LANES,
     MESH_SHAPE,
     Qwen38MeshContract,
-    TensorPlacement,
-    is_slab_rows,
     replicate_tensor_2d_mesh_mapper,
+    same_buffer,
+    TensorPlacement,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dense_dtype_tag,
@@ -1051,9 +1052,14 @@ class Qwen38TTNNMoE:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         if self.rows != 1:
+            # ttnn.reshape of a ROW_MAJOR device tensor is a zero-cost view: a new tensor id over the SAME buffer, so a
+            # tensor-id test says "different" and freeing the source frees the rows the view still reads (the
+            # 2026-09-26 slab defect: the op's next DRAM allocation, its packed token-list page, landed on the input's
+            # first rows; docs/NUMERICS.md).  The source is freed only when the reshape produced its own buffer; a
+            # view's buffer is released once, through sparse_input, after the call.
             untilized_rows = sparse_input
             sparse_input = ttnn.reshape(untilized_rows, self.row_contract.moe_sparse_input)
-            if _tensor_key(sparse_input) != _tensor_key(untilized_rows):
+            if not same_buffer(sparse_input, untilized_rows):
                 _deallocate(untilized_rows)
         if _shape(sparse_input) != self.row_contract.moe_sparse_input:
             raise RuntimeError(
@@ -1366,8 +1372,9 @@ class Qwen38TTNNMoE:
                 f"local combine produced {_shape(outputs[5])}, expected {self.row_contract.local_combine}"
             )
         _deallocate(outputs[0], outputs[1], outputs[2], outputs[4])
-        if sparse_rows is None or _tensor_key(sparse_input) != _tensor_key(sparse_rows):
-            _deallocate(sparse_input)  # own rows, or the rows view the reshape allocated; the caller's rows stay the caller's
+        if sparse_rows is None or not same_buffer(sparse_input, sparse_rows):
+            # own rows, or a reshape that copied; a VIEW of the caller's rows shares their buffer and the caller frees it
+            _deallocate(sparse_input)
         if not self.routing_in_l1:
             _deallocate(indices_l1, scores_l1)
         phase_observer("before-selective-reduce")

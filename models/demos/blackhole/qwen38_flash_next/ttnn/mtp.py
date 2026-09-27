@@ -41,6 +41,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROW_COUNTS,
     MESH_SHAPE,
     Qwen38MeshContract,
+    same_buffer,
     TensorPlacement,
 )
 
@@ -698,7 +699,7 @@ class Qwen38TTNNMTPInput:
         )
         token_rows = ttnn.permute(hidden_residual_rows, (0, 2, 1, 3), memory_config=dram)
         flat_rows = ttnn.reshape(token_rows, flat_shape)
-        if _tensor_key(flat_rows) != _tensor_key(token_rows):
+        if not same_buffer(flat_rows, token_rows):  # a copy today (the last dim changes); never free a view's source
             ttnn.deallocate(token_rows)
         self.mesh_contract.validate_tensor(flat_rows, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
         # The flattened scale broadcasts over the token rows (one [1,1,1,2560] row).
@@ -710,7 +711,7 @@ class Qwen38TTNNMTPInput:
         )
         ttnn.deallocate(flat_rows)
         normalized_tokens = ttnn.reshape(normalized_flat, (1, rows, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE))
-        if _tensor_key(normalized_tokens) != _tensor_key(normalized_flat):
+        if not same_buffer(normalized_tokens, normalized_flat):  # a copy today (the last dim changes)
             ttnn.deallocate(normalized_flat)
         normalized_hidden = ttnn.permute(normalized_tokens, (0, 2, 1, 3), memory_config=dram)
         ttnn.deallocate(normalized_tokens)

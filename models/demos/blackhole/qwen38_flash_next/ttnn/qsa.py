@@ -48,18 +48,19 @@ from models.demos.blackhole.qwen38_flash_next.checkpoint import INDEX_SHA256, Qw
 from models.demos.blackhole.qwen38_flash_next.config import Qwen38Placement
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROW_COUNTS,
+    chunk_row_tiles,
     CHUNK_ROWS,
+    is_slab_rows,
     LONG_CHUNK_ROWS,
     MAX_LANES,
     MESH_SHAPE,
     POSITION_INDEX_ROW_SHAPE,
     Qwen38MeshContract,
-    TensorPlacement,
-    chunk_row_tiles,
-    is_slab_rows,
     replicate_tensor_2d_mesh_mapper,
     require_lane_count,
+    same_buffer,
     tensor_metadata,
+    TensorPlacement,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn import prefill_glue
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
@@ -4563,7 +4564,7 @@ class Qwen38TTNNQSA:
         # [1, 1, 1, 1536] row, so one tiled-reshape program replaces the
         # transpose(1, 2) + reshape pair (same bytes).
         local_flat = ttnn.reshape(gated, (1, 1, 1, LOCAL_QUERY_WIDTH))
-        if _tensor_key(local_flat) != _tensor_key(gated):
+        if not same_buffer(local_flat, gated):  # a copy today (the last dim changes); never free a view's source
             _deallocate(gated)
         _retag_tensor(local_flat, reference=state.packed_kv_cache, shard_dim=3)
         self.mesh_contract.validate_tensor(local_flat, placement=TensorPlacement.HEAD_SHARDED, shard_dim=3)

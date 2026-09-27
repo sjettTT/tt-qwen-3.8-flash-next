@@ -19,9 +19,10 @@ from models.demos.blackhole.qwen38_flash_next.tt.model import Qwen38FinalMixerWe
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     MESH_SHAPE,
     Qwen38MeshContract,
-    TensorPlacement,
     replicate_tensor_2d_mesh_mapper,
     require_lane_count,
+    same_buffer,
+    TensorPlacement,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
     dense_dtype_tag,
@@ -504,7 +505,9 @@ class Qwen38TTNNFinalMixer:
             unit_tokens = ttnn.permute(unit, (0, 2, 1, 3), memory_config=dram)
             _deallocate(unit)
             unit_flat = ttnn.reshape(unit_tokens, flat_shape)
-            if _tensor_key(unit_flat) != _tensor_key(unit_tokens):
+            if not same_buffer(
+                unit_flat, unit_tokens
+            ):  # a copy today (the last dim changes); never free a view's source
                 _deallocate(unit_tokens)
         if _shape(unit_flat) != flat_shape or _padded_shape(unit_flat) != flat_padded:
             raise RuntimeError(
@@ -565,7 +568,7 @@ class Qwen38TTNNFinalMixer:
             gated = ttnn.experimental.view(gated_flat, residual_shape)  # owns gated_flat's buffer
         else:
             gated_tokens = ttnn.reshape(gated_flat, (1, rows, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE))
-            if _tensor_key(gated_tokens) != _tensor_key(gated_flat):
+            if not same_buffer(gated_tokens, gated_flat):  # a copy today (the last dim changes)
                 _deallocate(gated_flat)
             gated = ttnn.permute(gated_tokens, (0, 2, 1, 3), memory_config=dram)
             _deallocate(gated_tokens)

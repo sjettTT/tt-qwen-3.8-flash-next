@@ -2,7 +2,9 @@
 
 The server prefills a prompt through traced chunk bodies on the same device state the decode traces use: 32-row
 chunks (the default), 128-row chunks ahead of them with `--long-chunks`, and, with `--prefill-slab ROWS`, slabs of
-ROWS rows (a multiple of 128 from 256 to 4096; 2048 is the measured form) ahead of the 128-row chunks.  Whatever the
+ROWS rows (a multiple of 128 from 256 to 4096; 2048 is the measured form) ahead of the 128-row chunks.  The slab and
+the 128-row form are tolerance class against each other; on long chat-shaped prompts their greedy streams part early
+(token 30 of a 2,160-token document, token 0 of a 20,612-token one; `NUMERICS.md`).  Whatever the
 chunk sizes, the last prompt token is teacher-forced through the decode traces, so the decode, the MTP hand-off and the
 prompt-end snapshot see the same objects: the committed GDN recurrent state (fp32) and conv history, the QSA KV and
 compressed caches, the staging tile and raw-key ring, the PLE history and the device position.

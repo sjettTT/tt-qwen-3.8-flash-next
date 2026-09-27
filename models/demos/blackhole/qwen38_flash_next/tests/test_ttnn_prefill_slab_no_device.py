@@ -9,6 +9,7 @@ matmul config, and the source pins that keep the slab's forms apart from the 32/
 from __future__ import annotations
 
 import inspect
+import re
 import itertools
 import math
 from types import SimpleNamespace
@@ -260,6 +261,104 @@ def test_slab_moe_defaults_when_nothing_is_set(monkeypatch) -> None:
     monkeypatch.setenv(moe_module.MOE_SLAB_RINGS_ENV, "2")
     assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(one_call) == 2
     assert moe_module.Qwen38TTNNMoE.prefill_rings.fget(blocks) is None
+
+
+def _reshape_is_view(layout: str, source: tuple[int, ...], target: tuple[int, ...]) -> bool:
+    """``ttnn.reshape``'s view rule for an interleaved tensor whose buffer type does not change
+    (reshape_view/reshape.cpp ``this_is_view``): the last dimension is kept and (ROW_MAJOR, or the second-last
+    dimension is kept, or both second-last dimensions are tile multiples); a rank-1 target and an equal shape are views
+    too.  Everything else copies."""
+
+    if source == target or len(target) == 1:
+        return True
+    if source[-1] != target[-1]:
+        return False
+    return layout == "ROW_MAJOR" or source[-2] == target[-2] or (source[-2] % 32 == 0 and target[-2] % 32 == 0)
+
+
+# Every reshape whose SOURCE the model frees afterwards: (module, function, source layout, source shape, target shape).
+# The predicate at each site is ``same_buffer`` (buffer address), never ``_tensor_key`` (tensor ids, which a view never
+# shares).  The view column is today's rule; the predicate keeps every site right if the rule moves.
+RESHAPE_FREE_SITES = (
+    ("moe", "_routed_partial", "ROW_MAJOR", (1, 1, 2048, 2560), (1, 2048, 2560), True),  # the 2026-09-26 defect
+    ("moe", "_routed_local_sum", "ROW_MAJOR", (1, 1, 128, 2560), (1, 128, 2560), True),  # a view of the caller's rows
+    ("final_mixer", "rows", "TILE", (1, 2048, 4, 640), (1, 1, 2048, 2560), False),
+    ("final_mixer", "rows", "TILE", (1, 1, 2048, 2560), (1, 2048, 4, 640), False),
+    ("gr", "read_rows", "TILE", (1, 2048, 4, 640), (1, 1, 2048, 2560), False),
+    ("gr", "read_rows", "TILE", (1, 1, 2048, 2560), (1, 2048, 4, 640), False),
+    ("mtp", "rows", "TILE", (1, 128, 4, 640), (1, 1, 128, 2560), False),
+    ("mtp", "rows", "TILE", (1, 1, 128, 2560), (1, 128, 4, 640), False),
+    ("mtp_v2", "forward_verify_head", "ROW_MAJOR", (1, 1, 5, 64), (1, 1, 1, 320), False),
+    ("qsa", "_sparse_value_attention", "TILE", (1, 12, 1, 256), (1, 1, 1, 1536), False),
+)
+
+
+def test_a_reshape_source_is_freed_only_when_the_reshape_copied() -> None:
+    """The 2026-09-26 slab defect: ``ttnn.reshape`` of the untilized rows is a zero-cost view (a new tensor id over
+    the SAME buffer), so the old tensor-id test freed the buffer ``sparse_input`` still read and the op's packed
+    token-list page landed on the input's first rows (tokens 0, 8, .., 40 of a fresh launch).  Pinned for every
+    reshape-then-free site of the model: the predicate is ``same_buffer`` (by buffer address), the moe_compute source
+    is freed before the call only when the reshape copied and never after it, no tensor-id test decides a free, and
+    today's view/copy fact of each site under the reshape rule."""
+    from models.demos.blackhole.qwen38_flash_next.ttnn import contracts, final_mixer, gr, mtp, mtp_v2
+
+    class _Tensor:
+        def __init__(self, address: int, tensor_id: int) -> None:
+            self._address, self.tensor_id = address, tensor_id
+
+        def buffer_address(self) -> int:
+            return self._address
+
+        def device(self):
+            return "mesh"
+
+    view, source, copy = _Tensor(0x1000, 7), _Tensor(0x1000, 3), _Tensor(0x2000, 9)
+    assert contracts.same_buffer(view, source) and not contracts.same_buffer(copy, source)
+    assert contracts._tensor_key(view) != contracts._tensor_key(source)  # the id test that misled the old code
+    host_a, host_b = SimpleNamespace(tensor_id=4), SimpleNamespace(tensor_id=5)  # a host stand-in: no buffer to alias
+    assert contracts.same_buffer(host_a, host_a) and not contracts.same_buffer(host_a, host_b)
+    for module in (moe_module, final_mixer, gr, mtp, mtp_v2, qsa_module):
+        assert module.same_buffer is contracts.same_buffer
+    # the moe_compute site: reshape -> the guarded free of the source -> the call -> the rows freed once, after it
+    routed = inspect.getsource(moe_module.Qwen38TTNNMoE._routed_partial)
+    reshape = routed.index("sparse_input = ttnn.reshape(untilized_rows, self.row_contract.moe_sparse_input)")
+    guard = routed.index("if not same_buffer(sparse_input, untilized_rows):")
+    call = routed.index("outputs = ttnn.experimental.moe_compute(")
+    release = routed.index(
+        "_deallocate(outputs[0], outputs[1], outputs[2], outputs[4], sparse_input, indices_l1, scores_l1)"
+    )
+    assert reshape < guard < call < release
+    assert (
+        "_deallocate(untilized_rows)" in routed[guard : guard + 200]
+        and routed.count("_deallocate(untilized_rows)") == 1
+    )
+    local_sum = inspect.getsource(moe_module.Qwen38TTNNMoE._routed_local_sum)
+    assert "if sparse_rows is None or not same_buffer(sparse_input, sparse_rows):" in local_sum
+    # every site's source text: same_buffer decides, no tensor-id test does
+    functions = {
+        ("moe", "_routed_partial"): moe_module.Qwen38TTNNMoE._routed_partial,
+        ("moe", "_routed_local_sum"): moe_module.Qwen38TTNNMoE._routed_local_sum,
+        ("final_mixer", "rows"): final_mixer.Qwen38TTNNFinalMixer.rows,
+        ("gr", "read_rows"): gr.Qwen38TTNNGatedResidual.read_rows,
+        ("gr", "read_rows"): gr.Qwen38TTNNGatedResidual.read_rows,
+        ("mtp", "rows"): mtp.Qwen38TTNNMTPInput.rows,
+        ("mtp_v2", "forward_verify_head"): mtp_v2.forward_verify_head,
+        ("qsa", "_sparse_value_attention"): qsa_module.Qwen38TTNNQSA._sparse_value_attention,
+    }
+    for (module_name, function_name), function in functions.items():
+        text = inspect.getsource(function)
+        assert "not same_buffer(" in text, (module_name, function_name)
+        assert not re.search(
+            r"_tensor_key\((\w+)\) != _tensor_key\((\w+)\):\s*\n\s*(_deallocate|ttnn\.deallocate)\(\)", text
+        ), (
+            module_name,
+            function_name,
+        )
+    # today's view/copy fact per site (the rule as mirrored above): only the two moe_compute sites are views
+    for module_name, function_name, layout, source_shape, target_shape, expected_view in RESHAPE_FREE_SITES:
+        assert (module_name, function_name) in functions
+        assert _reshape_is_view(layout, source_shape, target_shape) is expected_view, (module_name, function_name)
+    assert sum(1 for site in RESHAPE_FREE_SITES if site[5]) == 2
 
 
 def test_slab_moe_switches_are_admitted_before_the_device(monkeypatch) -> None:

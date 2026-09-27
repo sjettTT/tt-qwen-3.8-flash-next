@@ -59,9 +59,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROWS,
     MESH_SHAPE,
     Qwen38MeshContract,
-    TensorPlacement,
     replicate_tensor_2d_mesh_mapper,
+    same_buffer,
     tensor_metadata,
+    TensorPlacement,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.embedding import (
     SAMPLING_CANDIDATE_ROW_SHAPE,
@@ -1663,7 +1664,7 @@ def forward_verify_head(
             logits, split.candidates_constants, into=split.candidates_readback
         )
         flat = ttnn.reshape(candidates, (1, 1, 1, verify.rows * CANDIDATE_LANES_PER_ROW))
-        if _tensor_key(flat) != _tensor_key(candidates):
+        if not same_buffer(flat, candidates):  # a copy today (the last dim changes); never free a view's source
             _deallocate(candidates)
         readback = ttnn.concat([accept.accepted_lane, accept.next_token, argmax_lanes, flat], dim=3, memory_config=dram)
         width = head_readback_width(verify.rows)

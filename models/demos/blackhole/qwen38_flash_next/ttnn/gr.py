@@ -54,9 +54,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
     CHUNK_ROWS,
     MESH_SHAPE,
     Qwen38MeshContract,
-    TensorPlacement,
     replicate_tensor_2d_mesh_mapper,
     require_lane_count,
+    same_buffer,
+    TensorPlacement,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn import prefill_glue
@@ -105,7 +106,9 @@ def residual_rows_shape(rows: int) -> tuple[int, int, int, int]:
 
     lanes = not isinstance(rows, bool) and type(rows) is int and 1 <= rows <= CHUNK_ROWS
     if rows not in CHUNK_ROW_COUNTS and not is_slab_rows(rows) and not lanes:
-        raise ValueError(f"GR rows path admits 1..{CHUNK_ROWS} rows, {CHUNK_ROW_COUNTS} rows or a slab row count, got {rows}")
+        raise ValueError(
+            f"GR rows path admits 1..{CHUNK_ROWS} rows, {CHUNK_ROW_COUNTS} rows or a slab row count, got {rows}"
+        )
     return (1, RESIDUAL_BRANCHES, rows, LOCAL_HIDDEN_SIZE)
 
 
@@ -875,7 +878,9 @@ class Qwen38TTNNGatedResidual:
             unit_tokens = ttnn.permute(unit, (0, 2, 1, 3), memory_config=dram)
             _deallocate(unit)
             unit_flat = ttnn.reshape(unit_tokens, flat_rows_shape)
-            if _tensor_key(unit_flat) != _tensor_key(unit_tokens):
+            if not same_buffer(
+                unit_flat, unit_tokens
+            ):  # a copy today (the last dim changes); never free a view's source
                 _deallocate(unit_tokens)
         if _shape(unit_flat) != flat_rows_shape or _padded_shape(unit_flat) != flat_rows_padded:
             raise RuntimeError(
@@ -1089,7 +1094,7 @@ class Qwen38TTNNGatedResidual:
             _deallocate(*branches)
         else:
             gated_tokens = ttnn.reshape(gated_flat, (1, rows, RESIDUAL_BRANCHES, LOCAL_HIDDEN_SIZE))
-            if _tensor_key(gated_tokens) != _tensor_key(gated_flat):
+            if not same_buffer(gated_tokens, gated_flat):  # a copy today (the last dim changes)
                 _deallocate(gated_flat)
             gated = ttnn.permute(gated_tokens, (0, 2, 1, 3), memory_config=dram)
             _deallocate(gated_tokens)

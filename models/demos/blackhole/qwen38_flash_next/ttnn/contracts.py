@@ -62,6 +62,8 @@ def chunk_row_tiles(rows: int) -> int:
             f"(a multiple of {SLAB_ROW_STEP} in {MIN_SLAB_ROWS}..{MAX_SLAB_ROWS}), got {rows!r}"
         )
     return rows // ttnn.TILE_SIZE
+
+
 # Batched decode: lane u of a [1,1,1,32] row (position, token) or row u of a [.., 32, ..] tile is user u; every
 # per-lane tensor is one tile tall, so the lane count is 1..32 and the row count of a multi-row path is the same
 # contract (1 = decode, 5 = the MTP verifier, 32 = the prefill chunk).
@@ -438,6 +440,20 @@ def _tensor_key(tensor) -> tuple[str, int]:
     if callable(tensor_id):
         tensor_id = tensor_id()
     return ("ttnn", int(tensor_id)) if tensor_id is not None else ("python", id(tensor))
+
+
+def same_buffer(left, right) -> bool:
+    """Whether two device tensors are one allocation: a zero-cost view (``ttnn.reshape`` of a ROW_MAJOR tensor, or of
+    a TILE tensor that keeps its last dimension) and its source share a buffer under different tensor ids.  This is
+    the test that decides whether a reshape's SOURCE may be freed while the result is still read: freeing the source
+    of a view frees the result's rows (the 2026-09-26 slab defect, docs/NUMERICS.md); ``_tensor_key`` compares tensor
+    ids, which a view never shares, and must not decide it."""
+
+    left_address, right_address = getattr(left, "buffer_address", None), getattr(right, "buffer_address", None)
+    if not callable(left_address) or not callable(right_address):
+        # a host stand-in (the no-device tests' fakes) has no device buffer and nothing to alias: the id test decides
+        return _tensor_key(left) == _tensor_key(right)
+    return int(left_address()) == int(right_address())
 
 
 def _host_uint32(shape: tuple[int, ...], value, *, label: str) -> torch.Tensor:

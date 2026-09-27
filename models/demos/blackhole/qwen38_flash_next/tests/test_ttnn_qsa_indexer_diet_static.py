@@ -575,7 +575,7 @@ def test_sparse_query_is_built_from_the_module_zero_half_with_one_row_major_pad(
     ]
     assert "ttnn.zeros_like(" not in source and "ttnn.transpose(" not in source
     assert "local_flat = ttnn.reshape(gated, (1, 1, 1, LOCAL_QUERY_WIDTH))" in source
-    assert "if _tensor_key(local_flat) != _tensor_key(gated):\n            _deallocate(gated)" in source
+    assert "if not same_buffer(local_flat, gated):" in source
     assert "ttnn.concat([self.zero_value_half, query], dim=3" in source
     assert "ttnn.to_layout(\n            sparse_query_tiled, ttnn.ROW_MAJOR_LAYOUT" in source
     pad = source.split("sparse_query = ttnn.pad(", 1)[1].split("\n        )", 1)[0]
