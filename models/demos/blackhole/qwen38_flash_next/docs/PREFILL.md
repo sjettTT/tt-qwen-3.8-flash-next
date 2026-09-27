@@ -36,7 +36,7 @@ restores the chain): 6 programs where the chain ran 53 per GDN layer, bitwise, t
 
 The remainder of a prompt after the slabs runs through the 128-row chunks, then the 32-row chunks and the padded tail,
 then the ordinary hand-off from the 32-row state.  `--prefill-slab` implies `--long-chunks`; with `--mtp` (since
-2026-09-26) the MTP layer's rows of a slab run inside the slab body through the 128-row twin's slab form -- the slab as
+2026-09-27) the MTP layer's rows of a slab run inside the slab body through the 128-row twin's slab form -- the slab as
 `ROWS / 128` slices of 128 rows, each the 128-row form exactly (its residual rows cut from the slab's layer-47 residual,
 its RoPE and QSA chunk inputs at `P + 128 i` from the slab body's own index rows, its MTP tokens one tile per slice), so
 the MTP layer's KV rows land where the 128-row chunks would write them and the hand-off stays the 32-row twin's; the
