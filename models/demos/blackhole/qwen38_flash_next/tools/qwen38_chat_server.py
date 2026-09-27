@@ -100,7 +100,11 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
     Qwen38ResidentContext,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
-from models.demos.blackhole.qwen38_flash_next.ttnn.moe import admit_slab_moe_switches, moe_local_output_enabled
+from models.demos.blackhole.qwen38_flash_next.ttnn.moe import (
+    admit_slab_moe_switches,
+    moe_local_output_enabled,
+    moe_rows_form,
+)
 
 MODEL_ID = "Qwen/Qwen3.8-Flash-Next"
 ACCEPTANCE_CONTINUATION = 96
@@ -1914,7 +1918,9 @@ def main() -> int:
         "sampling": (
             "candidate_row_device_sampler"
             if args.device_sampler
-            else "candidate_row_host_sampler" if args.sampling else "greedy"
+            else "candidate_row_host_sampler"
+            if args.sampling
+            else "greedy"
         ),
         "sampling_discriminator": bool(args.sampling_discriminator),
         "agreement": (
@@ -2198,6 +2204,7 @@ def main() -> int:
                 "fused_kernels": sorted(fused.enabled_names()),
                 "dram_workers_per_bank": report["chain"]["dram_workers_per_bank"],
                 "moe_local_output": moe_local_output_enabled(),
+                "moe_rows_form": moe_rows_form(),
                 "dram_workers_fallback": report["chain"]["dram_workers_fallback"],
                 "dense_weight_dtype": report["chain"]["dense_weight_dtype"],
                 "route": list(hardware_profile.route),

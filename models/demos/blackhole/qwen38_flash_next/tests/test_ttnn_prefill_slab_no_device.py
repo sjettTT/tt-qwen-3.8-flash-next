@@ -100,11 +100,14 @@ def test_slab_one_call_switch(monkeypatch) -> None:
     with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
         moe_module.moe_slab_prefill_rings()
     monkeypatch.delenv(moe_module.MOE_SLAB_RINGS_ENV)
-    # the kwarg reaches the op only from the one-call slab; every other instance passes None (the op's default)
+    # the kwarg reaches the op from the one-call slab (its ring switch) and from the one-tile rows forms (their
+    # QWEN38_MOE_ROWS_FORM table); the 128-row chunk passes None (the op's default)
     partial = inspect.getsource(moe_module.Qwen38TTNNMoE._routed_partial)
     assert "prefill_rings=self.prefill_rings," in partial
     prop = inspect.getsource(moe_module.Qwen38TTNNMoE.prefill_rings.fget)
-    assert "moe_slab_prefill_rings() if self.slab_one_call else 0" in prop and "return rings if rings else None" in prop
+    assert "if self.slab_one_call:" in prop and "rings = moe_slab_prefill_rings()" in prop
+    assert "return rings if rings else None" in prop
+    assert 'return MOE_ROWS_FORMS[getattr(self, "rows_form", "fulllocal")][1]' in prop
     assert moe_module.SLAB_REDUCE_BLOCK_ROWS == 512 and SLAB % moe_module.SLAB_REDUCE_BLOCK_ROWS == 0
     # a slab whose rows the 512-row blocks do not divide is refused at construction, not at its first slice
     init = inspect.getsource(moe_module.Qwen38TTNNMoE.__init__)
