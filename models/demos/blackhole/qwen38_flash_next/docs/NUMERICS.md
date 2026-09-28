@@ -476,6 +476,18 @@ time (the program's device law ~58 + 5.2 x rows us).  The MTP lane's fold-levers
 beside the law tool, not exported) holds the program law, this lever's record and the three levers measured and
 dropped (the reader's reads, one pack per state form, the top-face activations).
 
+The fold's lanes form (2026-09-28, `ttnn/fused/gdn_rows_scan` `run_lanes` / `run_pick_lanes`; the MTP lane body's B lanes x
+R = k + 1 verify rows lane-major in one tile run the same recurrence on one (value head, lane) item per core with the
+single form's compute kernel unchanged, the prefix states `[B R, 12, 128, 128]` and a per-lane pick as the commit; the
+served single-stream fold is byte-identical): BITWISE per lane the sequential 1-row `gdn_step` from that lane's state at
+every lane shape within the tile (B in 2, 4, 6, 8 x R in 1..5 on one die, every prefix slot and gated row; the pad rows
+and the other lanes' rows may hold any finite value and change nothing), so the lanes carry the fold's stream and its
+class -- COMPONENT against the chunk chain, exactly as the single form -- instead of the chain's.  One die, 200 traced
+replays: 170.9 us per layer at 4 x 5 on 48 cores (198.8 at 6 x 5, 204.9 at 8 x 4; the single form 106.1 on its 48-core
+split, 159.6 on the 12-core one), the lane pick 48.0 us; the lanes form is not a verify-time lever (the batched chunk
+call it replaces reads about 151 us at B = 4), its lever is the commit (one pick per lane against the batched chunk
+re-run).  On the 1x4 p150 line at 4 lanes x k = 4, 32k (2026-09-28, the lane tool's windows: 200 timed passes; the fold ON on both sides): the lanes' refereed passes against the head's B=1 chain are exact where the chain's lanes were not: the twelve STAGE-3 prompts in three batches of four, 3884/3884 refereed lane passes exact and every committed stream equal to the head's B=1 chain's (chat 409/409, code 293/293, fact 275/275, json 229/229, multilingual 248/248, prose 398/398, list 276/276, math 262/262, refactor 292/292, sky 257/257, story 571/571, summary 374/374; the chain fold-on read 26/400, 3/293, 11/275, 27/229 on the first batch), and the 4x4 pass wall is 60.71 / 60.75 / 59.64 ms p50 per batch (p10 58.0-58.9 / p90 62.6-62.8; the blocking probe 64.4-65.0) against the chain's 79.45 / 78.46 / 77.72: the commit replay 9.27 -> 2.17 ms (the picks) and the verify replay 62.20 -> 49.4-49.8 ms (the lanes' chunk chain was the composed one, about thirty programs per GDN layer, where the B=1 stream sat on the wrap), the draft replay equal (8.62-8.72 against 8.69).  The prefix states per bank: 35,389,440 / 70,778,880 / 106,168,320 / 113,246,208 B at 10 / 20 / 30 / 32 lane rows (36 GDN layers, 8 banks; `gdn_rows_scan.prefix_states_bytes`), measured at rows 20 as +70,789,120 B per bank of lane verify state against the chain's; the three lane traces shrink from 7,340,224 to 3,864,512 B per bank.  The lane body dispatches through the fold's registry step exactly as the single stream does (`QWEN38_FUSED_OFF=gdn_rows_scan` restores the chunk chain for both), and allocating the lane verify state allocates the prefix states.  The wave-F development note beside the MTP lane stage notes (2026-09-28, not exported) holds the die proof, the one-die law and the line tables.
+
 The rows of record of the served default set -- the verify-rows fold (`gdn_rows_scan`) with its gate scalars in one
 SFPU pass, the MoE rows on two rings (`rings2`) and the gated-residual read's re-associated norm (`gr_recip_last`) --
 measured 2026-09-28 on one idle 1x4 p150 line (hold sb-case2-49b8a0f, host load 1.49 / 1.04 / 1.63 at the clients; the fork runtime built at

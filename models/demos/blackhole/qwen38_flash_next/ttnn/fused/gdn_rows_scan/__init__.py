@@ -72,6 +72,10 @@ READER = fp.kernel_source(NAME, "reader.cpp")
 WRITER = fp.kernel_source(NAME, "writer.cpp")
 COMPUTE = fp.kernel_source(NAME, "compute.cpp")
 PICK = fp.kernel_source(NAME, "pick.cpp")
+# the lanes form (one (value head, lane) item per core, the whole head per core, compute.cpp shared)
+READER_LANES = fp.kernel_source(NAME, "reader_lanes.cpp")
+WRITER_LANES = fp.kernel_source(NAME, "writer_lanes.cpp")
+PICK_LANES = fp.kernel_source(NAME, "pick_lanes.cpp")
 
 TILE = fp.TILE  # the verify tile: 32 rows
 HT = HEAD_DIM // TILE  # 4 column tiles per head
@@ -82,6 +86,10 @@ HISTORY_ROWS = 3  # the FIR history rows before row 0
 SPLIT = 4
 # The most verify rows the fold admits (k + 1; the prefix states are rows x 786 KB per layer per device).
 MAX_ROWS = 8
+# The lanes form: B lanes x R rows (R = k + 1 <= MAX_ROWS) lane-major in one tile, B * R <= 32, one (value head,
+# lane) item per core (12 B cores, the whole head per core), the state [B, 12, 128, 128] and the prefix states
+# [B * R, 12, 128, 128] (slot u * R + j = lane u after j + 1 rows; the single form's tensor with rows = B * R).
+MAX_LANES = 8
 # The layer's verify segment with the fold on: the all-gather, the projection linear, its S2I, the qkv landing slice,
 # this program, the out-projection linear, the reduce-scatter (the wrap runs 11, the chain 58); the commit: the pick,
 # the history concat and its select matmul (the wrap runs 5).
@@ -327,6 +335,190 @@ def run_pick(accepted, prefix, recurrent):
     return recurrent
 
 
+# ------------------------------------------------------------------------------------------ the lanes form
+
+
+def lanes_admitted(lanes: int, rows: int) -> bool:
+    """Whether ``lanes`` x ``rows`` is a shape the lanes form runs: 1..MAX_LANES lanes of 1..MAX_ROWS rows, B * R rows
+    in one tile.  (The lane body itself runs 2..8 lanes; one lane is the die test's degenerate case.)"""
+
+    return 1 <= lanes <= MAX_LANES and 1 <= rows <= MAX_ROWS and lanes * rows <= TILE
+
+
+def lanes_prefix_shape(lanes: int, rows: int) -> tuple[int, int, int, int]:
+    return (lanes * rows, HEADS, HEAD_DIM, HEAD_DIM)
+
+
+def prefix_states_bytes(rows: int, layers: int = 1) -> int:
+    """The prefix states' bytes per device for ``rows`` slots (the lanes form: rows = B * R) over ``layers`` GDN
+    layers: rows x 12 x 16 tile pages of 4 KiB per layer (786,432 B per slot)."""
+
+    return layers * rows * HEADS * STATE_TILES * fp.TILE_BYTES[FP32]
+
+
+def _lane_items(lanes: int) -> list[tuple[int, int]]:
+    return [(head, lane) for lane in range(lanes) for head in range(HEADS)]
+
+
+def run_lanes(projected, history, taps, constants, norm, recurrent, prefix, out, *, lanes: int, rows: int):
+    """The scan program's lanes form on explicit tensors (local shapes): ``projected`` [1,1,32,4160] bf16 TILE, the
+    lane-major verify tile (tile row u * rows + j = lane u's row j; every row finite); ``history`` [1,lanes,32,2560] bf16
+    (rows 0..2 of every lane valid, the rest finite); ``taps`` 4 x [1,1,1,2560] bf16; ``constants`` from
+    ``gdn_step.constant_tiles``; ``norm`` [1,1,1,128] bf16; ``recurrent`` [lanes,12,128,128] fp32 (read only);
+    ``prefix`` [lanes*rows,12,128,128] fp32 (written: slot u*rows + j = lane u's state after j + 1 rows); ``out``
+    [1,1,32,1536] bf16 (rows >= lanes*rows exact zeros).  One (value head, lane) item per core: 12 * lanes cores, the
+    whole head per core; the compute kernel is the single form's with ROWS = ``rows`` (one lane's rows)."""
+
+    lanes, rows = int(lanes), int(rows)
+    if not lanes_admitted(lanes, rows):
+        raise ValueError(
+            f"{NAME} lanes form admits 1..{MAX_LANES} lanes x 1..{MAX_ROWS} rows within one tile, got {lanes} x {rows}"
+        )
+    if not fp.is_row_tile(projected) or fp.tile_width_of(projected) != PROJECTION_WIDTH:
+        raise ValueError(f"{NAME} projection must be one row tile of width {PROJECTION_WIDTH}, got {projected.shape}")
+    if tuple(recurrent.shape) != (lanes, HEADS, HEAD_DIM, HEAD_DIM) or recurrent.dtype != FP32:
+        raise ValueError(
+            f"{NAME} lanes state must be [{lanes}, {HEADS}, {HEAD_DIM}, {HEAD_DIM}] fp32, got {recurrent.shape}"
+        )
+    if tuple(prefix.shape) != lanes_prefix_shape(lanes, rows) or prefix.dtype != FP32:
+        raise ValueError(
+            f"{NAME} lanes prefix states must be {lanes_prefix_shape(lanes, rows)} fp32, got {prefix.shape} {prefix.dtype}"
+        )
+    if tuple(history.shape) != (1, lanes, TILE, QKV_WIDTH) or history.dtype != BF16:
+        raise ValueError(f"{NAME} lanes history must be [1, {lanes}, {TILE}, {QKV_WIDTH}] bf16, got {history.shape}")
+    if len(taps) != 4:
+        raise ValueError(f"{NAME} takes four conv taps")
+    mesh = projected.device()
+    vbt = HT  # the whole head per core
+    items = _lane_items(lanes)
+    work = fp.split_work(len(items), mesh)
+    cores = fp.core_rectangle(work, mesh)
+    if len(work) != len(items):
+        raise RuntimeError(f"{NAME} lanes form places one item per core; {len(items)} items got {len(work)} cores")
+
+    def pairs(w):
+        return [value for item in items[w.start : w.start + w.count] for value in item]
+
+    reader_cta = [rows, vbt, lanes]
+    for tensor in (projected, history, *taps, constants, norm, recurrent):
+        reader_cta.extend(fp.accessor_args(tensor))
+    reader_addrs = [
+        projected.buffer_address(),
+        history.buffer_address(),
+        *(t.buffer_address() for t in taps),
+        constants.buffer_address(),
+        norm.buffer_address(),
+        recurrent.buffer_address(),
+    ]
+    writer_cta = [rows, vbt, lanes, *fp.accessor_args(prefix), *fp.accessor_args(out)]
+    writer_addrs = [prefix.buffer_address(), out.buffer_address()]
+    defines = [("INP_FLOAT32", "1")]
+    cbs = [
+        fp.cb_descriptor(index, dtype, fp.TILE_BYTES[dtype], pages, cores)
+        for index, dtype, pages in cb_table(rows, vbt)
+    ]
+    cbs.append(
+        ttnn.CBDescriptor(
+            total_size=2 * HT * vbt * fp.TILE_BYTES[FP32],
+            core_ranges=cores,
+            format_descriptors=[
+                ttnn.CBFormatDescriptor(buffer_index=CB_SNEWC, data_format=FP32, page_size=fp.TILE_BYTES[FP32]),
+                ttnn.CBFormatDescriptor(buffer_index=CB_OUTS, data_format=FP32, page_size=fp.TILE_BYTES[FP32]),
+            ],
+        )
+    )
+    reader = fp.reader_kernel(
+        READER_LANES, cores, reader_cta, [(w.core, [*reader_addrs, w.count, *pairs(w)]) for w in work], defines=defines
+    )
+    writer = fp.writer_kernel(
+        WRITER_LANES, cores, writer_cta, [(w.core, [*writer_addrs, w.count, *pairs(w)]) for w in work], defines=defines
+    )
+    compute = fp.compute_kernel(
+        COMPUTE,
+        cores,
+        [rows, vbt],
+        [(w.core, [w.count]) for w in work],
+        defines=defines,
+        fidelity=ttnn.MathFidelity.HiFi4,
+        fp32_dest=True,
+        unpack_to_dest_fp32=FP32_COPY_CBS,
+    )
+    io = [projected, history, *taps, constants, norm, recurrent, prefix, out]
+    # per item the projection's q/k/v/z/a/b tiles and the lane's history tiles, the taps, the lane's fp32 state once;
+    # the prefix states and the gated rows written; per item the 4-tap conv and the two l2 norms over the 32-row
+    # tile, per lane row the fp32 delta-rule update and read-out on one head of 128 x 128, the gated norm over the tile
+    meta = fp.program_meta(
+        NAME,
+        "verify_rows_lanes",
+        lanes * rows,
+        reads=(projected, *taps, constants, norm, recurrent),
+        writes=(prefix, out),
+        partial=((history, lanes * (2 * HT + vbt) * HEADS * fp.TILE_BYTES[BF16]),),
+        dram_bytes=(lanes - 1) * (fp.tensor_bytes(projected) + sum(fp.tensor_bytes(t) for t in taps)),
+        flops=lanes
+        * (TILE * (2 * 4 * QKV_WIDTH + 6 * 2 * QK_WIDTH + 6 * VALUE_WIDTH) + rows * 8 * HEADS * HEAD_DIM * HEAD_DIM),
+        cores=len(work),
+        outputs=((out, 3), (prefix, 1)),
+    )
+    descriptor = fp.program_descriptor([reader, writer, compute], cbs)
+    fp.run_program(io, descriptor, meta=meta)
+    return out
+
+
+def run_pick_lanes(counts, prefix, recurrent, *, lanes: int, rows: int):
+    """The lanes commit under the fold: for every lane u with ``c_u >= 1``, ``recurrent[u] = prefix[u * rows + c_u - 1]``
+    (lane u's state after ``c_u`` committed rows); ``c_u == 0`` writes nothing (the lane keeps its state bitwise).
+    ``counts`` is the pass's fp32 TILE ``[1, lanes, 1, 1]`` committed-rows tensor (the lane selectors' ``(a_u + 1) *
+    active_u``; the kernel clamps to ``rows``), read on the device.  One data-movement program, (lane, head, column)
+    items over the grid."""
+
+    lanes, rows = int(lanes), int(rows)
+    if not lanes_admitted(lanes, rows):
+        raise ValueError(
+            f"{NAME} lanes pick admits 1..{MAX_LANES} lanes x 1..{MAX_ROWS} rows within one tile, got {lanes} x {rows}"
+        )
+    if tuple(counts.shape) != (1, lanes, 1, 1) or counts.dtype != FP32 or counts.layout != ttnn.TILE_LAYOUT:
+        raise ValueError(
+            f"{NAME} lanes pick needs the fp32 TILE [1, {lanes}, 1, 1] committed counts, got {counts.shape} {counts.dtype}"
+        )
+    if tuple(prefix.shape) != lanes_prefix_shape(lanes, rows) or prefix.dtype != FP32:
+        raise ValueError(
+            f"{NAME} lanes prefix states must be {lanes_prefix_shape(lanes, rows)} fp32, got {prefix.shape}"
+        )
+    if tuple(recurrent.shape) != (lanes, HEADS, HEAD_DIM, HEAD_DIM) or recurrent.dtype != FP32:
+        raise ValueError(
+            f"{NAME} lanes state must be [{lanes}, {HEADS}, {HEAD_DIM}, {HEAD_DIM}] fp32, got {recurrent.shape}"
+        )
+    mesh = prefix.device()
+    items = [(lane, head, col) for lane in range(lanes) for head in range(HEADS) for col in range(HT)]
+    work = fp.split_work(len(items), mesh)
+    cores = fp.core_rectangle(work, mesh)
+
+    def triples(w):
+        return [value for item in items[w.start : w.start + w.count] for value in item]
+
+    cta = [rows, lanes, *fp.accessor_args(counts), *fp.accessor_args(prefix), *fp.accessor_args(recurrent)]
+    addrs = [counts.buffer_address(), prefix.buffer_address(), recurrent.buffer_address()]
+    cbs = [
+        fp.cb_descriptor(0, FP32, fp.TILE_BYTES[FP32], lanes, cores),
+        fp.cb_descriptor(1, FP32, fp.TILE_BYTES[FP32], HT, cores),
+    ]
+    kernel = fp.reader_kernel(PICK_LANES, cores, cta, [(w.core, [*addrs, w.count, *triples(w)]) for w in work])
+    # the counts once per core, one prefix slot read per lane (at most), the lane states written
+    meta = fp.program_meta(
+        NAME,
+        "commit_pick_lanes",
+        lanes * rows,
+        writes=(recurrent,),
+        partial=((prefix, lanes * HEADS * STATE_TILES * fp.TILE_BYTES[FP32]),),
+        dram_bytes=len(work) * lanes * fp.TILE_BYTES[FP32],
+        cores=len(work),
+        outputs=((recurrent, 1),),
+    )
+    fp.run_program([counts, prefix, recurrent], fp.program_descriptor([kernel], cbs), meta=meta)
+    return recurrent
+
+
 # ------------------------------------------------------------------------------- the per-layer buffers (the rows state)
 
 
@@ -385,6 +577,68 @@ def buffers_of(rows_state) -> Buffers | None:
     return getattr(rows_state, "scan_buffers", None)
 
 
+class LaneBuffers:
+    """The lanes form's per-layer tensors, allocated with the lane rows state and freed with it: the prefix states
+    ``[B * R, 12, 128, 128]`` fp32 (slot u * R + j = lane u after j + 1 rows) and the program's constants (shared with
+    the decode step, not owned here)."""
+
+    __slots__ = ("prefix", "constants", "gated_memory_config", "lanes", "rows")
+
+    def __init__(self, *, prefix, constants, gated_memory_config, lanes: int, rows: int):
+        self.prefix, self.constants, self.gated_memory_config = prefix, constants, gated_memory_config
+        self.lanes, self.rows = int(lanes), int(rows)
+
+    def deallocate(self) -> None:
+        _release(self.prefix)
+
+
+def qualifies_lanes(rows_state) -> bool:
+    """Whether a lane rows state is the form the lanes fold serves: the 32-row lane-major verify tile, ``lanes`` x
+    ``rows`` within the admission, device tensors.  Shapes only, read once when the state is allocated."""
+
+    constants = getattr(rows_state, "constants", None)
+    lane_constants = getattr(rows_state, "lane_constants", None)
+    if constants is None or lane_constants is None:
+        return False
+    if not callable(getattr(getattr(rows_state, "v", None), "buffer_address", None)):
+        return False
+    lanes, rows = getattr(rows_state, "lanes", 0), getattr(constants, "rows", 0)
+    if getattr(lane_constants, "lanes", None) != lanes or getattr(lane_constants, "rows", None) != rows:
+        return False
+    return getattr(constants, "tile_rows", 0) == TILE and lanes_admitted(lanes, rows)
+
+
+def attach_lanes(gdn, rows_state, environ=None) -> LaneBuffers | None:
+    """Allocate the lanes form's buffers onto a newly allocated lane rows state and return them, or None when the fold
+    is off (the same switch as the single form: ``QWEN38_FUSED_OFF=gdn_rows_scan``) or the state is not the form it
+    serves.  Called from ``allocate_lane_rows_state``: the form is fixed before the warm pass and the capture, and the
+    commit that picks the prefix states cannot find itself on the other side of the switch from the forward pass."""
+
+    environ = os.environ if environ is None else environ
+    if not enabled(NAME, environ) or not qualifies_lanes(rows_state):
+        return None
+    mesh = gdn.mesh_device
+    lanes, rows = rows_state.lanes, rows_state.constants.rows
+    prefix = fp.allocate(lanes_prefix_shape(lanes, rows), FP32, ttnn.TILE_LAYOUT, mesh)
+    fp.stamp_topology(prefix, rows_state.v, shard_dim=1)
+    buffers = LaneBuffers(
+        prefix=prefix,
+        constants=gdn_step._constants(gdn),
+        gated_memory_config=gdn.out_proj_act_memory_config,
+        lanes=lanes,
+        rows=rows,
+    )
+    rows_state.scan_buffers = buffers
+    return buffers
+
+
+def lane_buffers_of(rows_state) -> LaneBuffers | None:
+    """The lanes form's buffers of a lane rows state, or None when it runs the chain."""
+
+    buffers = getattr(rows_state, "scan_buffers", None)
+    return buffers if isinstance(buffers, LaneBuffers) else None
+
+
 # ---------------------------------------------------------------------------------------------- the bodies
 
 
@@ -392,8 +646,10 @@ def rows_body_scan(gdn, full_hidden, rows_state, state, *, full_tile: bool = Fal
     """The folded body: the projection's linear and S2I, the qkv landing the history advance reads, the scan program
     (the gated tile into the out-projection's activation shard, the prefix states into the rows state's buffer),
     then the chain's own out-projection.  Returns ``(output, None)``: the state after all rows is prefix slot
-    ``rows - 1``."""
+    ``rows - 1``.  On a lane rows state that carries the lanes buffers, the lanes form (``rows_body_scan_lanes``)."""
 
+    if lane_buffers_of(rows_state) is not None:
+        return rows_body_scan_lanes(gdn, full_hidden, rows_state, state)
     buffers = buffers_of(rows_state)
     projected = gdn._project_rows_linear(full_hidden, rows_state)
     gdn._land_rows_qkv(projected, rows_state)
@@ -417,16 +673,29 @@ def rows_body_scan(gdn, full_hidden, rows_state, state, *, full_tile: bool = Fal
 
 def rows_body_fallback(gdn, full_hidden, rows_state, state, *, full_tile: bool = False):
     """Today's stream where the fold does not serve: the wrap on a rows state that carries its buffers, the chain
-    otherwise (the layer's resolved wrap-or-chain body)."""
+    otherwise (the layer's resolved wrap-or-chain body); on a lane rows state, the lanes chain (one batched chunk
+    call from the lanes' states)."""
 
+    if is_lane_rows_state(rows_state):
+        return gdn._rows_body_lanes_chain(full_hidden, rows_state, state)
     return gdn._rows_body_wrap()(gdn, full_hidden, rows_state, state, full_tile=full_tile)
+
+
+def is_lane_rows_state(rows_state) -> bool:
+    """Whether ``rows_state`` is the lane rows form (B lanes lane-major; ``Qwen38TTNNGDNLaneRowsState``): it carries
+    a lane count and the lane constants; the single stream's rows state carries neither."""
+
+    return getattr(rows_state, "lane_constants", None) is not None and getattr(rows_state, "lanes", None) is not None
 
 
 def admits(gdn, full_hidden, rows_state, state, *, full_tile: bool = False) -> bool:
     """The fold's input contract for one ``forward_rows`` body: the rows state carries the fold's buffers (which
     ``attach`` gives only the admitted verify form, and only when the kernel is on) and the call's state is the
-    single-lane fp32 recurrent tensor.  Shapes only: host fakes and every other form take today's stream."""
+    single-lane fp32 recurrent tensor.  Shapes only: host fakes and every other form take today's stream.  A lane
+    rows state is admitted by the lanes form's contract (``admits_lanes``), the same registry step serving both."""
 
+    if is_lane_rows_state(rows_state):
+        return admits_lanes(rows_state, state)
     if buffers_of(rows_state) is None or not qualifies(rows_state):
         return False
     recurrent = getattr(state, "recurrent", None)
@@ -461,6 +730,77 @@ def commit_all_rows(buffers, state) -> None:
         raise RuntimeError(f"{NAME} committed-state slice did not land in the recurrent state")
 
 
+def admits_lanes(rows_state, state) -> bool:
+    """The lanes form's input contract for one ``forward_rows_lanes`` body: the lane rows state carries the lanes
+    buffers (which ``attach_lanes`` gives only the admitted form, and only when the kernel is on) and the call's state
+    is the ``[B, 12, 128, 128]`` fp32 lane recurrent tensor."""
+
+    buffers = lane_buffers_of(rows_state)
+    if buffers is None or not qualifies_lanes(rows_state):
+        return False
+    recurrent = getattr(state, "recurrent", None)
+    if recurrent is None:
+        return False
+    try:
+        return tuple(recurrent.shape) == (buffers.lanes, HEADS, HEAD_DIM, HEAD_DIM) and recurrent.dtype == FP32
+    except (AttributeError, TypeError):
+        return False
+
+
+def rows_body_scan_lanes(gdn, full_hidden, rows_state, state):
+    """The folded lane body: the projection's linear and S2I, the q|k|v landing and its per-lane expand (the commit's
+    history advance reads both), the lanes scan program (the gated tile into the out-projection's activation shard,
+    the prefix states into the lane rows state's buffer), then the chain's own out-projection.  Returns ``(output,
+    None)``: lane u's state after all rows is prefix slot ``u * R + R - 1``.  The state must be the lane state the
+    buffers were attached for (``admits_lanes``); anything else is a wiring error, not a fallback."""
+
+    buffers = lane_buffers_of(rows_state)
+    if buffers is None or not admits_lanes(rows_state, state):
+        raise RuntimeError(
+            f"{NAME} lanes body called on a state outside its contract (lanes {getattr(rows_state, 'lanes', None)})"
+        )
+    projected = gdn._project_rows_linear(full_hidden, rows_state)
+    gdn._land_rows_qkv(projected, rows_state)
+    gdn._select_rows(
+        rows_state.lane_constants.expand_select,
+        rows_state.qkv,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        label="GDN lane rows expand",
+        output_tensor=rows_state.qkv_lanes,
+    )
+    gated = fp.allocate((1, 1, TILE, VALUE_WIDTH), BF16, ttnn.TILE_LAYOUT, gdn.mesh_device, buffers.gated_memory_config)
+    run_lanes(
+        projected,
+        rows_state.history,
+        gdn.weights.conv_taps,
+        buffers.constants,
+        gdn.weights.norm,
+        state.recurrent,
+        buffers.prefix,
+        gated,
+        lanes=buffers.lanes,
+        rows=buffers.rows,
+    )
+    _release(projected)
+    output = gdn._out_proj_tile(gated, full_hidden)  # consumes the gated tile
+    _release(full_hidden)
+    return output, None
+
+
+def commit_lanes(gdn, rows_state, buffers, state, selectors) -> None:
+    """The lanes commit under the fold: lane u's prefix slot ``u * R + c_u - 1`` into ``state.recurrent[u]`` by the
+    lanes pick program (``c_u == 0`` keeps the lane's state).  The counts are the selectors' committed-rows tensor
+    (``build_rows_selectors_lanes`` keeps it)."""
+
+    counts = getattr(selectors, "committed_counts", None)
+    if counts is None:
+        raise RuntimeError(
+            f"the {NAME} lanes commit needs the per-lane committed counts on its selectors "
+            "(build_rows_selectors_lanes sets committed_counts)"
+        )
+    run_pick_lanes(counts, buffers.prefix, state.recurrent, lanes=buffers.lanes, rows=buffers.rows)
+
+
 # ---------------------------------------------------------------------------------------------- the reference
 
 
@@ -482,6 +822,22 @@ def reference_rows(projected, history, taps, dt_bias, neg_exp_A, norm, state, ro
         states.append(current[0])
         gated_rows.append(gated[0])
     return torch.stack(states), torch.stack(gated_rows)
+
+
+def reference_rows_lanes(projected, history, taps, dt_bias, neg_exp_A, norm, state, lanes: int, rows: int):
+    """The lanes form's claim in torch: per lane, ``reference_rows`` on that lane's rows (tile rows u*rows .. u*rows +
+    rows - 1 of the lane-major ``projected`` [32, 4160]), its history ``history[u]`` [32, 2560] (rows 0..2) and its
+    state ``state[u]`` [12, 128, 128].  Returns (prefix [lanes*rows, 12, 128, 128] fp32: slot u*rows + j = lane u
+    after j + 1 rows; gated [lanes*rows, 1536] bf16)."""
+
+    states, gated_rows = [], []
+    for lane in range(lanes):
+        lane_tile = torch.zeros_like(projected)
+        lane_tile[:rows] = projected[lane * rows : (lane + 1) * rows]
+        prefix, gated = reference_rows(lane_tile, history[lane], taps, dt_bias, neg_exp_A, norm, state[lane], rows)
+        states.append(prefix)
+        gated_rows.append(gated)
+    return torch.cat(states), torch.cat(gated_rows)
 
 
 register(

@@ -1502,6 +1502,9 @@ class Qwen38TTNNGDNLaneRowsState:
     beta: Any
     g: Any
     mesh_contract: Qwen38MeshContract
+    # The verify-rows fold's lanes buffers (``fused.gdn_rows_scan.attach_lanes``: the ``[B * R, 12, 128, 128]`` prefix
+    # states), freed with the state; while they are here the fold owns the lane recurrence and the lane commit.
+    scan_buffers: Any = None
 
     @classmethod
     def allocate(
@@ -1580,6 +1583,9 @@ class Qwen38TTNNGDNLaneRowsState:
 
     def deallocate(self) -> None:
         _deallocate(self.history, self.qkv, self.qkv_lanes, self.q, self.k, self.v, self.beta, self.g)
+        if self.scan_buffers is not None:
+            self.scan_buffers.deallocate()
+            self.scan_buffers = None
 
 
 @dataclass(frozen=True)
@@ -1602,12 +1608,19 @@ class Qwen38TTNNRowsSelectorsLanes:
     commit_col: Any
     keep_col: Any
     onehot_bf16: tuple[Any, ...]
+    # ``c_u`` itself, ``[1,B,1,1]`` FP32 TILE: the verify-rows fold's lane commit reads it on the device (the pick of
+    # prefix slot ``u * R + c_u - 1``; ``c_u == 0`` keeps the lane's state).  None on selectors built without it.
+    committed_counts: Any = None
 
     def validate(self, lanes: int, rows: int) -> None:
         if (self.lanes, self.rows) != (lanes, rows) or len(self.onehot_bf16) != rows + 1:
             raise ValueError(
                 f"lane selectors were built for {self.lanes} x {self.rows}, the path runs {lanes} x {rows}"
             )
+        if self.committed_counts is not None:
+            _require_shape(self.committed_counts, (1, lanes, 1, 1), label="lane committed counts")
+            if self.committed_counts.dtype != ttnn.float32:
+                raise RuntimeError(f"lane committed counts must be FP32, got {self.committed_counts.dtype}")
         _require_shape(self.committed_mask, (1, lanes, CHUNK_SIZE, 1), label="lane committed rows mask")
         _require_shape(self.history_select, (1, lanes, CHUNK_SIZE, CONV_WINDOW_TILE_ROWS), label="lane history select")
         for name, tensor in (("commit_col", self.commit_col), ("keep_col", self.keep_col)):
@@ -1624,7 +1637,14 @@ class Qwen38TTNNRowsSelectorsLanes:
                 raise RuntimeError(f"lane selector onehot_bf16[{index}] dtype is {bf16.dtype}")
 
     def deallocate(self) -> None:
-        _deallocate(self.committed_mask, self.history_select, self.commit_col, self.keep_col, *self.onehot_bf16)
+        _deallocate(
+            self.committed_mask,
+            self.history_select,
+            self.commit_col,
+            self.keep_col,
+            *self.onehot_bf16,
+            self.committed_counts,
+        )
 
 
 def build_rows_selectors_lanes(
@@ -1660,9 +1680,10 @@ def build_rows_selectors_lanes(
     onehot_bf16 = tuple(
         ttnn.eq(committed_col, float(count), dtype=ttnn.bfloat16, memory_config=dram) for count in range(rows + 1)
     )
-    _deallocate(plus_one, onehot_row, select_flat, committed)  # ``committed_col`` is a view of ``committed``
+    # ``committed`` (``committed_col`` is its view) stays: the fold's lane commit reads the counts on the device
+    _deallocate(plus_one, onehot_row, select_flat)
     selectors = Qwen38TTNNRowsSelectorsLanes(
-        lanes, rows, committed_mask, history_select, commit_col, keep_col, onehot_bf16
+        lanes, rows, committed_mask, history_select, commit_col, keep_col, onehot_bf16, committed_counts=committed
     )
     selectors.validate(lanes, rows)
     return selectors
@@ -3493,9 +3514,13 @@ class Qwen38TTNNGDN:
     def allocate_lane_rows_state(
         self, constants: Qwen38TTNNGDNRowsConstants, lane_constants: Qwen38TTNNGDNLaneRowsConstants
     ) -> Qwen38TTNNGDNLaneRowsState:
-        return Qwen38TTNNGDNLaneRowsState.allocate(
+        rows_state = Qwen38TTNNGDNLaneRowsState.allocate(
             self.mesh_device, self.mesh_contract, constants, lane_constants, layer_index=self.weights.layer_index
         )
+        # Whether this state runs the verify-rows fold's lanes form is decided here, before the warm pass: its prefix
+        # states are the admission, so the warm rounds, the capture and the commit that picks them cannot disagree.
+        fused.gdn_rows_scan.attach_lanes(self, rows_state)
+        return rows_state
 
     def _validate_lane_rows_state(self, rows_state: Qwen38TTNNGDNLaneRowsState, state: Qwen38TTNNGDNState) -> int:
         if rows_state.layer_index != self.weights.layer_index:
@@ -3736,6 +3761,22 @@ class Qwen38TTNNGDN:
 
         rows = self._validate_lane_rows_state(rows_state, state)
         full_hidden = self._all_gather_rows(hidden_rows, rows)
+        # The body between the gather and the result, dispatched exactly as ``forward_rows`` dispatches the single
+        # stream's: the verify-rows fold's registry step (``fused.resolve_admitted("gdn_rows_scan")``, resolved once)
+        # runs the fold's lanes form on a lane rows state that carries its buffers and the lanes chain
+        # (``_rows_body_lanes_chain``, the fold's composed fallback for a lane rows state) otherwise --
+        # QWEN38_FUSED_OFF=gdn_rows_scan restores the chain for both streams.
+        body = self._rows_body()
+        output, final_state = body(self, full_hidden, rows_state, state)
+        _require_shape(output, (1, 1, CHUNK_SIZE, HIDDEN_SIZE_PER_DEVICE), label="GDN lane rows output tile")
+        self.mesh_contract.validate_tensor(output, placement=TensorPlacement.HIDDEN_SHARDED, shard_dim=3)
+        return Qwen38TTNNGDNRowsResult(output, final_state, state, rows_state)
+
+    def _rows_body_lanes_chain(self, full_hidden, rows_state: Qwen38TTNNGDNLaneRowsState, state: Qwen38TTNNGDNState):
+        """The lanes chain between the gather and the result: the projection, the per-lane expands, the FIR, the
+        chunk inputs, ONE batched chunk call from the lanes' states and the gate + out-projection.  Returns
+        ``(output, final_state)`` with the lanes' states after all rows in a new buffer the caller deallocates."""
+
         z, a, b = self._project_rows(full_hidden, rows_state)
         self._select_rows(
             rows_state.lane_constants.expand_select,
@@ -3750,7 +3791,7 @@ class Qwen38TTNNGDN:
         self._make_chunk_inputs_lanes(conv, a_lanes, b_lanes, rows_state)
         recurrent_output, final_state = self._chunk_rows_lanes(rows_state, initial_state=state.recurrent)
         output = self._gate_and_project_rows_lanes(recurrent_output, z, full_hidden, rows_state)
-        return Qwen38TTNNGDNRowsResult(output, final_state, state, rows_state)
+        return output, final_state
 
     def commit_rows_lanes(
         self,
@@ -3771,15 +3812,21 @@ class Qwen38TTNNGDN:
         rows = self._validate_lane_rows_state(rows_state, state)
         selectors.validate(rows_state.lanes, rows)
         dram = ttnn.DRAM_MEMORY_CONFIG
-        output, final_state = self._chunk_rows_lanes(
-            rows_state, initial_state=state.recurrent, committed_mask=selectors.committed_mask
-        )
-        _deallocate(output)
-        kept = ttnn.multiply(state.recurrent, selectors.keep_col, memory_config=dram)
-        taken = ttnn.multiply(final_state, selectors.commit_col, memory_config=dram)
-        landed = ttnn.add(kept, taken, output_tensor=state.recurrent)
-        _require_landed(landed, state.recurrent, label="GDN lane rows committed states")
-        _deallocate(kept, taken, final_state)
+        scan = fused.gdn_rows_scan.lane_buffers_of(rows_state)
+        if scan is not None:
+            # Lane u's state after c_u rows is the forward pass's prefix slot u * R + c_u - 1: one pick per lane, no
+            # re-run; a lane committing nothing keeps its state (the pick writes nothing for it).
+            fused.gdn_rows_scan.commit_lanes(self, rows_state, scan, state, selectors)
+        else:
+            output, final_state = self._chunk_rows_lanes(
+                rows_state, initial_state=state.recurrent, committed_mask=selectors.committed_mask
+            )
+            _deallocate(output)
+            kept = ttnn.multiply(state.recurrent, selectors.keep_col, memory_config=dram)
+            taken = ttnn.multiply(final_state, selectors.commit_col, memory_config=dram)
+            landed = ttnn.add(kept, taken, output_tensor=state.recurrent)
+            _require_landed(landed, state.recurrent, label="GDN lane rows committed states")
+            _deallocate(kept, taken, final_state)
         window = self._lane_conv_window(rows_state)
         landed = ttnn.matmul(
             selectors.history_select,
