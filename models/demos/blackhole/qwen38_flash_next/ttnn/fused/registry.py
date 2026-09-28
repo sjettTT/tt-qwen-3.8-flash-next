@@ -40,6 +40,7 @@ DEFAULT_ON: frozenset[str] = frozenset(
         "gdn_step",
         "gr_fold",
         "gr_read",
+        "gr_recip_last",
         "gr_write",
         "greedy_tail",
         "moe_combine",

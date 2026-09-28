@@ -1,12 +1,12 @@
 {
  "expected": {
-  "chat": 43,
+  "chat": 39,
   "code": 32,
   "document": 12,
   "fact": 15,
   "json": null,
-  "list": 56,
-  "math": 63,
+  "list": 46,
+  "math": 56,
   "multilingual": 9,
   "prose": 13,
   "refactor": 24,
@@ -18,8 +18,9 @@
  "schema": "qwen38-ci-baseline/v1",
  "source": {
   "date": "2026-09-27",
-  "evidence": "chat server startup replay with --prefill-slab 2048 --mtp 4 (the 128-row MTP chunk extension's slab form: the slab's MTP rows as 16 x 128-row slices inside the slab body), one idle run on a 1x4 p150 line, 2026-09-27, hold rb-serve1; the twelve study records are 37-434 prompt tokens (prefill_slabs 0 on each), so their rows equal the same head's --mtp 4 table (A3-mtp4-32k) by construction; the slab record 'document' (2228 prompt tokens, prefill_slabs 1) is the only pin exercising a slab body under MTP: its MTP stream after the slab prefill is tolerance-class against the chunked forms (docs/NUMERICS.md), pinned here as measured",
-  "head": "e60ad515103777003b867e064371d4733f3c1e79",
+  "evidence": "chat server startup replay with --prefill-slab 2048 --mtp 4, one 1x4 p150 line, 2026-09-27: gr_recip_last by default beside the MoE rows form on two rings; the twelve study records read as the --mtp 4 table (chat 39, list 46, math 56; nine unchanged) and the slab record document (2,228 prompt tokens, one slab) stays at divergence index 12 with its own stream: the only pin exercising a slab body under MTP, tolerance-class against the chunked forms (docs/NUMERICS.md)",
+  "head": "1aae82bbe33f7dcb7b61be56623972edbe51a921",
+  "run": "acceptance-slab2048-mtp4.json",
   "sku": "p150x4"
  },
  "status": "proposal"

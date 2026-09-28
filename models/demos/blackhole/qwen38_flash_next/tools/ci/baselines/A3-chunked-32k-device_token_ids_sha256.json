@@ -1,24 +1,25 @@
 {
  "expected": {
-  "chat": "34686e9146e7ec4ce2b89a22cd86d8649f184bbddbda94690ae5183bdf7cda16",
-  "code": "0234032be259edb09c5a14223164516548a972e013dc66d2e6452ee9c14d5c08",
+  "chat": "1bbbf060a22e2aa1b9613a7b48b18680b6f2c02f4b06636859d563b50dd43690",
+  "code": "159de7287947ac44a7f8fe4d4405341775aaf5b0c73b974dce3e826dbc2d42ff",
   "fact": "9afd57cc03036e8beac9b7fc53121826c939780b810095f3b88e2c987be9c521",
   "json": "a5b4defa72fae270391869377862fe60b95d893a6c2cfd24ea265bb59de6d16f",
-  "list": "5a3a0e334566126f19c51c649e4bda0536aedcc28a0f5be55bddc0a5de06f70a",
-  "math": "19f55ccb4bb2174423d32141df95c365aa6306b246a65f26b4e5b255b64a7ea2",
-  "multilingual": "c60fa8f457608453dbf2c5c51d3bc64338c7b6f22115867272ed1786f59422b2",
-  "prose": "e1416bf3c3d4a28bd4b42b93aba1451558cb0a7dbfd5c7cf7f3fb66023a37d4e",
-  "refactor": "8fad29b699a43b385a99541cf4aac4a775415f0919ef8c154a5054629d0dbc92",
+  "list": "8253ba344696e880fc2ea18fe604e6c46e92c4401b748abc239c436cd27f0d44",
+  "math": "96290ed7ae52dd7c2c04922955aa1820d9a969045b3909188572a1754c199550",
+  "multilingual": "3069debfd813bbea34363c10d2edf1d1df1515072d207b8b47577bc91ece231a",
+  "prose": "19538e64128d3b8c2f47fc3580ee0ddf792b59ba6b0ef12989181b30df69a547",
+  "refactor": "8a812a8ea01b3d7da9da5788d0d03034082562b5c5e7208ab7efc74ac301ee3d",
   "sky": "de86bbc09c482272bf2da4c31c3f13cc593e5590ed85a8dacbd72d6cc80205fc",
-  "story": "d1897b72f57de336477b57a6d5f13fcb611f44bcee99a57236ba4022572a7b97",
+  "story": "efaf8f20e25c7c28bc558ffaff42caf2a05be421c80a16552c67a64ec780bab4",
   "summary": "d9d024681580637c7df49daeb494605434d11459d87314dae53566a7527cbba6"
  },
  "pin": "A3/chunked-32k/device_token_ids_sha256",
  "schema": "qwen38-ci-baseline/v1",
  "source": {
-  "date": "2026-09-25",
-  "evidence": "chat server startup replay, chunked prefill, one lane of a 4x p150 host, 2026-09-25, on two hosts with identical device tokens record for record (12/12): bf8 dense weights, the fused GDN step and moe_compute's compact expert layout by default; against the 2026-09-06 table chat 43 -> 2 (the device's own row holds 449 one bf16 step above the CPU's 264: a near-tie; the bf8 weights and the fused step each move it one step), the other eleven indices unchanged; six streams differ after their divergence (fact at 60, multilingual at 32, prose at 76, refactor at 83, story at 16)",
-  "head": "79082e430439e60f2e14b5f127ae91f601f232f9",
+  "date": "2026-09-27",
+  "evidence": "chat server startup replay, chunked prefill, one 1x4 p150 line, 2026-09-27: gr_recip_last (the gated-residual read's front with the rsqrt applied after the down projection, COMPONENT class) by default beside the MoE rows form on two rings; against the 2026-09-25 table chat 2 -> 56 and code 32 -> none (later), math 61 -> 56 (the near-tie NUMERICS records at 0.36 logits), the other nine indices unchanged; eight streams differ past their divergence",
+  "head": "1aae82bbe33f7dcb7b61be56623972edbe51a921",
+  "run": "acceptance-default.json",
   "sku": "p150x4"
  },
  "status": "proposal"

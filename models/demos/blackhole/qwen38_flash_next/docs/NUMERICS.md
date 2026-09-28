@@ -25,7 +25,8 @@ Every number here was measured on 4x p150 unless a date and host say otherwise.
 
 Decode chains run as fused programs (`ttnn/fused/`, built on `ttnn.generic_op`) where a kernel is bitwise against the
 chain it replaces on device, leaves every pinned table above unchanged and beats the previous step time in its own
-timing slot. On by default: `gr_read` with `gr_fold`, `gr_write`, `greedy_tail`, `moe_combine` (the prefill slab's
+timing slot. On by default: `gr_read` with `gr_recip_last` (its front with the rsqrt applied after the down projection,
+COMPONENT class, its own section below; `QWEN38_FUSED_OFF=gr_recip_last` restores `gr_fold`), `gr_write`, `greedy_tail`, `moe_combine` (the prefill slab's
 MoE combine as one program), `moe_post`, `ple`, `position_derive`,
 `qsa_block`, `qsa_rows`, `router_tail`, `shared_expert`: the gated-residual read as two programs with its two all-gathers inside
 them (the stats, their gather, normalize + down-project and the partial gather as one program whose transport cores send
@@ -267,6 +268,75 @@ and diverging from position 8128, where a query first attends across a slab boun
 The HiFi2 form is the default: closer to the control and to the reference than the HiFi4 form (whose fp32
 destination changes where the scores round) and 10 % faster to the first token at 32k; under the device profiler the
 attention class of one slab is 5.5x shorter than the chain's (89.77 -> 16.28 ms) and the slab's kernel time 9 % shorter.
+
+## The GR read with the rsqrt applied last (`QWEN38_FUSED=gr_recip_last`, 2026-09-27)
+
+A COMPONENT-class fused kernel, on by default since 2026-09-27 with the component proof below recorded in its registry
+entry (it needs `gr_read`; `QWEN38_FUSED_OFF=gr_recip_last` restores the fold's front): `gr_recip_last` replaces `gr_fold`'s one-program front (the stats, their line gather, normalize and
+the down projection, the partials' line gather) with the same program re-associated so that nothing waits on the
+statistics exchange.  The fold's 5-row zone timeline (the MTP verify's rows, 111 traced calls, one 1x4 p150 line) puts
+22 of its 44.1 us per call between the two gathers waiting on rsqrt(mean): the norm compute 8.6, the 80-tile multicast
+of the normalized row into the twelve down workers 7.8 and the matmul 6.1; the two data legs themselves are 3.8 and
+7.0 us.  Here the norm cores compute u = bf16(x * gamma/4) right after the stats and multicast it at once; the workers
+run the same 80 matmul blocks into one fp32 dest tile per residual stream while the stats round trip is in flight;
+the norm cores turn the gathered stats into rsqrt(mean + eps) (the chain's reduce, eps and rsqrt, bitwise that far)
+and multicast the four fp32 tiles to the workers, which scale each stream's partial (the chain's column-broadcast
+multiply, on the fp32 partial) and sum the four in stream order into the partial tile the partials gather carries as
+before; the gate's operand bf16(u * rsqrt) is written off the critical path.  The transports, the payload and
+`low_rank_gate` are unchanged.  Rounding points that move against the chain: bf16(x * gamma/4) enters the matmul where
+the chain rounds bf16(bf16(x * rsqrt) * gamma/4); no spill/reload of the running partial; rsqrt is applied to the fp32
+partial; the gate's operand has one bf16 rounding where the chain has two.
+
+The component gate (the 1x4 replica against the tt/ oracle's `read_tp4` on captured residual rows, layers 2/12/47 x
+rows 1/5/32, the checkpoint's attention-block weights; the composed column is the bitwise fold): block-input rms_rel
+against the oracle 0.0036-0.0045 where the composed chain reads 0.0038-0.0045 (the kernel is closer at layers 2 and
+12 and 4 % farther at layer 47, within the component rule's 1.10x + 1e-3 on every row), |bias| <= 1.9e-4, ULP p99
+8-16 against the chain's 8-16, the injection's rms_rel equal to the chain's to three digits; the two device forms
+differ from each other by rms_rel 0.0036-0.0040:
+
+| layer | rows | fused rms_rel | composed rms_rel | allowed (1.10x + 1e-3) | fused bias | fused / composed ULP p99 |
+|---|---|---|---|---|---|---|
+| 2 | 1 | 0.00385 | 0.00391 | 0.00530 | 9.1e-05 | 16 / 12 |
+| 2 | 5 | 0.00408 | 0.00426 | 0.00568 | 7.3e-05 | 16 / 16 |
+| 2 | 32 | 0.00413 | 0.00425 | 0.00568 | 5.6e-05 | 16 / 16 |
+| 12 | 1 | 0.00363 | 0.00376 | 0.00514 | 4.7e-05 | 10.4 / 15.4 |
+| 12 | 5 | 0.00408 | 0.00443 | 0.00587 | 4.0e-05 | 16 / 16 |
+| 12 | 32 | 0.00428 | 0.00449 | 0.00594 | 4.5e-05 | 16 / 16 |
+| 47 | 1 | 0.00445 | 0.00427 | 0.00569 | 1.9e-04 | 8 / 8 |
+| 47 | 5 | 0.00436 | 0.00424 | 0.00567 | 1.9e-04 | 9 / 8 |
+| 47 | 32 | 0.00412 | 0.00407 | 0.00548 | 7.4e-05 | 11 / 12 |
+
+Program cache +1 on the first call then 0; 3 x 100 trace replays with
+the rows refreshed bitwise against eager calls; every transport semaphore 0 afterwards.  Cost: the front 44.1 -> 33.1
+us per call on the device (span, 5 rows), the read (front + `low_rank_gate`) 71.5-72.1 -> 59.7-60.7 us traced host wall
+at rows 1/5/32; the new pacer is the u multicast (8.3 -> 17.5 us), then the partials exchange (8 us: six 4 KB packets
+per transport core; a pool of packet headers in place of the per-packet flush was measured flat, so the sender's
+slot wait paces those sends, not the flush; multicasting the u row in 4-tile pieces as it is packed measured 2.4-3.2 us
+slower, so that multicast is bandwidth-bound, not issue-bound).
+
+Measured 2026-09-27 on the 1x4 p150 line with the kernel on against the fold (the same tree, both arms): the served
+`--mtp 4` pass p50 chat560 48.82 -> 47.58 ms, json 48.28 -> 46.86, prose 47.22 -> 45.51, chat560 sampled 51.27 -> 50.00
+(100 pipelined passes per cell, the verify replay 37.84 -> 36.59 / 37.07 -> 35.87 / 36.39 -> 35.06, the draft and commit
+replays unchanged); the paired 43-prompt EOS-honoured sample (the twelve acceptance records, sixteen served / eval
+corpus items, six book excerpts, five synthetic chats; one greedy 256-token request each, `ignore_eos` false; a second
+quiet 1x4 line, load under 2): 3108.2 against 3027.9 tok/s summed (+2.7 %), up on 28 prompts / down on 15, paired mean
++1.87 tok/s (s.e. 0.52; 95 % interval +0.85..+2.89), mean relative +2.99 % (s.e. 0.94), by part acceptance +3.3 %,
+served +4.0 %, eval +1.4 %, book +0.7 %, synthetic +3.1 %.  The token streams change (a tolerance-class kernel), so the
+tokens per pass move both ways per prompt while the pass wall gain is deterministic.  The acceptance replays under
+the kernel (json 96/96 on every path): plain decode against the pinned chunked table keeps fact 15, list 56,
+multilingual 9, prose 13, refactor 24, sky 19, story 6, summary 75 and leaves the reference later on chat (2 -> 56) and
+code (32 -> none in 96), earlier on math (61 -> 56); `--mtp 4` against the pinned MTP table keeps nine indices (code 32,
+fact 15, multilingual 9, prose 13, refactor 24, sky 19, story 6, summary 1, json none) and moves chat 43 -> 39, list 56 ->
+46, math 63 -> 56 -- the positions the k = 5 study above records as 0.09-0.36-logit near-ties; `--prefill-slab 2048
+--mtp 4` against its 13-row table keeps the slab record at 12 and reads the twelve study records exactly as the MTP
+replay does.  The pins moved to this kernel's tables with the default (below).  The README's `--mtp 4` row, re-measured on the
+combined head (the MoE rows form on two rings and this kernel by default) on a quiet 1x4 p150 line, 2026-09-27, the
+EOS-honoured client (1 warm-up + median of 3, greedy, max 256): chat560 64.35 tok/s (256 tokens, 2.98 tokens per pass),
+the 177-token multi-turn chat 56.77 (256, 2.56), code 102.2 (256, 4.65), json 103.89 (153 to its end marker, 4.78),
+prose 50.18 (193, 2.24) against the rings row's 64.86 / 61.04 / 97.47 / 101.01 / 47.25 (the 177-token chat's stream
+leaves the fold's at token 39 and accepts fewer drafts: 2.83 -> 2.56 tokens per pass; code and json accept more);
+sampled TPOT (median of 6 chats) 17.60 ms non-thinking and 19.32 ms thinking against 19.8 / 19.1; the chat560 pass p50
+45.84 ms (p10 45.15 / p90 46.39, 100 pipelined passes, 2.914 tokens per pass), json 45.11, prose 44.16.
 
 ## The acceptance mechanism
 

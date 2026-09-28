@@ -1,11 +1,11 @@
 {
  "expected": {
-  "chat": 2,
-  "code": 32,
+  "chat": 56,
+  "code": null,
   "fact": 15,
   "json": null,
   "list": 56,
-  "math": 61,
+  "math": 56,
   "multilingual": 9,
   "prose": 13,
   "refactor": 24,
@@ -16,9 +16,10 @@
  "pin": "A3/chunked-32k/divergence_index",
  "schema": "qwen38-ci-baseline/v1",
  "source": {
-  "date": "2026-09-25",
-  "evidence": "chat server startup replay, chunked prefill, one lane of a 4x p150 host, 2026-09-25, on two hosts with identical device tokens record for record (12/12): bf8 dense weights, the fused GDN step and moe_compute's compact expert layout by default; against the 2026-09-06 table chat 43 -> 2 (the device's own row holds 449 one bf16 step above the CPU's 264: a near-tie; the bf8 weights and the fused step each move it one step), the other eleven indices unchanged; six streams differ after their divergence (fact at 60, multilingual at 32, prose at 76, refactor at 83, story at 16)",
-  "head": "79082e430439e60f2e14b5f127ae91f601f232f9",
+  "date": "2026-09-27",
+  "evidence": "chat server startup replay, chunked prefill, one 1x4 p150 line, 2026-09-27: gr_recip_last (the gated-residual read's front with the rsqrt applied after the down projection, COMPONENT class) by default beside the MoE rows form on two rings; against the 2026-09-25 table chat 2 -> 56 and code 32 -> none (later), math 61 -> 56 (the near-tie NUMERICS records at 0.36 logits), the other nine indices unchanged; eight streams differ past their divergence",
+  "head": "1aae82bbe33f7dcb7b61be56623972edbe51a921",
+  "run": "acceptance-default.json",
   "sku": "p150x4"
  },
  "status": "proposal"

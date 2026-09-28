@@ -1056,29 +1056,32 @@ def test_committed_baselines_belong_to_baseline_pins_and_carry_their_source():
         }
     )
     assert chunked["json"] is None and forced["json"] is None
-    assert chunked == {  # the 2026-09-25 replay: bf8 dense weights, the fused GDN step and the compact expert layout
-        "json": None,
-        "chat": 2,
-        "code": 32,
-        "fact": 15,
-        "list": 56,
-        "math": 61,
-        "multilingual": 9,
-        "prose": 13,
-        "refactor": 24,
-        "sky": 19,
-        "story": 6,
-        "summary": 75,
-    }
+    assert (
+        chunked
+        == {  # the 2026-09-27 replay: gr_recip_last (the GR read's front with the rsqrt applied last) by default
+            "json": None,
+            "chat": 56,
+            "code": None,
+            "fact": 15,
+            "list": 56,
+            "math": 56,
+            "multilingual": 9,
+            "prose": 13,
+            "refactor": 24,
+            "sky": 19,
+            "story": 6,
+            "summary": 75,
+        }
+    )
     mtp4_table = {
         m: ci.load_baseline(f"A3/mtp4-32k/{m}")["expected"] for m in ("divergence_index", "device_token_ids_sha256")
     }
     mtp4 = mtp4_table["divergence_index"]
     assert set(mtp4) == set(chunked) and mtp4["json"] is None
-    # the same replay through the MTP pass loop: later on chat and math, earlier on summary, where the device's own
-    # logits hold the two candidates within one bf16 step (the verify row and the 1-row TAIL break the tie apart; the
-    # fused GDN step serves the one-row step only)
-    assert mtp4 == {**chunked, "chat": 43, "math": 63, "summary": 1}
+    # the same replay through the MTP pass loop: earlier on chat (39) and list (46), the reference held to 32 on code
+    # where plain decode holds it to 96, earlier on summary (1), where the device's own logits hold the two candidates
+    # within one bf16 step (the verify row and the 1-row TAIL break the tie apart); math 56 on both paths
+    assert mtp4 == {**chunked, "chat": 39, "code": 32, "list": 46, "summary": 1}
     # the slab tables (--prefill-slab 2048 with and without --mtp 4) carry a thirteenth row, the slab record: the one
     # acceptance record long enough to run a 2048-row slab (tools/acceptance/greedy-prompts/prompt-document-greedy.json,
     # replayed only under --prefill-slab).  The twelve study records stay under 2048 tokens (no slab fires), so on them

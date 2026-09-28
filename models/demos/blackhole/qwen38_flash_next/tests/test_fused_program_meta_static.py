@@ -17,8 +17,8 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.fused import program as fp
 
 FUSED = Path(fp.__file__).parent
 MODULES = sorted(FUSED.glob("*/__init__.py"))
-KERNELS = 22  # sub-packages under ttnn/fused
-LAUNCHES = 62  # run_program call sites over them (every one passes its meta)
+KERNELS = 23  # sub-packages under ttnn/fused
+LAUNCHES = 63  # run_program call sites over them (every one passes its meta)
 # a program's ``kernel`` is a registered name; the QSA block's mirrors and probes that are not a kernel of their own say
 # ``qsa_block``; the names bound in the modules that hold a kernel name
 KERNEL_NAMES = set(fused.kernels()) | {"qsa_block"}
@@ -91,6 +91,7 @@ def test_every_meta_names_a_kernel_and_a_distinct_variant():
     # the served step's programs are legible by these names (the census table's rows)
     assert {"post", "post_sigmoid"} <= seen["moe_post"]
     assert {"stats_normalize_down_gather", "normalize_down_gather", "stats_gather", "gather_line"} <= seen["gr_fold"]
+    assert seen["gr_recip_last"] == {"stats_recip_down_gather"}
     assert {"normalize_down", "low_rank_gate", "normalize", "down_project", "low_rank", "gate", "stats"} <= seen[
         "gr_read"
     ]

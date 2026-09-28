@@ -20,8 +20,8 @@ BUILDERS = sorted(FUSED.glob("**/*.py"))
 INCLUDE = '#include "../../kernels/zones.h"'
 ZONE = re.compile(r'FUSED_ZONE\("([^"]+)"\)')
 NAME = re.compile(r"^fz_[a-z0-9_]+$")
-KERNEL_FILES = 103
-ZONES = 226
+KERNEL_FILES = 107
+ZONES = 239
 # every kernel's zone names carry its prefix (the census table's phase column reads them)
 PREFIX = {
     "final_mixer": "fz_fm_",
@@ -31,6 +31,7 @@ PREFIX = {
     "gdn_step": "fz_gs_",
     "gr_fold": "fz_gf_",
     "gr_read": "fz_gr_",
+    "gr_recip_last": "fz_gl_",
     "gr_write": "fz_gw_",
     "greedy_tail": "fz_gt_",
     "moe_combine": "fz_mc_",

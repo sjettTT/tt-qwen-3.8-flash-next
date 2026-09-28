@@ -55,6 +55,7 @@ from . import (
     untilize_rows,
 )
 from . import gr_fold  # after gr_read: it composes gr_read's programs
+from . import gr_recip_last  # after gr_fold: it composes gr_fold's transports over gr_read's programs
 from . import moe_dense  # after router_tail, shared_expert, untilize_rows and gr_read: it hosts their kernels
 from . import gdn_prefill_rows  # after the two rows programs: it wires them together for the prefill slab
 from . import qsa_rows  # after qsa_block: it composes its score merge over the verify tile's rows
@@ -83,6 +84,7 @@ __all__ = [
     "gdn_rows_wrap",
     "gdn_step",
     "gr_read",
+    "gr_recip_last",
     "gr_write",
     "greedy_tail",
     "kernel",
