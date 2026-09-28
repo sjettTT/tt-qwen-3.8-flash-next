@@ -1078,10 +1078,12 @@ def test_committed_baselines_belong_to_baseline_pins_and_carry_their_source():
     }
     mtp4 = mtp4_table["divergence_index"]
     assert set(mtp4) == set(chunked) and mtp4["json"] is None
-    # the same replay through the MTP pass loop: earlier on chat (39) and list (46), the reference held to 32 on code
-    # where plain decode holds it to 96, earlier on summary (1), where the device's own logits hold the two candidates
-    # within one bf16 step (the verify row and the 1-row TAIL break the tie apart); math 56 on both paths
-    assert mtp4 == {**chunked, "chat": 39, "code": 32, "list": 46, "summary": 1}
+    # the same replay through the MTP pass loop with the verify rows' GDN body on the fold (gdn_rows_scan, bitwise
+    # the 1-row step) beside the MoE rows on two rings and gr_recip_last (2026-09-28): the stream leaves the reference
+    # where plain decode does on 11 of 12 and LATER on math (61 against plain decode's 56: the re-associated norm moved
+    # plain decode's near-tie at 56 while the MTP path's own logits held the reference's token there); before
+    # gr_recip_last the fold read plain decode's index on all 12 (chat 2, math 61, summary 75 on 2026-09-26)
+    assert mtp4 == {**chunked, "math": 61}
     # the slab tables (--prefill-slab 2048 with and without --mtp 4) carry a thirteenth row, the slab record: the one
     # acceptance record long enough to run a 2048-row slab (tools/acceptance/greedy-prompts/prompt-document-greedy.json,
     # replayed only under --prefill-slab).  The twelve study records stay under 2048 tokens (no slab fires), so on them

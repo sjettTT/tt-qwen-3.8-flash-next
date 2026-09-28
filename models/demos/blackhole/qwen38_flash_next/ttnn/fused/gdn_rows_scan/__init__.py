@@ -11,11 +11,13 @@ Stage B of the verify-rows scan design (the fold).  One GDN layer's verify body 
 where the wrap (``gdn_rows_wrap``, today's default) runs six programs between the S2I and the out-projection
 (``gdn_pre_rows`` -> ``chunk_gdn_prep`` -> ``chunk_gdn_scan`` -> ``post_cast`` -> ``post_norm`` on the chunk / WY form
 at TF32 operand precision) and the chain 53.  The program runs gdn_step's compute body in a row loop: conv + SiLU and
-both l2 norms once over the 32-row tile, then per row the gate scalars, ``S' = S * exp(g)``, ``v_read = k S'``,
-``delta = (v - v_read) * beta`` on that row alone (the one-hot row mask), ``S = S' + k^T delta`` and ``o = (q S) *
-128^-0.5``, the state carried row to row in L1; then the gated RMSNorm once on the assembled o rows.  Every LLK call,
-rounding point and DST accumulation order is gdn_step's, so the program is BITWISE with ``rows`` sequential fused
-``gdn_step`` calls from the same state (the die proof), and its numerics class against today's MTP stream (the chunk
+both l2 norms once over the 32-row tile, the gate scalars of every row in one SFPU pass over the a / b tiles (element
+(row, head) of beta_all / decay_all, which the reader replicates into one exact fp32 tile per row), then per row
+``S' = S * exp(g)``, ``v_read = k S'``, ``delta = (v - v_read) * beta`` on that row alone (the one-hot row mask), ``S =
+S' + k^T delta`` and ``o = (q S) * 128^-0.5``, the state carried row to row in L1; then the gated RMSNorm once on the
+assembled o rows.  Every LLK call, rounding point and DST accumulation order is gdn_step's (the gate ops are
+lane-wise, so a whole-tile pass gives each element the bits the per-row scalar chain gave it), so the program is
+BITWISE with ``rows`` sequential fused ``gdn_step`` calls from the same state (the die proof), and its numerics class against today's MTP stream (the chunk
 form) is COMPONENT.
 
 Outputs per layer: the gated tile ``[1, 1, 32, 1536]`` bf16 straight into the out-projection's activation shard (rows
@@ -27,8 +29,9 @@ instead of the wrap's masked re-run of the two prims (its TF32-class passthrough
 under the fold returns ``final_state=None``: the state after all rows is prefix slot ``rows - 1``, owned by the rows
 state, and the verify body only frees the result's final state.
 
-Opt-in: ``QWEN38_FUSED=gdn_rows_scan`` (class COMPONENT; the served stream's pins move toward plain decode's GDN
-numerics, a re-pin the user decides at gate time).  Admission is a property of the rows state, decided when it is
+On by default since 2026-09-26 (class COMPONENT with its component-gate record: the probe's rows column against the
+CPU oracle; ``QWEN38_FUSED_OFF=gdn_rows_scan`` restores the wrap, and the served stream's pins are this kernel's:
+plain decode's divergence on 12 of 12 records).  Admission is a property of the rows state, decided when it is
 allocated (``attach``): the 32-row verify form with ``1 <= rows <= MAX_ROWS``, its own body, device tensors.  With
 the fold attached the wrap is not; ``QWEN38_FUSED_OFF`` semantics are unchanged.
 
@@ -93,7 +96,7 @@ BF16, FP32 = ttnn.bfloat16, ttnn.float32
 CB_STATE, CB_SNEW, CB_OUTS, CB_DEBUG, CB_SNEWC, CB_OROWS, CB_OBF = 7, 24, 25, 28, 30, 29, 31
 # debug taps (DEBUG_TAPS builds) in program order, one fp32 tile each: per item, then per row
 ITEM_TAPS = ("conv_q0", "conv_v0", *(f"q{t}" for t in range(4)), *(f"k{t}" for t in range(4)))  # the conv and the norms
-GATE_TAPS = ("beta", "decay")  # per row, in the gates block after the norms
+GATE_TAPS = ("beta", "decay")  # per row, in the gates block after the norms (the reader's replicated tiles)
 LATE_TAPS = ("kcol0",)  # after the gates: the k columns
 ROW_TAPS = ("sdec0", "vread0", "deltab0", "snew0", "o0")  # per row, in the recurrence
 # fp32 CBs consumed only by copy_tile (exact unpack to DST); matmul, reduce and broadcast operands stay Default
@@ -110,7 +113,7 @@ def cb_table(rows: int, vbt: int) -> tuple[tuple[int, object, int], ...]:
         (1, BF16, 3 * nt),  # S: the three shifted slots per tile
         (2, BF16, 4 * nt),  # T: the four taps per tile
         (3, BF16, HT),  # Z
-        (4, BF16, 2 * rows),  # AB: one a / b pair per row
+        (4, BF16, 2),  # AB: the a and b tiles (every row's gate scalars; the gates take all rows in one pass)
         (5, FP32, 2),  # DTNA
         (6, BF16, HT),  # W
         (7, FP32, st),  # STATE (S at pass start)
@@ -119,7 +122,7 @@ def cb_table(rows: int, vbt: int) -> tuple[tuple[int, object, int], ...]:
         (10, BF16, 4),  # CONVSUM
         (11, BF16, nt),  # QKV: silu(conv)
         (12, BF16, HT),  # SQ / NRMW
-        (13, BF16, 2),  # STAT
+        (13, FP32, 2),  # GALL: beta_all / decay_all (compute -> reader, which replicates them per row)
         (14, BF16, HT),  # UNIT / NRM
         (15, FP32, HT),  # QROW
         (16, FP32, HT),  # KROW
@@ -492,9 +495,15 @@ register(
         fused=rows_body_scan,
         composed=rows_body_fallback,
         admits=admits,
-        # COMPONENT against today's stream (the chunk form): the component proof is the die proof against rows
-        # sequential gdn_step calls (bitwise) plus the verify-rows probe column; none recorded yet, so never a default
-        component_proof=None,
+        # COMPONENT against the wrap's stream (the chunk form); the component gate is the fused GDN step probe's rows
+        # column (fused_gdn_step_probe --rows 5): the fold's slots against the CPU oracle, and bitwise the fused step
+        # run sequentially in every window (the die proof's identity on real inputs)
+        component_proof=(
+            "the fused GDN step probe's rows column against the CPU oracle, one p150 die, 2026-09-26 (run "
+            "probe-rows5-8edcaf9279c-162454, --rows 5, 64 steps): state error 0.0048 and gated output 0.0098 for "
+            "the fold's five rows, open and closed loop, 0.0048 and 0.0098 for the fused step and 0.0081 and "
+            "0.0234 for the composed chain; every window's slots and rows bitwise the fused step run sequentially"
+        ),
         gate=None,
     )
 )

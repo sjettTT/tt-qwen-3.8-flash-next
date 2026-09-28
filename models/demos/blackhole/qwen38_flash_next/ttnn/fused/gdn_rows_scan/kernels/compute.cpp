@@ -3,9 +3,10 @@
 //
 // The verify rows' GDN recurrence as gdn_step's compute body in a row loop: for one (value head, state column
 // block) item, conv + SiLU and both l2 norms once over the 32-row tile, then rows r = 0 .. ROWS-1 through the SAME
-// per-row calls as gdn_step (gate scalars; S' = S * decay; v_read = k S'; delta_b = ((v - v_read) * M_r) * beta;
-// S = S' + k^T delta_b; o_r = (q S) * 128^-0.5), the state carried row to row in L1 and every prefix state handed to
-// the writer, and the gated RMSNorm once on the assembled o rows.  Rounding points, LLK calls, DST accumulation
+// per-row calls as gdn_step (S' = S * decay; v_read = k S'; delta_b = ((v - v_read) * M_r) * beta;
+// S = S' + k^T delta_b; o_r = (q S) * 128^-0.5) with the gate scalars of every row computed in one pass before them
+// (gates_all; the reader replicates them into per-row tiles), the state carried row to row in L1 and every prefix
+// state handed to the writer, and the gated RMSNorm once on the assembled o rows.  Rounding points, LLK calls, DST accumulation
 // orders and CB discipline are gdn_step's call for call: the row loop is bitwise ROWS sequential gdn_step calls.
 // Compile-time args: 0 ROWS (real rows of the tile), 1 VBT (state column tiles per item: 4 = whole head, 1 = one of
 // four blocks).  Runtime args: 0 items on this core.
@@ -38,7 +39,7 @@ using namespace ckernel;
 
 namespace {
 constexpr uint32_t CB_P = 0, CB_S = 1, CB_T = 2, CB_Z = 3, CB_AB = 4, CB_DTNA = 5, CB_W = 6, CB_STATE = 7;
-constexpr uint32_t CB_MASK = 8, CB_SCALER = 9, CB_CONVSUM = 10, CB_QKV = 11, CB_SQ = 12, CB_STAT = 13, CB_UNIT = 14;
+constexpr uint32_t CB_MASK = 8, CB_SCALER = 9, CB_CONVSUM = 10, CB_QKV = 11, CB_SQ = 12, CB_GALL = 13, CB_UNIT = 14;
 constexpr uint32_t CB_QROW = 15, CB_KROW = 16, CB_KCOL = 17, CB_BETA = 18, CB_DECAY = 19, CB_SDEC = 20, CB_SDECC = 21;
 constexpr uint32_t CB_VREAD = 22, CB_DELTAB = 23, CB_SNEW = 24, CB_OUTS = 25, CB_OUTG = 26, CB_RS = 27;
 constexpr uint32_t CB_DBG = 28, CB_OROWS = 29, CB_SNEWC = 30, CB_OBF = 31;
@@ -134,26 +135,26 @@ ALWI void l2_norm(uint32_t base, uint32_t out_cb) {
 
     cb_wait_front(CB_SQ, HT);
     reconfig_data_format(CB_SCALER, CB_SQ);
-    reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(CB_SQ, CB_SCALER, CB_STAT);
-    pack_reconfig_data_format(CB_STAT);
+    reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(CB_SQ, CB_SCALER, CB_CONVSUM);
+    pack_reconfig_data_format(CB_CONVSUM);
     tile_regs_acquire();
     for (uint32_t t = 0; t < HT; ++t) {
         reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(CB_SQ, CB_SCALER, t, 0, 0);
     }
     tile_regs_commit();
     tile_regs_wait();
-    cb_reserve_back(CB_STAT, 1);
-    pack_tile(0, CB_STAT);
-    cb_push_back(CB_STAT, 1);
+    cb_reserve_back(CB_CONVSUM, 1);
+    pack_tile(0, CB_CONVSUM);
+    cb_push_back(CB_CONVSUM, 1);
     tile_regs_release();
     reduce_uninit();
     cb_pop_front(CB_SQ, HT);
 
     // + eps -> bf16, then rsqrt -> bf16
     for (uint32_t step = 0; step < 2; ++step) {
-        cb_wait_front(CB_STAT, 1);
-        reconfig_data_format_srca(CB_STAT);
-        copy_init(CB_STAT);
+        cb_wait_front(CB_CONVSUM, 1);
+        reconfig_data_format_srca(CB_CONVSUM);
+        copy_init(CB_CONVSUM);
         if (step == 0) {
             binop_with_scalar_tile_init();
         } else {
@@ -161,7 +162,7 @@ ALWI void l2_norm(uint32_t base, uint32_t out_cb) {
             recip_tile_init();
         }
         tile_regs_acquire();
-        copy_tile(CB_STAT, 0, 0);
+        copy_tile(CB_CONVSUM, 0, 0);
         if (step == 0) {
             add_unary_tile(0, EPS_1E6);
         } else {
@@ -170,28 +171,28 @@ ALWI void l2_norm(uint32_t base, uint32_t out_cb) {
         }
         tile_regs_commit();
         tile_regs_wait();
-        cb_reserve_back(CB_STAT, 1);
-        pack_tile(0, CB_STAT);
-        cb_push_back(CB_STAT, 1);
+        cb_reserve_back(CB_CONVSUM, 1);
+        pack_tile(0, CB_CONVSUM);
+        cb_push_back(CB_CONVSUM, 1);
         tile_regs_release();
-        cb_pop_front(CB_STAT, 1);
+        cb_pop_front(CB_CONVSUM, 1);
     }
 
-    cb_wait_front(CB_STAT, 1);
-    reconfig_data_format(CB_QKV, CB_STAT);
-    mul_bcast_cols_init(CB_QKV, CB_STAT);
+    cb_wait_front(CB_CONVSUM, 1);
+    reconfig_data_format(CB_QKV, CB_CONVSUM);
+    mul_bcast_cols_init(CB_QKV, CB_CONVSUM);
     pack_reconfig_data_format(CB_UNIT);
     cb_reserve_back(CB_UNIT, HT);
     for (uint32_t t = 0; t < HT; ++t) {
         tile_regs_acquire();
-        mul_tiles_bcast_cols(CB_QKV, CB_STAT, base + t, 0, 0);
+        mul_tiles_bcast_cols(CB_QKV, CB_CONVSUM, base + t, 0, 0);
         tile_regs_commit();
         tile_regs_wait();
         pack_tile(0, CB_UNIT);
         tile_regs_release();
     }
     cb_push_back(CB_UNIT, HT);
-    cb_pop_front(CB_STAT, 1);
+    cb_pop_front(CB_CONVSUM, 1);
 
     cb_wait_front(CB_UNIT, HT);
     reconfig_data_format_srca(CB_UNIT);
@@ -236,49 +237,48 @@ ALWI void k_columns() {
     cb_push_back(CB_KCOL, HT);
 }
 
-// beta = bf16(sigmoid(b)) and decay = exp(neg_exp_A * softplus(a + dt_bias)) as full fp32 tiles, from row `row`'s
-// a / b pair (CB_AB tiles 2 row, 2 row + 1; the reader patched element (row, head) into [0, 0]).  All rows' gates
-// are computed in one block right after the l2 norms, where gdn_step computes its one row's (the scalar broadcast
-// unpack follows the norm's copies there, never a matmul); dt_bias / neg_exp_A stay for every row.
-ALWI void gate_scalars(uint32_t row) {
-    cb_wait_front(CB_AB, 2 * ROWS);
+// beta_all = bf16(sigmoid(b)) and decay_all = exp(neg_exp_A * softplus(a + dt_bias)) for EVERY element of the
+// projection's a / b tiles (CB_AB: tile 0 = a, tile 1 = b; element (row, head) is row `row`'s scalar of head `head`)
+// in one SFPU pass each -- the same element-wise LLK calls gdn_step runs on its one scalar (the scalar-broadcast
+// unpack there and the plain bf16 copy here both land the exact bf16 value in DST; sigmoid / softplus / exp / the
+// binary ops are lane-wise), so element (row, head) holds bit for bit the value gdn_step's chain gives that row.  The
+// two results go to the reader as fp32 tiles (CB_GALL), which replicates each row's element into the full fp32 tiles
+// the recurrence multiplies (CB_BETA / CB_DECAY, exact 32-bit copies); beta keeps its bf16 pack round trip before
+// that.  dt_bias / neg_exp_A stay full tiles (an fp32 broadcast through the source registers would truncate them).
+ALWI void gates_all() {
+    cb_wait_front(CB_AB, 2);
     cb_wait_front(CB_DTNA, 2);
-
+    cb_reserve_back(CB_GALL, 2);
+    // beta: sigmoid(b) -> bf16 (CB_CONVSUM, free after the conv) -> fp32 tile 0 of CB_GALL
     tile_regs_acquire();
     reconfig_data_format_srca(CB_AB);
-    unary_bcast_init<BroadcastType::SCALAR>(CB_AB);
-    unary_bcast<BroadcastType::SCALAR>(CB_AB, 2 * row + 1, 0);
+    copy_init(CB_AB);
+    copy_tile(CB_AB, 1, 0);
     sigmoid_tile_init<false>();
     sigmoid_tile<VectorMode::RC, false>(0);
     tile_regs_commit();
     tile_regs_wait();
-    cb_reserve_back(CB_STAT, 1);
-    pack_reconfig_data_format(CB_STAT);
-    pack_tile(0, CB_STAT);
-    cb_push_back(CB_STAT, 1);
+    cb_reserve_back(CB_CONVSUM, 1);
+    pack_reconfig_data_format(CB_CONVSUM);
+    pack_tile(0, CB_CONVSUM);
+    cb_push_back(CB_CONVSUM, 1);
     tile_regs_release();
-
-    cb_wait_front(CB_STAT, 1);
+    cb_wait_front(CB_CONVSUM, 1);
     tile_regs_acquire();
-    reconfig_data_format_srca(CB_STAT);
-    copy_init(CB_STAT);
-    copy_tile(CB_STAT, 0, 0);
+    reconfig_data_format_srca(CB_CONVSUM);
+    copy_init(CB_CONVSUM);
+    copy_tile(CB_CONVSUM, 0, 0);
     tile_regs_commit();
     tile_regs_wait();
-    cb_reserve_back(CB_BETA, 1);
-    pack_reconfig_data_format(CB_BETA);
-    pack_tile(0, CB_BETA);
-    cb_push_back(CB_BETA, 1);
-#ifdef DEBUG_TAPS
-    tap(0, CB_BETA);
-#endif
+    pack_reconfig_data_format(CB_GALL);
+    pack_tile(0, CB_GALL);
     tile_regs_release();
-    cb_pop_front(CB_STAT, 1);
-
+    cb_pop_front(CB_CONVSUM, 1);
+    // decay: exp(neg_exp_A * softplus(a + dt_bias)) -> fp32 tile 1 of CB_GALL
     tile_regs_acquire();
     reconfig_data_format_srca(CB_AB);
-    unary_bcast_init<BroadcastType::SCALAR>(CB_AB);
-    unary_bcast<BroadcastType::SCALAR>(CB_AB, 2 * row, 0);
+    copy_init(CB_AB);
+    copy_tile(CB_AB, 0, 0);
     reconfig_data_format_srca(CB_DTNA);
     copy_init(CB_DTNA);
     copy_tile(CB_DTNA, 0, 1);
@@ -293,15 +293,36 @@ ALWI void gate_scalars(uint32_t row) {
     exp_tile<false>(0);
     tile_regs_commit();
     tile_regs_wait();
-    cb_reserve_back(CB_DECAY, 1);
-    pack_reconfig_data_format(CB_DECAY);
-    pack_tile(0, CB_DECAY);
-    cb_push_back(CB_DECAY, 1);
-#ifdef DEBUG_TAPS
-    tap(0, CB_DECAY);
-#endif
+    pack_tile(0, CB_GALL);
+    cb_push_back(CB_GALL, 2);
     tile_regs_release();
 }
+
+#ifdef DEBUG_TAPS
+// the per-row gate taps (beta, decay) in the gates block's place: the reader's replicated tiles, once they exist
+ALWI void tap_gate_tiles() {
+    cb_wait_front(CB_BETA, ROWS);
+    cb_wait_front(CB_DECAY, ROWS);
+    for (uint32_t row = 0; row < ROWS; ++row) {
+        tile_regs_acquire();
+        reconfig_data_format_srca(CB_BETA);
+        copy_init(CB_BETA);
+        copy_tile(CB_BETA, row, 0);
+        tile_regs_commit();
+        tile_regs_wait();
+        tap(0, CB_KCOL);
+        tile_regs_release();
+        tile_regs_acquire();
+        reconfig_data_format_srca(CB_DECAY);
+        copy_init(CB_DECAY);
+        copy_tile(CB_DECAY, row, 0);
+        tile_regs_commit();
+        tile_regs_wait();
+        tap(0, CB_KCOL);
+        tile_regs_release();
+    }
+}
+#endif
 
 // One row: S' = S * decay; v_read = k S'; delta_b = ((v - v_read) * M_row) * beta; S_new = S' + k^T delta_b;
 // o = (q S_new) * 128^-0.5.  The state comes from CB_STATE on the first row and from the previous row's CB_SNEWC
@@ -615,12 +636,13 @@ void kernel_main() {
         cb_pop_front(CB_QKV, QK_TILES);  // the item's v tiles are the front for every row
         {
             FUSED_ZONE("fz_gsc_c_gates");
-            for (uint32_t row = 0; row < ROWS; ++row) {
-                gate_scalars(row);
-            }
+            gates_all();
         }
-        cb_pop_front(CB_AB, 2 * ROWS);
+        cb_pop_front(CB_AB, 2);
         cb_pop_front(CB_DTNA, 2);
+#ifdef DEBUG_TAPS
+        tap_gate_tiles();
+#endif
         cb_wait_front(CB_QKV, VBT);
         cb_wait_front(CB_QROW, HT);
         {
@@ -629,12 +651,14 @@ void kernel_main() {
         }
         cb_wait_front(CB_KCOL, HT);
         cb_wait_front(CB_MASK, ROWS);
-        cb_wait_front(CB_BETA, ROWS);
-        cb_wait_front(CB_DECAY, ROWS);
 
         for (uint32_t row = 0; row < ROWS; ++row) {
-            FUSED_ZONE("fz_gsc_c_recurrence");
-            recurrence(row, row == 0);
+            cb_wait_front(CB_BETA, row + 1);  // the reader replicates the gate tiles row by row
+            cb_wait_front(CB_DECAY, row + 1);
+            {
+                FUSED_ZONE("fz_gsc_c_recurrence");
+                recurrence(row, row == 0);
+            }
         }
         // the state after every row: to the writer (prefix state ROWS-1)
         cb_wait_front(CB_SNEWC, ST);

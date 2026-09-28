@@ -1,25 +1,24 @@
 {
  "expected": {
-  "chat": "293f9371cdc2c82152065cb8e9a9236fd0190309f05614854bcbcd72ad8c8dcf",
-  "code": "0234032be259edb09c5a14223164516548a972e013dc66d2e6452ee9c14d5c08",
-  "fact": "d165f2fd536c951e30a81542d4da983cb6d9034183d4d497e4dd9a07c924c53e",
+  "chat": "1bbbf060a22e2aa1b9613a7b48b18680b6f2c02f4b06636859d563b50dd43690",
+  "code": "159de7287947ac44a7f8fe4d4405341775aaf5b0c73b974dce3e826dbc2d42ff",
+  "fact": "9afd57cc03036e8beac9b7fc53121826c939780b810095f3b88e2c987be9c521",
   "json": "a5b4defa72fae270391869377862fe60b95d893a6c2cfd24ea265bb59de6d16f",
-  "list": "181bcc466a67a153a4459ba0b01a8f06328f72ae1f8fc554e51f6df60d6ad546",
-  "math": "08370e1b09d9baad31c1b70698927a792181b94df3502be0b0a4078fc74f07b8",
-  "multilingual": "4bfb5ba6f9c53bb4da314a9c698eb8a5e145c8fa5080ce4434d57dbd17ae7af6",
-  "prose": "ac760d13cef263e55bdc6e63ed14f9166576ce28ecb26d4f5bbda08f0672ebde",
-  "refactor": "c85de7b4b54734aca888134450a94db82fe6a83ba3ebcbc4145c356377b0ac60",
+  "list": "8253ba344696e880fc2ea18fe604e6c46e92c4401b748abc239c436cd27f0d44",
+  "math": "19f55ccb4bb2174423d32141df95c365aa6306b246a65f26b4e5b255b64a7ea2",
+  "multilingual": "8b3efd7442387f9681d8badad61e359a0e7bcf85a925df9bc7d5cdf9d2e74032",
+  "prose": "19538e64128d3b8c2f47fc3580ee0ddf792b59ba6b0ef12989181b30df69a547",
+  "refactor": "8a812a8ea01b3d7da9da5788d0d03034082562b5c5e7208ab7efc74ac301ee3d",
   "sky": "de86bbc09c482272bf2da4c31c3f13cc593e5590ed85a8dacbd72d6cc80205fc",
-  "story": "953a8e6101789584b3a98346d3987beb36039ca784b9308dd5f2975bd44cc6fc",
-  "summary": "e712d2764ee75508c85e4e7f90f8951929da81e76dda514f8548b871aab1202c"
+  "story": "efaf8f20e25c7c28bc558ffaff42caf2a05be421c80a16552c67a64ec780bab4",
+  "summary": "d9d024681580637c7df49daeb494605434d11459d87314dae53566a7527cbba6"
  },
  "pin": "A3/mtp4-32k/device_token_ids_sha256",
  "schema": "qwen38-ci-baseline/v1",
  "source": {
-  "date": "2026-09-27",
-  "evidence": "chat server startup replay, chunked prefill with MTP drafting k=4 (--mtp 4), one 1x4 p150 line, 2026-09-27: gr_recip_last by default beside the MoE rows form on two rings; against the 2026-09-25 MTP table chat 43 -> 39, list 56 -> 46, math 63 -> 56 (the k = 5 study's near-tie positions, 0.09-0.36 logits), the other nine indices unchanged; the same indices measured on a second 1x4 line the same day",
-  "head": "1aae82bbe33f7dcb7b61be56623972edbe51a921",
-  "run": "acceptance-mtp4.json",
+  "date": "2026-09-28",
+  "evidence": "chat server startup replay, chunked prefill with MTP drafting k=4 (--mtp 4) on the served default set (the verify-rows fold gdn_rows_scan, the MoE rows on two rings, the gated-residual read's re-associated norm gr_recip_last), one idle run on a 1x4 p150 line, 2026-09-28, hold sb-case2-49b8a0f; every value measured on this replay",
+  "head": "49b8a0f2ea3cd4193e14a2c237109d2e0fd942b7",
   "sku": "p150x4"
  },
  "status": "proposal"

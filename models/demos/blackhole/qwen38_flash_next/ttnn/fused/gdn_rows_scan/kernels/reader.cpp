@@ -5,9 +5,9 @@
 // (q and k of key head h/3, its v tiles) with the three FIR slots assembled as full shifted windows in L1 (slot i,
 // row j = window row j + i; window = [history rows 0..2 | projection rows 0..31], so every row is finite and rows
 // >= ROWS are the chain's own padding rows, masked downstream), the four taps' tiles (tile-major CBs pushed per
-// tile, as gdn_step's reader), the head's z tiles, ROWS a/b pairs with element (row, head) patched into [0, 0], the
-// head's dt_bias / neg_exp_A tiles, the item's state tiles (S at pass start, read once), and the ROWS one-hot row
-// masks.  Tile ids of the [1,1,32,4160] projection: q 4(h/3)+c, k 16+4(h/3)+c, v 32+4h+c, z 80+4h+c, a 128, b 129;
+// tile, as gdn_step's reader), the head's z tiles, the a and b tiles once, the head's dt_bias / neg_exp_A tiles, the
+// item's state tiles (S at pass start, read once), the ROWS one-hot row masks, and then -- from the compute's all-rows
+// gate tiles -- one replicated fp32 beta and decay tile per row (the gates' exact 32-bit fan-out).  Tile ids of the [1,1,32,4160] projection: q 4(h/3)+c, k 16+4(h/3)+c, v 32+4h+c, z 80+4h+c, a 128, b 129;
 // the history tile ids are the q|k|v column tiles' (0..79); state tile (kt, vt) of head h at page h*16 + kt*4 + vt.
 // Compile-time args: 0 ROWS, 1 VBT; then TensorAccessorArgs of projected, history, tap0..tap3, dtna, norm, state.
 // Runtime args: 0 projected, 1 history, 2-5 taps, 6 dtna, 7 norm, 8 state addresses, 9 items, then (head, vb) pairs.
@@ -19,7 +19,7 @@
 
 namespace {
 constexpr uint32_t CB_P = 0, CB_S = 1, CB_T = 2, CB_Z = 3, CB_AB = 4, CB_DTNA = 5, CB_W = 6, CB_STATE = 7;
-constexpr uint32_t CB_MASK = 8, CB_SCALER = 9;
+constexpr uint32_t CB_MASK = 8, CB_SCALER = 9, CB_GALL = 13, CB_BETA = 18, CB_DECAY = 19;
 constexpr uint32_t ROWS = get_compile_time_arg_val(0);
 constexpr uint32_t VBT = get_compile_time_arg_val(1);
 constexpr uint32_t HEADS = 12, HT = 4, QK_TILES = 2 * HT, NT = QK_TILES + VBT, ST = HT * VBT, HISTORY_ROWS = 3;
@@ -35,6 +35,21 @@ uint32_t read_tiles(uint32_t cb, const Acc& acc, const uint32_t* ids, uint32_t c
         noc_async_read_page(ids[t], acc, l1 + t * tile_bytes);
     }
     return l1;
+}
+
+// Fill one fp32 tile (1024 words) with `value`: RISC word stores, eight per iteration.
+inline void fill_tile_words(uint32_t l1, uint32_t value) {
+    volatile tt_l1_ptr uint32_t* p = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1);
+    for (uint32_t k = 0; k < FP32_TILE / 4; k += 8) {
+        p[k] = value;
+        p[k + 1] = value;
+        p[k + 2] = value;
+        p[k + 3] = value;
+        p[k + 4] = value;
+        p[k + 5] = value;
+        p[k + 6] = value;
+        p[k + 7] = value;
+    }
 }
 
 // L1 -> L1 copy on the NoC (asynchronous; a noc_async_read_barrier lands it).
@@ -159,13 +174,11 @@ void kernel_main() {
             z_ids[c] = Z_TILE0 + head * HT + c;
         }
         read_tiles(CB_Z, p, z_ids, HT, BF16_TILE);
-        // one a / b pair per row (the same two tiles; element (row, head) goes to [0, 0] below)
-        cb_reserve_back(CB_AB, 2 * ROWS);
+        // the a and b tiles once: every row's gate scalars of every head (the compute's gates take all rows in one pass)
+        cb_reserve_back(CB_AB, 2);
         const uint32_t ab_l1 = get_write_ptr(CB_AB);
-        for (uint32_t r = 0; r < ROWS; ++r) {
-            noc_async_read_page(A_TILE, p, ab_l1 + (2 * r) * BF16_TILE);
-            noc_async_read_page(B_TILE, p, ab_l1 + (2 * r + 1) * BF16_TILE);
-        }
+        noc_async_read_page(A_TILE, p, ab_l1);
+        noc_async_read_page(B_TILE, p, ab_l1 + BF16_TILE);
         const uint32_t dtna_ids[2] = {head, HEADS + head};
         read_tiles(CB_DTNA, dtna, dtna_ids, 2, FP32_TILE);
         uint32_t state_ids[ST];
@@ -176,16 +189,8 @@ void kernel_main() {
         }
         read_tiles(CB_STATE, state, state_ids, ST, FP32_TILE);
         noc_async_read_barrier();
-        for (uint32_t r = 0; r < ROWS; ++r) {
-            volatile tt_l1_ptr uint16_t* a = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ab_l1 + (2 * r) * BF16_TILE);
-            volatile tt_l1_ptr uint16_t* b =
-                reinterpret_cast<volatile tt_l1_ptr uint16_t*>(ab_l1 + (2 * r + 1) * BF16_TILE);
-            const uint32_t src = fused_rows::face_element(r, head);
-            a[0] = a[src];
-            b[0] = b[src];
-        }
         cb_push_back(CB_Z, HT);
-        cb_push_back(CB_AB, 2 * ROWS);
+        cb_push_back(CB_AB, 2);
         cb_push_back(CB_DTNA, 2);
         cb_push_back(CB_STATE, ST);
 
@@ -197,5 +202,26 @@ void kernel_main() {
             }
         }
         cb_push_back(CB_MASK, ROWS);
+        // The gates: the compute's beta_all / decay_all fp32 tiles (CB_GALL: tile 0 beta, tile 1 decay; element
+        // (row, head) is this item's row `row` scalar) replicated into one full fp32 tile per row for the
+        // recurrence's element-wise multiplies -- exact 32-bit copies, pushed row by row so row 0 starts first.
+        {
+            FUSED_ZONE("fz_gsc_r_gates");
+            cb_wait_front(CB_GALL, 2);
+            const uint32_t gall = get_read_ptr(CB_GALL);
+            cb_reserve_back(CB_BETA, ROWS);
+            cb_reserve_back(CB_DECAY, ROWS);
+            const uint32_t beta_l1 = get_write_ptr(CB_BETA);
+            const uint32_t decay_l1 = get_write_ptr(CB_DECAY);
+            for (uint32_t r = 0; r < ROWS; ++r) {
+                const uint32_t at = 4 * fused_rows::face_element(r, head);
+                fill_tile_words(beta_l1 + r * FP32_TILE, *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(gall + at));
+                fill_tile_words(
+                    decay_l1 + r * FP32_TILE, *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(gall + FP32_TILE + at));
+                cb_push_back(CB_BETA, 1);
+                cb_push_back(CB_DECAY, 1);
+            }
+            cb_pop_front(CB_GALL, 2);
+        }
     }
 }

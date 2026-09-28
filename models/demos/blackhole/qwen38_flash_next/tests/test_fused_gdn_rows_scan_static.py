@@ -4,7 +4,8 @@
 """No-device contract of ``gdn_rows_scan`` (the verify rows' fold): the CB table shared by the kernels and the Python
 side, the kernel argument layouts, the registry entry (opt-in, COMPONENT, never a default without a proof), the
 shape-only admission, what ``attach`` gives a rows state and when, the layer's dispatch and commit wiring in
-ttnn/gdn.py, the pick's accept-count read, and ``reference_rows`` as rows sequential ``gdn_step.reference_step`` calls."""
+ttnn/gdn.py, the pick's accept-count read, and ``reference_rows`` as rows sequential ``gdn_step.reference_step`` calls.
+"""
 
 from __future__ import annotations
 
@@ -55,8 +56,10 @@ def test_cb_indices_agree_between_kernels_and_python():
         pages = {index: pages for index, _, pages in table}
         assert pages[0] == 8 + vbt and pages[1] == 3 * (8 + vbt) and pages[2] == 4 * (8 + vbt) and pages[11] == 8 + vbt
         assert pages[7] == pages[20] == pages[21] == pages[24] == 4 * vbt
-        assert pages[4] == 2 * rows and pages[8] == rows and pages[31] == 2 * vbt
-        assert pages[18] == rows and pages[19] == rows  # one beta / decay tile per row, computed before the recurrences
+        assert pages[4] == 2 and pages[8] == rows and pages[31] == 2 * vbt  # the a / b tiles once, one mask per row
+        assert pages[18] == rows and pages[19] == rows  # one beta / decay tile per row, replicated by the reader
+        dtypes = {index: dtype for index, dtype, _ in table}
+        assert pages[13] == 2 and dtypes[13] == ttnn.float32  # beta_all / decay_all (compute -> reader)
     assert (
         compute["CB_SNEWC"] == module.CB_SNEWC == 30
         and compute["CB_OUTS"] == module.CB_OUTS == 25
@@ -77,6 +80,17 @@ def test_cb_indices_agree_between_kernels_and_python():
     text = (KERNELS / "compute.cpp").read_text()
     assert "pack_tile(j, CB_SNEW);" in text and "pack_tile(j, CB_SNEWC);" in text
     assert "matmul_tiles(CB_QROW, CB_SNEW" in text and "copy_tile(src, t, 0)" in text
+    # the gates: one whole-tile SFPU pass per gate (no per-row scalar chain), the results to the reader as fp32 tiles,
+    # which fans each row's element out into the full tiles the recurrence multiplies (exact 32-bit copies)
+    assert "gates_all();" in text and "gate_scalars" not in text and "unary_bcast" not in text
+    assert (
+        "copy_tile(CB_AB, 1, 0);" in text and "copy_tile(CB_AB, 0, 0);" in text and "cb_push_back(CB_GALL, 2);" in text
+    )
+    assert "cb_wait_front(CB_BETA, row + 1);" in text and "cb_wait_front(CB_DECAY, row + 1);" in text
+    reader_text = (KERNELS / "reader.cpp").read_text()
+    assert "cb_wait_front(CB_GALL, 2);" in reader_text and "fill_tile_words(" in reader_text
+    assert "4 * fused_rows::face_element(r, head)" in reader_text and "cb_push_back(CB_AB, 2);" in reader_text
+    assert reader["CB_GALL"] == compute["CB_GALL"] == 13 and reader["CB_BETA"] == 18 and reader["CB_DECAY"] == 19
 
 
 def test_per_core_l1_of_the_largest_form_fits():
@@ -130,21 +144,21 @@ def test_the_builder_passes_the_rows_and_the_split_as_compile_time_args():
 # --------------------------------------------------------------------------------------- the registry entry
 
 
-def test_registry_entry_is_an_opt_in_component_kernel():
+def test_registry_entry_is_a_default_component_kernel_with_its_gate_record():
     entry = fused.kernel(NAME)
-    assert entry.tolerance == fused.COMPONENT and entry.default_on is False and NAME not in fused.DEFAULT_ON
+    assert entry.tolerance == fused.COMPONENT and entry.default_on is True and NAME in fused.DEFAULT_ON
     assert entry.fused is module.rows_body_scan and entry.composed is module.rows_body_fallback
-    assert entry.admits is module.admits and entry.gate is None and entry.component_proof is None
+    assert entry.admits is module.admits and entry.gate is None
+    assert "probe-rows5-8edcaf9279c-162454" in entry.component_proof and "0.0048" in entry.component_proof
     assert "gdn_pre_rows" in entry.replaces and "prefix" in entry.replaces
-    # off by default: the composed callable (today's stream) serves outright
-    assert fused.resolve_admitted(NAME, {}) is module.rows_body_fallback
-    assert fused.resolve(NAME, {}) is module.rows_body_fallback
-    # opt-in: the admitted dispatcher
-    on = fused.resolve_admitted(NAME, {fused.ENV: NAME})
+    # the default: the admitted dispatcher; QWEN38_FUSED_OFF restores the wrap outright
+    assert fused.resolve_admitted(NAME, {fused.OFF_ENV: NAME}) is module.rows_body_fallback
+    assert fused.resolve(NAME, {fused.OFF_ENV: NAME}) is module.rows_body_fallback
+    on = fused.resolve_admitted(NAME, {})
     assert isinstance(on, fused.AdmittedStep) and on.fused is module.rows_body_scan
     assert on.composed is module.rows_body_fallback and on.admits is module.admits
     assert fused.resolve_admitted(NAME, {fused.ENV: NAME, fused.OFF_ENV: NAME}) is module.rows_body_fallback
-    assert fused.enabled(NAME, {}) is False and fused.enabled(NAME, {fused.ENV: NAME}) is True
+    assert fused.enabled(NAME, {}) is True and fused.enabled(NAME, {fused.OFF_ENV: NAME}) is False
     # the wrap stays the default beside it
     assert fused.kernel(wrap.NAME).default_on is True
 
@@ -197,7 +211,7 @@ def test_qualifies_is_the_verify_form_with_up_to_max_rows():
     assert not module.qualifies(SimpleNamespace())
 
 
-def test_attach_needs_the_switch_and_the_form(monkeypatch):
+def test_attach_needs_the_form_and_honours_the_off_switch(monkeypatch):
     allocated = []
     monkeypatch.setattr(
         fp, "allocate", lambda shape, dtype, layout, mesh, *a: allocated.append((shape, dtype)) or _Fake(shape, dtype)
@@ -205,10 +219,11 @@ def test_attach_needs_the_switch_and_the_form(monkeypatch):
     monkeypatch.setattr(fp, "stamp_topology", lambda tensor, reference, shard_dim=None: tensor)
     monkeypatch.setattr(gdn_step, "_constants", lambda gdn: "dt-na-tiles")
     gdn = SimpleNamespace(mesh_device="mesh", out_proj_act_memory_config="out-proj-shard")
-    assert module.attach(gdn, _RowsState(), {}) is None and allocated == []  # off: nothing allocated
-    assert module.attach(gdn, _RowsState(rows=9), {fused.ENV: NAME}) is None and allocated == []
+    # off (QWEN38_FUSED_OFF names the fold): nothing allocated; the default with a form past MAX_ROWS: refused
+    assert module.attach(gdn, _RowsState(), {fused.OFF_ENV: NAME}) is None and allocated == []
+    assert module.attach(gdn, _RowsState(rows=9), {}) is None and allocated == []
     state = _RowsState(rows=5)
-    buffers = module.attach(gdn, state, {fused.ENV: NAME})
+    buffers = module.attach(gdn, state, {})  # the default: no switch needed
     assert buffers is module.buffers_of(state) is state.scan_buffers
     assert allocated == [((5, HEADS, HEAD_DIM, HEAD_DIM), ttnn.float32)]
     assert buffers.rows == 5 and buffers.constants == "dt-na-tiles" and buffers.gated_memory_config == "out-proj-shard"

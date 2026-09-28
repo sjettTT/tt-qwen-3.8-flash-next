@@ -37,6 +37,7 @@ DEFAULT_ON: frozenset[str] = frozenset(
     {
         "gdn_prefill_rows",
         "gdn_rows_wrap",
+        "gdn_rows_scan",
         "gdn_step",
         "gr_fold",
         "gr_read",

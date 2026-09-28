@@ -272,7 +272,7 @@ RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES = {
     131072: (313_694_272, 313_040_128),
     262144: (94_378_048, 93_723_904),
 }
-# The verify-rows fold (``QWEN38_FUSED=gdn_rows_scan``, opt-in; ttnn/fused/gdn_rows_scan) keeps every GDN layer's k + 1
+# The verify-rows fold (``gdn_rows_scan``, the default; ``QWEN38_FUSED_OFF`` restores the wrap) keeps every GDN layer's k + 1
 # prefix states in DRAM for the pass: ``[k + 1, 12, 128, 128]`` fp32 per layer = (k + 1) x 786,432 bytes per layer per
 # device (3,932,160 at k = 4; 141,557,760 over the 36 GDN layers), interleaved one 4 KiB tile page at a time over the
 # banks, so the states term grows by GDN layers x ceil((k + 1) x 192 pages / banks) x 4,096 bytes per bank (17,694,720 at
@@ -347,8 +347,9 @@ def mtp_capacity_admission(
     table, the live ``after_build`` read) and adds the MTP layer's 128-row extension
     (:data:`MTP_LONG_CHUNK_EXTENSION_BYTES_PER_BANK`) to the states remainder.
 
-    ``gdn_rows_scan`` (the verify-rows fold on: ``QWEN38_FUSED`` names it) adds the fold's persistent prefix states to
-    the states remainder, derived from ``drafts`` and the GDN layer count (:func:`fold_prefix_states_bytes_per_bank`),
+    ``gdn_rows_scan`` (the verify-rows fold serving: the registry's default less ``QWEN38_FUSED_OFF``) adds the fold's
+    persistent prefix states to the states remainder, derived from ``drafts`` and the GDN layer count
+    (:func:`fold_prefix_states_bytes_per_bank`),
     with the same margin; the traces remainder stays the wrap's (an over-estimate under the fold).  The term is per
     chain: a second drafting chain (``components_shared``) allocates its own GDN rows states, so its admission
     charges its own ``drafts + 1`` rows."""
