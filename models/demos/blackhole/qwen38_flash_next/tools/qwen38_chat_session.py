@@ -575,12 +575,20 @@ class Qwen38ChatCompletion:
     mtp: dict[str, Any] | None = None
     # The prompt-end snapshot was restored: prefix_reused is the snapshot's length, the rest of the prompt the tail.
     restored: bool = False
+    # The schedule of the snapshot this request restored (SNAPSHOT_SCHEDULES; None when it did not restore one): a
+    # restored row is classified against a fresh prefill of the same prompt without its history -- "chunked" = the
+    # fresh state bitwise, "forced-tail" = the fresh state to rounding.  ``snapshot_captured`` is the schedule of the
+    # snapshot this request left for the next one (None when its prefill did not reach the last prompt token).
+    snapshot_schedule: str | None = None
+    snapshot_captured: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "prefix_reused": self.prefix_reused,
             "reset": self.reset,
             "prefix_restored": self.restored,
+            "snapshot_schedule": self.snapshot_schedule,
+            "snapshot_captured": self.snapshot_captured,
             "prefill_tokens": self.prefill_tokens,
             "prefill_seconds": round(self.prefill_seconds, 4),
             "prefill_mode": self.prefill_mode,
@@ -604,13 +612,25 @@ class Qwen38ChatCompletion:
         }
 
 
+# The schedule that produced a snapshot's state (``Qwen38PromptSnapshot.schedule``, the ledger's
+# ``qwen38.snapshot_schedule``): ``chunked`` = every position came from a prefill of exactly these ids from position 0
+# (the chunk driver, or its own teacher-forced form for a prompt below CHUNK_PREFILL_MIN_ROWS), the schedule a fresh
+# prefill of the ids takes, so an exact repeat restores the fresh state bitwise; ``forced-tail`` = a restored or
+# extended request captured it: positions a fresh prefill would compute inside the chunk driver came from 1-row steps
+# (a teacher-forced tail, a decoded reply) or from the tail's own alignment steps and chunk boundaries, so the state
+# agrees with a fresh prefill's to rounding only (docs/NUMERICS.md).  A restore whose tail is the last prompt token
+# alone recaptures the restored state and inherits its value.
+SNAPSHOT_SCHEDULES = ("chunked", "forced-tail")
+
+
 @dataclass(frozen=True)
 class Qwen38PromptSnapshot:
     """The host record of the chain's prompt-end snapshot: the ids consumed when it was taken (the prompt without
-    its last token) and the n-gram context after them."""
+    its last token), the n-gram context after them and the schedule that produced the state (SNAPSHOT_SCHEDULES)."""
 
     ids: tuple[int, ...]
     ple_context: tuple[int, int] | None
+    schedule: str = "chunked"
 
 
 @dataclass(frozen=True)
@@ -1226,10 +1246,14 @@ class Qwen38ChatSession:
         return path
 
     def reset(self) -> None:
-        """Position 0 and position-zero state at the captured addresses; the committed sequence is dropped."""
+        """Position 0 and position-zero state at the captured addresses; the committed sequence is dropped, and so
+        is the prompt-end snapshot's record: the prefill that follows writes the KV and compressed caches from row 0,
+        so the snapshot's positional half (the caches below its position, which the snapshot does not copy) is gone
+        the moment that prefill starts, whether or not it reaches its last token."""
 
         self.chain.reset_and_seed(SEED_TOKEN_ID)
         self.committed = []
+        self.snapshot = None
         self.ple_context = None
         self.last_finish = None
         self.row_unconsumed = False
@@ -1274,14 +1298,17 @@ class Qwen38ChatSession:
             if hasattr(self.chain, "mtp"):
                 self.chain.mtp = chain_mtp
 
-    def _capture_prompt_snapshot(self) -> None:
+    def _capture_prompt_snapshot(self, schedule: str = "chunked") -> None:
         """The device state after the committed ids (every prompt token but the last), copied on the chain; the
-        record makes a later render that extends these ids a restore instead of a reset."""
+        record makes a later render that extends these ids a restore instead of a reset.  ``schedule`` names what
+        produced the state (SNAPSHOT_SCHEDULES)."""
 
+        if schedule not in SNAPSHOT_SCHEDULES:
+            raise ValueError(f"snapshot schedule must be one of {SNAPSHOT_SCHEDULES}, got {schedule!r}")
         if not self.snapshot_available or not self.committed:
             return
         self.chain.capture_prompt_snapshot(len(self.committed))
-        self.snapshot = Qwen38PromptSnapshot(tuple(self.committed), self.ple_context)
+        self.snapshot = Qwen38PromptSnapshot(tuple(self.committed), self.ple_context, schedule)
 
     def complete(
         self,
@@ -1365,27 +1392,41 @@ class Qwen38ChatSession:
                 refusal = refusal or f"refused: {'teacher-forced prefill' if mode != 'chunked' else 'not speculative'}"
             drafting = drafting and refusal is None
             sampling.mtp_drafting = "drafted" if drafting else refusal
+        snapshot_before = self.snapshot
+        restored_schedule = snapshot_before.schedule if reuse == "snapshot" and snapshot_before is not None else None
         try:
             self.row_token = None
             self.device_accept_records = []
             if reuse == "snapshot":
                 self._restore_prompt_snapshot()
             elif reuse == "reset":
-                self.reset()
-            # The snapshot stays valid until a prefill reaching its last token replaces it (its buffers change on no
-            # other path), so a reset or a stopped prefill leaves the earlier one restorable.
+                self.reset()  # drops the snapshot record too: the caches below its position are rewritten from row 0
+            # The snapshot stays valid until a prefill reaching its last token replaces it or a reset drops it (its
+            # recurrent buffers change on no other path; a stopped prefill that extends the committed ids leaves the
+            # caches below the snapshot's position untouched), so a stopped extension leaves the earlier one restorable.
             suffix = token_ids[common:]
             chunked: Qwen38PrefillResult | None = None
+            # The schedule the capture records (SNAPSHOT_SCHEDULES): a prefill from position 0 is the schedule a fresh
+            # prefill of these ids takes; a restore whose tail is the last token alone recaptures the restored state
+            # itself; every other restore or extension leaves positions a fresh prefill would chunk to the 1-row steps
+            # or to the tail's own schedule.
+            if reuse == "reset" or common == 0:
+                schedule = "chunked"  # a prefill from position 0 (a reset, or a new session's first request)
+            elif reuse == "snapshot" and len(suffix) == 1:
+                schedule = snapshot_before.schedule
+            else:
+                schedule = "forced-tail"
+            capture = partial(self._capture_prompt_snapshot, schedule)
             # All but the last prompt token through the chunk trace when enough rows remain after the alignment
             # steps; the last one is the first decode replay and is always teacher-forced inside the guard.  The
             # prompt-end snapshot is taken before that last token: after the hand-off, or inside the forced prefill.
-            before_last: Callable[[], None] | None = self._capture_prompt_snapshot
+            before_last: Callable[[], None] | None = capture
             if mode == "chunked" and self.chunk_prefill_rows(len(suffix) - 1) >= CHUNK_PREFILL_MIN_ROWS:
                 chunked = self._prefill_chunked(suffix[:-1], suffix[-1], should_stop)
                 suffix = suffix[-1:]
                 before_last = None
                 if chunked.stopped is None:
-                    self._capture_prompt_snapshot()
+                    capture()
             # A stop inside the chunk driver ended the request at its hand-off: nothing more runs on the device.
             chunk_stopped = chunked is not None and chunked.stopped is not None
             generated: list[int] = []
@@ -1492,6 +1533,10 @@ class Qwen38ChatSession:
             prefix_reused=common,
             reset=reuse == "reset",
             restored=reuse == "snapshot",
+            snapshot_schedule=restored_schedule,
+            snapshot_captured=(
+                None if self.snapshot is None or self.snapshot is snapshot_before else self.snapshot.schedule
+            ),
             prefill_tokens=prefill_tokens,
             prefill_seconds=(prefill_done_ns - started_ns) / 1e9,
             ttft_seconds=(first_ns - started_ns) / 1e9,

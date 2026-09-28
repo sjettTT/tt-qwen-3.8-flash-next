@@ -214,7 +214,22 @@ states and ring slots, PLE slots, QSA staging and raw-key rings, ~53 MB per devi
 positional and rewritten by the tail) into a resident snapshot, and a follow-up whose render extends those ids
 copies it back and prefills only the rendered tail (the re-rendered reply and the new turn) from that position.  An
 exact repeat of a prompt restores the same way.  A history that diverges earlier (an edited turn) still resets and
-prefills the whole conversation (3.3 ms per token of history, `qwen38.reset` true).
+prefills the whole conversation (3.3 ms per token of history, `qwen38.reset` true).  A reset also drops the snapshot:
+the prefill that follows rewrites the caches from row 0, so a prefill stopped before its last token (a hang-up, a
+deadline) leaves nothing restorable and the next request of the earlier prompt prefills it whole.
+
+The restore copies the snapshot's buffers back bitwise (the round trip is checked at every start), and the snapshot is
+exact for the path that produced it -- which is not always a fresh prefill's path.  `qwen38.snapshot_schedule`
+(null unless the request restored a snapshot) names that path: `chunked` = the snapshot came from a prefill of exactly
+its ids from position 0 (the chunk driver, or the teacher-forced form of a prompt under 16 rows), so the restored state
+is bitwise what a fresh prefill of the prompt produces and the reply is the fresh reply; `forced-tail` = the snapshot was
+captured by a request that had itself restored or extended (a thinking conversation's render alternation, a repeat
+with a stop string, a follow-up turn), so positions a fresh prefill computes inside the chunk driver came from the
+1-row decode steps or from the tail's own alignment steps and chunk boundaries, and the restored state agrees with a
+fresh prefill's to rounding: the reply can part from the fresh one at a near-tie (`docs/NUMERICS.md`, the snapshot
+section).  A restore whose tail is the last prompt token alone recaptures the restored state and inherits its
+schedule; `qwen38.snapshot_captured` is the schedule of the snapshot the request left for the next one.  The rows of
+record and the acceptance replays are fresh prefills and never restore.
 
 ## Hang-ups, stalled readers, deadlines
 

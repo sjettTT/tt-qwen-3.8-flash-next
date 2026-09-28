@@ -21,6 +21,35 @@ Every number here was measured on 4x p150 unless a date and host say otherwise.
   packer), and every start re-packs one routed expert of the first cached layer from the checkpoint and compares the
   bytes with the cache; a cache converted by different code is refused (`SERVER.md`).
 
+## The prompt-end snapshot restore (2026-09-28)
+
+The chat server's prompt-end snapshot (`docs/SERVER.md`) copies the recurrent buffers (GDN states and ring slots, PLE
+slots, QSA staging tiles and raw-key rings of the 48 layers and of the MTP layer) before the last prompt token and copies
+them back on a restore; the KV and compressed caches are positional and not copied (rows past the position are never
+gathered, blocks at or past the position are masked or rewritten before they are scored).  The copy is bitwise (pinned
+at every start).  What a restore reproduces is the state of the request that captured it, and that state is
+schedule-dependent: a 177-token prompt prefilled from position 0 computes positions 160-175 inside one padded 32-row
+chunk, while the same prompt restored from a 174-token snapshot (the same messages rendered with thinking on) and
+teacher-forced over its 3-token tail computes positions 174-175 in the 1-row FP32 step; the two states at 176 agree to
+rounding, and a greedy reply parts from the fresh reply at the next near-tie.  On the served lanes smoke of 2026-09-28
+(a 1x4 p150 line, `--mtp 4` greedy, the wrap form) that was token 40 of the `chat` record's max_tokens-40 reply ("crowd
+levels" restored, "crowd flow" fresh; the ledger: the row before it restored at 174 with `prefill_forced_tokens` 3 and
+recaptured at 176).  This is the tolerance class the 2026-09-06 design already stated for follow-up turns, not a
+restore defect: `qwen38.snapshot_schedule` reads `forced-tail` on such a row and `chunked` on an exact repeat after a
+fresh prefill, which restores the fresh state bitwise.  The rows of record and the acceptance replays are fresh
+prefills.  Measured with the snapshot-restore audit tool, development side (every snapshot buffer, the QSA caches and the
+position dumped and compared bitwise per device; 32k, `--mtp 4` greedy, both fold settings, 2026-09-28; the full tables
+are in the development notes): the exact repeat restores all 215 snapshot buffers bitwise and the
+caches differ only at rows at or past the position (KV rows >= 176, compressed blocks >= 44), the reply identical
+(40/40, 256/256, the 1-row loop too); the smoke's history (the thinking-on render fresh, the thinking-off render restoring
+it with a 2-token forced tail, then restored again at 176) differs from the fresh 177-token state in 172 of the 215
+buffers: every GDN recurrent state (fp32, max abs 0.0024-0.050 per layer), the ring slots of positions 174 and 175 (max
+abs 0.73 and 2.48: the 1-row q/k/v projection vs the chunk's 32-row matmul), the QSA staging rows of 174-175 (max abs up
+to 23), the PLE slots of 174-175 (1-2 bf16 ulp), and the caches at KV rows 174-175 and compressed block 43; the landing
+ring slot and the raw-key rings differ too but are dead or inert at that position.  The reply parts at token 40 under the
+wrap (ids 6195 vs 5684, the 15th pass accepting 0 vs 3 after 14 identical passes) and at token 27 under the fold (and
+on the 1-row loop under both).  A second fresh prefill reproduces the first bitwise, state and tokens, in every cell.
+
 ## Fused decode kernels and two-reader decode linears (2026-09-16)
 
 Decode chains run as fused programs (`ttnn/fused/`, built on `ttnn.generic_op`) where a kernel is bitwise against the
