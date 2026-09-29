@@ -7,13 +7,24 @@ boundaries.  No device import: the device is an object with the methods below, s
 with a fake and the server with :class:`Qwen38LanesSession`.
 
 The driver loop (:meth:`Qwen38LaneScheduler.run`): at every pass boundary (1) the lanes whose request ended are
-parked and freed, (2) a waiting request is admitted into a free lane -- ONE per boundary while another lane decodes
-(its prefill, eviction and import stall the batch: every active lane's pass boundary stretches by it, recorded as that
-lane's ``stalled_seconds``), back to back while none does -- (3) the host writes the boundary needs (the accept counts
-of admitted or overridden lanes, a rewound position, the next token blocks, the active mask) and (4) one pass runs;
-its committed ids reach every active lane's request through its ticket queue, token by token, under the request's own
-rules (EOS, ``max_tokens``, the thinking budget, an oversize id), the handler thread's rules (a stop string, the
-deadline, a hang-up) arriving as a cancel the driver reads at the boundary.
+parked and freed, (2) a waiting request is admitted into a free lane -- ONE per boundary while another lane decodes,
+back to back while none does -- (3) the host writes the boundary needs (the accept counts of admitted or overridden
+lanes, a rewound position, the next token blocks, the active mask) and (4) one pass runs; its committed ids reach
+every active lane's request through its ticket queue, token by token, under the request's own rules (EOS,
+``max_tokens``, the thinking budget, an oversize id), the handler thread's rules (a stop string, the deadline, a
+hang-up) arriving as a cancel the driver reads at the boundary.
+
+The stall policy: an admission's device work (its prefill, eviction and import) is what the decoding lanes wait for,
+so the device runs it in segments (the chunk groups of the prefill, one per 128 prompt rows; the forced last step;
+the eviction; the import) and between two segments the driver runs one pass for the decoding lanes whenever the
+admission work since their last pass reached ``stall_budget_seconds`` (the admission's ``between`` yield point; the
+clock is the decoding lanes' last pass, or the moment the first of them became active, so a boundary of several short
+admissions counts them together): every other lane pauses at most the budget plus one segment instead of the whole
+admission, and the admitted request's first token waits one pass per interleaved pass.  The total device work is unchanged, so this
+moves latency, not throughput: ``stalled_seconds`` counts the admission segments a decoding lane waited for (never
+the passes it got), ``admission_seconds`` those segments, ``admission_wall_seconds`` the admission from its start to
+its end with the interleaved passes inside, ``interleaved_passes`` their count.  ``stall_budget_seconds`` None runs
+every admission whole (the first form of the mode).
 
 A lane's request ends at a boundary; the lane is then free and the next admission overwrites every family of its
 state (readmission into any lane is exact: the stage-4 lifecycle gate), so an event that ends a request costs the
@@ -27,8 +38,10 @@ single stream's re-entry after its forced step does.
 
 Device protocol (every call from the driver thread):
 
-* ``admit(lane, ticket) -> Qwen38LaneAdmitted``: prefill the request's prompt on the single-lane chain, evict its
-  state into the lane's host slot, import it into ``lane`` (the lane's position and n-gram context follow);
+* ``admit(lane, ticket, between=None) -> Qwen38LaneAdmitted``: prefill the request's prompt on the single-lane
+  chain, evict its state into the lane's host slot, import it into ``lane`` (the lane's position and n-gram context
+  follow); ``between(segment, done, total) -> seconds`` is called between the admission's device segments and runs
+  the decoding lanes' pass when the stall budget says so (its segment records exclude the seconds it returns);
 * ``write_counts(counts)``: the per-lane accept counts the coming commit takes (-1 commits nothing);
 * ``override_commit(lane, record, committed_rows)``: lane ``lane`` commits ``committed_rows`` of the pass ``record``
   (fewer than the device accepted): its position mirror and device row rewound to ``start + committed_rows``, its
@@ -58,6 +71,11 @@ ONE_TILE_ROWS = 32
 # Placeholder drafts of a host-written block (the bootstrap's form; any exact ids would do: acceptance is a filter).
 PLACEHOLDER_DRAFT_TOKEN = 0
 IDLE_WAIT_SECONDS = 0.25  # the driver's wait on the condition between submits when no lane is active
+# The stall budget: the admission work (seconds) the decoding lanes wait for, since their last pass, before the driver
+# runs their pass between two admission segments; None runs every admission whole.  The default is the measured
+# setting of the 2026-09-29 sweep (docs/NUMERICS.md "Served lanes": half the interleave cost of 0.25 s on a four-burst
+# for a pause bounded near 0.7 s; docs/SERVER.md states the trade-off).
+DEFAULT_STALL_BUDGET_SECONDS = 0.5
 # Finish reasons the driver assigns; the handler's cancels arrive with their own ("stop", "deadline", "disconnected").
 FINISH_SHUTDOWN = "shutdown"
 
@@ -79,6 +97,30 @@ def lane_geometry(lanes: int, drafts: int) -> tuple[int, int]:
             f"--lanes {lanes} --mtp {drafts}: B x (k + 1) = {lanes * rows} rows exceed the {ONE_TILE_ROWS}-row tile"
         )
     return lanes, rows
+
+
+def stall_budget_seconds_admitted(value: Any) -> float | None:
+    """The stall budget as the scheduler takes it: None (admissions run whole) or a non-negative number of seconds
+    (0: a pass at every admission segment)."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or value < 0:
+        raise ValueError(f"the stall budget is None or a non-negative number of seconds, got {value!r}")
+    return float(value)
+
+
+class _Boundary:
+    """The host writes one pass boundary owes the device: the accept counts the coming commit takes (as the host last
+    wrote or the device last landed them, -1 on the inactive lanes: an admission or an override rewrites the vector,
+    so it persists across boundaries), the next token blocks (None: the device-assembled block), the active mask, and
+    whether anything is to write."""
+
+    def __init__(self, lanes: int) -> None:
+        self.counts: list[int] = [-1] * lanes
+        self.blocks: list = [None] * lanes
+        self.mask: list[int] = [0] * lanes
+        self.writes = False
 
 
 @dataclass(frozen=True)
@@ -304,10 +346,12 @@ class Qwen38LaneTicket:
     finish: str | None = None
     finish_detail: str | None = None
     queue_wait: float = 0.0
-    admission_seconds: float = 0.0
+    admission_seconds: float = 0.0  # the admission's device segments (what the decoding lanes waited for)
+    admission_wall_seconds: float = 0.0  # the admission from its start to its end, the interleaved passes inside
     admission_segments: dict[str, float] = field(default_factory=dict)
+    interleaved_passes: int = 0  # the decoding lanes' passes run between this admission's segments
     prefill: dict[str, Any] = field(default_factory=dict)
-    stalled_seconds: float = 0.0  # other requests' admissions while this one decoded
+    stalled_seconds: float = 0.0  # other requests' admission segments while this one decoded
     passes: int = 0
     committed: int = 0  # ids delivered to the queue
     position: int = 0
@@ -349,14 +393,22 @@ class Qwen38LaneScheduler:
     """``B`` lane slots, the FIFO beyond them (``queue_limit`` waiting tickets, then busy), the driver loop."""
 
     def __init__(
-        self, *, lanes: int, drafts: int, queue_limit: int, clock: Callable[[], float] = time.perf_counter
+        self,
+        *,
+        lanes: int,
+        drafts: int,
+        queue_limit: int,
+        clock: Callable[[], float] = time.perf_counter,
+        stall_budget_seconds: float | None = DEFAULT_STALL_BUDGET_SECONDS,
     ) -> None:
         self.lanes, self.rows = lane_geometry(lanes, drafts)
         self.drafts = drafts
         if isinstance(queue_limit, bool) or type(queue_limit) is not int or queue_limit < 1:
             raise ValueError(f"queue_limit must be a positive int, got {queue_limit!r}")
         self.queue_limit = queue_limit
+        self.stall_budget_seconds = stall_budget_seconds_admitted(stall_budget_seconds)
         self.clock = clock
+        self.interleaved_passes = 0
         self.lock = threading.Lock()
         self.wake = threading.Condition(self.lock)
         self.waiting: collections.deque[Qwen38LaneTicket] = collections.deque()
@@ -369,6 +421,9 @@ class Qwen38LaneScheduler:
         self.requests_done = 0
         self.stalled_seconds_total = 0.0
         self.last_progress: float = clock()  # the last completed device call (a pass, an admission)
+        # When the decoding lanes last progressed: the end of the last pass, or the activation of the first lane
+        # after an idle boundary (the stall budget counts admission work from here).
+        self.lanes_progressed_at: float = clock()
         self.last_pass_seconds: float | None = None
         self.pass_seconds: collections.deque[float] = collections.deque(maxlen=200)
 
@@ -425,6 +480,8 @@ class Qwen38LaneScheduler:
                 "lanes": self.lanes,
                 "drafts": self.drafts,
                 "rows": self.rows,
+                "stall_budget_seconds": self.stall_budget_seconds,
+                "interleaved_passes": self.interleaved_passes,
                 "active": sum(1 for ticket in self.active if ticket is not None),
                 "active_requests": active,
                 "free": sum(1 for ticket in self.active if ticket is None),
@@ -456,16 +513,34 @@ class Qwen38LaneScheduler:
             ticket.committed += 1
             ticket.tokens.put((token, finish))
 
-    def _admit(
-        self, device, ticket: Qwen38LaneTicket, lane: int, counts: list[int], blocks: list, mask: list[int]
-    ) -> None:
+    def _admit(self, device, ticket: Qwen38LaneTicket, lane: int, boundary: _Boundary) -> None:
+        """One admission into ``lane``: the device's prefill / evict / import in segments, the decoding lanes' pass
+        between two segments once the admission work since their last pass reached the stall budget, then the
+        stream's start and the boundary's writes for the new lane."""
+
         started = self.clock()
         ticket.queue_wait = started - ticket.submitted
         ticket.lane = lane
-        admitted = device.admit(lane, ticket)
+        budget = self.stall_budget_seconds
+        was_idle = self.active_count == 0
+
+        def between(segment: str, done: int, total: int) -> float:
+            if budget is None or self.active_count == 0:
+                return 0.0
+            now = self.clock()
+            if now - self.lanes_progressed_at < budget:
+                return 0.0
+            self._pass(device, boundary)
+            ticket.interleaved_passes += 1
+            self.interleaved_passes += 1
+            return self.clock() - now
+
+        interleave = budget is not None and self.active_count > 0
+        admitted = device.admit(lane, ticket, between=between if interleave else None)
         ticket.admitted_at = self.clock()
-        ticket.admission_seconds = ticket.admitted_at - started
+        ticket.admission_wall_seconds = ticket.admitted_at - started
         ticket.admission_segments = dict(admitted.seconds)
+        ticket.admission_seconds = sum(float(value) for value in admitted.seconds.values())
         ticket.prefill = dict(admitted.prefill)
         ticket.position = admitted.position
         ticket.ple_context = admitted.ple_context
@@ -490,9 +565,60 @@ class Qwen38LaneScheduler:
             self._finish(ticket, step.finish, detail=step.finish_detail)
             return
         self.active[lane] = ticket
-        counts[lane] = -1  # the admitted lane's first commit takes nothing
-        blocks[lane] = list(step.block)
-        mask[lane] = 1
+        boundary.counts[lane] = -1  # the admitted lane's first commit takes nothing
+        boundary.blocks[lane] = list(step.block)
+        boundary.mask[lane] = 1
+        boundary.writes = True
+        if was_idle:
+            self.lanes_progressed_at = self.clock()  # the first decoding lane's wait starts here
+
+    def _pass(self, device, boundary: _Boundary) -> None:
+        """One pass for the active lanes: the boundary's pending writes, the active mask, the pass, then every
+        active lane's stream over its committed ids (the deliveries, the ends, the overrides and next blocks the
+        following boundary writes)."""
+
+        if boundary.writes:
+            device.write_counts(list(boundary.counts))
+            device.set_blocks(boundary.blocks)
+        device.set_active(list(boundary.mask))
+        started = self.clock()
+        record = device.step()
+        now = self.clock()
+        self.passes += 1
+        self.last_pass_seconds = now - started
+        self.pass_seconds.append(self.last_pass_seconds)
+        self.last_progress = now
+        self.lanes_progressed_at = now
+        boundary.counts = [-1 if self.active[u] is None else int(record.accepted[u]) for u in range(self.lanes)]
+        boundary.blocks = [None] * self.lanes
+        boundary.writes = False
+        for lane, ticket in enumerate(self.active):
+            if ticket is None:
+                continue
+            ticket.passes += 1
+            if ticket.first_pass_at is None:
+                ticket.first_pass_at = now
+            step = ticket.stream.after_pass(record.committed[lane], record.argmaxes[lane], record.positions[lane])
+            self._deliver(ticket, step)
+            if step.committed_rows is not None:
+                boundary.counts[lane] = step.committed_rows - 1
+                device.override_commit(lane, record, step.committed_rows)
+                ticket.position = record.positions[lane] + step.committed_rows
+                boundary.writes = True
+            else:
+                ticket.position = record.positions[lane] + len(record.committed[lane])
+            if step.block is not None:
+                boundary.blocks[lane] = list(step.block)
+                boundary.writes = True
+            finish = step.finish if step.finish is not None else ticket.cancelled
+            if finish is not None:
+                boundary.mask[lane] = 0
+                self._finish(ticket, finish, detail=step.finish_detail)
+        if boundary.writes:
+            device.write_counts(list(boundary.counts))
+            device.set_blocks(boundary.blocks)
+            boundary.blocks = [None] * self.lanes
+            boundary.writes = False
 
     def run(self, device, *, forever: bool = True) -> None:
         """The driver loop; ``forever`` waits for submits when idle, else returns once every ticket is done (the
@@ -500,10 +626,7 @@ class Qwen38LaneScheduler:
         in ``fatal`` for the server (a poisoned model owner cannot serve)."""
 
         self.running = True
-        mask = [0] * self.lanes
-        # The accept counts the coming commit takes, as the host last wrote or the device last landed them (-1 on the
-        # inactive lanes): an admission or an override rewrites the vector, so it persists across the boundary.
-        counts: list[int] = [-1] * self.lanes
+        boundary = _Boundary(self.lanes)
         try:
             while True:
                 with self.lock:
@@ -517,9 +640,8 @@ class Qwen38LaneScheduler:
                     admit_now = list(self.waiting) if self.active_count == 0 else list(self.waiting)[:1]
                     for ticket in admit_now:
                         self.waiting.remove(ticket)
-                # -- the boundary's host work: admissions (one while a lane decodes, every one while none does)
-                blocks: list = [None] * self.lanes
-                writes = False
+                # -- the boundary's host work: admissions (one while a lane decodes, every one while none does; from
+                # the second on, the decoding lanes' passes run between an admission's segments under the budget)
                 for index, ticket in enumerate(admit_now):
                     if ticket.cancelled is not None:
                         self._finish(ticket, ticket.cancelled)
@@ -529,53 +651,11 @@ class Qwen38LaneScheduler:
                         with self.lock:
                             self.waiting.extendleft(reversed(admit_now[index:]))
                         break
-                    self._admit(device, ticket, free[0], counts, blocks, mask)
-                    writes = True
+                    self._admit(device, ticket, free[0], boundary)
                 if self.active_count == 0:
                     continue
-                if writes:
-                    device.write_counts(list(counts))
-                    device.set_blocks(blocks)
-                device.set_active(list(mask))
-                # -- the pass
-                started = self.clock()
-                record = device.step()
-                now = self.clock()
-                self.passes += 1
-                self.last_pass_seconds = now - started
-                self.pass_seconds.append(self.last_pass_seconds)
-                self.last_progress = now
-                # -- every active lane's stream
-                counts = [-1 if self.active[u] is None else int(record.accepted[u]) for u in range(self.lanes)]
-                blocks = [None] * self.lanes
-                writes = False
-                for lane, ticket in enumerate(self.active):
-                    if ticket is None:
-                        continue
-                    ticket.passes += 1
-                    if ticket.first_pass_at is None:
-                        ticket.first_pass_at = now
-                    step = ticket.stream.after_pass(
-                        record.committed[lane], record.argmaxes[lane], record.positions[lane]
-                    )
-                    self._deliver(ticket, step)
-                    if step.committed_rows is not None:
-                        counts[lane] = step.committed_rows - 1
-                        device.override_commit(lane, record, step.committed_rows)
-                        ticket.position = record.positions[lane] + step.committed_rows
-                        writes = True
-                    else:
-                        ticket.position = record.positions[lane] + len(record.committed[lane])
-                    if step.block is not None:
-                        blocks[lane] = list(step.block)
-                        writes = True
-                    finish = step.finish if step.finish is not None else ticket.cancelled
-                    if finish is not None:
-                        mask[lane] = 0
-                        self._finish(ticket, finish, detail=step.finish_detail)
-                if writes:
-                    device.write_counts(list(counts))
-                    device.set_blocks(blocks)
+                # -- the pass and every active lane's stream
+                self._pass(device, boundary)
         except BaseException as error:  # noqa: BLE001  the device failed: every request ends, the server learns
             self.fatal = error
             with self.lock:
@@ -598,7 +678,7 @@ class Qwen38LaneScheduler:
                 for ticket in list(self.active):
                     if ticket is not None:
                         self._finish(ticket, FINISH_SHUTDOWN)
-                if any(mask):
+                if any(boundary.mask):
                     try:
                         device.set_active([0] * self.lanes)
                     except BaseException as error:  # noqa: BLE001

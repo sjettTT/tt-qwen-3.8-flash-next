@@ -22,7 +22,9 @@ QuietBox the pass over the 104 GB took 13 s from a warm cache (7.8 GB/s); a cold
 interpreter and the `ttnn` extension, then the profile, the device set, the context and the run directory, and starts
 the server with `--sampling` (sampled requests are served; a request naming no sampling field is still the bitwise
 greedy stream) and `--stall-seconds 300` (the watchdog, below); `--no-sampling` serves greedy requests only (+0.3 ms
-per token saved, sampling fields refused with HTTP 400) and `--stall-seconds 0` disables the watchdog.
+per token saved, sampling fields refused with HTTP 400) and `--stall-seconds 0` disables the watchdog.  The chunked
+prefill runs 128-row chunks where the prompt allows since 2026-09-29 (bitwise the 32-row chunks, `docs/PREFILL.md`;
+`--long-chunks` is accepted and changes nothing).
 
 What the launcher does not do: no device locks, no runtime archives or digests.  It exports the QuietBox mesh graph
 descriptor for `tt-quietbox` (`tools/qb_p150_x4_1x4_line_mesh_graph_descriptor.textproto`: the four chips' ethernet
@@ -136,15 +138,27 @@ wrap for the whole process; that switch is gone.
 Scheduling: a request that finds a free lane is admitted at the next pass boundary; the B+1th waits in the FIFO
 (`usage.queue_wait_seconds` counts from its arrival to its admission) and up to `--queue-limit` (4) wait behind the B
 lanes, the next gets HTTP 503 with `Retry-After`.  An admission prefills the prompt on the single-stream chain (the same
-chunked prefill), evicts that state into a host slot and imports it into the lane -- and STALLS EVERY LANE for its
-duration, because the device runs one thing at a time: the other requests' passes pause for the prefill (MEASURED on a
-4x p150 hold at 32k: 0.3-1.4 s for the acceptance prompts of 40-560 tokens; a prompt of tens of thousands of tokens
-stalls the lanes for its prefill time, seconds) plus the eviction and import (about 0.2 s).  One admission per boundary
-while any lane decodes, back to back while none does.  Every request's response carries the record: `qwen38.lanes`
-(`lane`, `admission_seconds` and its `prefill` / `evict` / `import` parts, `stalled_seconds` = the other requests'
-admissions while this one decoded, `passes`, `committed_tokens`, `finish_detail`, `forced_think_ends`) beside the
-usual `qwen38` fields; `/health.lanes` has the live counts (active, free, waiting, passes, admissions, the stall total)
-and `READY.lanes` the geometry, the DRAM admission and growth, and the startup gate.  A request ends at a pass boundary
+chunked prefill: 128-row chunks where the prompt allows, 32-row chunks for the remainder), evicts that state into a
+host slot and imports it into the lane.  The device runs one thing at a time, so that work is what the other lanes wait
+for; since 2026-09-29 it runs in SEGMENTS -- the chunk groups of the prefill (one per 128 prompt rows), the forced last
+step, the eviction, the import -- and between two segments the driver runs one pass for the decoding lanes whenever the
+admission work since their last pass reached `--lanes-stall-budget` (seconds; the default 0.5 is the measured
+setting of the 2026-09-29 sweep in `docs/NUMERICS.md`, "Served lanes"; `0` runs a pass at every segment; `off` runs
+every admission whole, the form of 2026-09-28).  The trade-off, measured: the device work is the same, so the interleave
+costs exactly the passes it inserts -- on a four-request burst of 560-token prompts the later admissions' passes serve
+one to three lanes and the batch ends one pass later per inserted pass (the aggregate 8 % under `off` at 0.5 s, 10 %
+at 0.25 s), and a 4,000-token prompt's own first token waits one pass per inserted pass (+0.8 s at 0.5 s) -- while
+every other lane pauses at most the budget plus one 128-row segment (0.6-0.8 s at 0.5 s, 0.4 s at 0.25 s) instead of
+the whole admission (1.05-1.11 s for a 560-token prompt, 5.5 s for the 4,000-token one); the natural mixed batch is
+within noise across the settings.  `off` is for an operator who wants the burst aggregate and accepts multi-second
+freezes of the other streams.  One admission per boundary while any lane decodes; while none does the waiting requests are
+admitted back to back, the first whole and the next ones interleaved with the first one's passes.  Every request's
+response carries the record: `qwen38.lanes` (`lane`, `admission_seconds` = the admission's segments with its `prefill`
+/ `evict` / `import` parts, `admission_wall_seconds` = the admission with the interleaved passes inside,
+`interleaved_passes`, `stalled_seconds` = the other requests' admission segments while this one decoded (never the
+passes it got), `passes`, `committed_tokens`, `finish_detail`, `forced_think_ends`) beside the usual `qwen38` fields;
+`/health.lanes` has the live counts (active, free, waiting, passes, admissions, interleaved passes, the stall total, the
+budget) and `READY.lanes` the geometry, the DRAM admission and growth, the budget and the startup gate.  A request ends at a pass boundary
 (EOS, a stop string, `max_tokens`, the deadline, a hang-up) and frees its lane -- these are exact: the answer equals
 the single stream's byte for byte (measured 11 of 11 on the 2026-09-28 rows, the fold on both sides: four concurrent
 acceptance prompts and a fifth behind them, the EOS / stop-string / `max_tokens` / lifecycle rows).  The thinking
@@ -309,7 +323,8 @@ since its last completed step.
 The stall watchdog (`--stall-seconds`, 300 through the launchers) fires only on zero progress.  Its clock belongs to
 the request holding the device: it starts when the request is admitted from the queue and restarts at every
 completed device step: every decode step (50 ms), every teacher-forced prefill event (16 forced tokens, under a
-second) and every chunk-prefill event sync (4 chunks, about 0.4 s; 1.3 s with `--long-chunks`), so a 200k-token
+second) and every chunk-prefill event sync (4 chunks: about 0.4 s in 32-row chunks, 1.3 s in the default 128-row
+chunks), so a 200k-token
 prefill restarts it several times a second and a long answer every token; it is not measured while no request holds
 the device or while requests only wait in the queue.  A request whose device call has not returned for that long is
 a wedge: the server logs `stalled`, ends with exit status 1 without releasing the chain, and a supervisor restarts
@@ -331,9 +346,9 @@ served (no CORS headers); a body needs `Content-Length`.
 | JIT kernel cache | about 1.3 GB | fills during the warm pass, two to four minutes cold |
 | host memory, first start | about 10 GB in flight | one MoE layer at a time; 64 GB is comfortable |
 | host memory, CPU reference (`tools/run_full_cpu_oracle.py`) | 170-240 GB | not a user step |
-| device DRAM free per bank after the captures, 32k | 1,603,483,392 bytes | QuietBox 2026-09-25 with the compact expert layout (largest contiguous 1,602,833,984); 1,531,678,912 with `--mtp 4` (71.8 MB less), 1,569,890,816 with `--long-chunks` (33.6 MB less); with both, the MTP admission takes the 33.6 MB off the free bytes and adds the MTP layer's 128-row chunk extension (measured by the first `--mtp --long-chunks` open); 474,261,568 / 375,594,496 / 439,384,896 before it (2026-09-06) |
+| device DRAM free per bank after the captures, 32k | 1,603,483,392 bytes | QuietBox 2026-09-25 with the compact expert layout (largest contiguous 1,602,833,984); 1,531,678,912 with `--mtp 4` (71.8 MB less), 1,569,890,816 with the 128-row chunks (33.6 MB less: the served default since 2026-09-29, every chunked-prefill server carries it); with `--mtp` the MTP admission takes the 33.6 MB off the free bytes and adds the MTP layer's 128-row chunk extension, 25,600 bytes per bank (measured by the first `--mtp --long-chunks` open); 474,261,568 / 375,594,496 / 439,384,896 before it (2026-09-06) |
 | device DRAM free per bank, 64k | 419,440,704 bytes | QuietBox 2026-09-06, before the compact expert layout (which frees a further 1,146,621,952 bytes per bank at 32k) |
-| device DRAM free, 256k | about 750 MB per device | QuietBox 2026-09-06, before the compact expert layout; single-user; MTP did not fit then (94 MB free per bank against the 128 MiB contiguous it needs) |
+| device DRAM free, 256k | 1,299,216,512 bytes per bank after the captures (a 1x4 p150 line, 2026-09-29, the compact expert layout, the 128-row chunk default, no MTP) | about 750 MB per device on the QuietBox 2026-09-06, before the compact expert layout (94 MB free per bank then, so MTP did not fit; not re-tried at 256k since); single-user |
 | the prompt-end snapshot | ~53 MB per device | resident; the recurrent part of the device state (above) |
 
 ## The server behind uvicorn (the container form)

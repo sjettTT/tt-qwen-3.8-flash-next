@@ -113,6 +113,21 @@ def test_parser_takes_lanes_and_dropped_the_old_lane_service_flags() -> None:
     ]
     parsed = parser.parse_args(argv)
     assert parsed.lanes == 4 and parsed.mtp == 4 and parsed.sampling is False
+    # the stall budget: the scheduler's default, a number of seconds, or off (whole admissions)
+    assert parsed.lanes_stall_budget == scheduler_module.DEFAULT_STALL_BUDGET_SECONDS
+    assert parser.parse_args(argv + ["--lanes-stall-budget", "0"]).lanes_stall_budget == 0.0
+    assert parser.parse_args(argv + ["--lanes-stall-budget", "off"]).lanes_stall_budget is None
+    assert parser.parse_args(argv + ["--lanes-stall-budget", "0.5"]).lanes_stall_budget == 0.5
+    for bad in ("-1", "nan", "soon"):
+        with pytest.raises(SystemExit):  # allow-pytest.raises: argparse refuses the value
+            parser.parse_args(argv + ["--lanes-stall-budget", bad])
+    # --long-chunks is accepted (the Hub manifests pass it) and is the chunked prefill's default
+    assert parser.parse_args(argv + ["--long-chunks"]).long_chunks is True
+    main = SERVER_SOURCE.read_text(encoding="utf-8")
+    main = main[main.index("def main() ->") :]
+    assert 'args.long_chunks = args.prefill_mode == "chunked"' in main
+    assert '"--lanes-stall-budget needs --lanes' in main
+    assert "stall_budget_seconds=args.lanes_stall_budget," in main
 
 
 # --------------------------------------------------------------------------- the DRAM admission
@@ -403,6 +418,7 @@ def test_lanes_request_path_calls_no_device_method_of_the_session() -> None:
 def test_replay_acceptance_lanes_compares_every_stream_with_the_single_stream_replay() -> None:
     source = inspect.getsource(server.replay_acceptance_lanes)
     assert "scheduler.run(lanes_session, forever=False)" in source
+    assert "stall_budget_seconds=stall_budget_seconds" in source  # the served budget drives the pin's replay too
     assert '"equals_single_stream": single is not None and actual == list(single)' in source
     assert "if require_gate and not (gate_pass and equals_single_stream):" in source
     assert '"schema": "qwen38-chat-server-acceptance-lanes/v1"' in source
@@ -422,8 +438,24 @@ def test_scheduler_and_session_modules_split_the_device_from_the_rules() -> None
         "tracker.verify_before_replay(trace_id)",
         "mtp_lanes.write_lane_accepted(self.model, self.verify, list(counts))",
         "self.lane_chain.set_active([0] * self.lanes)",
+        # the admission's segments and the scheduler's yield point between them
+        "between_chunks=None if between is None else between_chunks,",
+        "event_rows=None if between is None else ADMISSION_EVENT_ROWS,",
+        'between("prefilled", len(ids), len(ids))',
+        'between("evicted", len(ids), len(ids))',
+        '"prefill": (prefilled - started) / 1e9 - spent,',
     ):
         assert call in session_source, call
+    assert lanes_module.ADMISSION_EVENT_ROWS == 128 and lanes_module.ADMISSION_SEGMENTS == (
+        "chunks",
+        "prefilled",
+        "evicted",
+    )
+    # the scheduler's between: a pass once the admission work since the last pass reached the budget
+    assert (
+        "if now - self.lanes_progressed_at < budget:" in scheduler_source
+        and "self._pass(device, boundary)" in scheduler_source
+    )
     # the import warm-up covers every residue variant for every lane before the captures
     assert "for shift in range(IMPORT_RESIDUES):" in session_source and lanes_module.IMPORT_RESIDUES == 4
     assert lanes_module.EAGER_PASSES == 2

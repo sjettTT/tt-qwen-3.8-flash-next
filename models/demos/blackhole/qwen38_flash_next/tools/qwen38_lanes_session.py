@@ -19,6 +19,11 @@ and the lane bodies run two eager passes (their programs); the chain then captur
 traces are captured after them, the allocation tracker verifies every trace, and the program cache must not have
 grown.  From then on the program-cache miss guard stays closed: an admission's prefill, eviction and import are
 replays and warmed eager programs, so a program the warm-up missed raises instead of compiling under live traces.
+An admission is a sequence of device segments (the chunk groups of the prefill, one event per 128 prompt rows; the
+forced last step; the eviction; the import), and between them the scheduler may run the decoding lanes' passes
+(:meth:`Qwen38LanesSession.admit`'s ``between``): the lane traces and the chunk traces share the one command queue
+in order, the lane states and the traced chain's state are disjoint buffers, and every eager move (the seed, the
+hand-off, the eviction, the import) follows a device synchronize or a blocking readback, as it did before.
 
 Greedy only (the lane body resolves by argmax; the sampled lanes form is a later wave).  The verify-rows fold
 (``gdn_rows_scan``) serves the lanes through its lanes form (its prefix states are allocated with the lane verify state,
@@ -36,6 +41,7 @@ from ttnn.unsafe_allocation_tracker import UnsafeAllocationTracker
 
 from models.demos.blackhole.qwen38_flash_next.tools import resident_decode
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import CHUNK_PREFILL_MIN_ROWS
+from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import LONG_CHUNK_ROWS
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lane_scheduler import (
     Qwen38LaneAdmitted,
     Qwen38LaneTicket,
@@ -56,6 +62,12 @@ IMPORT_RESIDUES = gdn_module.CONV_KERNEL_SIZE
 # verify, draft), as the stage-3 tool ran them; every program of the three bodies compiles here.
 EAGER_PASSES = 2
 WARM_TOKEN_ID = 1  # any exact vocabulary id for the warm passes' rows
+# The admission prefill's event cadence in prompt rows: one event (and one ``between`` call, the scheduler's yield
+# point) per 128-row chunk, or per four 32-row chunks, so the decoding lanes' passes can run between chunk groups.
+ADMISSION_EVENT_ROWS = LONG_CHUNK_ROWS
+# The admission's segments as ``between`` names them: the chunk groups of the prefill, the forced last step and the
+# row read, the eviction into the host slot; the import into the lane ends the admission.
+ADMISSION_SEGMENTS = ("chunks", "prefilled", "evicted")
 
 
 class Qwen38LanesSessionError(RuntimeError):
@@ -322,11 +334,20 @@ class Qwen38LanesSession:
 
     # -- the device protocol (the driver thread) ------------------------------------------------
 
-    def admit(self, lane: int, ticket: Qwen38LaneTicket) -> Qwen38LaneAdmitted:
+    def admit(
+        self, lane: int, ticket: Qwen38LaneTicket, between: Callable[[str, int, int], float] | None = None
+    ) -> Qwen38LaneAdmitted:
         """The request's prompt prefilled on the traced chain (the session's own prefill section: the reset, the
         chunked prefill of all but the last token when the prompt admits it, the last token forced, the model's next
         token read from the row), the generic and alignment states evicted into the host slots, the image imported
-        into ``lane``."""
+        into ``lane``.
+
+        ``between`` is the scheduler's yield point between the admission's device segments: called after every
+        128 prompt rows of the chunked prefill (``"chunks"``, with the rows consumed and the rows of the prefill),
+        after the forced last step and its row read (``"prefilled"``) and after the eviction (``"evicted"``), each
+        time with the device idle and every chunk input for the next segment prepared but not uploaded; it returns
+        the seconds it spent (the decoding lanes' passes), which the segment records below exclude.  None: the
+        admission runs whole (the single-stream event cadence)."""
 
         session, chain, model = self.session, self.chain, self.model
         if session is None or self.lane_chain is None:
@@ -334,12 +355,24 @@ class Qwen38LanesSession:
         ids = [int(token) for token in ticket.prompt_ids]
         if not ids:
             raise Qwen38LanesSessionError("an admission needs a prompt")
+        spent = 0.0  # seconds ``between`` took inside the prefill segment
+
+        def between_chunks(done: int, total: int) -> None:
+            nonlocal spent
+            spent += float(between("chunks", done, total))
+
         started = self.clock_ns()
         session.reset()
         suffix = list(ids)
         chunked = None
         if session.prefill_mode == "chunked" and session.chunk_prefill_rows(len(suffix) - 1) >= CHUNK_PREFILL_MIN_ROWS:
-            chunked = session._prefill_chunked(suffix[:-1], suffix[-1], None)
+            chunked = session._prefill_chunked(
+                suffix[:-1],
+                suffix[-1],
+                None,
+                between_chunks=None if between is None else between_chunks,
+                event_rows=None if between is None else ADMISSION_EVENT_ROWS,
+            )
             if chunked.stopped is not None:
                 raise Qwen38LanesSessionError(f"the chunked prefill stopped: {chunked.stopped!r}")
             suffix = suffix[-1:]
@@ -353,9 +386,15 @@ class Qwen38LanesSession:
             raise Qwen38LanesSessionError(f"device position {position} after prefilling {len(ids)} tokens")
         ple_context = session.ple_context
         prefilled = self.clock_ns()
+        if between is not None:
+            between("prefilled", len(ids), len(ids))
+        evict_started = self.clock_ns()
         self.backbone_pager.evict(0, self.backbone_pool.slots[0])
         self.alignment_pager.evict(0, self.alignment_pool.slots[0])
         evicted = self.clock_ns()
+        if between is not None:
+            between("evicted", len(ids), len(ids))
+        import_started = self.clock_ns()
         gdn_layers = sum(1 for layer in model.layers if isinstance(layer.attention, gdn_module.Qwen38TTNNGDN))
         mtp_lanes.import_lane_state(
             model,
@@ -377,9 +416,9 @@ class Qwen38LanesSession:
             position=position,
             ple_context=ple_context,
             seconds={
-                "prefill": (prefilled - started) / 1e9,
-                "evict": (evicted - prefilled) / 1e9,
-                "import": (imported - evicted) / 1e9,
+                "prefill": (prefilled - started) / 1e9 - spent,
+                "evict": (evicted - evict_started) / 1e9,
+                "import": (imported - import_started) / 1e9,
             },
             prefill={
                 "mode": "teacher_forced" if chunked is None else "chunked",

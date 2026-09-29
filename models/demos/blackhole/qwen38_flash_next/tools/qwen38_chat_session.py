@@ -1092,13 +1092,17 @@ class Qwen38ChatSession:
         following_token: int,
         should_stop: Callable[[], str | None] | None,
         vision: vision_splice.Qwen38VisionPrompt | None = None,
+        *,
+        between_chunks: Callable[[int, int], None] | None = None,
+        event_rows: int | None = None,
     ) -> Qwen38PrefillResult:
         """The chunk driver over ``token_ids`` from the committed position; its alignment steps are this session's
         forced steps (with the prefill event cadence).  Runs outside the loop guard: the seed and the hand-off
         synchronize and allocate.  The committed sequence and the n-gram context follow the device: a stop at one
         of the driver's event syncs (``result.stopped``) leaves the prompt committed up to the hand-off.
         ``following_token`` (the last prompt token, teacher-forced afterwards) is the MTP layer's token at the last
-        prefilled position."""
+        prefilled position.  ``between_chunks`` and ``event_rows`` are the lanes admission's hooks (the driver's:
+        other device work between chunk groups, and the event cadence in rows); the single stream passes neither."""
 
         forced = 0
         start = len(self.committed)
@@ -1114,8 +1118,13 @@ class Qwen38ChatSession:
                 self.chain.event_synchronize(self.chain.record_event())
             return self.ple_context
 
-        # An image prompt's rotary positions and feature rows ride along; a text prompt's call is the one it always was.
-        vision_inputs = {} if vision is None else {"positions": vision.positions, "features": vision.features}
+        # An image prompt's rotary positions and feature rows ride along, and so do the lanes admission's hooks; a
+        # text prompt's plain call is the one it always was.
+        hooks: dict[str, Any] = {} if vision is None else {"positions": vision.positions, "features": vision.features}
+        if between_chunks is not None:
+            hooks["between_chunks"] = between_chunks
+        if event_rows is not None:
+            hooks["event_rows"] = event_rows
         result = self.chain.chunk_prefill(
             token_ids,
             start_position=start,
@@ -1123,7 +1132,7 @@ class Qwen38ChatSession:
             forced_step=forced_step,
             following_token=following_token,
             should_stop=should_stop,
-            **vision_inputs,
+            **hooks,
         )
         if result.timing.alignment_steps != forced:
             raise Qwen38ChatChainError(f"chunk prefill forced {forced} alignment steps, reported {result.timing}")
@@ -2404,14 +2413,17 @@ class Qwen38TracedChain:
         forced_step: Callable[[int, tuple[int, int] | None], tuple[int, int] | None],
         following_token: int | None = None,
         should_stop: Callable[[], str | None] | None = None,
+        between_chunks: Callable[[int, int], None] | None = None,
+        event_rows: int | None = None,
         positions=None,
         features=None,
     ) -> Qwen38PrefillResult:
         """The chunk driver on this chain (the full-model gate's prefill path): alignment steps through
         ``forced_step``, the seed, chunk replays (``should_stop`` polled at their event syncs), the padded tail,
         the hand-off.  Not under the loop guard.  ``following_token`` is the MTP layer's token at the last
-        prefilled position (MTP chains).  ``positions`` / ``features`` are an image prompt's rotary positions and
-        feature rows (``Qwen38ChunkPrefill.run``)."""
+        prefilled position (MTP chains).  ``between_chunks`` / ``event_rows``: the driver's hooks (the lanes
+        admission runs the decoding lanes' passes between chunk groups, one event per 128 rows).  ``positions`` /
+        ``features`` are an image prompt's rotary positions and feature rows (``Qwen38ChunkPrefill.run``)."""
 
         if self.chunk_trace_id is None:
             raise Qwen38ChatChainError("the chain was opened without the chunk trace")
@@ -2430,6 +2442,7 @@ class Qwen38TracedChain:
             slab_state=self.slab_state,
             slab_trace_id=self.slab_trace_id,
             long_mtp=None if self.mtp is None else self.mtp.long_chunk_extension,
+            **({} if event_rows is None else {"event_rows": event_rows}),
         ).run(
             token_ids,
             start_position=start_position,
@@ -2438,6 +2451,7 @@ class Qwen38TracedChain:
             should_stop=should_stop,
             positions=positions,
             features=features,
+            **({} if between_chunks is None else {"between_chunks": between_chunks}),
         )
 
     # -- the MTP pass loop primitives (mtp chains) ---------------------------------------------

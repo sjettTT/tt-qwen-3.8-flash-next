@@ -14,7 +14,7 @@
 #                           directories (about 23 GB for 32k plus 107 GB of BF4 experts on the first start)
 #   --allocated-context N   32768 (default) | 65536 | 131072 | 262144
 #   --mtp K                 multi-token-prediction drafting depth, 3, 4 or 5 (off by default; greedy chunked-mode requests draft)
-#   --long-chunks           prefill in 128-row chunks where the prompt allows (off by default; combines with --mtp)
+#   --long-chunks           accepted for compatibility: the 128-row chunks are the server's default (combines with --mtp)
 #   --prefill-slab ROWS     prefill in slabs of ROWS rows (a multiple of 128, 256..4096; 2048 is the measured form)
 #                           ahead of the 128-row chunks (off by default; implies --long-chunks; not with --mtp)
 #   --no-sampling           serve greedy requests only (the default server takes --sampling: a request naming no

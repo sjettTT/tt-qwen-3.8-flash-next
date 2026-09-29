@@ -124,8 +124,13 @@ class FakeLanesDevice:
     of them (the host-written or landed count) for the lanes whose commit mask is set (the mask of the pass being
     committed); an inactive lane's rows are junk and its position holds; an admission imports a fresh state."""
 
-    def __init__(self, lanes: int, *, fail_on_pass: int | None = None, admit_seconds: float = 0.0):
+    def __init__(
+        self, lanes: int, *, fail_on_pass: int | None = None, admit_seconds: float = 0.0, segments: int = 3, clock=None
+    ):
         self.lanes = lanes
+        self.segments = segments  # the admission's device segments; ``between`` is called after all but the last
+        self.clock = clock  # a fake clock the admission advances by admit_seconds / segments per segment
+        self.between_calls: list[tuple[str, int, int, float]] = []
         self.sequence = [[] for _ in range(lanes)]  # the committed rows per lane
         self.last_rows = [None] * lanes  # the previous pass's rows (the persistent buffers)
         self.counts = [-1] * lanes
@@ -138,8 +143,18 @@ class FakeLanesDevice:
         self.fail_on_pass = fail_on_pass
         self.admit_seconds = admit_seconds
 
-    def admit(self, lane: int, ticket: Qwen38LaneTicket) -> Qwen38LaneAdmitted:
+    def admit(self, lane: int, ticket: Qwen38LaneTicket, between=None) -> Qwen38LaneAdmitted:
         self.calls.append(("admit", lane, ticket.request_id))
+        # the segments: the clock advances per segment, ``between`` runs after every segment but the last and its
+        # seconds are excluded from the segment records (the session's rule)
+        spent = 0.0
+        for index in range(self.segments):
+            if self.clock is not None:
+                self.clock.advance(self.admit_seconds / self.segments)
+            if between is not None and index + 1 < self.segments:
+                seconds = between(("chunks", "prefilled", "evicted")[min(index, 2)], index + 1, self.segments)
+                self.between_calls.append((ticket.request_id, index + 1, self.segments, seconds))
+                spent += seconds
         self.sequence[lane] = list(ticket.prompt_ids)
         self.last_rows[lane] = None
         self.positions[lane] = len(ticket.prompt_ids)
@@ -228,8 +243,27 @@ def _delivered(ticket: Qwen38LaneTicket) -> list[int]:
         tokens.append(token)
 
 
-def _run(device: FakeLanesDevice, tickets, *, lanes: int, queue_limit: int = 16) -> Qwen38LaneScheduler:
-    scheduler = Qwen38LaneScheduler(lanes=lanes, drafts=DRAFTS, queue_limit=queue_limit)
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _run(
+    device: FakeLanesDevice, tickets, *, lanes: int, queue_limit: int = 16, stall_budget_seconds=None, clock=None
+) -> Qwen38LaneScheduler:
+    scheduler = Qwen38LaneScheduler(
+        lanes=lanes,
+        drafts=DRAFTS,
+        queue_limit=queue_limit,
+        stall_budget_seconds=stall_budget_seconds,
+        **({} if clock is None else {"clock": clock}),
+    )
     for ticket in tickets:
         scheduler.submit(ticket)
     scheduler.run(device, forever=False)
@@ -479,24 +513,106 @@ def test_a_cancel_parks_the_lane_at_the_next_boundary_and_the_others_continue() 
 
 
 def test_stalls_are_charged_to_the_lanes_that_were_decoding() -> None:
-    device = FakeLanesDevice(2, admit_seconds=0.0)
+    """A decoding lane is charged the admission's device segments (the device's record of them), never the wall
+    the admission took on the host; the admitted request records both."""
+
+    device = FakeLanesDevice(2, admit_seconds=0.6)
     clock = [0.0]
 
     def tick() -> float:
         clock[0] += 1.0
         return clock[0]
 
-    scheduler = Qwen38LaneScheduler(lanes=2, drafts=DRAFTS, queue_limit=4, clock=tick)
+    scheduler = Qwen38LaneScheduler(lanes=2, drafts=DRAFTS, queue_limit=4, clock=tick, stall_budget_seconds=None)
     tickets = [_ticket(name, prompt, max_tokens=30, stop_ids=()) for name, prompt in list(PROMPTS.items())[:3]]
     for ticket in tickets:
         scheduler.submit(ticket)
     scheduler.run(device, forever=False)
     third = tickets[2]
-    assert third.queue_wait > 0 and third.admission_seconds > 0
-    # the lane that was still decoding when the third was admitted carries that admission as a stall
+    assert third.queue_wait > 0 and third.admission_seconds == pytest.approx(0.6)
+    assert third.admission_wall_seconds > 0 and third.interleaved_passes == 0
+    # the lane that was still decoding when the third was admitted carries that admission's segments as a stall
     stalled = [t for t in tickets[:2] if t.stalled_seconds > 0]
-    assert stalled and all(t.stalled_seconds == 0 for t in (third,))
-    assert scheduler.stalled_seconds_total == sum(t.stalled_seconds for t in tickets)
+    assert stalled and all(
+        t.stalled_seconds == pytest.approx(0.6) or t.stalled_seconds == pytest.approx(1.2) for t in stalled
+    )
+    assert third.stalled_seconds == 0
+    assert scheduler.stalled_seconds_total == pytest.approx(sum(t.stalled_seconds for t in tickets))
+
+
+@pytest.mark.parametrize("stall_budget_seconds", [0.0, 0.5, 2.0, None])
+def test_admissions_interleave_the_decoding_lanes_passes_under_the_budget(stall_budget_seconds) -> None:
+    """Three requests on two lanes: the first admission runs whole (no lane decodes), the second and the third
+    interleave the decoding lane's passes between their segments once the admission work since the last pass reached
+    the budget (0: every segment; 2.0 with 1.2 s admissions: never; None: never); every stream equals the reference
+    whatever the budget; the stall a decoding lane carries is the admission's segments, never the passes it got;
+    the admitted request's wall carries the passes."""
+
+    clock = FakeClock()
+    device = FakeLanesDevice(2, admit_seconds=1.2, segments=3, clock=clock)
+    tickets = [_ticket(name, prompt, max_tokens=30, stop_ids=()) for name, prompt in list(PROMPTS.items())[:3]]
+    scheduler = _run(device, tickets, lanes=2, stall_budget_seconds=stall_budget_seconds, clock=clock)
+    for ticket in tickets:
+        expected, finish = reference_stream(ticket.prompt_ids, max_tokens=30, stop_ids=(), think_budget=None)
+        assert _delivered(ticket) == expected and ticket.finish == finish
+    first, second, third = tickets
+    assert first.interleaved_passes == 0  # no lane decoded during the first admission
+    interleaved = second.interleaved_passes + third.interleaved_passes
+    if stall_budget_seconds is None or stall_budget_seconds > 1.2:
+        assert interleaved == 0 and scheduler.interleaved_passes == 0
+        assert not device.between_calls if stall_budget_seconds is None else device.between_calls
+    else:
+        assert interleaved > 0 and scheduler.interleaved_passes == interleaved
+        per_segment = 1.2 / 3
+        # budget 0: a pass at both yield points of an admission with a decoding lane; 0.5: after the second segment
+        expected_per_admission = 2 if stall_budget_seconds == 0.0 else 1
+        assert second.interleaved_passes == expected_per_admission
+        # the passes' seconds came back through ``between`` and were excluded from the segment records
+        assert all(seconds >= 0.0 for _, _, _, seconds in device.between_calls)
+        assert second.admission_wall_seconds >= second.admission_seconds
+    for ticket in tickets:
+        assert ticket.admission_seconds == pytest.approx(1.2)
+    # the decoding lane's stall is the admission segments only (1.2 s per admission it lived through)
+    assert first.stalled_seconds == pytest.approx(1.2) or first.stalled_seconds == pytest.approx(2.4)
+    assert scheduler.stalled_seconds_total == pytest.approx(sum(t.stalled_seconds for t in tickets))
+    assert scheduler.status()["stall_budget_seconds"] == stall_budget_seconds
+    assert scheduler.status()["interleaved_passes"] == scheduler.interleaved_passes
+
+
+def test_the_budget_counts_admission_work_since_the_decoding_lanes_last_pass() -> None:
+    """A boundary with several short admissions: none reaches the budget alone, together they do, so the decoding
+    lane gets its pass inside the second or third admission instead of waiting for the whole boundary."""
+
+    clock = FakeClock()
+    device = FakeLanesDevice(4, admit_seconds=0.3, segments=3, clock=clock)
+    tickets = [_ticket(name, prompt, max_tokens=12, stop_ids=()) for name, prompt in list(PROMPTS.items())[:4]]
+    # 0.45 and not 0.5: the fake clock sums 0.1 s steps, and 0.8 - 0.3 in floats falls a hair under 0.5
+    scheduler = _run(device, tickets, lanes=4, stall_budget_seconds=0.45, clock=clock)
+    for ticket in tickets:
+        expected, finish = reference_stream(ticket.prompt_ids, max_tokens=12, stop_ids=(), think_budget=None)
+        assert _delivered(ticket) == expected and ticket.finish == finish
+    # the first admission runs whole (no lane decodes) and the first lane's wait starts at its activation; the second
+    # admission's segments reach 0.1 and 0.2 s of wait, the third's 0.4 then 0.5 >= 0.45: the pass lands inside the
+    # third admission (a per-admission clock would never have run it: every admission is 0.3 s); the fake pass takes
+    # no clock time, so the fourth admission's segments reach 0.2 only
+    assert [t.interleaved_passes for t in tickets] == [0, 0, 1, 0]
+    assert scheduler.interleaved_passes == 1
+
+
+def test_stall_budget_is_none_or_a_non_negative_number() -> None:
+    from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lane_scheduler import (
+        DEFAULT_STALL_BUDGET_SECONDS,
+        stall_budget_seconds_admitted,
+    )
+
+    assert stall_budget_seconds_admitted(None) is None and stall_budget_seconds_admitted(0) == 0.0
+    assert stall_budget_seconds_admitted(0.25) == 0.25 and DEFAULT_STALL_BUDGET_SECONDS == 0.5
+    assert (
+        Qwen38LaneScheduler(lanes=2, drafts=DRAFTS, queue_limit=1).stall_budget_seconds == DEFAULT_STALL_BUDGET_SECONDS
+    )
+    for bad in (-0.1, True, "0.2", float("nan")):
+        with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
+            stall_budget_seconds_admitted(bad)
 
 
 def test_a_device_failure_ends_every_request_with_error_and_is_kept_as_fatal() -> None:

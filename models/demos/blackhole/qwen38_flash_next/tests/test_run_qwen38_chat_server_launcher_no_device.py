@@ -120,7 +120,7 @@ def test_long_chunks_and_a_slab_combine_with_mtp(tmp_path) -> None:
     launcher = LAUNCHER.read_text(encoding="utf-8")
     assert "--long-chunks and --mtp are alternatives" not in launcher
     assert "--prefill-slab and --mtp are alternatives" not in launcher
-    assert "prefill in 128-row chunks where the prompt allows (off by default; combines with --mtp)" in launcher
+    assert "accepted for compatibility: the 128-row chunks are the server's default (combines with --mtp)" in launcher
 
 
 def test_the_launcher_changes_directory_before_the_interpreter_runs() -> None:

@@ -96,6 +96,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     template_decoder,
 )
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lane_scheduler import (
+    DEFAULT_STALL_BUDGET_SECONDS,
     Qwen38LaneScheduler,
     Qwen38LaneSchedulerBusy,
     Qwen38LaneTicket,
@@ -1459,7 +1460,9 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             "lanes": {
                 "lane": ticket.lane,
                 "admission_seconds": round(ticket.admission_seconds, 4),
+                "admission_wall_seconds": round(ticket.admission_wall_seconds, 4),
                 "admission": {name: round(value, 4) for name, value in ticket.admission_segments.items()},
+                "interleaved_passes": ticket.interleaved_passes,
                 "stalled_seconds": round(ticket.stalled_seconds, 4),
                 "passes": ticket.passes,
                 "committed_tokens": ticket.committed,
@@ -1885,14 +1888,17 @@ def replay_acceptance_lanes(
     single_stream: Mapping[str, Any],
     require_gate: bool,
     continuation: int = ACCEPTANCE_CONTINUATION,
+    stall_budget_seconds: float | None = DEFAULT_STALL_BUDGET_SECONDS,
 ) -> dict[str, Any]:
     """The acceptance records through the lane scheduler (every record submitted at once, ``lanes`` admitted, the
-    rest in the FIFO and admitted as lanes free), each stream compared with the single-stream replay of the same
-    process (``single_stream``: ``replay_acceptance``'s record on the same chain form) and with the CPU record.
-    The pin is exactness against the single stream on every record and the ``json`` gate; ``require_gate`` refuses
-    a miss."""
+    rest in the FIFO and admitted as lanes free, their admissions interleaved with the decoding lanes' passes under
+    the served ``stall_budget_seconds``), each stream compared with the single-stream replay of the same process
+    (``single_stream``: ``replay_acceptance``'s record on the same chain form) and with the CPU record.  The pin is
+    exactness against the single stream on every record and the ``json`` gate; ``require_gate`` refuses a miss."""
 
-    scheduler = Qwen38LaneScheduler(lanes=lanes, drafts=drafts, queue_limit=max(len(records), 1))
+    scheduler = Qwen38LaneScheduler(
+        lanes=lanes, drafts=drafts, queue_limit=max(len(records), 1), stall_budget_seconds=stall_budget_seconds
+    )
     tickets = []
     for record in records:
         expected = record["generated_token_ids"][:continuation]
@@ -1927,7 +1933,9 @@ def replay_acceptance_lanes(
             "finish": ticket.finish,
             "queue_wait_seconds": round(ticket.queue_wait, 4),
             "admission_seconds": round(ticket.admission_seconds, 4),
+            "admission_wall_seconds": round(ticket.admission_wall_seconds, 4),
             "admission": {name: round(value, 4) for name, value in ticket.admission_segments.items()},
+            "interleaved_passes": ticket.interleaved_passes,
             "stalled_seconds": round(ticket.stalled_seconds, 4),
             "passes": ticket.passes,
             "tokens_per_pass": None if not ticket.passes else round(ticket.committed / ticket.passes, 3),
@@ -1956,6 +1964,8 @@ def replay_acceptance_lanes(
         "compared_prompts": len(results),
         "passes": scheduler.passes,
         "admissions": scheduler.admissions,
+        "interleaved_passes": scheduler.interleaved_passes,
+        "stall_budget_seconds": scheduler.stall_budget_seconds,
         "pass_seconds_median": (
             None
             if not scheduler.pass_seconds
@@ -2085,7 +2095,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--long-chunks",
         action="store_true",
-        help="chunked prefill only: also capture the 128-row chunk trace and run 128-row chunks ahead of the 32-row ones",
+        help="accepted for compatibility: the 128-row chunk trace and the 128-row chunks ahead of the 32-row ones are "
+        "the served default of the chunked prefill (bitwise the 32-row chunks, docs/PREFILL.md); --prefill-mode "
+        "teacher_forced has no chunks at all",
     )
     parser.add_argument(
         "--prefill-slab",
@@ -2190,7 +2202,30 @@ def _parser() -> argparse.ArgumentParser:
         "rows, needs --mtp; greedy only: no --sampling, the second-queue early read and the per-request drafts "
         "field are refused); 0 (the default): the single-stream chain with its queue",
     )
+    parser.add_argument(
+        "--lanes-stall-budget",
+        type=stall_budget_argument,
+        default=DEFAULT_STALL_BUDGET_SECONDS,
+        metavar="SECONDS",
+        help="--lanes only: the admission work (seconds) the decoding lanes wait for before their pass runs between "
+        "two segments of an admission (0: a pass at every segment; 'off': every admission runs whole and stalls the "
+        f"lanes for its length); default {DEFAULT_STALL_BUDGET_SECONDS} (docs/SERVER.md)",
+    )
     return parser
+
+
+def stall_budget_argument(text: str) -> float | None:
+    """``--lanes-stall-budget``: a non-negative number of seconds, or ``off`` / ``none`` for whole admissions."""
+
+    if text.strip().lower() in ("off", "none"):
+        return None
+    try:
+        value = float(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"a number of seconds or 'off', got {text!r}") from error
+    if value != value or value < 0:
+        raise argparse.ArgumentTypeError(f"a non-negative number of seconds or 'off', got {text!r}")
+    return value
 
 
 def main() -> int:
@@ -2231,6 +2266,12 @@ def main() -> int:
     if args.sampling_discriminator and (not args.sampling or args.acceptance_prompts is None):
         raise SystemExit("--sampling-discriminator needs --sampling and the acceptance prompt records")
     lanes_switch = lanes_switches(os.environ, args)  # the lanes' geometry and refusals
+    if lanes_switch is None and args.lanes_stall_budget != DEFAULT_STALL_BUDGET_SECONDS:
+        raise SystemExit("--lanes-stall-budget needs --lanes (the budget is the lane scheduler's)")
+    # The 128-row chunks are the served default of the chunked prefill (bitwise the 32-row chunks; the 560-token chat
+    # prompt prefills in 0.81 s against 1.19 s in 32-row chunks alone, docs/PREFILL.md): the flag is accepted, the
+    # teacher-forced mode has no chunk trace to extend.
+    args.long_chunks = args.prefill_mode == "chunked"
     if args.agreement_reference is not None and not args.sampling:
         raise SystemExit("--agreement-reference needs --sampling (the records read the candidate row)")
     if args.agreement_reference is not None and not args.agreement_reference.is_file():
@@ -2360,9 +2401,7 @@ def main() -> int:
         "sampling": (
             "candidate_row_device_sampler"
             if args.device_sampler
-            else "candidate_row_host_sampler"
-            if args.sampling
-            else "greedy"
+            else "candidate_row_host_sampler" if args.sampling else "greedy"
         ),
         "sampling_discriminator": bool(args.sampling_discriminator),
         "agreement": (
@@ -2439,7 +2478,10 @@ def main() -> int:
 
         lanes_session = Qwen38LanesSession(lanes=lanes_switch["lanes"], drafts=lanes_switch["drafts"], marker=marker)
         scheduler = Qwen38LaneScheduler(
-            lanes=lanes_switch["lanes"], drafts=lanes_switch["drafts"], queue_limit=args.queue_limit
+            lanes=lanes_switch["lanes"],
+            drafts=lanes_switch["drafts"],
+            queue_limit=args.queue_limit,
+            stall_budget_seconds=args.lanes_stall_budget,
         )
     if not (args.prepare_only or args.sampling_discriminator):
         # The port is claimed before the minutes of mesh open, captures and replay: a taken port fails here.
@@ -2600,6 +2642,7 @@ def main() -> int:
                 [t for t in (chain.chunk_trace_id, chain.long_chunk_trace_id, chain.slab_trace_id) if t is not None]
             ),
             "prefill_slab_rows": args.prefill_slab,
+            "prefill_long_chunks": chain.long_chunk_trace_id is not None,
             "chunk_capture_ms": chain.chunk_capture_ms,
             "long_chunk_capture_ms": chain.long_chunk_capture_ms,
             "prefill_mode": session.prefill_mode,
@@ -2665,6 +2708,7 @@ def main() -> int:
                 report["acceptance_lanes"] = replay_acceptance_lanes(
                     lanes_session,
                     records,
+                    stall_budget_seconds=args.lanes_stall_budget,
                     lanes=lanes_switch["lanes"],
                     drafts=lanes_switch["drafts"],
                     single_stream=report["acceptance"],
@@ -2761,6 +2805,7 @@ def main() -> int:
                         **lanes_session.summary(),
                         "greedy_only": True,
                         "queue_limit": args.queue_limit,
+                        "stall_budget_seconds": args.lanes_stall_budget,
                         "acceptance": (
                             None
                             if "acceptance_lanes" not in report

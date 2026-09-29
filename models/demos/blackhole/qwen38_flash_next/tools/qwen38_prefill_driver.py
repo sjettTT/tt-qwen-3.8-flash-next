@@ -14,10 +14,14 @@ histories); ``N // S`` slabs of ``S`` rows when the chain captured a slab trace 
 chunks (accept scalar 31) over the remainder ``M``; if ``M % 32 = r > 0`` one padded chunk whose rows ``r .. 31`` are
 :data:`CHUNK_PAD_TOKEN_ID` with accept scalar ``r - 1``; ``finish_prefill`` from the 32-row state.  The host work of
 chunk i + 1 (``prepare_chunk_inputs``: the n-gram lookups from the running context and the row packing; then
-``upload_chunk_inputs``: the token-row and PLE-row copies) is queued behind chunk i's replay and an event every
-``event_interval`` chunks bounds the run-ahead (a slab: the previous slab's event, waited for once the next replay
-is queued, so the host prepares slab k + 1 while slab k replays); the eager seed and hand-off run only
-after a device synchronize (their transients must not land in a running trace's addresses).
+``upload_chunk_inputs``: the token-row and PLE-row copies) runs under chunk i's replay: the host half is prepared as
+soon as chunk i is queued and the copies are queued behind it, so only the first chunk's preparation is exposed
+whatever the event cadence.  An event every ``event_interval`` chunks (or, with ``event_rows``, once the chunk rows
+since the last event reach that count: the lanes' admission form, one event per 128 prompt rows) bounds the run-ahead
+(a slab: the previous slab's event, waited for once the next replay is queued); ``run``'s ``between_chunks`` hook is
+called after every such event, with the prompt rows consumed so far, so a caller may run other device work between
+two chunk groups (the lanes server runs the decoding lanes' passes there); the eager seed and hand-off run only after
+a device synchronize (their transients must not land in a running trace's addresses).
 
 Timing (the rule every measurement here follows): ``verify_before_replay`` once per trace, outside the window; the raw
 ``ttnn._ttnn_execute_trace`` per chunk is timed only with ``time_each_chunk`` (blocking replays, no host overlap); the
@@ -128,6 +132,7 @@ class Qwen38ChunkPrefill:
         forced_step: Callable[[int, tuple[int, int] | None], tuple[int, int] | None],
         pad_token_id: int = CHUNK_PAD_TOKEN_ID,
         event_interval: int = CHUNK_EVENT_INTERVAL,
+        event_rows: int | None = None,
         verify_allocations: bool = True,
         gdn_step_anchor: bool = False,
         long_chunk_state: Any | None = None,
@@ -139,6 +144,10 @@ class Qwen38ChunkPrefill:
     ) -> None:
         if isinstance(event_interval, bool) or type(event_interval) is not int or event_interval <= 0:
             raise ValueError(f"event interval must be a positive int, got {event_interval!r}")
+        if event_rows is not None and (
+            isinstance(event_rows, bool) or type(event_rows) is not int or event_rows <= 0 or event_rows % CHUNK_ROWS
+        ):
+            raise ValueError(f"event rows must be a positive multiple of {CHUNK_ROWS} or None, got {event_rows!r}")
         for name, trace_id in (("chunk", chunk_trace_id), ("long chunk", long_chunk_trace_id), ("slab", slab_trace_id)):
             if isinstance(trace_id, (bool, str, float)):  # the runtime's trace handle (MeshTraceId) or None
                 raise ValueError(f"{name} trace id must be a trace handle or None (the eager body), got {trace_id!r}")
@@ -177,6 +186,9 @@ class Qwen38ChunkPrefill:
         self.forced_step = forced_step
         self.pad_token_id = pad_token_id
         self.event_interval = event_interval
+        # The event cadence in chunk rows instead of chunks (None: every ``event_interval`` chunks, the chain owner's
+        # form): the lanes' admission takes an event, and a ``between_chunks`` call, per 128 prompt rows.
+        self.event_rows = event_rows
         self.verify_allocations = verify_allocations
         self.gdn_step_anchor = gdn_step_anchor
         # The MTP-drafting chain's chunk extensions (mtp_v2.Qwen38TTNNMTPChunkExtension): the 32-row chunk trace was
@@ -232,6 +244,35 @@ class Qwen38ChunkPrefill:
 
         return {"short": self.mtp, "long": self.long_mtp, "slab": self.long_mtp}[kind]
 
+    def _prepare(
+        self,
+        plan: list,
+        starts: Sequence[int],
+        index: int,
+        ple_context: tuple[int, int] | None,
+        position: int,
+        positions,
+        features,
+        feature_cursor: int,
+    ):
+        """The host half of chunk ``index`` of the plan (its rows padded when it is the tail; ``starts[index]`` its
+        first row within the prefill, so its rotary positions start at ``position + starts[index]`` and its feature
+        rows follow ``feature_cursor``): ``(inputs, ns, feature_cursor after it)``, or None past the last chunk.
+        Host work only: it runs while the previous chunk replays."""
+
+        if index >= len(plan):
+            return None
+        chunk_state, _kind, rows, accepted = plan[index]
+        if accepted is not None and accepted != CHUNK_ROWS - 1:
+            rows = rows + [self.pad_token_id] * (CHUNK_ROWS - len(rows))
+        started_ns = time.perf_counter_ns()
+        chunk_positions = self._chunk_positions(positions, position + starts[index], rows)
+        chunk_features, feature_cursor = vision_splice.split_features(rows, features, feature_cursor)
+        prepared = self.model.prepare_chunk_inputs(
+            chunk_state, rows, ple_context=ple_context, positions=chunk_positions, features=chunk_features
+        )
+        return prepared, time.perf_counter_ns() - started_ns, feature_cursor
+
     def run(
         self,
         token_ids: Sequence[int],
@@ -241,6 +282,7 @@ class Qwen38ChunkPrefill:
         time_each_chunk: bool = False,
         following_token: int | None = None,
         should_stop: Callable[[], str | None] | None = None,
+        between_chunks: Callable[[int, int], None] | None = None,
         positions: mrope.Qwen38MRoPEPositions | None = None,
         features: torch.Tensor | None = None,
     ) -> Qwen38PrefillResult:
@@ -248,7 +290,11 @@ class Qwen38ChunkPrefill:
         token after them (``following_token``, the MTP token of the last prefilled position when the chain drafts).
         Returns the position after the prefill and the committed stream's n-gram context.  ``should_stop`` is
         polled at every event sync: a reason ends the prefill after the chunks already replayed (the hand-off runs
-        at that position; ``stopped`` carries the reason, ``position`` what was consumed).
+        at that position; ``stopped`` carries the reason, ``position`` what was consumed).  ``between_chunks(done,
+        total)`` runs after every chunk event sync that did not stop (the chunk rows consumed so far, the chunk rows
+        of the whole prefill): the device is idle at that point and the next chunk's inputs are prepared but not yet
+        uploaded, so the caller may run other device work there (never after a slab's event: that waits for the slab
+        before it while the slab itself still replays).
 
         An image prompt passes ``positions`` (the whole sequence's (t, h, w) rotary positions, ``mrope``; the rows of
         ``start_position ..`` are this prefill's) and ``features`` (the tower's rows, one per ``<|image_pad|>`` of
@@ -374,6 +420,13 @@ class Qwen38ChunkPrefill:
                 "short": (host_ms, replay_ms),
             }
             slab_event = None  # recorded after the last slab replay; waited for after the next one is queued
+            rows_since_event = 0  # the chunk rows replayed since the last event (the event_rows cadence)
+            # The next chunk's host half (the n-gram lookup and the row packing) is prepared while the current chunk
+            # replays and consumed at the next iteration: only the first chunk's preparation is exposed.
+            starts = [0]
+            for _state, _kind, plan_rows, _accepted in plan[:-1]:
+                starts.append(starts[-1] + len(plan_rows))
+            pending = self._prepare(plan, starts, 0, ple_context, position, positions, features, feature_cursor)
             for index, (chunk_state, kind, rows, accepted) in enumerate(plan):
                 real_rows = len(rows)
                 start = row_offset
@@ -381,12 +434,7 @@ class Qwen38ChunkPrefill:
                 host_started_ns = time.perf_counter_ns()
                 if accepted is not None and accepted != CHUNK_ROWS - 1:
                     self.model.write_chunk_accepted(self.chunk_state, accepted)
-                    rows = rows + [self.pad_token_id] * (CHUNK_ROWS - real_rows)
-                chunk_positions = self._chunk_positions(positions, position + start, rows)
-                chunk_features, feature_cursor = vision_splice.split_features(rows, features, feature_cursor)
-                prepared = self.model.prepare_chunk_inputs(
-                    chunk_state, rows, ple_context=ple_context, positions=chunk_positions, features=chunk_features
-                )
+                prepared, prepare_ns, feature_cursor = pending
                 ple_context = prepared.contexts[real_rows]
                 upload_started_ns = time.perf_counter_ns()
                 self.model.upload_chunk_inputs(chunk_state, prepared)
@@ -402,28 +450,39 @@ class Qwen38ChunkPrefill:
                         extension.write_tokens(self.model, ahead + [self.pad_token_id] * (width - len(ahead)))
                 replay_started_ns = time.perf_counter_ns()
                 if kind == "slab":
-                    slab_prepare_ms.append((upload_started_ns - host_started_ns) / 1_000_000)
+                    slab_prepare_ms.append(prepare_ns / 1_000_000)
                     slab_upload_ms.append((replay_started_ns - upload_started_ns) / 1_000_000)
                 if time_each_chunk:
-                    timings[kind][0].append((replay_started_ns - host_started_ns) / 1_000_000)
+                    timings[kind][0].append((prepare_ns + replay_started_ns - host_started_ns) / 1_000_000)
                     self._run_chunk(blocking=True, kind=kind)
                     timings[kind][1].append((time.perf_counter_ns() - replay_started_ns) / 1_000_000)
+                else:
+                    self._run_chunk(blocking=False, kind=kind)
+                # The next chunk's host half under this chunk's replay (its copies are queued behind the replay on the
+                # same command queue at the next iteration, so the device finishes reading the input buffers before
+                # they change); a slab's wait for the previous slab's event follows, so the host runs one slab ahead.
+                pending = self._prepare(
+                    plan, starts, index + 1, ple_context, position, positions, features, feature_cursor
+                )
+                if time_each_chunk:
                     continue
-                self._run_chunk(blocking=False, kind=kind)
-                # A slab's host work runs under the device: with slab k's replay queued the host waits for slab
-                # k - 1's event and records slab k's, then prepares slab k + 1 while slab k replays (its input copies
-                # queue behind the running replay on the same command queue, so the device finishes reading the
-                # buffers before they change).  The smaller chunks sync every few.
                 if kind == "slab":
                     wait_started_ns = time.perf_counter_ns()
                     if slab_event is not None:
                         ttnn.event_synchronize(slab_event)
                     slab_event = ttnn.record_event(self.mesh, cq_id=0)
                     slab_wait_ms.append((time.perf_counter_ns() - wait_started_ns) / 1_000_000)
-                elif (index + 1) % self.event_interval == 0:
-                    ttnn.event_synchronize(ttnn.record_event(self.mesh, cq_id=0))
+                    rows_since_event = 0
                 else:
-                    continue
+                    rows_since_event += real_rows
+                    if self.event_rows is None:
+                        due = (index + 1) % self.event_interval == 0
+                    else:
+                        due = rows_since_event >= self.event_rows
+                    if not due:
+                        continue
+                    ttnn.event_synchronize(ttnn.record_event(self.mesh, cq_id=0))
+                    rows_since_event = 0
                 stopped = None if should_stop is None else should_stop()
                 if stopped is not None:
                     done = plan[: index + 1]
@@ -432,6 +491,8 @@ class Qwen38ChunkPrefill:
                     long_done = sum(1 for _, done_kind, _, _ in done if done_kind == "long")
                     slabs_done = sum(1 for _, done_kind, _, _ in done if done_kind == "slab")
                     break
+                if between_chunks is not None and kind != "slab":
+                    between_chunks(row_offset, len(remaining))
             position += consumed
             handoff_started_ns = time.perf_counter_ns()
             ttnn.synchronize_device(self.mesh)

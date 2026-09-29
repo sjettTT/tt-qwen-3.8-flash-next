@@ -778,7 +778,126 @@ batch; the levers left -- a prefill beside the passes, the 20-row body -- are la
 
 The single stream's TTFT for the 560-token chat prompt is 1.21 s; a lane's is 1.4-5.4 s in a four-request burst: the
 admissions serialise (one per pass boundary while a lane decodes; 1.34 s each = prefill 1.19 + evict 0.05 + import
-0.10) and every other lane pauses for them -- the honest cost of admission in this wave.
+0.10) and every other lane pauses for them -- the honest cost of admission in that wave; the next section is the
+2026-09-29 stage that cut it.
+
+### The admission in segments, the 128-row chunks as the served default (2026-09-29)
+
+Two changes (`docs/SERVER.md`, "Several requests at once"): the chunked prefill runs 128-row chunks where the prompt
+allows for every server form (the rows of record above ran both servers on 32-row chunks alone, `READY.mtp.admission`
+`long_chunks false`; the 128-row chunks are bitwise the 32-row path, the section "`--long-chunks`" above), and an
+admission runs in segments with the decoding lanes' passes between them under `--lanes-stall-budget` (the chunk driver
+also prepares the next chunk's host inputs under the running replay for every caller, so only the first chunk's
+preparation is exposed at any event cadence).  The pins, in the `--lanes 4 --mtp 4` process of the first hold at the new
+head (a 1x4 p150 line, 32k, the served default set, host 1-min load 8-16 -- the gates are load-independent, the rows
+are not): the single-stream replay reads the `A3-mtp4-32k` sha table 12/12 and `json` 96/96 (the divergence row above,
+unchanged); the lanes replay under the interleave (budget 0.25 s, 13 interleaved passes over the 12 admissions, 111
+passes, pass p50 59.9 ms) 12/12 lane streams equal the single-stream replay; the lanes' DRAM growth states
+393,805,440 + traces 3,375,424 B per bank (the 2026-09-28 record 393,809,536 / 3,375,424), free after every capture
+1,209,590,016 (before 1,242,104,320: the 128-row chunk state and trace, 32.5 MB), the estimate 451,965,918 holds,
+program cache 828 -> 1272 across the captures and none after; READY 502 s (the first start at the head: the kernels
+compiled).
+
+| admission at 32k (prefill / evict / import, s; the startup replay, load 8-16) | tokens | 32-row chunks (2026-09-28) | 128-row chunks |
+|---|---|---|---|
+| `sky` / `code` / `fact` / `story` / `list` / `prose` / `multilingual` | 37-58 | -- | 0.27-0.29 / 0.05 / 0.09-0.11 |
+| `json` | 85 | -- | 0.344 / 0.056 / 0.103 |
+| `math` | 99 | -- | 0.385 / 0.047 / 0.101 |
+| `chat` | 177 | -- | 0.455 / 0.051 / 0.101 |
+| `summary` | 221 | -- | 0.542 / 0.048 / 0.098 |
+| `refactor` | 434 | -- | 0.755 / 0.054 / 0.102 |
+| the 560-token chat prompt (the served batch) | 560 | 1.19-1.20 / 0.05 / 0.10-0.11 | 0.90-0.96 / 0.05 / 0.10 (load 8; the quiet-host row below) |
+
+The served byte gate at the new head (the same smoke set, the `--lanes 4 --mtp 4` server at the default budget against
+the 2026-09-28 comparator's replies, the default single stream on 32-row chunks; host load 10-21): 11/11 rows byte for
+byte (the four acceptance prompts at once, the fifth, 4 x chat560 at once, the stop-string and `max_tokens` 40 rows),
+the forced `</think>` rows 6/6 through the forced token and parting afterwards on the same three budgets at the same
+characters as before (the 1-row seam above, untouched), the lanes' own repeats 8/8; at 128k the same process form
+reads the shas 12/12 and the lanes pin 12/12 (15 interleaved passes, pass p50 66.5 ms), the admission fits with 6.3 MB
+per bank of headroom at the hook and 269,504,768 B per bank stay free after every capture (305,185,280 before the
+128-row state).
+
+**The stall budget sweep (RELATIVE, host 1-min load 11-62: other sessions' test sets and two masked full sets of
+this branch ran alongside; the four settings interleaved in two rounds so the drift hits them alike; each hold its own
+`--lanes 4 --mtp 4` server at 32k on a 1x4 p150 line, the same request bodies).  CAVEAT: the sweep ran BEFORE the
+budget clock's fix (the landed form counts the admission work from the decoding lanes' last pass, or the first lane's
+activation after an idle boundary; the sweep's clock restarted per admission), so the natural batch's pauses in this
+table are the old clock's (a boundary of four short admissions never reached 0.5 s and the first lane waited the whole
+boundary: 0.96-1.07 s at 0.5 s); the rows of record below run with the fix and supersede them; the burst rows (one
+admission of 1.1 s or more at a time) are the same under either clock.**  4 x chat560 at once (2048 tokens), the natural batch chat / code / json / prose at once
+with a fifth chat 2 s behind, and the stall row: three chat560 at once and a 4,031-token prompt 3 s later.
+
+| budget (round a: load 26-62; round b: load 11-34) | 4 x chat560 aggregate a / b | TTFT by arrival (b) | per request (b) | the decoding lanes' longest pause (b) | natural batch aggregate a / b, TTFT (b) | fifth TTFT (b) | the 4k prompt: its admission wall / TTFT, the three lanes' longest pause (b) |
+|---|---|---|---|---|---|---|---|
+| `off` (whole admissions, the 2026-09-28 form) | 142.6 / **144.6** tok/s | 1.08 / 2.15 / 3.24 / 4.39 s | 39.3 / 42.8 / 47.1 / 52.3 | 1.1-2.2 s (a: 3.5) | 79.6 / 83.2; 0.48 / 1.03 / 1.52 / 2.19 | 2.63 s | 5.51 s / 5.83 s; **5.56 s** |
+| 0.5 s (the default since this stage) | 130.3 / 133.8 | 1.11 / 2.25 / 3.52 / 4.71 | 36.8 / 39.9 / 43.8 / 48.2 | 0.62-0.64 s (1-2 interleaved passes per admission) | 79.5 / 82.5; 0.55 / 1.02 / 1.44 / 2.19 | 2.73 | 6.06 / 6.63 (9 interleaved passes); 0.76 |
+| 0.25 s | 121.8 / 130.5 | 1.07 / 2.40 / 3.74 / 5.03 | 36.8 / 39.9 / 43.6 / 47.9 | 0.40-0.44 s (3 per admission) | 72.3 / 82.8; 0.57 / 1.22 / 1.77 / 2.32 | 2.76 | 6.54 / 7.23 (17); 0.40 |
+| 0 (a pass at every segment) | 121.9 / 127.1 | 1.11 / 2.56 / 4.01 / 5.43 | 36.7 / 39.7 / 43.4 / 47.8 | 0.34-0.43 s (6 per admission) | 74.5 / 82.4; 0.78 / 1.38 / 2.02 / 2.66 | 3.06 | 7.49 / 8.51 (33); 0.32 |
+
+What the table says: the device work is the same at every setting, so the interleave costs exactly the passes it
+inserts -- on a four-burst the later admissions' passes serve one to three lanes and the batch ends one pass later per
+inserted pass (`off` 14.16 s against 15.31 s at 0.5 and 15.70 s at 0.25: -8 % and -10 % aggregate), and a long prompt's
+first token waits one pass per inserted pass (+0.8 s at 0.5, +1.4 s at 0.25, +2.7 s at 0) -- while it bounds what the
+decoding lanes see: a pause of budget plus one 128-row segment (0.6-0.8 s at 0.5, 0.4 s at 0.25) instead of the whole
+admission (1.1 s per 560-token prompt, 5.6 s for the 4k prompt).  The natural batch (short prompts, admissions of
+0.43-0.66 s) is within noise across the settings.  The default is 0.5 s: half the interleave cost of 0.25 s for a
+pause under a second; `--lanes-stall-budget off` is kept for an operator who wants the burst aggregate and accepts
+multi-second freezes, `0` for the shortest pauses.  The rows of record at the default (a quiet host) follow.
+
+**The rows of record of this stage (2026-09-29, a 1x4 p150 line at 32k, both servers `--mtp 4 --no-sampling` greedy on
+the served default set, 128-row chunks, the fold on; ONE host and one session, the comparator first; the 1-min host load
+per row group stated, the servers' own load included: the comparator 0.8-2.6, the lanes 0.9-1.6; the lanes at the default
+budget 0.5 s, two runs).**  The byte gate: 13/13 rows equal the comparator's replies on both runs (the four acceptance
+prompts at once, the fifth, 4 x chat560 at once, the three chat560 of the stall row and the 4k prompt).
+
+| row (`--lanes 4 --mtp 4`, budget 0.5 s) | lanes (4 at once), run 1 / run 2 | single stream (the default server, in turn) |
+|---|---|---|
+| 4 x chat560 (thinking off, EOS honoured; 2048 tokens): aggregate | **132.2 / 131.3 tok/s** (2048 / 15.49 s; 15.60 s) | 57.6 tok/s (2048 / 35.53 s) |
+| 4 x chat560: per request (by arrival) | 36.5 / 39.4 / 42.9 / 47.1 (36.1 / 39.0 / 42.4 / 46.4); 177 passes each | 66.7 / 66.8 / 66.7 / 66.7 |
+| 4 x chat560: TTFT | 1.10 / 2.27 / 3.47 / 4.65 s (1.07 / 2.23 / 3.42 / 4.59) | 0.91 / 0.91 / 0.91 / 0.91 s |
+| 4 x chat560: the admission | 1.04-1.09 s of segments (prefill 0.90-0.95 + evict 0.06 + import 0.08), the first whole, the next three with one interleaved pass each (wall 1.10-1.14 s) | -- |
+| 4 x chat560: the decoding lanes' longest pause / stalled | 0.61-0.62 s; 3.20 / 2.14 / 1.06 / 0 s (3.17 / 2.13 / 1.04 / 0) | -- |
+| mixed natural batch chat / code / json / prose (EOS honoured): per user | run 1: 37.7 / 46.6 / 74.1 / 28.1 tok/s; run 2: 36.7 / 60.3 / 52.8 / 28.3 (the arrival order differs between the runs) | 62.2 / 102.3 / 110.4 / 49.2 |
+| mixed batch: aggregate over the batch wall | 80.5 / 81.8 tok/s (1194 / 14.83 s; 14.60 s) | 63.5 (1194 / 18.81 s in turn) |
+| mixed batch: TTFT chat / code / json / prose | run 1: 1.26 / 0.60 / 2.30 / 1.77 s; run 2: 0.68 / 2.08 / 1.13 / 1.61 (one admission of 0.41-0.62 s per boundary, none reaching the budget; the longest pause 0.54-0.61 s) | 0.50 / 0.28 / 0.36 / 0.28 s |
+| the fifth request (chat, 2 s behind the four) | TTFT 3.06 / 2.71 s, 43.1 / 43.0 tok/s, one interleaved pass | -- |
+| the stall row: three chat560 at once, a 4,031-token prompt 3 s later | the long admission 5.49 s of segments (prefill 5.35 = 1.33 ms per prompt token, evict 0.06, import 0.08) as 8 interleaved passes, wall 5.95 s, its TTFT 6.35 / 6.42 s and 54.2 tok/s after; the three decoding lanes' longest pause 0.72-0.80 s (a 5.5 s freeze on the 2026-09-28 form), their stalled 7.57 / 6.53 / 5.49 s, 27.1-30.5 tok/s over their answers | the 4k prompt's TTFT 5.34 s (about 760 prompt tokens per second) and 73.8 tok/s after; the three chat560 in turn 66.6-66.8 |
+| startup: READY (warm caches) / the pin | 142-151 s; 12/12 lane streams = the single-stream replay = the shipped shas, 4 interleaved passes in the replay, pass p50 61.0 ms | 370 s (the first `--no-sampling` start at the head) |
+
+Against the 2026-09-28 rows of record (32-row chunks, whole admissions): the burst's aggregate 134.0 -> 132.2 tok/s (-1.3 %:
+the 128-row chunks' 0.28 s per admission bought back by the interleave's passes), its TTFTs 1.37 / 2.70 / 4.04 / 5.44 ->
+1.10 / 2.27 / 3.47 / 4.65 s, the other lanes' pause per admission 1.35 -> 0.62 s, stalled 4.03 / 2.69 / 1.35 -> 3.20 /
+2.14 / 1.06 s; the natural batch 83.5 -> 80.5-81.8 (the same host-noise band as its 2026-09-28 rows at load 3-7); the
+fifth 2.73 -> 2.71-3.06 s.  The single stream's own rows moved with the 128-row default: the 560-token chat prompt's TTFT
+1.21 -> 0.91 s (-25 %), the natural rows 0.54 / 0.28 / 0.34 / 0.29 -> 0.50 / 0.28 / 0.36 / 0.28, the decode 67.1-67.7 ->
+66.7-66.8 tok/s (the same, within noise).
+
+`--lanes-stall-budget off` on the same host in the same session (04:35-04:39Z, load 0.8-1.6; the byte compare 13/13):
+4 x chat560 134.3 tok/s (2048 / 15.25 s), per request 36.6 / 39.5 / 43.1 / 47.3, TTFT 1.09 / 2.20 / 3.34 / 4.45 s,
+admissions 1.05-1.09 s whole, the decoding lanes' longest pause 1.10-1.15 s (the admission itself), stalled 3.19 / 2.14 /
+1.05 / 0; the natural batch 82.0 tok/s, TTFT 0.62 / 1.21 / 1.62 / 2.10, the longest pause 1.54 s (json's boundary); the
+fifth TTFT 2.68 s; the stall row: the 4k prompt's admission 5.46 s whole, its TTFT 5.76 s, the three decoding lanes
+frozen 5.51 s.  Against the default on the quiet host the interleave costs 1.5-2.3 % of the burst's aggregate (the loud
+sweep's 8 % carried the host load's share of every inserted pass's host work) and 0.6 s of the 4k prompt's first token,
+for pauses of 0.6-0.8 s instead of 1.1-5.5 s.
+
+128k (`--allocated-context 131072`, the same host and session, 04:39-04:45Z, load 1.0-1.7; READY 216 s, the pin 12/12,
+growth states 1,151,188,608 + traces 3,375,424 B per bank, free after every capture 269,504,768): 4 x chat560 109.7 tok/s
+(2048 / 18.67 s; 112.4 on 2026-09-28 with 1.65-1.70 s freezes), per request 30.7 / 33.7 / 37.3 / 41.8, TTFT 1.43 / 3.09 /
+4.76 / 6.44 s (1.67 / 3.36 / 5.07 / 6.79), admissions 1.42-1.48 s of segments (prefill 1.00-1.01 + evict 0.19 + import
+0.24) with two interleaved passes each after the first (the evict and import segments carry the 128k state), the
+decoding lanes' longest pause 0.69-0.70 s, stalled 4.42 / 2.95 / 1.48 / 0; the natural batch 68.5 tok/s, TTFT 0.94 /
+1.84 / 2.61 / 3.48 s, pauses under 0.84 s; the fifth TTFT 4.50 s, 38.5 tok/s; the stall row: the 4k prompt's admission
+6.35 s (prefill 5.86 = 1.45 ms per prompt token at 128k) as 11 interleaved passes, its TTFT 8.91 s, the three decoding
+lanes' longest pause 0.70 s.
+
+256k (`--allocated-context 262144`, the single-stream server, no `--mtp`; the same host, 04:45-04:49Z): READY after 180 s
+(the first 256k start on that host converted its caches inside the start), the 32-row and 128-row chunk traces
+captured (the 128-row capture 2.36 s), the acceptance replay 12/12 with `json` 96/96, free after every capture
+1,299,216,512 B per bank -- the 128-row default fits the largest context with the compact expert layout (the
+2026-09-06 table's 94 MB per bank at 256k predates that layout).
+
+
 
 ## The device sampler's law (2026-09-25)
 

@@ -608,16 +608,24 @@ def test_driver_prepares_the_next_slab_while_the_current_one_replays(monkeypatch
 
     plan = [("slab", SLAB)] * 3 + [("long", 128)] * 5 + [("short", 32)] * 2
     expected: list[tuple] = [("synchronize",), ("reset", 32), ("reset", 128), ("reset", SLAB)]
+    chunks = []
     offset = 0
-    pending = None
-    event = 0
-    for index, (kind, rows) in enumerate(plan):
+    for kind, rows in plan:
         chunk = tokens[offset : offset + rows]
         offset += rows
-        if len(chunk) < rows:
-            expected.append(("accepted", len(chunk) - 1))
-            chunk = chunk + [driver_module.CHUNK_PAD_TOKEN_ID] * (rows - len(chunk))
-        expected += [("write", rows, tuple(chunk)), ("upload", rows), ("replay", traces[kind], False)]
+        accepted = len(chunk) - 1 if len(chunk) < rows else None
+        chunks.append((kind, rows, chunk + [driver_module.CHUNK_PAD_TOKEN_ID] * (rows - len(chunk)), accepted))
+    pending = None
+    event = 0
+    # The host half of chunk i + 1 (its "write") is prepared right after chunk i's replay is queued, before the wait
+    # for the previous slab's event or the chunk event: the host runs one chunk ahead of the device at every cadence.
+    expected.append(("write", chunks[0][1], tuple(chunks[0][2])))
+    for index, (kind, rows, chunk, accepted) in enumerate(chunks):
+        if accepted is not None:
+            expected.append(("accepted", accepted))
+        expected += [("upload", rows), ("replay", traces[kind], False)]
+        if index + 1 < len(chunks):
+            expected.append(("write", chunks[index + 1][1], tuple(chunks[index + 1][2])))
         if kind == "slab":
             if pending is not None:
                 expected.append(("wait", pending))

@@ -141,15 +141,24 @@ def test_run_sequences_alignment_chunks_tail_and_handoff(harness, start: int, co
         ("verify_before_replay", TRACE_ID),
     ]
     context = _expected_context(tokens[:aligned], None)
+    padded = [
+        remaining[32 * index : 32 * (index + 1)]
+        + [CHUNK_PAD_TOKEN_ID] * (32 - len(remaining[32 * index : 32 * (index + 1)]))
+        for index in range(len(accepts))
+    ]
+    # The host half of chunk i + 1 is prepared right after chunk i's replay is queued (under it), before the event;
+    # only the first chunk's preparation precedes its own upload.
+    expected.append(("prepare_chunk_inputs", tuple(padded[0]), context))
     for index, accepted in enumerate(accepts):
-        rows = remaining[32 * index : 32 * (index + 1)]
-        real = len(rows)
+        rows = padded[index]
+        real = len(remaining[32 * index : 32 * (index + 1)])
         if accepted != 31:
             expected.append(("write_chunk_accepted", accepted))
-            rows = rows + [CHUNK_PAD_TOKEN_ID] * (32 - real)
-        expected += [("prepare_chunk_inputs", tuple(rows), context), ("upload_chunk_inputs", tuple(rows))]
+        expected.append(("upload_chunk_inputs", tuple(rows)))
         context = _expected_context(rows[:real], context)  # the pad rows never enter the committed context
         expected.append(("replay", False))
+        if index + 1 < len(accepts):
+            expected.append(("prepare_chunk_inputs", tuple(padded[index + 1]), context))
         if (index + 1) % 4 == 0:
             expected += [("record_event",), ("event_synchronize", "event")]
     expected += [("synchronize_device",), ("finish_prefill", start + count), ("synchronize_device",)]
@@ -234,6 +243,58 @@ def test_verify_can_be_skipped_and_the_budget_is_checked(harness) -> None:
         Qwen38ChunkPrefill(harness.model, "mesh", "s", "c", TRACE_ID, forced_step=lambda t, c: c, event_interval=0)
 
 
+@pytest.mark.parametrize("count", (100, 128, 300, 479))
+def test_event_rows_cadence_syncs_per_rows_and_calls_between_chunks(harness, count: int) -> None:
+    """The lanes admission's form: an event once the chunk rows since the last one reach ``event_rows`` (128 here:
+    every four 32-row chunks), ``between_chunks`` right after it with the rows consumed so far; the padded tail
+    ends without one (the hand-off synchronizes)."""
+
+    yields: list[tuple[int, int]] = []
+    prefill = Qwen38ChunkPrefill(
+        harness.model, "mesh", "state", "chunk_state", TRACE_ID, forced_step=harness.prefill.forced_step, event_rows=128
+    )
+    tokens = list(range(1, count + 1))
+    result = prefill.run(tokens, start_position=0, ple_context=None, between_chunks=lambda d, t: yields.append((d, t)))
+    assert result.position == count and result.ple_context == _expected_context(tokens, None)
+    full = count // 32
+    expected_syncs = full // 4
+    events = [entry for entry in harness.log if entry[0] == "event_synchronize"]
+    assert len(events) == expected_syncs
+    assert yields == [(128 * (k + 1), count) for k in range(expected_syncs)]
+    # every yield follows its event and precedes the next chunk's upload; the next chunk's inputs were prepared before
+    log = harness.log
+    for done, _total in yields:
+        sync = [i for i, e in enumerate(log) if e[0] == "event_synchronize"][yields.index((done, count))]
+        before = [e[0] for e in log[:sync]]
+        assert before.count("prepare_chunk_inputs") == before.count("upload_chunk_inputs") + (
+            1 if done < full * 32 or count % 32 else 0
+        )
+    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test (a positive multiple of 32 or None)
+        Qwen38ChunkPrefill(harness.model, "mesh", "s", "c", TRACE_ID, forced_step=lambda t, c: c, event_rows=100)
+    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
+        Qwen38ChunkPrefill(harness.model, "mesh", "s", "c", TRACE_ID, forced_step=lambda t, c: c, event_rows=0)
+
+
+def test_between_chunks_is_not_called_when_stopped_or_without_events(harness) -> None:
+    """A stop at the event ends the prefill before the yield point; the chunk cadence without ``event_rows`` is the
+    single stream's (every four chunks) and the yield point follows each of its events."""
+
+    yields: list[tuple[int, int]] = []
+    result = harness.prefill.run(
+        list(range(300)),
+        start_position=0,
+        ple_context=None,
+        should_stop=lambda: "deadline",
+        between_chunks=lambda d, t: yields.append((d, t)),
+    )
+    assert result.stopped == "deadline" and result.position == 128 and yields == []
+    harness.log.clear()
+    result = harness.prefill.run(
+        list(range(300)), start_position=0, ple_context=None, between_chunks=lambda d, t: yields.append((d, t))
+    )
+    assert result.stopped is None and yields == [(128, 300), (256, 300)]
+
+
 def test_driver_source_pins() -> None:
     import inspect
 
@@ -246,19 +307,33 @@ def test_driver_source_pins() -> None:
         "ttnn.synchronize_device(self.mesh)",
         "self.model.reset_chunk_state_inplace(self.state, self.chunk_state)",
         "verify_before_replay",
+        "pending = self._prepare(plan, starts, 0, ple_context, position, positions, features, feature_cursor)",
         "self.model.write_chunk_accepted(self.chunk_state, accepted)",
-        "prepared = self.model.prepare_chunk_inputs(",
+        "prepared, prepare_ns, feature_cursor = pending",
         "ple_context = prepared.contexts[real_rows]",
         "self.model.upload_chunk_inputs(chunk_state, prepared)",
         "self._run_chunk(blocking=True, kind=kind)",
         "self._run_chunk(blocking=False, kind=kind)",
+        "pending = self._prepare(\n                    plan, starts, index + 1, ple_context, position, positions, features, feature_cursor\n                )",
         "ttnn.event_synchronize(ttnn.record_event(self.mesh, cq_id=0))",
+        "between_chunks(row_offset, len(remaining))",
         "self.model.finish_prefill(self.state, self.chunk_state, position, rope_shift=rope_shift)",
     )
     positions = [run.index(fragment) for fragment in order]
     assert positions == sorted(positions)
+    # The next chunk's host half is prepared under the running replay, before any event wait or yield point.
+    assert run.index(
+        "pending = self._prepare(\n                    plan, starts, index + 1, ple_context, position, positions, features, feature_cursor\n                )"
+    ) < run.index("ttnn.event_synchronize(slab_event)")
+    prepare = inspect.getsource(Qwen38ChunkPrefill._prepare)
+    assert (
+        "prepared = self.model.prepare_chunk_inputs(" in prepare
+        and "positions=chunk_positions, features=chunk_features" in prepare
+    )
+    assert "chunk_features, feature_cursor = vision_splice.split_features(rows, features, feature_cursor)" in prepare
+    assert "rows = rows + [self.pad_token_id] * (CHUNK_ROWS - len(rows))" in prepare
     # The host half (the lookup and the packing) is timed apart from the copies' enqueue and the slab's event wait.
-    assert run.index("slab_prepare_ms.append((upload_started_ns - host_started_ns)") < run.index(
+    assert run.index("slab_prepare_ms.append(prepare_ns / 1_000_000)") < run.index(
         "slab_upload_ms.append((replay_started_ns - upload_started_ns)"
     )
     assert "slab_wait_ms.append((time.perf_counter_ns() - wait_started_ns)" in run
