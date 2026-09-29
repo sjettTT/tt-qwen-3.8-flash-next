@@ -1010,6 +1010,7 @@ def test_committed_pins_load_and_cover_the_four_metric_families():
                 "/requests_incomplete",
                 "/program_cache_delta",
                 "/handoff_pass",
+                "/equals_single_stream",  # the lanes' exactness gate: every lane stream equals the single-stream replay
             )
         )
     }

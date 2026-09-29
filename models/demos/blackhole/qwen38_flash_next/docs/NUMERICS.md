@@ -703,6 +703,83 @@ process confined to the core pair of the busiest completion-queue reader thread 
 cell, the pass 45.44 / 44.56 / 46.57 ms (-1.4 / -1.6 / -1.5 against unpinned): a launch-time placement under study, not
 code.
 
+## Served lanes (`--lanes 4 --mtp 4`), 32k and 128k, 2026-09-28
+
+The lanes server (`docs/SERVER.md`, "Several requests at once") serves up to B greedy requests at once through the MTP
+lane chain (`ttnn/mtp_lanes.py`: B lanes verify k + 1 rows each in one tile).  The verify-rows fold serves the lanes
+through its lanes form (`ttnn/fused/gdn_rows_scan`), so a `--lanes` process runs the served default set and a lane's
+stream is the DEFAULT single-stream server's.  (Before the lanes form landed the lanes ran the chunk chain and a
+`--lanes` process turned the fold off: on that form the lanes matched a fold referee for 3-27 passes and then diverged on
+every prompt -- the fold is COMPONENT class -- and matched a wrap referee on every pass; the fold-off rows are in the
+dev note.)
+
+**The pin table `A3-lanes4-mtp4-32k` (`tools/ci/baselines/`), the lanes' startup replay: the twelve records through the
+lane scheduler four at a time (each admitted into a lane while the others decode, queue waits 0-11 s), against the CPU
+records and the single-stream replay of the same process.**  12/12 streams equal the single-stream replay, `json`
+96/96; the same twelve streams at 128k (bitwise the 32k replay's: the lane arithmetic carries no context term);
+identical on a second start.  Divergence index against the CPU record and the stream sha256 (first 12): the fold's streams (12 of 12 equal the `--mtp 4` pin's sha).
+
+| lanes 4, k=4, 2026-09-28 | json | chat | code | fact | list | math | multilingual | prose | refactor | sky | story | summary |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| divergence index | none (96/96) | 56 | none (96/96) | 15 | 56 | 61 | 9 | 13 | 24 | 19 | 6 | 75 |
+| lane stream sha256 (first 12) | a5b4defa72fa | 1bbbf060a22e | 159de7287947 | 9afd57cc0303 | 8253ba344696 | 19f55ccb4bb2 | 8b3efd744238 | 19538e64128d | 8a812a8ea01b | de86bbc09c48 | efaf8f20e25c | d9d024681580 |
+| stream equals the single-stream replay of the same process | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
+
+**Served gates (a 1x4 p150 line, 32k, both servers `--mtp 4` greedy on the served default set, the same request bodies; Exact: 11/11 rows byte for byte (the four acceptance prompts at once, the fifth, 4 x chat560 at once, a stop-string row, a `max_tokens` 40 row); the forced `</think>` rows equal through the reasoning and the forced token 6/6; the lanes' own determinism 8/8 repeats byte-identical).**
+Exact: the four acceptance prompts `chat` / `code` / `json` / `prose` served at once over their natural segments
+(EOS honoured, `max_tokens` 512) and a fifth request behind them, a stop-string row and a `max_tokens` 40 row: byte for
+byte the single stream's reply (reasoning, content, finish reason) on every row (11 of 11).  Tolerance, the forced
+`</think>` of the thinking budget: budgets 3 / 5 / 6 / 7 / 9 / 12 on the 177-token chat record (the budget landing inside a
+pass at 3 and 7, on a pass's last emitted token at 5, 6, 9 and 12) equal the single stream's reply through the reasoning
+and the forced token on 6 of 6, byte-identical to the end on 3 (budgets 3, 5, 6) and parting 611-1023 characters into
+the answer on the other 3 (12, 7, 9; on the wrap form of the interim record 0 of 6 held to the end and the parts came at
+17-331 characters): the single stream feeds the forced token
+(and the token before it in the last-token case) through its 1-row decode traces, a lane through the verify body, and
+the rows path is not bitwise with the 1-row path (this section's MTP-vs-plain rows); the same budgeted request twice on
+the lanes is byte-identical.  A second single-stream seam surfaced by these rows: the single stream served a
+`max_tokens` 40 row from its restored prompt-end snapshot (the previous request had the same prompt, `prefill_tokens`
+1) with a different 40th token than a fresh prefill of the same prompt gives (`crowd levels` / `crowd flow`); the
+comparator therefore prefills fresh before every event row (a one-token request on another prompt displaces the
+snapshot), and the restored form is recorded as a single-stream item of its own.
+
+**DRAM (per bank, the allocator's view, MEASURED at the lanes server's start; the admission
+`lanes_capacity_admission` decides on the live reading at the chain's warm hook, before any capture, and READY is refused
+when the measured growth exceeds the estimate).**
+
+| 4 x 4 lanes (the fold's lanes form; 20 rows of prefix states) | 32,768 | 131,072 |
+|---|---|---|
+| free at the hook (before the lane states) | 1,652,521,152 | 1,473,018,048 |
+| estimate required (lane states + pagers + the fold's prefix states 70,778,880 + MoE rows instances, +7 % slope, 10 % margin; + traces) | 451,965,918 | 1,336,834,040 |
+| reserved for the chain's own captures | 74,138,023 | 74,138,023 |
+| MEASURED growth: lane states + pagers + prefix states / the three lane traces | 393,809,536 / 3,375,424 | 1,151,192,704 / 3,375,424 |
+| free after every capture (the served headroom) | 1,242,104,320 | 305,185,280 |
+| lane pass p50 in the startup replay (107 passes, 4 lanes) | 58.7 ms | 67.0 ms |
+| READY, warm caches (lanes: allocate 2.7, imports 1.8, eager passes 5.9, captures 1.0 s) | 135 s | 176 s |
+
+**Served rows of record (the same hold, the 1-min host load stated in the table; the lanes' per-user rate is
+0.55-0.7x the single stream's: the 4-lane pass wall is 58.7 ms in the replay (67.0 at 128k) against the single stream's
+46 -- the 20-row verify body -- and every other lane pauses for an admission's prefill, so a lane commits the same
+tokens per pass at a lower pass rate while the four together commit 2.37x the single stream's tokens on the full
+batch; the levers left -- a prefill beside the passes, the 20-row body -- are later waves').**
+
+| row (`--lanes 4 --mtp 4`, 32k, the served default set; the 1-min host load per row group: the 4 x chat560 rows from the 23:11Z hold at 1.35-1.42 on the lanes rows and 2.1-2.3 on the comparator's (its own startup's tail), the other rows from the 22:08Z hold at 2.7-4.0 on the comparator rows and 3.1-7.0 on the lanes rows with another session's partition validation alongside) | lanes (4 at once) | single stream (the default server, in turn) |
+|---|---|---|
+| 4 x chat560 (thinking off, EOS honoured; 2048 tokens): aggregate | **134.0 tok/s** (2048 / 15.28 s wall; 147.2 from the first token) | 56.5 tok/s (2048 / 36.27 s) |
+| 4 x chat560: per request | 36.9 / 40.8 / 45.7 / 51.9 tok/s; 177 passes each = 2.89 tok/pass | 67.1 / 67.2 / 67.3 / 67.7 |
+| 4 x chat560: TTFT | 1.37 / 2.70 / 4.04 / 5.44 s (admissions 1.34-1.35 s each = prefill 1.19-1.20 + evict 0.05 + import 0.10-0.11, one per boundary) | 1.21 / 1.21 / 1.21 / 1.24 s |
+| 4 x chat560: stalled by the others' admissions | 0.00 / 1.35 / 2.69 / 4.03 s | -- |
+| mixed batch chat / code / json / prose (natural, EOS honoured): per user | 40.3 / 47.5 / 77.2 / 26.6 tok/s (194 / 71 / 32 / 105 passes) | 63.0 / 103.9 / 111.7 / 50.2 |
+| mixed batch: aggregate over the batch wall | 83.5 tok/s (1194 / 14.30 s; the short answers end early) | 64.7 (1194 / 18.45 s in turn) |
+| mixed batch: TTFT | 1.62 / 0.55 / 2.10 / 0.97 s | 0.54 / 0.28 / 0.34 / 0.29 s |
+| the fifth request (chat, 2 s behind the four) | queue_wait 2.04 s, TTFT 2.73 s, 44.7 tok/s | -- |
+| startup: READY / lane pass p50 in the replay | 135 s (warm caches) / 58.7 ms over 107 passes | -- |
+| 128k: 4 x chat560 aggregate / per request / TTFT | 112.4 tok/s (2048 / 18.23 s); 31.1 / 34.7 / 39.1 / 44.7; TTFT 1.67 / 3.36 / 5.07 / 6.79 s (admissions 1.65-1.70 s) | -- |
+| 128k: READY / lane pass p50 in the replay / free after captures | 176 s / 67.0 ms / 305,185,280 B per bank (growth states 1,151,192,704, traces 3,375,424) | -- |
+
+The single stream's TTFT for the 560-token chat prompt is 1.21 s; a lane's is 1.4-5.4 s in a four-request burst: the
+admissions serialise (one per pass boundary while a lane decodes; 1.34 s each = prefill 1.19 + evict 0.05 + import
+0.10) and every other lane pauses for them -- the honest cost of admission in this wave.
+
 ## The device sampler's law (2026-09-25)
 
 The on-device sampler (`sampler_tail`, one program on one core after the top-32 candidate row) is gated on its law, not

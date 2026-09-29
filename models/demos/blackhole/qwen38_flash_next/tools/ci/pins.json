@@ -40,6 +40,16 @@
     "temperature": 0
    }
   },
+  "lanes4-mtp4-32k": {
+   "description": "the served lanes mode: four concurrent greedy requests through the MTP lane chain (--lanes 4 --mtp 4, no sampling; the verify-rows fold off for the process), chunked prefill, 32768 context; the pins read the lanes' startup replay (acceptance-lanes.json)",
+   "server": {
+    "allocated_context": 32768,
+    "mtp": 4,
+    "lanes": 4,
+    "prefill_mode": "chunked",
+    "sampling": false
+   }
+  },
   "mtp4-32k": {
    "description": "chunked prefill with MTP drafting k=4 (--mtp 4), 32768 context",
    "server": {
@@ -367,6 +377,36 @@
    "rule": "exact",
    "status": "active",
    "target": 0
+  },
+  "A3/lanes4-mtp4-32k/device_token_ids_sha256": {
+   "baseline": true,
+   "note": "the lane streams' sha256 per record (the single stream's fold-off streams: the lanes run the wrap); a differing stream without an earlier index is a numerics-class change",
+   "rule": "exact",
+   "severity": "info",
+   "status": "todo"
+  },
+  "A3/lanes4-mtp4-32k/divergence_index": {
+   "baseline": true,
+   "note": "per record the first index where a lane's stream leaves the CPU greedy stream; null is the largest; never earlier than the baseline",
+   "rule": "not_earlier",
+   "status": "todo"
+  },
+  "A3/lanes4-mtp4-32k/equals_single_stream": {
+   "note": "every lane stream equals the single-stream replay of the same process (the same chain form): the lanes' exactness gate",
+   "rule": "exact",
+   "status": "active",
+   "target": true
+  },
+  "A3/lanes4-mtp4-32k/gate_compared_tokens": {
+   "rule": "exact",
+   "status": "active",
+   "target": 96
+  },
+  "A3/lanes4-mtp4-32k/gate_pass": {
+   "note": "the json record replays 96/96 CPU greedy tokens through a lane (--require-json-96)",
+   "rule": "exact",
+   "status": "active",
+   "target": true
   },
   "A3/mtp4-32k/device_token_ids_sha256": {
    "baseline": true,

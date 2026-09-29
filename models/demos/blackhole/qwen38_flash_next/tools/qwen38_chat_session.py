@@ -501,6 +501,228 @@ def mtp_capacity_admission(
     }
 
 
+# The lanes' DRAM per bank (``--lanes B``), MODELED from the lane families' shapes (ttnn/lanes.py ``_lane_shapes``, the
+# MTP-lane extras of ttnn/mtp_lanes.py) with the slope correction of the one measurement past B = 1 (the stage-1
+# B = 1 / 2 / 4 lane verify states at 32,768: 71.0 MB per bank per lane against the model's 66.0, +7 %) and the growth
+# margin on every modeled term; the required side of ``lanes_capacity_admission``.  MEASURED reference (a 4x p150 hold,
+# head 1ce94766f7b1, 2026-09-28): the 4 x 4 lane verify state at 32,768 is 297.3 MB per bank
+# (LANES_MEASURED_VERIFY_STATE_BYTES_PER_BANK_4X4_32K), the model's estimate with its margins 27 % above it.
+LANES_IMAGE_BYTES_PER_DEVICE_SLOPE = 13_056  # per context row: the 12 KV slabs and the 12 compressed caches
+LANES_IMAGE_BYTES_PER_DEVICE_FIXED = 29_684_736  # the recurrent states, ring slots, stagings, rings, PLE slots
+LANES_FIXED_BYTES_PER_DEVICE = 60_424_192  # the KV import scratch (13 layers x 4,096 rows) and the GDN lane rows qkv
+LANES_MOE_ROWS_SLOPE_BYTES_PER_BANK = 295_632  # the states remainder per verify MoE row (the 5- and 32-row terms' line)
+LANES_PER_LANE_SLOPE_CORRECTION_PERCENT = 7  # the measured per-lane increment over the modeled one at 32,768
+LANES_TRACES_BYTES_PER_BANK = (51_000_000 + 47_000_000) // 8 + 7_400_000  # the three lane traces, measured 2026-09-20
+LANE_KV_STAGINGS = 2  # ttnn/lanes.py KV_STAGINGS: the pagers' whole-lane KV slab pair
+# MEASURED per bank on a 4x p150 hold at head 1ce94766f7b1, 2026-09-28 (the allocator's view, 4 x 4 lanes, k = 4, the
+# B = 1 chain kept beside them): the lane verify state 297,300,000 at 32,768 and 993,686,336 at 131,072 (a per-lane
+# slope of 1,771 B per bank per context row, the model's 1,768), the two pagers 85.0 MB per bank at 131,072 (the
+# model's 84.5), the three lane traces 7.3 MB per bank (the 2026-09-20 figure above is the upper bound the estimate
+# keeps).  The lanes' net cost at 131,072 was 917,362,880 B per bank with 456,988,928 free after the captures
+# (largest contiguous 373,234,752); a served process carries about 100,444,352 B per bank more than the tool's chain
+# (the long-chunks state and trace, the slab buffers, the sampled state), leaving about 356 MB per bank at 4 x 128k.
+LANES_MEASURED_VERIFY_STATE_BYTES_PER_BANK_4X4_32K = 297_300_000
+LANES_MEASURED_VERIFY_STATE_BYTES_PER_BANK_4X4_128K = 993_686_336
+LANES_MEASURED_PAGERS_BYTES_PER_BANK_128K = 85_000_000
+LANES_MEASURED_TRACES_BYTES_PER_BANK = 7_300_000
+LANES_MEASURED_FREE_AFTER_CAPTURES_BYTES_PER_BANK_4X4_128K = 456_988_928
+LANES_SERVED_EXTRAS_BYTES_PER_BANK = 100_444_352
+
+
+def lanes_image_bytes_per_device(allocated_context: int) -> int:
+    """One lane's image per device (the seven families at ``allocated_context`` rows)."""
+
+    return LANES_IMAGE_BYTES_PER_DEVICE_SLOPE * int(allocated_context) + LANES_IMAGE_BYTES_PER_DEVICE_FIXED
+
+
+def lanes_mtp_extra_bytes_per_device(allocated_context: int, rows: int) -> int:
+    """Beyond the lane image, per lane and device: the MTP layer's own lane QSA state, the backbone QSA lane verify
+    states, the GDN lane rows buffers and constants, the PLE lane rows state, the residual and draft rows."""
+
+    context = int(allocated_context)
+    qsa_layers, gdn_layers, heads, head_dim = 12, GDN_LAYERS, gdn_module.VALUE_HEADS_PER_DEVICE, gdn_module.HEAD_DIM
+    qkv_width, chunk_rows = gdn_module.QKV_WIDTH_PER_DEVICE, CHUNK_ROWS
+    mtp_layer_qsa = Qwen38ResidentContext(context).qsa_generic_state_bytes + 2 * 32 * 128 * 2
+    backbone_qsa_verify = qsa_layers * 2 * 32 * 128 * 2
+    gdn_rows_per_layer = (
+        2 * chunk_rows * qkv_width * 2 + 3 * chunk_rows * heads * head_dim * 2 + 2 * chunk_rows * heads * 4
+    )
+    gdn_rows = gdn_layers * gdn_rows_per_layer
+    gdn_lane_constants = 2 * chunk_rows * chunk_rows * 2 + 4 * chunk_rows * 4
+    ple_rows = (9 + rows) * 4 * 640 * 2
+    misc = 4 * 640 * 2 + rows * 640 * 2 + 2 * 32 * 128 * 2
+    return mtp_layer_qsa + backbone_qsa_verify + gdn_rows + gdn_lane_constants + ple_rows + misc
+
+
+def lanes_pager_bytes_per_device(allocated_context: int) -> int:
+    """The two 1-lane pagers (the generic state's and the alignment layer's): their pack buffers and the whole-lane KV
+    staging pair each, from the family shapes."""
+
+    context = int(allocated_context)
+    compressed_rows = context // 4 + 32
+    backbone = (
+        12 * compressed_rows * 128 * 2
+        + 36 * gdn_module.VALUE_HEADS_PER_DEVICE * gdn_module.HEAD_DIM * gdn_module.HEAD_DIM * 4
+        + 12 * 32 * 512 * 2
+        + 12 * 32 * 128 * 2
+        + 144 * gdn_module.QKV_WIDTH_PER_DEVICE * 2
+        + 9 * 4 * 640 * 2
+    )
+    alignment = compressed_rows * 128 * 2 + 32 * 512 * 2 + 32 * 128 * 2
+    stagings = 2 * LANE_KV_STAGINGS * context * 512 * 2
+    return backbone + alignment + stagings
+
+
+def lanes_fold_prefix_states_bytes_per_bank(total_rows: int, banks: int = RESIDENT_DRAM_BANKS) -> int:
+    """The verify-rows fold's prefix states for a lane tile of ``total_rows`` real rows (B x R): ``[total_rows, 12, 128,
+    128]`` fp32 per GDN layer, interleaved one 4 KiB tile page at a time over the banks (the B = 1 form's rule,
+    :func:`fold_prefix_states_bytes_per_bank`, at the lanes' row count); 70,778,880 B per bank at 20 rows."""
+
+    pages = int(total_rows) * GDN_STATE_TILE_PAGES
+    return GDN_LAYERS * -(-pages // banks) * GDN_STATE_PAGE_BYTES
+
+
+def lanes_capacity_admission(
+    allocated_context: int,
+    *,
+    lanes: int,
+    drafts: int,
+    live: Mapping[str, Any] | None = None,
+    reserved_bytes_per_bank: int = 0,
+    gdn_rows_scan: bool = False,
+) -> dict[str, Any]:
+    """Whether ``lanes`` MTP lanes at ``drafts`` drafts fit beside the resident build and its single-lane MTP chain
+    at ``allocated_context``: the one-tile rule (``B x (k + 1) <= 32``), then the DRAM per bank.
+
+    The required side is MODELED: the lane states (``lanes`` x (the lane image + the MTP-lane extra) x the slope
+    correction + the fixed part) over the banks, the verify MoE instances at ``B x R`` rows (the states remainder's
+    line), the two pagers, and the three lane traces (measured 2026-09-20), each with the growth margin; the free side
+    is the live allocator's reading (``free_bytes_per_bank``, ``largest_contiguous_bytes_free_per_bank``) less
+    ``reserved_bytes_per_bank`` (what the chain still allocates after the reading: its traces), or the 2026-09-04 table
+    without a device.  ``gdn_rows_scan`` (the verify-rows fold serving the lanes) adds the fold's prefix states at the
+    lanes' row count (:func:`lanes_fold_prefix_states_bytes_per_bank`) to the states remainder.  The largest single
+    lane tensor, the flat KV ``[1, 1, B x C + scratch, 512]`` of one QSA layer,
+    must fit the largest contiguous block.  The open measures the growth (states, traces) and refuses READY when it
+    exceeds the required side: the estimate's margins are what the measurement is judged against."""
+
+    if isinstance(lanes, bool) or type(lanes) is not int or not 2 <= lanes <= 8:
+        raise ValueError(f"lanes must be an int in [2, 8], got {lanes!r}")
+    if isinstance(drafts, bool) or type(drafts) is not int or drafts not in mtp_v2.SUPPORTED_DRAFTS:
+        raise ValueError(f"drafts must be one of {mtp_v2.SUPPORTED_DRAFTS}, got {drafts!r}")
+    rows = drafts + 1
+    total_rows = lanes * rows
+    if total_rows > CHUNK_ROWS:
+        raise ValueError(f"{lanes} lanes x {rows} rows = {total_rows} exceed the {CHUNK_ROWS}-row tile")
+    context = Qwen38ResidentContext(allocated_context).allocated_context
+    if (
+        isinstance(reserved_bytes_per_bank, bool)
+        or type(reserved_bytes_per_bank) is not int
+        or reserved_bytes_per_bank < 0
+    ):
+        raise ValueError(f"reserved_bytes_per_bank must be a non-negative int, got {reserved_bytes_per_bank!r}")
+    if type(gdn_rows_scan) is not bool:
+        raise ValueError(f"gdn_rows_scan must be a bool, got {gdn_rows_scan!r}")
+    if live is None:
+        measured_at = [c for c in sorted(RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES) if c >= context]
+        if not measured_at:
+            raise ValueError(f"no free-bytes-after-captures measurement at or above {context} tokens")
+        free, largest = RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES[measured_at[0]]
+        source: dict[str, Any] = {
+            "free_bytes_source": "table_2026-09-04",
+            "free_bytes_measured_at_context": measured_at[0],
+        }
+    else:
+        banks = int(live.get("num_banks", RESIDENT_DRAM_BANKS))
+        if banks != RESIDENT_DRAM_BANKS:
+            raise ValueError(
+                f"the live DRAM view has {banks} banks, the admission is written for {RESIDENT_DRAM_BANKS}"
+            )
+        live_free, live_largest = int(live["free_bytes_per_bank"]), int(live["largest_contiguous_bytes_free_per_bank"])
+        if live_free < 0 or live_largest < 0 or live_largest > live_free:
+            raise ValueError(f"inconsistent live DRAM view: free {live_free}, largest contiguous {live_largest}")
+        free, largest = live_free - reserved_bytes_per_bank, max(live_largest - reserved_bytes_per_bank, 0)
+        source = {
+            "free_bytes_source": "measured_live",
+            "live_free_bytes_per_bank": live_free,
+            "live_largest_contiguous_bytes_free_per_bank": live_largest,
+            "reserved_bytes_per_bank": reserved_bytes_per_bank,
+        }
+
+    def with_margin(remainder: int) -> int:
+        return -(-remainder * (100 + MTP_GROWTH_ESTIMATE_MARGIN_PERCENT) // 100)
+
+    per_lane = lanes_image_bytes_per_device(context) + lanes_mtp_extra_bytes_per_device(context, rows)
+    per_lane_corrected = -(-per_lane * (100 + LANES_PER_LANE_SLOPE_CORRECTION_PERCENT) // 100)
+    lane_states_per_device = lanes * per_lane_corrected + LANES_FIXED_BYTES_PER_DEVICE
+    pagers_per_device = lanes_pager_bytes_per_device(context)
+    moe_states = (
+        MTP_STATES_BEYOND_QSA_STATE_BYTES_PER_BANK_BY_MOE_ROWS[5]
+        + (total_rows - 5) * LANES_MOE_ROWS_SLOPE_BYTES_PER_BANK
+    )
+    remainders = {
+        "lane_states": -(-lane_states_per_device // RESIDENT_DRAM_BANKS),
+        "pagers": -(-pagers_per_device // RESIDENT_DRAM_BANKS),
+        "moe_rows_instances": moe_states,
+        "fold_prefix_states": lanes_fold_prefix_states_bytes_per_bank(total_rows) if gdn_rows_scan else 0,
+        "traces": LANES_TRACES_BYTES_PER_BANK,
+    }
+    estimate = {
+        "states": with_margin(
+            remainders["lane_states"]
+            + remainders["pagers"]
+            + remainders["moe_rows_instances"]
+            + remainders["fold_prefix_states"]
+        ),
+        "traces": with_margin(remainders["traces"]),
+    }
+    required = sum(estimate.values())
+    # the largest single lane tensor: one QSA layer's flat KV over the banks (page-interleaved)
+    flat_kv_per_bank = -(-(lanes * context + mtp_lanes_scratch_rows(context)) * 512 * 2 // RESIDENT_DRAM_BANKS)
+    contiguous = max(flat_kv_per_bank, RESIDENT_MIN_CONTIGUOUS_BYTES_PER_BANK)
+    shortfalls = [
+        name
+        for name, short in (
+            ("free_bytes_below_estimate", free < required),
+            ("largest_contiguous_below_lane_kv", largest < contiguous),
+        )
+        if short
+    ]
+    return {
+        "allocated_context": context,
+        "lanes": lanes,
+        "drafts": drafts,
+        "rows": rows,
+        "total_rows": total_rows,
+        "one_tile": total_rows <= CHUNK_ROWS,
+        "gdn_rows_scan": gdn_rows_scan,
+        "num_banks": RESIDENT_DRAM_BANKS,
+        **source,
+        "free_bytes_per_bank": free,
+        "largest_contiguous_bytes_free_per_bank": largest,
+        "per_lane_bytes_per_device": per_lane,
+        "per_lane_slope_correction_percent": LANES_PER_LANE_SLOPE_CORRECTION_PERCENT,
+        "lanes_growth_remainders_bytes_per_bank": remainders,
+        "lanes_growth_estimate_margin_percent": MTP_GROWTH_ESTIMATE_MARGIN_PERCENT,
+        "lanes_growth_estimate_bytes_per_bank": estimate,
+        "required_free_bytes_per_bank": required,
+        "required_largest_contiguous_bytes_per_bank": contiguous,
+        "headroom_bytes_per_bank": free - required,
+        "decided_by": {
+            "free_side": source["free_bytes_source"],
+            "required_side": f"estimate lanes={lanes} k={drafts} rows={total_rows} (modeled, +{LANES_PER_LANE_SLOPE_CORRECTION_PERCENT} % slope, {MTP_GROWTH_ESTIMATE_MARGIN_PERCENT} % margin)"
+            + (" gdn_rows_scan" if gdn_rows_scan else ""),
+            "shortfalls": shortfalls,
+        },
+        "fits": not shortfalls,
+    }
+
+
+def mtp_lanes_scratch_rows(allocated_context: int) -> int:
+    """The lane KV cache's scratch rows past the last lane: one import chunk (ttnn/mtp_lanes.py ``kv_scratch_rows``)."""
+
+    return min(4096, int(allocated_context))
+
+
 class Qwen38ChatRequestError(ValueError):
     """A request the session refuses (HTTP 400): bad messages, context length, bad token budget."""
 
@@ -3362,8 +3584,11 @@ def construct_chain(
     mtp_moe_rows: int | None = None,
     mtp_alternates: Sequence[int] = (),
     mtp_ple_early: bool = False,
+    warm_hook: Callable[[Qwen38TracedChain], None] | None = None,
 ) -> Qwen38TracedChain:
-    """Live construction on the open mesh (missing BF4 layers converted first), then the chain prologue."""
+    """Live construction on the open mesh (missing BF4 layers converted first), then the chain prologue.
+    ``warm_hook`` is the open's (after the warm pass, before any capture: the lanes server allocates its lane states
+    and compiles their programs there)."""
 
     construction = construct_live_decode_diagnostic(
         prepared,
@@ -3387,4 +3612,5 @@ def construct_chain(
         mtp_moe_rows=mtp_moe_rows,
         mtp_alternates=mtp_alternates,
         mtp_ple_early=mtp_ple_early,
+        warm_hook=warm_hook,
     )

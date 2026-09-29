@@ -39,6 +39,7 @@ import http.server
 import itertools
 import json
 import os
+import queue
 import secrets
 import select
 import signal
@@ -78,18 +79,27 @@ from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_rows_scan as gdn_rows_scan_module
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     DEFAULT_PREFILL_MODE,
+    LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES,
     MAX_TOKENS_BOUND,
     MTP_DRAFTS,
     MTP_GDN_ANCHORS,
     PREFILL_MODES,
+    RESIDENT_POST_BUILD_BYTES_PER_BANK_UPPER_BOUND,
     Qwen38ChatChainError,
     Qwen38ChatSession,
     construct_chain,
+    lanes_capacity_admission,
     mtp_capacity_admission,
     mtp_verify_forms,
     open_partition_b_mesh,
     resolve_route,
     template_decoder,
+)
+from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lane_scheduler import (
+    Qwen38LaneScheduler,
+    Qwen38LaneSchedulerBusy,
+    Qwen38LaneTicket,
+    lane_geometry,
 )
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_mtp_device_accept import SWITCH as DEVICE_ACCEPT_SWITCH
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_mtp_device_accept import device_accept_switch
@@ -265,6 +275,39 @@ def ple_early_switch(environment: Mapping[str, str], *, applicable: bool = True)
 
 
 # -- requests and responses ----------------------------------------------------------------------
+
+
+def lanes_switches(environment: Mapping[str, str], args: Any) -> dict[str, Any] | None:
+    """``--lanes B``'s admission at start (None without it): B in 2..8 with B x (k + 1) <= 32 rows, ``--mtp``
+    required, greedy only (``--sampling``, ``--sampling-discriminator`` and ``--agreement-reference`` refused), the
+    second command queue's early rows read (``QWEN38_MTP_PLE_EARLY=1``) and the per-request drafting chains
+    (``QWEN38_MTP_DRAFTS_PER_REQUEST=1``) refused (neither has a lanes form).  The verify-rows fold serves the lanes
+    through its lanes form (``ttnn/fused/gdn_rows_scan``), so a ``--lanes`` process runs the same fused set as the
+    single-stream server.  Returns the geometry."""
+
+    lanes = int(args.lanes)
+    if lanes == 0:
+        return None
+    if args.mtp is None:
+        raise SystemExit("--lanes needs --mtp (the lanes are the MTP lane chain: B x (k + 1) rows in one tile)")
+    try:
+        lanes, rows = lane_geometry(lanes, int(args.mtp))
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if args.sampling:
+        raise SystemExit(
+            "--lanes serves greedy requests only (the lane body resolves by argmax; the sampled lanes form is a later "
+            "wave): drop --sampling (the argparse default, --no-sampling, refuses sampling fields with HTTP 400)"
+        )
+    if args.sampling_discriminator or args.agreement_reference is not None:
+        raise SystemExit("--lanes does not combine with --sampling-discriminator or --agreement-reference")
+    if environment.get(PLE_EARLY_VARIABLE, "").strip() == "1":
+        raise SystemExit(
+            f"{PLE_EARLY_VARIABLE}=1 has no lanes form: unset it under --lanes (the lanes run the one-queue form)"
+        )
+    if environment.get(MTP_DRAFTS_PER_REQUEST_VARIABLE, "").strip() == "1":
+        raise SystemExit(f"{MTP_DRAFTS_PER_REQUEST_VARIABLE}=1 has no lanes form: unset it under --lanes")
+    return {"lanes": lanes, "rows": rows, "drafts": int(args.mtp)}
 
 
 def parse_chat_request(
@@ -534,6 +577,7 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
         dram_after_captures: Mapping[str, Any] | None = None,
         mtp_drafts_admitted: Sequence[int] = (),
         listen: bool = True,
+        lanes: Qwen38LaneScheduler | None = None,
     ) -> None:
         # The address is bound here, so a taken port or a host the address family cannot carry fails at once (main
         # constructs the server before the mesh opens, with the session attached after the captures); connections
@@ -563,6 +607,10 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
         # that applies to every card): free_bytes_per_bank is the build's headroom, reported as read, never updated.
         self.dram_after_captures = dram_after_captures
         self.created = int(time.time())  # /v1/models created: when this server came up
+        # ``--lanes B``: the scheduler over the lane chain replaces the turnstile (its driver thread owns the device;
+        # handler threads submit tickets and read their queues); None is the single-stream server.
+        self.lanes = lanes
+        self.lanes_thread: threading.Thread | None = None
         self.turnstile = threading.Condition()
         self.waiting: collections.deque[int] = collections.deque()
         self.tickets = itertools.count()
@@ -573,7 +621,13 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
 
     @property
     def queue_depth(self) -> int:
-        return len(self.waiting)
+        return len(self.waiting) if self.lanes is None else self.lanes.waiting_count
+
+    @property
+    def device_busy(self) -> bool:
+        """A request holds the device: the turnstile's, or any lane active."""
+
+        return self.busy if self.lanes is None else self.lanes.active_count > 0
 
     def current_request(self) -> dict[str, Any] | None:
         """The request holding the device: when it started and how long since the device last completed a step
@@ -637,6 +691,14 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
             self.stopping = True
             self.turnstile.notify_all()
         self.server_close()
+        if self.lanes is not None:
+            # The lanes: the driver ends every active lane's request with ``shutdown`` at its next pass boundary and
+            # leaves its loop; the device is free once the thread has ended.
+            self.lanes.stop()
+            if self.lanes_thread is not None:
+                self.lanes_thread.join(timeout=seconds)
+                return not self.lanes_thread.is_alive() and self.lanes.fatal is None
+            return True
         with self.turnstile:
             return self.turnstile.wait_for(lambda: not self.busy, timeout=seconds)
 
@@ -781,8 +843,9 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 {
                     "status": "stopping" if self.server.stopping else "ready",
                     "model": MODEL_ID,
-                    "busy": self.server.busy,
+                    "busy": self.server.device_busy,
                     "queue_depth": self.server.queue_depth,
+                    "lanes": None if self.server.lanes is None else self.server.lanes.status(),
                     "current_request": self.server.current_request(),
                     "committed_tokens": len(session.committed),
                     "requests_served": session.requests_served,
@@ -911,6 +974,9 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
         request_id = _completion_id()
         created = int(time.time())
         wire = _ClientWire(self)
+        if self.server.lanes is not None:
+            self._serve_lanes(session, request, prompt_ids, request_id, received_utc, created, wire)
+            return
         try:
             ticket = self.server.enqueue()
         except Qwen38ServerBusy as error:
@@ -1209,6 +1275,277 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                     phase="reply",
                     error=f"{type(error).__name__}: {error}",
                 )
+
+    def _serve_lanes(
+        self,
+        session: Qwen38ChatSession,
+        request: dict[str, Any],
+        prompt_ids: list[int],
+        request_id: str,
+        received_utc: str,
+        created: int,
+        wire: _ClientWire,
+    ) -> None:
+        """The request on the lanes server: a ticket in the scheduler's FIFO (503 with Retry-After beyond its limit),
+        the stream head and keepalives while it waits and while its prompt prefills, then its tokens from the ticket's
+        queue as the driver thread delivers them pass by pass; a stop string, the deadline or a hang-up end it at the
+        next pass boundary (the ticket's cancel).  No device call on this thread."""
+
+        scheduler = self.server.lanes
+        ticket = Qwen38LaneTicket(
+            request_id=request_id,
+            prompt_ids=list(prompt_ids),
+            max_tokens=request["max_tokens"],
+            stop_ids=() if request["ignore_eos"] else tuple(EOS_TOKEN_IDS),
+            think_budget=request["think_budget"],
+        )
+        try:
+            scheduler.submit(ticket)
+        except Qwen38LaneSchedulerBusy as error:
+            self._send_error_json(503, str(error), "server_busy", Retry_After=str(RETRY_AFTER_SECONDS))
+            return
+        assembler = protocol.Qwen38ReplyAssembler(
+            template_decoder(session.template),
+            thinking_open=request["enable_thinking"],
+            stop_strings=request["stop"],
+            tools=request["tools"],
+        )
+        started = time.perf_counter()
+        deadline = self.server.request_deadline_seconds
+        heartbeat_stop = threading.Event()
+        heartbeats = [0]
+
+        def chunk(choice: dict[str, Any], **extra: Any) -> dict[str, Any]:
+            return {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": MODEL_ID,
+                "system_fingerprint": self.server.system_fingerprint,
+                "choices": [{"index": 0, **choice}],
+                **extra,
+            }
+
+        def heartbeat() -> None:
+            while not heartbeat_stop.wait(self.server.heartbeat_seconds):
+                heartbeats[0] += 1
+                status = scheduler.status()
+                silent = status["seconds_since_progress"] if (ticket.lane is not None or status["active"]) else None
+                _log(
+                    "heartbeat",
+                    request_id=request_id,
+                    elapsed_seconds=round(time.perf_counter() - started, 3),
+                    lane=ticket.lane,
+                    committed_tokens=ticket.committed,
+                    emitted_tokens=assembler.tokens,
+                    reasoning_tokens=assembler.reasoning_tokens,
+                    tool_calls=len(assembler.calls),
+                    seconds_since_progress=silent,
+                    lanes_active=status["active"],
+                    lanes_waiting=status["waiting"],
+                    host_vmrss_kib=_vmrss_kib(),
+                )
+                stall = self.server.stall_seconds
+                if stall is not None and silent is not None and silent > stall and self.server.fatal is None:
+                    self.server.fatal = Qwen38ChatChainError(
+                        f"the lanes made no progress for {silent:.1f} s with request {request_id} in them (--stall-seconds {stall})"
+                    )
+                    _log("stalled", request_id=request_id, seconds_since_progress=silent, stall_seconds=stall)
+                if wire.streaming and wire.error is None:
+                    try:
+                        wire.write(b": keepalive\n\n")
+                    except (OSError, ValueError):
+                        pass
+
+        def poll() -> None:
+            # Between deliveries: the client's socket, the deadline, the stop signal (the driver ends every lane with
+            # ``shutdown`` itself); a cancel reaches the driver at the next pass boundary.
+            if ticket.cancelled is not None:
+                return
+            if wire.error is not None or self._peer_closed():
+                ticket.cancel("disconnected")
+            elif deadline is not None and time.perf_counter() - started > deadline:
+                ticket.cancel("deadline")
+
+        first_token_at: float | None = None
+        last_token_at: float | None = None
+        consumed = 0  # tokens the reply took (up to the one that completed a stop string)
+        try:
+            if request["stream"]:
+                try:
+                    self._send_stream_head()
+                    wire.streaming = True
+                    wire.event(chunk({"delta": {"role": "assistant", "content": ""}, "finish_reason": None}))
+                except OSError as error:
+                    if scheduler.withdraw(ticket):
+                        _log(
+                            "client_disconnected",
+                            request_id=request_id,
+                            phase="queued",
+                            error=f"{type(error).__name__}: {error}",
+                        )
+                        return
+                    ticket.cancel("disconnected")
+            threading.Thread(target=heartbeat, name=f"heartbeat-{request_id}", daemon=True).start()
+            for token_id, _finish in ticket.items(poll_seconds=QUEUE_POLL_SECONDS, on_idle=poll):
+                last_token_at = time.perf_counter()
+                if first_token_at is None:
+                    first_token_at = last_token_at
+                if ticket.cancelled is not None:
+                    continue
+                consumed += 1  # the EOS counts as the single stream counts it (a consumed token, no text)
+                if token_id in ticket.stop_ids:
+                    continue
+                try:
+                    if request["stream"]:
+                        for delta in assembler.push(token_id):
+                            wire.event(chunk({"delta": delta, "finish_reason": None}))
+                    else:
+                        assembler.push(token_id)
+                except OSError:
+                    ticket.cancel("disconnected")
+                    continue
+                if assembler.stop_hit:
+                    ticket.cancel("stop")
+                poll()
+        finally:
+            heartbeat_stop.set()
+        finish = ticket.finish or "error"
+        if finish == "error" and scheduler.fatal is not None:
+            self.server.fatal = scheduler.fatal
+        if finish == "error":
+            self._answer_error(wire, 500, f"the lanes ended request {request_id} with an error", "server_error")
+            return
+        final_deltas = assembler.finish()
+        finish_reason = _finish_reason(finish, assembler)
+        decode_seconds = 0.0 if first_token_at is None or last_token_at is None else last_token_at - first_token_at
+        tokens_per_second = (consumed - 1) / decode_seconds if consumed >= 2 and decode_seconds > 0 else None
+        admitted = ticket.admitted_at if ticket.admitted_at is not None else started
+        extension = {
+            "finish": finish,
+            "queue_wait_seconds": round(ticket.queue_wait, 4),
+            "decode_loop": "greedy",
+            "served_reasoning_tokens": 0,
+            "sampling": None,
+            "seed": None,
+            "reasoning_tokens": assembler.reasoning_tokens,
+            "thinking_forced": ticket.stream is not None and ticket.stream.forced_think_ends > 0,
+            "stop_string_hit": assembler.stop_hit,
+            "tool_calls": len(assembler.calls),
+            "tool_parse_errors": assembler.parse_errors,
+            "truncated_tool_call": assembler.truncated_tool_call,
+            "prefix_reused": 0,
+            "reset": True,
+            # The snapshot vocabulary of the single stream's ledger: a lane admission is a fresh prefill of the prompt
+            # from position 0 (the chunk driver, or the teacher-forced form of a short prompt) and leaves no snapshot.
+            "snapshot_schedule": "chunked",
+            "snapshot_captured": False,
+            "prefill_tokens": len(prompt_ids),
+            "prefill_seconds": round(ticket.admission_segments.get("prefill", 0.0), 4),
+            "prefill_mode": ticket.prefill.get("mode"),
+            "prefill_forced_tokens": ticket.prefill.get("forced_tokens"),
+            "prefill_chunks": ticket.prefill.get("chunks"),
+            "prefill_long_chunks": ticket.prefill.get("long_chunks"),
+            "prefill_slabs": ticket.prefill.get("slabs"),
+            "ttft_seconds": None if first_token_at is None else round(first_token_at - ticket.submitted, 4),
+            "decode_seconds": round(decode_seconds, 4),
+            "tokens_per_second": None if tokens_per_second is None else round(tokens_per_second, 3),
+            "position": ticket.position,
+            "mtp": {
+                "k": scheduler.drafts,
+                "passes": ticket.passes,
+                "tokens_per_pass": None if not ticket.passes else round(ticket.committed / ticket.passes, 3),
+            },
+            "lanes": {
+                "lane": ticket.lane,
+                "admission_seconds": round(ticket.admission_seconds, 4),
+                "admission": {name: round(value, 4) for name, value in ticket.admission_segments.items()},
+                "stalled_seconds": round(ticket.stalled_seconds, 4),
+                "passes": ticket.passes,
+                "committed_tokens": ticket.committed,
+                "finish_detail": ticket.finish_detail,
+                "forced_think_ends": 0 if ticket.stream is None else ticket.stream.forced_think_ends,
+                "forced_think_end_inside_pass": 0 if ticket.stream is None else ticket.stream.forced_inside,
+                "forced_think_end_on_last_token": 0 if ticket.stream is None else ticket.stream.forced_last,
+                "admitted_after_seconds": round(admitted - ticket.submitted, 4),
+            },
+        }
+        usage = _usage(len(prompt_ids), consumed, ticket.queue_wait)
+        try:
+            append_phase_record(
+                self.server.ledger,
+                {
+                    "phase": "chat-request",
+                    "request_id": request_id,
+                    "received_utc": received_utc,
+                    "stream": request["stream"],
+                    "prompt_tokens": len(prompt_ids),
+                    "completion_tokens": consumed,
+                    "max_tokens": request["max_tokens"],
+                    "max_tokens_requested": request["max_tokens_requested"],
+                    "finish_reason": finish_reason,
+                    "text_characters": sum(len(piece) for piece in assembler.content),
+                    "reasoning_characters": sum(len(piece) for piece in assembler.reasoning),
+                    "enable_thinking": request["enable_thinking"],
+                    "reasoning_effort": request["reasoning_effort"],
+                    "think_budget": request["think_budget"],
+                    "tools_offered": len(request["tools"]),
+                    "ignore_eos": request["ignore_eos"],
+                    "logprobs": False,
+                    "deadline_seconds": deadline,
+                    "heartbeats": heartbeats[0],
+                    "host_vmrss_kib": _vmrss_kib(),
+                    "program_cache_entries": getattr(session.chain, "program_cache_entries", None),
+                    **extension,
+                    "position_after": ticket.position,
+                },
+            )
+            _log(
+                "request",
+                request_id=request_id,
+                prompt_tokens=len(prompt_ids),
+                completion_tokens=consumed,
+                finish_reason=finish_reason,
+                lane=ticket.lane,
+                queue_wait_seconds=extension["queue_wait_seconds"],
+                tokens_per_second=extension["tokens_per_second"],
+                stalled_seconds=extension["lanes"]["stalled_seconds"],
+            )
+        except OSError as error:
+            try:
+                _log("evidence_write_failed", request_id=request_id, error=f"{type(error).__name__}: {error}")
+            except OSError:
+                pass
+        if finish == "disconnected" or wire.error is not None:
+            _log(
+                "client_disconnected",
+                request_id=request_id,
+                phase="streaming" if request["stream"] else "generating",
+                completion_tokens=consumed,
+            )
+            return
+        try:
+            if request["stream"]:
+                for delta in final_deltas:
+                    wire.event(chunk({"delta": delta, "finish_reason": None}))
+                wire.event(chunk({"delta": {}, "finish_reason": finish_reason}, usage=usage, qwen38=extension))
+                wire.write(b"data: [DONE]\n\n")
+            else:
+                self._send_json(
+                    200,
+                    {
+                        "id": request_id,
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": MODEL_ID,
+                        "system_fingerprint": self.server.system_fingerprint,
+                        "choices": [{"index": 0, "message": assembler.message(), "finish_reason": finish_reason}],
+                        "usage": usage,
+                        "qwen38": extension,
+                    },
+                )
+        except OSError as error:
+            _log("client_disconnected", request_id=request_id, phase="reply", error=f"{type(error).__name__}: {error}")
 
     def _answer_error(
         self, wire: _ClientWire, status: int, message: str, kind: str, *, code: str | None = None, **headers: str
@@ -1536,6 +1873,123 @@ def record_agreement(
     return summary
 
 
+# -- the lanes' startup replay and driver --------------------------------------------------------
+
+
+def replay_acceptance_lanes(
+    lanes_session: Any,
+    records: list[dict[str, Any]],
+    *,
+    lanes: int,
+    drafts: int,
+    single_stream: Mapping[str, Any],
+    require_gate: bool,
+    continuation: int = ACCEPTANCE_CONTINUATION,
+) -> dict[str, Any]:
+    """The acceptance records through the lane scheduler (every record submitted at once, ``lanes`` admitted, the
+    rest in the FIFO and admitted as lanes free), each stream compared with the single-stream replay of the same
+    process (``single_stream``: ``replay_acceptance``'s record on the same chain form) and with the CPU record.
+    The pin is exactness against the single stream on every record and the ``json`` gate; ``require_gate`` refuses
+    a miss."""
+
+    scheduler = Qwen38LaneScheduler(lanes=lanes, drafts=drafts, queue_limit=max(len(records), 1))
+    tickets = []
+    for record in records:
+        expected = record["generated_token_ids"][:continuation]
+        ticket = Qwen38LaneTicket(
+            request_id=f"lanes-acceptance-{record['prompt']}",
+            prompt_ids=list(record["prompt_token_ids"]),
+            max_tokens=len(expected),
+            stop_ids=(),
+            think_budget=None,
+        )
+        tickets.append((record, expected, scheduler.submit(ticket)))
+    scheduler.run(lanes_session, forever=False)
+    reference = {row["prompt"]: row for row in single_stream["prompts"]}
+    results = []
+    for record, expected, ticket in tickets:
+        if not ticket.done.is_set():
+            raise Qwen38ChatChainError(f"lanes acceptance: ticket {ticket.request_id} did not finish")
+        actual = _drain_ticket(ticket)
+        single = reference.get(record["prompt"], {}).get("device_token_ids")
+        row = {
+            "prompt": record["prompt"],
+            "prompt_tokens": len(record["prompt_token_ids"]),
+            "compared_tokens": len(expected),
+            "divergence_index": _divergence(actual, expected),
+            "matched_tokens": len(expected) if _divergence(actual, expected) is None else _divergence(actual, expected),
+            "device_token_ids": actual,
+            "cpu_token_ids": expected,
+            "single_stream_token_ids": single,
+            "equals_single_stream": single is not None and actual == list(single),
+            "single_stream_divergence_index": None if single is None else _divergence(actual, list(single)),
+            "lane": ticket.lane,
+            "finish": ticket.finish,
+            "queue_wait_seconds": round(ticket.queue_wait, 4),
+            "admission_seconds": round(ticket.admission_seconds, 4),
+            "admission": {name: round(value, 4) for name, value in ticket.admission_segments.items()},
+            "stalled_seconds": round(ticket.stalled_seconds, 4),
+            "passes": ticket.passes,
+            "tokens_per_pass": None if not ticket.passes else round(ticket.committed / ticket.passes, 3),
+        }
+        results.append(row)
+        _log("acceptance_lanes_prompt", **{key: value for key, value in row.items() if not key.endswith("_ids")})
+    gate = next((row for row in results if row["prompt"] == ACCEPTANCE_GATE_PROMPT), None)
+    gate_pass = gate is not None and gate["divergence_index"] is None and gate["compared_tokens"] == continuation
+    equal = sum(1 for row in results if row["equals_single_stream"])
+    equals_single_stream = equal == len(results)
+    if require_gate and not (gate_pass and equals_single_stream):
+        unequal = [row["prompt"] for row in results if not row["equals_single_stream"]]
+        raise Qwen38ChatChainError(
+            f"lanes acceptance gate: json {None if gate is None else gate['matched_tokens']} of {continuation} CPU greedy "
+            f"tokens; {equal} of {len(results)} lane streams equal the single-stream replay (unequal: {unequal})"
+        )
+    return {
+        "schema": "qwen38-chat-server-acceptance-lanes/v1",
+        "continuation": continuation,
+        "lanes": lanes,
+        "drafts": drafts,
+        "gate_prompt": ACCEPTANCE_GATE_PROMPT,
+        "gate_pass": gate_pass,
+        "equals_single_stream": equals_single_stream,
+        "equal_prompts": equal,
+        "compared_prompts": len(results),
+        "passes": scheduler.passes,
+        "admissions": scheduler.admissions,
+        "pass_seconds_median": (
+            None
+            if not scheduler.pass_seconds
+            else round(sorted(scheduler.pass_seconds)[len(scheduler.pass_seconds) // 2], 4)
+        ),
+        "prompts": results,
+    }
+
+
+def _drain_ticket(ticket: Qwen38LaneTicket) -> list[int]:
+    """Every delivered id of a finished ticket."""
+
+    tokens: list[int] = []
+    while True:
+        try:
+            token, _finish = ticket.tokens.get_nowait()
+        except queue.Empty:
+            return tokens
+        if token is None:
+            return tokens
+        tokens.append(token)
+
+
+def _run_lanes_driver(scheduler: Qwen38LaneScheduler, lanes_session: Any, server: "Qwen38ChatHTTPServer") -> None:
+    """The lane driver thread: the scheduler's loop over the device; a failure is the server's fatal error."""
+
+    try:
+        scheduler.run(lanes_session, forever=True)
+    except BaseException as error:  # noqa: BLE001
+        _log("lanes_driver_failed", error=f"{type(error).__name__}: {error}", traceback=traceback.format_exc())
+        if server.fatal is None:
+            server.fatal = error
+
+
 # -- main --------------------------------------------------------------------------------------
 
 # The launcher's ``common`` block: the model inputs and caches; the runtime identity's arguments are ``runtime_admission``'s.
@@ -1732,18 +2186,9 @@ def _parser() -> argparse.ArgumentParser:
         "--lanes",
         type=int,
         default=0,
-        help="serve B batched lanes through the lane body; refused on this head (the lane service binds sessions "
-        "by the prompt splice, removed with the committed-prefix rule): 0, the single-lane chain",
-    )
-    parser.add_argument("--lane-slots", type=int, default=None, help="host slots for parked lane images (--lanes)")
-    parser.add_argument(
-        "--lane-verify-policy", default="2/0", help="N/M tracker passes after lane lifecycle events (--lanes)"
-    )
-    parser.add_argument(
-        "--lane-prefill-chunk-budget", type=int, default=2, help="chunk replays per device tick (--lanes)"
-    )
-    parser.add_argument(
-        "--lane-prefill-import-check", action="store_true", help="re-read prefilled lane images (--lanes)"
+        help="serve up to B concurrent greedy requests through the MTP lane chain (B in 2..8 with B x (k + 1) <= 32 "
+        "rows, needs --mtp; greedy only: no --sampling, the second-queue early read and the per-request drafts "
+        "field are refused); 0 (the default): the single-stream chain with its queue",
     )
     return parser
 
@@ -1785,12 +2230,7 @@ def main() -> int:
     args.device_sampler = effective_device_sampler(args)
     if args.sampling_discriminator and (not args.sampling or args.acceptance_prompts is None):
         raise SystemExit("--sampling-discriminator needs --sampling and the acceptance prompt records")
-    if args.lanes:
-        raise SystemExit(
-            "--lanes: the lane serving path is not on this head; it bound sessions by the prompt splice "
-            "(protocol.splice_prompt, Qwen38ServedTurn), removed with the committed-prefix rule the single-lane "
-            "server follows; the lane service serves again once it binds sessions by that rule"
-        )
+    lanes_switch = lanes_switches(os.environ, args)  # the lanes' geometry and refusals
     if args.agreement_reference is not None and not args.sampling:
         raise SystemExit("--agreement-reference needs --sampling (the records read the candidate row)")
     if args.agreement_reference is not None and not args.agreement_reference.is_file():
@@ -1858,6 +2298,8 @@ def main() -> int:
     mtp_ple_early = ple_early_switch(os.environ, applicable=args.mtp is not None)
     if mtp_ple_early and args.mtp is None:
         raise SystemExit(f"{PLE_EARLY_VARIABLE}=1 needs --mtp (the early rows are the MTP pass loop's)")
+    if lanes_switch is not None:
+        mtp_ple_early = False  # the lanes run the one-queue form: the second queue's early read has no lanes form
     # The open captures these forms; its gate evaluates the same configuration.
     forms = mtp_verify_forms(mtp_sampled, mtp_device_accept)
     # QWEN38_MTP_MOE_ROWS (diagnostic, default unset): the verify MoE row count forced on the chain (5, 6 or 32);
@@ -1882,7 +2324,7 @@ def main() -> int:
         mtp_admission_table["verify_forms_captured"] = list(forms)
         _log("mtp_admission_table_fallback", **mtp_admission_table)
     summary = {
-        "mode": "chat_server_single_trace_chain",
+        "mode": "chat_server_single_trace_chain" if lanes_switch is None else "chat_server_mtp_lanes",
         "model": MODEL_ID,
         "hardware_profile": hardware_profile.host,
         "hardware_partition": hardware_profile.partition,
@@ -1946,11 +2388,25 @@ def main() -> int:
             # with extra_body.mtp_drafts (the fingerprint and the acceptance baselines are the default chain's)
             "drafts_admitted": list(mtp_drafts_admitted),
         },
+        # --lanes B: the lane chain's geometry, the fold's off switch and the admission (filled at the chain's warm hook)
+        "lanes": (
+            None
+            if lanes_switch is None
+            else {
+                "lanes": lanes_switch["lanes"],
+                "drafts": lanes_switch["drafts"],
+                "rows": lanes_switch["rows"],
+                "greedy_only": True,
+                "admission": None,
+            }
+        ),
+        "fused_kernels": sorted(fused.enabled_names()),
         # What a seed reproduces against: the source head and the runtime; with the pass loop drafting for sampled
         # requests the draw order is the pass's, so the switch and k are part of the identity.
         "system_fingerprint": f"{runtime['head'][:12]}-{runtime['extension_sha256'][:12]}"
         + (f"-mtp{args.mtp}-sampled" if mtp_sampled else "")
-        + ("-device-accept" if mtp_sampled and device_accept_switch() else ""),
+        + ("-device-accept" if mtp_sampled and device_accept_switch() else "")
+        + ("" if lanes_switch is None else f"-lanes{lanes_switch['lanes']}"),
     }
     if args.validate_only:
         print(json.dumps({"status": "pass", "mesh_open_requested": False, **summary}, sort_keys=True))
@@ -1976,6 +2432,15 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_stop_signal)
     started_ns = time.perf_counter_ns()
     mesh = chain = server = None
+    lanes_session = None
+    scheduler = None
+    if lanes_switch is not None:
+        from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lanes_session import Qwen38LanesSession
+
+        lanes_session = Qwen38LanesSession(lanes=lanes_switch["lanes"], drafts=lanes_switch["drafts"], marker=marker)
+        scheduler = Qwen38LaneScheduler(
+            lanes=lanes_switch["lanes"], drafts=lanes_switch["drafts"], queue_limit=args.queue_limit
+        )
     if not (args.prepare_only or args.sampling_discriminator):
         # The port is claimed before the minutes of mesh open, captures and replay: a taken port fails here.
         try:
@@ -1991,6 +2456,7 @@ def main() -> int:
                 system_fingerprint=summary["system_fingerprint"],
                 mtp_drafts_admitted=mtp_drafts_admitted,
                 listen=False,
+                lanes=scheduler,
             )
         except OSError as error:
             raise SystemExit(f"--host {args.host} --port {args.port}: cannot bind: {error}") from error
@@ -2029,6 +2495,43 @@ def main() -> int:
             ttnn.synchronize_device(mesh)
             report["status"] = "stopped"
             raise Qwen38ChatServerStop("prepare-only run complete")
+        warm_hook = None
+        if lanes_session is not None:
+
+            def warm_hook(opened_chain) -> None:
+                # The lanes' admission on the live allocator (after the resident build, the MTP states and the warm
+                # pass; before any capture), then their allocation and compile in the chain's warm hook.  What the
+                # chain still allocates after this reading (its traces) is reserved on the free side.
+                live = hardware_profiles.symmetric_mesh_dram_memory(mesh, hardware_profile.route)
+                reserved = RESIDENT_POST_BUILD_BYTES_PER_BANK_UPPER_BOUND + int(
+                    opened_chain.mtp.admission["mtp_growth_estimate_bytes_per_bank"]["traces"]
+                )
+                if bool(args.long_chunks) or args.prefill_slab is not None:
+                    reserved += LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES
+                admission = lanes_capacity_admission(
+                    resident_context.allocated_context,
+                    lanes=lanes_switch["lanes"],
+                    drafts=lanes_switch["drafts"],
+                    live=live,
+                    reserved_bytes_per_bank=reserved,
+                    gdn_rows_scan=fused_module.enabled(gdn_rows_scan_module.NAME),
+                )
+                lanes_session.admission = admission
+                summary["lanes"]["admission"] = admission
+                _log(
+                    "lanes_admission",
+                    **{key: value for key, value in admission.items() if key != "decided_by"},
+                    **admission["decided_by"],
+                )
+                if not admission["fits"]:
+                    raise Qwen38ChatChainError(
+                        f"--lanes {lanes_switch['lanes']} refused at allocated context {resident_context.allocated_context}: "
+                        f"{admission['decided_by']['shortfalls']} (required {admission['required_free_bytes_per_bank']} B per bank "
+                        f"against {admission['free_bytes_per_bank']} free, contiguous {admission['largest_contiguous_bytes_free_per_bank']} "
+                        f"against {admission['required_largest_contiguous_bytes_per_bank']})"
+                    )
+                lanes_session.prepare(opened_chain)
+
         chain = construct_chain(
             prepared,
             mesh,
@@ -2046,6 +2549,7 @@ def main() -> int:
             mtp_moe_rows=mtp_moe_rows,
             mtp_alternates=mtp_drafts_admitted[1:],
             mtp_ple_early=mtp_ple_early,
+            warm_hook=warm_hook,
         )
         if chain.allocated_context != resident_context.allocated_context:
             raise Qwen38ChatChainError(
@@ -2136,6 +2640,40 @@ def main() -> int:
                 json.dumps(report["acceptance"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
             marker("after-chat-acceptance-replay")
+        if lanes_session is not None:
+            # The three lane traces after the chain's, the tracker over every trace, then the HARD gate: the lanes'
+            # measured growth (states at the hook, traces now) against the admission's estimate.
+            lanes_session.capture(chain, session)
+            growth = lanes_session.growth_bytes_per_bank()
+            estimate = lanes_session.admission["required_free_bytes_per_bank"]
+            _log("lanes_captured", **lanes_session.summary())
+            if sum(growth.values()) > estimate:
+                raise Qwen38ChatChainError(
+                    f"lanes DRAM growth {sum(growth.values())} bytes per bank {growth} exceeds the admission's estimate "
+                    f"{estimate} {lanes_session.admission['lanes_growth_estimate_bytes_per_bank']} for {lanes_switch['lanes']} lanes "
+                    f"at k={lanes_switch['drafts']}, allocated context {chain.allocated_context}"
+                )
+            report["chain"]["lanes"] = lanes_session.summary()
+            ttnn.synchronize_device(mesh)
+            report["chain"]["dram_after_captures"] = hardware_profiles.symmetric_mesh_dram_memory(
+                mesh, hardware_profile.route
+            )
+            if records:
+                # The lanes' pin: the same records through the scheduler, B at a time, against the single-stream
+                # replay just made in this process (the same chain form, the wrap): every stream must equal it.
+                marker("before-lanes-acceptance-replay")
+                report["acceptance_lanes"] = replay_acceptance_lanes(
+                    lanes_session,
+                    records,
+                    lanes=lanes_switch["lanes"],
+                    drafts=lanes_switch["drafts"],
+                    single_stream=report["acceptance"],
+                    require_gate=args.require_json_96,
+                )
+                (evidence / "acceptance-lanes.json").write_text(
+                    json.dumps(report["acceptance_lanes"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                marker("after-lanes-acceptance-replay")
         if args.agreement_reference is not None:
             marker("before-agreement-records")
             report["agreement"] = record_agreement(
@@ -2187,6 +2725,12 @@ def main() -> int:
         else:
             server.session = session
             server.dram_after_captures = report["chain"]["dram_after_captures"]
+            if lanes_session is not None:
+                # The driver thread: the only device thread from here on (the handler threads submit and read tickets).
+                server.lanes_thread = threading.Thread(
+                    target=_run_lanes_driver, args=(scheduler, lanes_session, server), name="lane-driver", daemon=True
+                )
+                server.lanes_thread.start()
             server.server_activate()
             ready = {
                 "pid": os.getpid(),
@@ -2209,6 +2753,24 @@ def main() -> int:
                 "dense_weight_dtype": report["chain"]["dense_weight_dtype"],
                 "route": list(hardware_profile.route),
                 "route_derivation": route_derivation["route_derivation"],
+                "mode": summary["mode"],
+                "lanes": (
+                    None
+                    if lanes_session is None
+                    else {
+                        **lanes_session.summary(),
+                        "greedy_only": True,
+                        "queue_limit": args.queue_limit,
+                        "acceptance": (
+                            None
+                            if "acceptance_lanes" not in report
+                            else {
+                                key: report["acceptance_lanes"][key]
+                                for key in ("gate_pass", "equals_single_stream", "equal_prompts", "compared_prompts")
+                            }
+                        ),
+                    }
+                ),
             }
             ready_marker.write_text(json.dumps(ready, sort_keys=True) + "\n", encoding="utf-8")
             marker("chat-server-ready")
@@ -2221,7 +2783,7 @@ def main() -> int:
                 # (a second signal or a drain past DRAIN_SECONDS leaves the boundary uncertain).
                 uncertain = True
                 report["status"] = "stopped_mid_request"
-                _log("draining", busy=server.busy, queue_depth=server.queue_depth, seconds=DRAIN_SECONDS)
+                _log("draining", busy=server.device_busy, queue_depth=server.queue_depth, seconds=DRAIN_SECONDS)
                 if server.drain(DRAIN_SECONDS) and not session.poisoned:
                     uncertain = False
                     report["status"] = "stopped"
@@ -2231,7 +2793,12 @@ def main() -> int:
             _log("failed", error=report["error"])
     except BaseException as error:
         uncertain = uncertain or (
-            server is not None and (server.busy or (server.session is not None and server.session.poisoned))
+            server is not None
+            and (
+                server.device_busy
+                or (server.session is not None and server.session.poisoned)
+                or (scheduler is not None and scheduler.fatal is not None)
+            )
         )
         report["error"] = f"{type(error).__name__}: {error}"
         report["traceback"] = traceback.format_exc()
@@ -2239,8 +2806,19 @@ def main() -> int:
     finally:
         if server is not None:
             server.server_close()
+        if scheduler is not None and scheduler.running:
+            scheduler.stop()
+            if server is not None and server.lanes_thread is not None:
+                server.lanes_thread.join(timeout=DRAIN_SECONDS)
+                uncertain = uncertain or server.lanes_thread.is_alive()
         # The runner's cleanup: a failure mid-loop leaves queue and trace ownership
         # uncertain; then the mesh is closed without release work.
+        if lanes_session is not None and not uncertain:
+            try:
+                marker("before-lanes-close")
+                lanes_session.close()
+            except BaseException as error:  # noqa: BLE001
+                cleanup_errors.append(f"lanes_close:{type(error).__name__}:{error}")
         if chain is not None and not uncertain:
             try:
                 marker("before-chat-chain-close")
@@ -2272,7 +2850,11 @@ def main() -> int:
             end_utc=utc_now(),
             cleanup_errors=cleanup_errors,
             uncertain_boundary=uncertain,
-            requests_served=None if server is None or server.session is None else server.session.requests_served,
+            requests_served=(
+                None
+                if server is None or server.session is None
+                else (server.session.requests_served if scheduler is None else scheduler.requests_done)
+            ),
         )
         stopped_marker.write_text(
             json.dumps({"pid": os.getpid(), "utc": utc_now(), "status": report["status"]}) + "\n",

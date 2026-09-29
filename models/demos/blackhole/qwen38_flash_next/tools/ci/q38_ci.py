@@ -322,12 +322,18 @@ def extract_corpus_agreement(job_dir: Path, _job: dict[str, Any]) -> tuple[dict[
     return observed, sorted(observed["top1"])
 
 
-def extract_acceptance(job_dir: Path, _job: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """A3: the server's startup replay (``acceptance.json``) and the runner's probes (``probes.json``)."""
+def extract_acceptance(job_dir: Path, job: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """A3: the server's startup replay (``acceptance.json``) and the runner's probes (``probes.json``).  A ``lanes``
+    configuration (``--lanes B``) reads the lanes' replay instead (``acceptance-lanes.json``: the records through the
+    lane scheduler, B at a time) and adds ``equals_single_stream`` (every lane stream equal to the single-stream replay
+    made in the same process)."""
 
-    acceptance = _read_json(job_dir / "acceptance.json")
-    if acceptance.get("schema") != "qwen38-chat-server-acceptance/v1":
-        raise CIError(f"{job_dir / 'acceptance.json'}: schema {acceptance.get('schema')!r}")
+    lanes = str(job.get("configuration", "")).startswith("lanes")
+    name = "acceptance-lanes.json" if lanes else "acceptance.json"
+    acceptance = _read_json(job_dir / name)
+    schema = "qwen38-chat-server-acceptance-lanes/v1" if lanes else "qwen38-chat-server-acceptance/v1"
+    if acceptance.get("schema") != schema:
+        raise CIError(f"{job_dir / name}: schema {acceptance.get('schema')!r}")
     prompts = acceptance["prompts"]
     gate = next((row for row in prompts if row["prompt"] == acceptance["gate_prompt"]), None)
     observed: dict[str, Any] = {
@@ -340,6 +346,8 @@ def extract_acceptance(job_dir: Path, _job: dict[str, Any]) -> tuple[dict[str, A
         "matched_tokens_total": sum(row["matched_tokens"] for row in prompts),
         "handoff_pass": None if acceptance.get("handoff") is None else acceptance["handoff"]["pass"],
     }
+    if lanes:
+        observed["equals_single_stream"] = acceptance["equals_single_stream"]
     probes_path = job_dir / "probes.json"
     if probes_path.exists():
         probes = _read_json(probes_path)

@@ -107,6 +107,57 @@ read candidate row, not the vocabulary (`logprobs_normalizer` in `/health` and `
 decodes at a time; up to four wait in the queue (`queue_wait_seconds` in `usage`), the fifth gets HTTP 503.  A prompt
 over the context limit gets HTTP 400 `context_length_exceeded`.
 
+### Several requests at once: `--lanes B` (opt-in, greedy only)
+
+`--lanes B` (B in 2..8 with B x (k + 1) <= 32 rows; needs `--mtp`; off by default) serves up to B requests at once
+through the MTP lane chain (`ttnn/mtp_lanes.py`: B lanes verify k + 1 rows each in one 32-row tile, every lane its own
+KV, GDN and n-gram state, one pass per boundary for all of them) instead of the single-stream chain with its queue.  It
+is GREEDY ONLY in this wave: the lane body resolves by argmax, so the server refuses `--sampling` at start and a request
+naming a sampling field gets HTTP 400 (`temperature 0` is fine); a field the lanes cannot honour is refused, never
+dropped: the per-request drafting chains (`QWEN38_MTP_DRAFTS_PER_REQUEST=1`) and the second command queue's early rows
+read (`QWEN38_MTP_PLE_EARLY=1`) have no lanes form and refuse the start.  The lanes run the served default set: the
+verify-rows fold serves them through its lanes form (`ttnn/fused/gdn_rows_scan`, state `[B, 12, 128, 128]`, prefix
+states `[B x R, ...]`; exact against the fold-on single stream on its line gate), so a lane's stream is the DEFAULT
+single-stream server's stream byte for byte (the startup pin below compares against the single-stream replay of the
+same process, the shipped `A3-mtp4-32k` table).  Without the lanes form (the branch's first days) the server ran the
+wrap for the whole process; that switch is gone.
+
+Scheduling: a request that finds a free lane is admitted at the next pass boundary; the B+1th waits in the FIFO
+(`usage.queue_wait_seconds` counts from its arrival to its admission) and up to `--queue-limit` (4) wait behind the B
+lanes, the next gets HTTP 503 with `Retry-After`.  An admission prefills the prompt on the single-stream chain (the same
+chunked prefill), evicts that state into a host slot and imports it into the lane -- and STALLS EVERY LANE for its
+duration, because the device runs one thing at a time: the other requests' passes pause for the prefill (MEASURED on a
+4x p150 hold at 32k: 0.3-1.4 s for the acceptance prompts of 40-560 tokens; a prompt of tens of thousands of tokens
+stalls the lanes for its prefill time, seconds) plus the eviction and import (about 0.2 s).  One admission per boundary
+while any lane decodes, back to back while none does.  Every request's response carries the record: `qwen38.lanes`
+(`lane`, `admission_seconds` and its `prefill` / `evict` / `import` parts, `stalled_seconds` = the other requests'
+admissions while this one decoded, `passes`, `committed_tokens`, `finish_detail`, `forced_think_ends`) beside the
+usual `qwen38` fields; `/health.lanes` has the live counts (active, free, waiting, passes, admissions, the stall total)
+and `READY.lanes` the geometry, the DRAM admission and growth, and the startup gate.  A request ends at a pass boundary
+(EOS, a stop string, `max_tokens`, the deadline, a hang-up) and frees its lane -- these are exact: the answer equals
+the single stream's byte for byte (measured 11 of 11 on the 2026-09-28 rows, the fold on both sides: four concurrent
+acceptance prompts and a fifth behind them, the EOS / stop-string / `max_tokens` / lifecycle rows).  The thinking
+budget's forced `</think>` continues the lane (the host rewrites the count the coming commit takes, the lane's position
+and its next block: the same mechanism an admission uses, no device change, one pass of placeholder drafts as the single
+stream's re-entry costs) and is a TOLERANCE event: the lane stream equals the single stream's through the reasoning and
+the forced token, and the two answers can part where a near-tie falls, because the single stream feeds the forced token
+(and the token before it when the budget lands on a pass's last token) through its 1-row decode traces while a lane
+feeds it through the verify body (the rows form of the GDN fold on the lanes, `docs/NUMERICS.md`).  Measured on the same
+rows, budgets 3 / 5 / 6 / 7 / 9 / 12 on the 177-token chat record, both forced forms (inside a pass and on the last
+emitted token): the reasoning and `</think>` equal on 6 of 6, the answers byte-identical to the end on 3 (budgets 3, 5,
+6) and equal for 611-1023 characters after `</think>` on the other 3 (12, 7, 9), then different; the same budgeted
+request twice on the lanes is byte-identical (8 of 8 repeats, the lanes' own determinism gate).  No prompt-prefix reuse
+in this wave: every request prefills from position 0, so `qwen38.snapshot_schedule` is `chunked` (the admission's own
+schedule: a prefill of exactly the prompt's ids from position 0) and `qwen38.snapshot_captured` is false (a lane leaves
+no prompt-end snapshot; the single stream's restore does not exist here).
+
+At start a `--lanes` server allocates the lane states before any capture (the lanes' DRAM admission on the live
+allocator, refused with the shortfall named; `lanes_capacity_admission`), captures its three lane traces after the
+chain's, checks the measured growth against the estimate (a hard gate: READY is refused when it exceeds it), and replays
+the acceptance records through the lanes B at a time: every lane stream must equal the single-stream replay just made
+in the same process and the `json` record must match the CPU 96/96 (`acceptance-lanes.json`; refused under
+`--require-json-96`).  The rows of record and the pin table are in `docs/NUMERICS.md` (the A3-lanes table).
+
 The sampled draw runs on the device by default: for `temperature` up to 4, `top_k` 1..32, `top_p`, `min_p` and a
 `presence_penalty` in [0, 2] the TAIL trace samples the token from the read candidate row (the request's emitted tokens
 are the device's own history), the same law as the host sampler (`docs/NUMERICS.md`, the law gate).  A request with
