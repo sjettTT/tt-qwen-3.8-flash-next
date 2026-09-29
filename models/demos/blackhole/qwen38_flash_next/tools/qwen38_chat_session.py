@@ -873,11 +873,26 @@ SNAPSHOT_SCHEDULES = ("chunked", "forced-tail")
 @dataclass(frozen=True)
 class Qwen38PromptSnapshot:
     """The host record of the chain's prompt-end snapshot: the ids consumed when it was taken (the prompt without
-    its last token), the n-gram context after them and the schedule that produced the state (SNAPSHOT_SCHEDULES)."""
+    its last token), the n-gram context after them, the schedule that produced the state (SNAPSHOT_SCHEDULES) and
+    the images' pad spans with their digests (``vision_splice.Qwen38VisionPrompt.spans``; empty for a text prompt):
+    the ids alone do not identify an image prompt's pixels."""
 
     ids: tuple[int, ...]
     ple_context: tuple[int, int] | None
     schedule: str = "chunked"
+    vision: tuple[tuple[int, int, str], ...] = ()
+
+
+def vision_spans_compatible(
+    committed: Sequence[tuple[int, int, str]], wanted: Sequence[tuple[int, int, str]], common: int
+) -> bool:
+    """Whether a committed prefix of ``common`` ids whose images are ``committed`` (spans with digests) may serve a
+    prompt whose images are ``wanted``: every image span that starts below ``common`` must be the same span with the
+    same digest on both sides (two images of one grid render the same pad ids; a span the prefix cuts through is not
+    reused)."""
+
+    below = lambda spans: {span for span in spans if span[0] < common}  # noqa: E731
+    return below(committed) == below(wanted) and all(stop <= common for _, stop, _ in below(wanted))
 
 
 @dataclass(frozen=True)
@@ -962,7 +977,9 @@ class Qwen38ChatSession:
         self.last_finish: str | None = None
         self.row_unconsumed = False  # the next token sits in the row (after length, disconnected, a hook stop)
         self.row_token: int | None = None  # a length finish's last token: read, delivered to the client, not committed
-        self.committed_vision_digest: str | None = None  # the committed prompt's images (None: a text prompt)
+        # The committed prompt's images: their pad spans with digests (empty for a text prompt); the reuse key
+        # beside the ids (``vision_spans_compatible``).
+        self.committed_vision: tuple[tuple[int, int, str], ...] = ()
         self.requests_served = 0
         # The device acceptance's diagnostics (QWEN38_MTP_DEVICE_ACCEPT_DUMP, dev): with a dump directory every
         # device-decided pass records the rows it decided on and complete() writes one JSON per request for
@@ -1522,33 +1539,43 @@ class Qwen38ChatSession:
         self.last_finish = None
         self.row_unconsumed = False
         self.row_token = None
-        self.committed_vision_digest = None
+        self.committed_vision = ()
 
-    def reusable_prefix(self, token_ids: Sequence[int]) -> tuple[int, str]:
-        """How the device meets ``token_ids``: ``(n, "extends")`` when they extend the committed ``n`` ids (or repeat
-        them exactly while the unconsumed next token is still in the row; a partial match cannot be rewound),
-        ``(n, "snapshot")`` when they extend the ``n`` ids of the prompt-end snapshot instead, else ``(0, "reset")``."""
+    def reusable_prefix(self, token_ids: Sequence[int], vision: Sequence[tuple[int, int, str]] = ()) -> tuple[int, str]:
+        """How the device meets ``token_ids`` whose images are ``vision`` (their pad spans with digests, empty for
+        text): ``(n, "extends")`` when they extend the committed ``n`` ids (or repeat them exactly while the
+        unconsumed next token is still in the row; a partial match cannot be rewound) and the images inside those
+        ids are the committed ones, ``(n, "snapshot")`` when they extend the ``n`` ids of the prompt-end snapshot
+        instead (its images alike), else ``(0, "reset")``.  Two images of one grid render identical ids, so the
+        spans' digests are part of the key."""
 
         common = 0
         while common < len(self.committed) and common < len(token_ids) and self.committed[common] == token_ids[common]:
             common += 1
-        if common == len(self.committed) and (common < len(token_ids) or self.row_unconsumed):
+        if (
+            common == len(self.committed)
+            and (common < len(token_ids) or self.row_unconsumed)
+            and vision_spans_compatible(self.committed_vision, vision, common)
+        ):
             return common, "extends"
         snapshot = self.snapshot
         if (
             snapshot is not None
             and len(token_ids) > len(snapshot.ids)
             and tuple(token_ids[: len(snapshot.ids)]) == snapshot.ids
+            and vision_spans_compatible(snapshot.vision, vision, len(snapshot.ids))
         ):
             return len(snapshot.ids), "snapshot"
         return 0, "reset"
 
     def _restore_prompt_snapshot(self) -> None:
-        """The chain's snapshot back on device (position and phases included); the host follows its record."""
+        """The chain's snapshot back on device (position, phases and rotary shift included); the host follows its
+        record."""
 
         self.chain.restore_prompt_snapshot()
         self.committed = list(self.snapshot.ids)
         self.ple_context = self.snapshot.ple_context
+        self.committed_vision = self.snapshot.vision
         self.last_finish = None
         self.row_unconsumed = False
 
@@ -1573,7 +1600,7 @@ class Qwen38ChatSession:
         if not self.snapshot_available or not self.committed:
             return
         self.chain.capture_prompt_snapshot(len(self.committed))
-        self.snapshot = Qwen38PromptSnapshot(tuple(self.committed), self.ple_context, schedule)
+        self.snapshot = Qwen38PromptSnapshot(tuple(self.committed), self.ple_context, schedule, self.committed_vision)
 
     def complete(
         self,
@@ -1595,9 +1622,11 @@ class Qwen38ChatSession:
         context when ``None``; ``require_budget``).
 
         ``vision`` carries an image prompt's rotary positions and feature rows (``token_ids`` are the expanded ids:
-        one ``<|image_pad|>`` per merged image token); such a prompt always prefills from position 0 through the
-        chunk trace (no prefix reuse, no prompt-end snapshot: the committed ids alone do not identify the pixels),
-        and a text prompt never reuses a committed image prompt's state.
+        one ``<|image_pad|>`` per merged image token) and its images' digests; the committed prefix and the
+        prompt-end snapshot are keyed on the ids AND the images' pad spans with their digests, so a follow-up turn on
+        the same image prefills only the new turn while a prompt with another image of the same grid (the same ids)
+        resets.  The pads of the extension never take 1-row steps: an extension whose alignment steps or forced tail
+        would hold a pad resets instead.
 
         Any failure inside the device section leaves the chain's queue and the
         model owner in an unknown state: the session is poisoned and must not
@@ -1661,11 +1690,16 @@ class Qwen38ChatSession:
         # the diagnostic form: a greedy request on the 1-row loop of an MTP chain).
         drafting = self.mtp is not None and speculative and mode == "chunked"
         started_ns = self.clock_ns()
-        common, reuse = self.reusable_prefix(token_ids)
-        if vision is not None or self.committed_vision_digest is not None:
-            # Stage 1 of the image path: an image prompt prefills from position 0, and the committed state of an
-            # image prompt serves no later request (the ids do not identify the pixels).
-            common, reuse = 0, "reset"
+        spans = () if vision is None else vision.spans(token_ids)
+        common, reuse = self.reusable_prefix(token_ids, spans)
+        if common and vision is not None:
+            # The extension's tokens that the 1-row body would take (the alignment steps of a chunked extension, or
+            # the whole forced tail of a short one) must be text: image pads never take 1-row steps.
+            head = list(token_ids[common:-1])
+            aligned = alignment_steps(common, len(head))
+            chunkable = mode == "chunked" and len(head) - aligned >= CHUNK_PREFILL_MIN_ROWS
+            if vision_splice.image_lanes(head[:aligned] if chunkable else head):
+                common, reuse = 0, "reset"
         # The device sampler's per-request writes (the policy, the greedy flag, the first draw) precede every
         # prompt step: the last prompt TAIL chooses the first token under this request's policy.
         device_loop = False
@@ -1712,13 +1746,22 @@ class Qwen38ChatSession:
             # steps; the last one is the first decode replay and is always teacher-forced inside the guard.  The
             # prompt-end snapshot is taken before that last token: after the hand-off, or inside the forced prefill.
             before_last: Callable[[], None] | None = capture
-            if vision is not None:
-                # No prompt-end snapshot of an image prompt (its record would match a later prompt by ids alone).
-                before_last = None
-                capture = lambda: None  # noqa: E731
+            # The prompt's images are the committed ones from here (the snapshot records them with the ids): the
+            # spans below ``common`` are the committed prefix's own, the rest this prefill's.
+            self.committed_vision = spans
+            prefill_vision = vision
+            if vision is not None and common:
+                # The extension carries the feature rows of the pads it covers (the prefix's pads are on device).
+                pads_before = len(vision_splice.image_lanes(token_ids[:common]))
+                pads_in = len(vision_splice.image_lanes(suffix[:-1]))
+                prefill_vision = vision_splice.Qwen38VisionPrompt(
+                    vision.positions,
+                    vision.features[pads_before : pads_before + pads_in],
+                    vision.digest,
+                    vision.image_digests,
+                )
             if mode == "chunked" and self.chunk_prefill_rows(len(suffix) - 1) >= CHUNK_PREFILL_MIN_ROWS:
-                chunked = self._prefill_chunked(suffix[:-1], suffix[-1], should_stop, vision)
-                self.committed_vision_digest = None if vision is None else vision.digest
+                chunked = self._prefill_chunked(suffix[:-1], suffix[-1], should_stop, prefill_vision)
                 suffix = suffix[-1:]
                 before_last = None
                 if chunked.stopped is None:

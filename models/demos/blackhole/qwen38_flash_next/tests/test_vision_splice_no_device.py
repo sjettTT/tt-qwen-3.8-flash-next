@@ -18,6 +18,7 @@ from models.demos.blackhole.qwen38_flash_next.vision_splice import (
     IMAGE_LANE_SENTINEL_TOKEN,
     NEGATIVE_ZERO_BF16_BITS,
     Qwen38VisionPrompt,
+    image_spans,
     clean_feature_rows,
     feature_rows_image,
     image_lanes,
@@ -143,6 +144,25 @@ def test_tail_rule_keeps_the_shift_within_the_block_start():
             assert positions.tail_is_plain(length)
             for consumed in (length - 1, length):  # the chunks' end and the first decode position
                 assert positions.shift_at(consumed) <= consumed & ~3
+
+
+def test_image_spans_and_the_prompt_objects_keyed_spans():
+    grid = Qwen38ImageGrid(1, 4, 4)  # 4 merged tokens
+    ids = _prompt(grid, 2) + [VISION_START_TOKEN_ID] + [IMAGE_TOKEN_ID] * 4 + [VISION_END_TOKEN_ID] + TEXT
+    first = len(TEXT) + 1
+    second = first + 4 + 1 + 2 + 1
+    assert image_spans(ids) == [(first, first + 4), (second, second + 4)]
+    assert image_spans(TEXT) == [] and image_spans([IMAGE_TOKEN_ID] * 3) == [(0, 3)]
+    positions = mrope_positions(ids, [grid, grid])
+    features = torch.zeros((8, 2560), dtype=torch.bfloat16)
+    keyed = Qwen38VisionPrompt(positions, features, "request", ("a", "b"))
+    assert keyed.spans(ids) == ((first, first + 4, "a"), (second, second + 4, "b"))
+    # without per-image digests every span carries the request digest (correct, less reusable)
+    plain = Qwen38VisionPrompt(positions, features, "request")
+    assert plain.spans(ids) == ((first, first + 4, "request"), (second, second + 4, "request"))
+    keyed.validate_prompt(ids)
+    with pytest.raises(ValueError, match="image digests"):
+        Qwen38VisionPrompt(positions, features, "request", ("a",)).validate_prompt(ids)
 
 
 def test_vision_prompt_validation():

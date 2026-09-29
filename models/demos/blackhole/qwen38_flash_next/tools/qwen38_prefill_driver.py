@@ -413,6 +413,22 @@ class Qwen38ChunkPrefill:
                 verify_ms = (time.perf_counter_ns() - verify_started_ns) / 1_000_000
             # The MTP layer's tokens sit one position ahead: the chunk's rows shifted by one, then the following token.
             following = remaining[1:] + [following_token if following_token is not None else self.pad_token_id]
+            # Their feature rows: ``pads_before[i]`` pads among ``remaining[:i]`` index the prefill's features (the
+            # alignment steps hold no pads), so the tokens ahead of rows ``start .. start + w`` take the features of
+            # the pads among ``remaining[start + 1 : start + 1 + w]`` (the following token is text: none).
+            pads_before = [0]
+            for token in remaining:
+                pads_before.append(pads_before[-1] + (token == vision_splice.IMAGE_TOKEN_ID))
+
+            def features_ahead(start: int, width: int):
+                if features is None:
+                    return None
+                first, last = (
+                    pads_before[min(start + 1, len(remaining))],
+                    pads_before[min(start + 1 + width, len(remaining))],
+                )
+                return features[first:last] if last > first else None
+
             row_offset = 0
             timings = {
                 "slab": (slab_host_ms, slab_replay_ms),
@@ -443,11 +459,19 @@ class Qwen38ChunkPrefill:
                     # The extension of the chunk's form takes the chunk's rows one position ahead (a long chunk and a
                     # slab are always full; the padded 32-row tail pads its MTP tokens too).
                     if kind == "slab":
-                        extension.write_slab_tokens(self.model, following[start : start + self.slab_rows])
+                        extension.write_slab_tokens(
+                            self.model,
+                            following[start : start + self.slab_rows],
+                            features=features_ahead(start, self.slab_rows),
+                        )
                     else:
                         width = CHUNK_ROWS if kind == "short" else LONG_CHUNK_ROWS
                         ahead = following[start : start + width]
-                        extension.write_tokens(self.model, ahead + [self.pad_token_id] * (width - len(ahead)))
+                        extension.write_tokens(
+                            self.model,
+                            ahead + [self.pad_token_id] * (width - len(ahead)),
+                            features=features_ahead(start, width),
+                        )
                 replay_started_ns = time.perf_counter_ns()
                 if kind == "slab":
                     slab_prepare_ms.append(prepare_ns / 1_000_000)

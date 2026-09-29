@@ -34,6 +34,10 @@ class Qwen38VisionPrompt:
     positions: Qwen38MRoPEPositions
     features: torch.Tensor
     digest: str = ""
+    # The per-image keys in prompt order (``qwen38_vision_inputs.image_digests``): with them a committed prefix
+    # that covers some of a prompt's images is reusable when those images match; without them every span carries
+    # the request digest (correct, and a new image appended behind a covered one then reads as a different prompt).
+    image_digests: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -60,6 +64,35 @@ class Qwen38VisionPrompt:
                 "an image ends within the last index block of the prompt: the prompt must end with text after its "
                 "last image (the chat template's assistant header does)"
             )
+        if self.image_digests and len(self.image_digests) != len(image_spans(ids)):
+            raise ValueError(f"{len(self.image_digests)} image digests for {len(image_spans(ids))} image spans")
+
+    def spans(self, token_ids: Sequence[int]) -> tuple[tuple[int, int, str], ...]:
+        """The images' pad spans of ``token_ids`` with their digests, ``(start, stop, digest)`` per image in prompt
+        order: the prefix-reuse key beside the ids (``Qwen38ChatSession.reusable_prefix``).  The per-image digests
+        when the request gave them, else the request digest on every span."""
+
+        runs = image_spans(token_ids)
+        digests = self.image_digests if len(self.image_digests) == len(runs) else (self.digest,) * len(runs)
+        return tuple((start, stop, digest) for (start, stop), digest in zip(runs, digests))
+
+
+def image_spans(token_ids: Sequence[int], *, image_token_id: int = IMAGE_TOKEN_ID) -> list[tuple[int, int]]:
+    """The runs of consecutive image pads in ``token_ids`` as ``(start, stop)`` lane ranges, one per image (the
+    chat template wraps every image's pads in its own vision markers, so two images never share a run)."""
+
+    spans: list[tuple[int, int]] = []
+    start = None
+    for lane, token in enumerate(token_ids):
+        if int(token) == image_token_id:
+            if start is None:
+                start = lane
+        elif start is not None:
+            spans.append((start, lane))
+            start = None
+    if start is not None:
+        spans.append((start, len(token_ids)))
+    return spans
 
 
 def image_lanes(token_ids: Sequence[int], *, image_token_id: int = IMAGE_TOKEN_ID) -> list[int]:

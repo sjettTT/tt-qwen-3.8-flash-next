@@ -110,12 +110,19 @@ def decode_image(data: bytes, detail: str = "auto") -> Qwen38DecodedImage:
     return Qwen38DecodedImage(image, width, height, detail, grid, digest)
 
 
+def image_digests(images: Sequence[Qwen38DecodedImage]) -> tuple[str, ...]:
+    """The per-image keys in prompt order (the bytes' digest, the detail, the grid): two images of one size render
+    identical pad ids, so the key beside the ids is what tells a committed prefix's image from another."""
+
+    return tuple(f"{image.sha256}:{image.detail}:{image.grid.as_tuple()}" for image in images)
+
+
 def request_digest(images: Sequence[Qwen38DecodedImage]) -> str:
-    """One digest over a request's images in prompt order (the state-reuse key beside the ids)."""
+    """One digest over a request's images in prompt order (the request's record; the reuse key is per image)."""
 
     digest = hashlib.sha256()
-    for image in images:
-        digest.update(f"{image.sha256}:{image.detail}:{image.grid.as_tuple()};".encode())
+    for key in image_digests(images):
+        digest.update(f"{key};".encode())
     return digest.hexdigest()
 
 

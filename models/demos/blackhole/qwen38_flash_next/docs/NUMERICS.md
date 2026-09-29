@@ -1034,6 +1034,37 @@ in every form, and the previous head's chat stream is the same stream token for 
 table's rows bit for bit, the feature buffer's text lanes hold -0.0 (the identity of the add) and the decode shift is
 zero.
 
+The lanes (`--lanes 4 --mtp 4`, one 1x4 p150 line, 32k, 2026-09-29): the four fixtures at once on four lanes, their
+same-length text prompts and a mixed wave of two text and two image requests reply byte for byte as the single stream
+(19 of 19 rows against the single-stream comparator; the lanes' startup replay 12 of 12).  An image admission is a text
+admission of the same length plus the tower: 0.732 against 0.711 s at 277 tokens (the 512 x 512 fixture), 0.787 against
+0.689 at 261 (the 384 x 640 fixture pads to the 1,024-row bucket), 1.873 against 1.616 at 1,045, 5.162 for demo.jpeg's
+2,773 tokens against 3.223 for a 2,321-token text prompt; the eviction and the import are unchanged.
+
+Prefix reuse for image prompts (2026-09-29): the committed prefix and the prompt-end snapshot are keyed on the images'
+pad spans with their digests beside the ids.  The second turn of an image conversation extends the committed state (24
+of 328 tokens prefilled, 0.41 s against 0.64 s for the whole prompt) and its reply is in the prompt-end snapshot's
+forced-tail class above -- the text path's second turn on the 177-token chat record (a 64-token first reply) parts from
+its fresh prefill the same way, from the first token, while a one-line first turn extended byte-equal -- and a prompt
+with another image of the same size (identical pad ids) resets.
+
+The MTP chunk extension's feature row (2026-09-29): the MTP layer's next-token embedding inside an image span is the
+tower's row (the zero sentinel plus the feature rows, as the backbone's chunk), not the pad's text embedding.  Image
+acceptance with the device tower (k = 4, 32 greedy tokens; passes / accepted drafts / tokens per pass), before and
+after:
+
+| fixture | image tokens | before | after |
+|---|---|---|---|
+| synthetic 512 x 512 | 256 (27 tokens, EOS) | 12 / 16 / 2.33 | 10 / 18 / 2.80 |
+| synthetic 384 x 640 | 240 | 14 / 19 / 2.36 | 14 / 19 / 2.36 |
+| synthetic 1024 x 1024 | 1,024 | 14 / 18 / 2.29 | 13 / 18 / 2.38 |
+| demo.jpeg 2048 x 1365 | 2,752 | 13 / 22 / 2.69 | 13 / 22 / 2.69 |
+| all four | | 53 passes / 75 accepted | 50 / 77 |
+| the chat control (97 text tokens) | | 35 / 62 / 2.77 | 35 / 62 / 2.77 |
+
+Every image pin (the divergence index and the stream sha) and the text control hold on both sides: the drafts change,
+the committed streams do not.  The text lanes' -0.0 rows are the add's identity, so text prompts are bitwise unchanged.
+
 ## The teacher-forced table
 
 `tools/ci/baselines/A3-forced-32k-divergence_index.json` pins the startup replay with the teacher-forced prefill

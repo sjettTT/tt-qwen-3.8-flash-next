@@ -381,7 +381,8 @@ def test_server_refuses_or_renders_with_the_grids_then_runs_the_tower_on_the_dev
     assert handler.index("self.server.vision_prompt_for(") < handler.index("completion = session.complete(")
     assert 'vision_inputs_kw = {"vision": vision_prompt}' in handler and "**vision_inputs_kw," in handler
     refusal = _server_function("vision_refusal")
-    assert "self.lanes is not None" in refusal and "--lanes" in refusal
+    # the lanes serve images since the follow-ups (the tower inside the lane admission): no lanes clause
+    assert "self.lanes" not in refusal and "--lanes" not in refusal
     assert "self.vision is None" in refusal and "self.vision.refusal_reason(grid.t * grid.h * grid.w)" in refusal
     prompt_for = _server_function("vision_prompt_for")
     assert "vision_inputs.pixel_patches(image)" in prompt_for

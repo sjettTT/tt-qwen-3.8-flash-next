@@ -22,9 +22,11 @@ clock is the decoding lanes' last pass, or the moment the first of them became a
 admissions counts them together): every other lane pauses at most the budget plus one segment instead of the whole
 admission, and the admitted request's first token waits one pass per interleaved pass.  The total device work is unchanged, so this
 moves latency, not throughput: ``stalled_seconds`` counts the admission segments a decoding lane waited for (never
-the passes it got), ``admission_seconds`` those segments, ``admission_wall_seconds`` the admission from its start to
-its end with the interleaved passes inside, ``interleaved_passes`` their count.  ``stall_budget_seconds`` None runs
-every admission whole (the first form of the mode).
+the passes it got), charged PER SEGMENT to the lanes active while it ran -- the admission's seconds are split over
+its yield-point intervals by their wall time, so a request that ends inside an interleaved pass carries the segments
+before its end and none after -- ``admission_seconds`` those segments, ``admission_wall_seconds`` the admission from
+its start to its end with the interleaved passes inside, ``interleaved_passes`` their count.  ``stall_budget_seconds``
+None runs every admission whole (the first form of the mode).
 
 A lane's request ends at a boundary; the lane is then free and the next admission overwrites every family of its
 state (readmission into any lane is exact: the stage-4 lifecycle gate), so an event that ends a request costs the
@@ -39,8 +41,9 @@ single stream's re-entry after its forced step does.
 Device protocol (every call from the driver thread):
 
 * ``admit(lane, ticket, between=None) -> Qwen38LaneAdmitted``: prefill the request's prompt on the single-lane
-  chain, evict its state into the lane's host slot, import it into ``lane`` (the lane's position and n-gram context
-  follow); ``between(segment, done, total) -> seconds`` is called between the admission's device segments and runs
+  chain (an image prompt's images through the resident tower first: the ``"tower"`` segment), evict its state into
+  the lane's host slot, import it into ``lane`` (the lane's position, rotary shift and n-gram context follow);
+  ``between(segment, done, total) -> seconds`` is called between the admission's device segments and runs
   the decoding lanes' pass when the stall budget says so (its segment records exclude the seconds it returns);
 * ``write_counts(counts)``: the per-lane accept counts the coming commit takes (-1 commits nothing);
 * ``override_commit(lane, record, committed_rows)``: lane ``lane`` commits ``committed_rows`` of the pass ``record``
@@ -133,6 +136,7 @@ class Qwen38LaneAdmitted:
     ple_context: tuple[int, int] | None
     seconds: dict[str, float]
     prefill: dict[str, Any] = field(default_factory=dict)  # the prefill's shape (chunks, slabs, forced tokens)
+    vision: dict[str, Any] | None = None  # an image prompt's record (the images, their tokens, the tower's time)
 
 
 @dataclass(frozen=True)
@@ -336,6 +340,11 @@ class Qwen38LaneTicket:
     think_budget: int | None
     submitted: float = field(default_factory=time.perf_counter)
     sampling: Any = None  # wave D: a sampled request's parameters; None = greedy (the only served form today)
+    # An image prompt: the decoded images in prompt order and the prompt's (t, h, w) rotary positions (the handler
+    # thread decodes and renders; the driver thread runs the tower inside the admission); the admission's record.
+    images: list = field(default_factory=list)
+    vision_positions: Any = None
+    vision: dict[str, Any] | None = None
     tokens: "queue.SimpleQueue[tuple[int | None, str | None]]" = field(default_factory=queue.SimpleQueue)
     done: threading.Event = field(default_factory=threading.Event)
     lane: int | None = None
@@ -523,33 +532,50 @@ class Qwen38LaneScheduler:
         ticket.lane = lane
         budget = self.stall_budget_seconds
         was_idle = self.active_count == 0
+        # The stall charge per segment: at every yield point (and at the end) the wall since the last mark and the
+        # decoding lanes that waited through it; the admission's device seconds are split over these intervals.
+        waited: list[tuple[float, tuple[Qwen38LaneTicket, ...]]] = []
+        mark = [started]  # the clock at the end of the last segment (a pass moves it: its seconds count for nobody)
+
+        def segment_done(now: float) -> None:
+            waited.append((now - mark[0], tuple(t for t in self.active if t is not None and t is not ticket)))
+            mark[0] = now
 
         def between(segment: str, done: int, total: int) -> float:
-            if budget is None or self.active_count == 0:
-                return 0.0
             now = self.clock()
-            if now - self.lanes_progressed_at < budget:
+            segment_done(now)
+            if budget is None or self.active_count == 0 or now - self.lanes_progressed_at < budget:
                 return 0.0
             self._pass(device, boundary)
             ticket.interleaved_passes += 1
             self.interleaved_passes += 1
-            return self.clock() - now
+            after = self.clock()
+            mark[0] = after
+            return after - now
 
         interleave = budget is not None and self.active_count > 0
         admitted = device.admit(lane, ticket, between=between if interleave else None)
         ticket.admitted_at = self.clock()
+        segment_done(ticket.admitted_at)
         ticket.admission_wall_seconds = ticket.admitted_at - started
         ticket.admission_segments = dict(admitted.seconds)
         ticket.admission_seconds = sum(float(value) for value in admitted.seconds.values())
         ticket.prefill = dict(admitted.prefill)
+        ticket.vision = admitted.vision
         ticket.position = admitted.position
         ticket.ple_context = admitted.ple_context
         self.admissions += 1
         self.last_progress = ticket.admitted_at
-        for other in self.active:
-            if other is not None and other is not ticket:
-                other.stalled_seconds += ticket.admission_seconds
-                self.stalled_seconds_total += ticket.admission_seconds
+        # The device's segment seconds (the passes excluded) over the yield-point intervals by wall share: each lane
+        # carries the intervals it was active for, so a lane whose request ended inside an interleaved pass is
+        # credited the segments it waited for and none after.
+        walls = [max(0.0, wall) for wall, _ in waited]
+        total_wall = sum(walls)
+        for wall, others in zip(walls, (lanes for _, lanes in waited)):
+            share = ticket.admission_seconds * (wall / total_wall if total_wall > 0 else 1.0 / len(waited))
+            for other in others:
+                other.stalled_seconds += share
+                self.stalled_seconds_total += share
         ticket.stream = Qwen38LaneStream(
             drafts=self.drafts,
             max_tokens=ticket.max_tokens,

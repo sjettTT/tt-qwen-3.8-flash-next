@@ -388,12 +388,19 @@ def test_lanes_request_path_calls_no_device_method_of_the_session() -> None:
         "template",
         "chain",
     }, session_attributes  # chain: the program-cache count for the ledger
+    # an image request rides on the ticket (the decoded images and the prompt's rotary positions): the driver thread
+    # runs the tower inside the admission; the reply carries the admission's vision record
+    serve_lanes_source = ast.unparse(serve_lanes)
+    assert "images=list(request.get('images') or ())" in serve_lanes_source
+    assert "vision_positions=request.get('vision_positions')" in serve_lanes_source
+    assert "{'vision': ticket.vision}" in serve_lanes_source
     source = SERVER_SOURCE.read_text(encoding="utf-8")
     main = source[source.index("def main() ->") :]
     for line in (
         "lanes_session.prepare(opened_chain)",
         "warm_hook=warm_hook,",
         "lanes_session.capture(chain, session)",
+        "lanes_session.tower = server.vision_prompt_for",  # the resident tower's request path, for the driver thread
         "if sum(growth.values()) > estimate:",  # the hard gate: measured growth against the estimate
         'target=_run_lanes_driver, args=(scheduler, lanes_session, server), name="lane-driver"',
         'report["acceptance_lanes"] = replay_acceptance_lanes(',
@@ -444,16 +451,26 @@ def test_scheduler_and_session_modules_split_the_device_from_the_rules() -> None
         'between("prefilled", len(ids), len(ids))',
         'between("evicted", len(ids), len(ids))',
         '"prefill": (prefilled - started) / 1e9 - spent,',
+        # an image prompt: the tower segment first, the vision inputs through the chunk driver, the shift at import
+        "vision, vision_record = self.tower(ids, ticket.vision_positions, ticket.images)",
+        'between("tower", len(ids), len(ids))',
+        "rope_shift = 0 if vision is None else min(vision.positions.shift_at(position), position & ~3)",
+        "rope_shift=rope_shift,",
+        'seconds = {"tower": tower_seconds, **seconds}',
+        "vision=vision_record,",
     ):
         assert call in session_source, call
     assert lanes_module.ADMISSION_EVENT_ROWS == 128 and lanes_module.ADMISSION_SEGMENTS == (
+        "tower",
         "chunks",
         "prefilled",
         "evicted",
     )
+    # the chunk driver takes the vision inputs as the single stream passes them (the positional ``vision``)
+    assert "                vision,\n                between_chunks=" in session_source
     # the scheduler's between: a pass once the admission work since the last pass reached the budget
     assert (
-        "if now - self.lanes_progressed_at < budget:" in scheduler_source
+        "if budget is None or self.active_count == 0 or now - self.lanes_progressed_at < budget:" in scheduler_source
         and "self._pass(device, boundary)" in scheduler_source
     )
     # the import warm-up covers every residue variant for every lane before the captures

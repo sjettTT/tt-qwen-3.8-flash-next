@@ -2602,6 +2602,17 @@ class Qwen38TTNNTextModel:
             raise
         return Qwen38TTNNRoPEInputs(None, *owned)
 
+    def host_chunk_feature_rows(self, feature_image):
+        """The host tensor of a chunk's feature rows (``vision_splice.feature_rows_image``: ``[1,1,rows,2560]`` BF16),
+        hidden-sharded for the copy into a chunk's persistent feature rows (the backbone's or the MTP extension's)."""
+
+        return ttnn.from_torch(
+            feature_image,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.TILE_LAYOUT,
+            mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3)),
+        )
+
     def _clean_feature_rows_host(self, rows: int):
         """The host tensor of a chunk's clean feature rows (every element -0.0), hidden-sharded like the upload."""
 
@@ -2900,14 +2911,7 @@ class Qwen38TTNNTextModel:
             plain = torch.arange(start_position, start_position + chunk_state.rows, dtype=torch.int64)
             positions = plain.reshape(1, -1).expand(3, -1)
         rope_rows = self.chunk_rope_host_rows(chunk_state, positions)
-        feature_rows = None
-        if feature_image is not None:
-            feature_rows = ttnn.from_torch(
-                feature_image,
-                dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT,
-                mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, mesh_shape=MESH_SHAPE, dims=(None, 3)),
-            )
+        feature_rows = None if feature_image is None else self.host_chunk_feature_rows(feature_image)
         return Qwen38TTNNChunkHostInputs(token_rows, embedding_rows, contexts, rope_rows, feature_rows, len(lanes))
 
     def upload_chunk_inputs(
@@ -2930,12 +2934,18 @@ class Qwen38TTNNTextModel:
         rope = chunk_state.rope_rows
         for host, target in zip(prepared.rope_rows, (rope.cos, rope.sin, rope.block_start_cos, rope.block_start_sin)):
             ttnn.copy_host_to_device_tensor(host, target)
-        features = chunk_state.feature_rows
-        if prepared.feature_rows is not None:
-            ttnn.copy_host_to_device_tensor(prepared.feature_rows, features.tensor)
+        self.write_chunk_feature_rows(chunk_state.feature_rows, prepared.feature_rows)
+
+    def write_chunk_feature_rows(self, features: Qwen38TTNNChunkFeatureRows, host_rows) -> None:
+        """The copy into a chunk's persistent feature rows: ``host_rows`` (an image chunk's, ``host_chunk_feature_rows``)
+        when given, else the clean image when the buffer still holds an earlier chunk's rows (a text chunk after a
+        text chunk copies nothing)."""
+
+        if host_rows is not None:
+            ttnn.copy_host_to_device_tensor(host_rows, features.tensor)
             features.clean = False
         elif not features.clean:
-            ttnn.copy_host_to_device_tensor(self._clean_feature_rows_host(chunk_state.rows), features.tensor)
+            ttnn.copy_host_to_device_tensor(self._clean_feature_rows_host(features.rows), features.tensor)
             features.clean = True
 
     def write_chunk_inputs(

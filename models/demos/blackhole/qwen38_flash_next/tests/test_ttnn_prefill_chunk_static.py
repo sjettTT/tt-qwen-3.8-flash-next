@@ -156,14 +156,21 @@ def test_model_chunk_state_is_allocated_before_capture_with_host_written_inputs(
     assert "self.model_io.embedding.host_token_rows(token_ids)" in prepare
     # the token rows (the zero sentinel at image lanes), the PLE rows (raw ids) and the feature rows of an image chunk;
     # the four RoPE rows come from chunk_rope_host_rows
-    assert "ple.host_rows(token_ids, ple_context)" in prepare and prepare.count("ttnn.from_torch(") == 3
+    # the token rows and the PLE rows here; the feature rows through the shared host helper (the MTP extension's too)
+    assert "ple.host_rows(token_ids, ple_context)" in prepare and prepare.count("ttnn.from_torch(") == 2
+    assert "self.host_chunk_feature_rows(feature_image)" in prepare
     assert "vision_splice.sentinel_token_rows(self.model_io.embedding.host_token_rows(token_ids), lanes)" in prepare
     assert "self.chunk_rope_host_rows(chunk_state, positions)" in prepare
     upload = inspect.getsource(Qwen38TTNNTextModel.upload_chunk_inputs)
-    assert upload.count("ttnn.copy_host_to_device_tensor(") == 5
+    # the token rows, the PLE rows, the RoPE rows; the feature rows through the shared helper (an image chunk's rows,
+    # or the clean image after one: the MTP chunk extension writes its own the same way)
+    assert upload.count("ttnn.copy_host_to_device_tensor(") == 3
+    assert "self.write_chunk_feature_rows(chunk_state.feature_rows, prepared.feature_rows)" in upload
+    feature_write = inspect.getsource(Qwen38TTNNTextModel.write_chunk_feature_rows)
+    assert feature_write.count("ttnn.copy_host_to_device_tensor(") == 2 and "features.clean = True" in feature_write
     assert "chunk_state.token_row)" in upload and "chunk_state.ple_rows.embedding_rows)" in upload
     assert "(rope.cos, rope.sin, rope.block_start_cos, rope.block_start_sin)" in upload
-    assert "features.clean = False" in upload and "features.clean = True" in upload
+    assert "features.clean = False" in feature_write and "features.clean = True" in feature_write
     inputs = inspect.getsource(Qwen38TTNNTextModel.write_chunk_inputs)
     assert inputs.index("self.prepare_chunk_inputs(") < inputs.index("self.upload_chunk_inputs(chunk_state, prepared)")
     reset = inspect.getsource(Qwen38TTNNTextModel.reset_chunk_state_inplace)

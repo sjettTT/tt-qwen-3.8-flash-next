@@ -89,7 +89,10 @@ with the seconds since its last completed step.
 ## Requests
 
 `POST /v1/chat/completions` (streaming or one document), `GET /v1/models`, `GET /health` (context limit, sampling
-mode, free DRAM after the captures, the runtime identity).  Requests: `messages`, `max_tokens` or
+mode, free DRAM after the captures, the runtime identity).  `GET /v1/models` lists the one model and
+`GET /v1/models/<id>` returns its object (OpenAI clients read `context_length` there; another id is 404
+`model_not_found`).  The server log's `http` event of a refused request carries the response's error body (`message`,
+`code`, `param`) beside the status.  Requests: `messages`, `max_tokens` or
 `max_completion_tokens` (default and limit: the remaining context, the context limit less the prompt), `stream`,
 `stop`, `tools` / `tool_choice` (OpenAI shape; `tool_calls` finish reason), `enable_thinking` (default true;
 reasoning streams as `reasoning_content`), `reasoning_effort`, `thinking_budget`, `ignore_eos`, `seed`,
@@ -132,16 +135,18 @@ carry `resident`, `buckets` and `resident_bytes_per_bank`, and on a shortfall `s
 `shortfall_bytes_per_bank`; READY also carries the admission's numbers and the per-bucket prewarm seconds.  A shortfall
 starts the server text-only: image parts then get HTTP 400 `vision_unavailable` ("the vision tower is not resident in
 this process" with the shortfall's reason); an image above the largest bucket gets the same code ("an image of N patches
-exceeds the largest row bucket 65536 ..."), and so do image parts under `--lanes` ("image parts are not served under
---lanes in this landing"; the single-stream server serves them).  Every start pays the prewarm (MEASURED 2026-09-29:
+exceeds the largest row bucket 65536 ...").  The lanes serve image parts as the single stream does (below).  Every
+start pays the prewarm (MEASURED 2026-09-29:
 42-44 s with the tower's programs in the host's kernel cache; 103-125 s on a host's first start, when they compile), and
 the text path is unchanged: with the tower resident the acceptance replay reproduces every pinned record.
 
-State reuse.  A request with images is prefilled from position 0 through the chunk trace and leaves no prompt-end
-snapshot; a later request never reuses a committed image prompt's state, and a text request never extends one: the
-committed ids alone do not identify the pixels (two images of one size render identical ids).  Reuse across turns of an
-image conversation keyed on the images' digest is a follow-up item; until it lands, every image request pays its full
-prefill.
+State reuse.  The committed prefix and the prompt-end snapshot are keyed on the ids and on the images' pad spans with
+their digests (the bytes' digest, the detail and the grid of each image): a follow-up turn on the same image prefills
+only the new turn (`qwen38.prefix_reused` and `prefix_restored` as for text; 24 of 328 tokens on the gate of
+2026-09-29), a prompt with another image of the same size -- identical pad ids -- resets, and a text request never
+extends into an image it does not carry.  The extension's forced tokens never hold an image pad (such a prompt resets
+and prefills whole).  The second turn's reply is in the same class as a text conversation's (`docs/NUMERICS.md`, the
+prompt-end snapshot: an extension after a decoded reply agrees with a fresh prefill to rounding).
 
 Positions.  Image tokens take the model's three-axis rotary positions (the reference's `get_rope_index`: text advances
 all axes together, an image's tokens sit on their (t, h, w) grid from the position the image starts at, the next text
@@ -182,10 +187,11 @@ the whole admission (1.05-1.11 s for a 560-token prompt, 5.5 s for the 4,000-tok
 within noise across the settings.  `off` is for an operator who wants the burst aggregate and accepts multi-second
 freezes of the other streams.  One admission per boundary while any lane decodes; while none does the waiting requests are
 admitted back to back, the first whole and the next ones interleaved with the first one's passes.  Every request's
-response carries the record: `qwen38.lanes` (`lane`, `admission_seconds` = the admission's segments with its `prefill`
-/ `evict` / `import` parts, `admission_wall_seconds` = the admission with the interleaved passes inside,
-`interleaved_passes`, `stalled_seconds` = the other requests' admission segments while this one decoded (never the
-passes it got), `passes`, `committed_tokens`, `finish_detail`, `forced_think_ends`) beside the usual `qwen38` fields;
+response carries the record: `qwen38.lanes` (`lane`, `admission_seconds` = the admission's segments with its `tower`
+(an image prompt) / `prefill` / `evict` / `import` parts, `admission_wall_seconds` = the admission with the interleaved
+passes inside, `interleaved_passes`, `stalled_seconds` = the other requests' admission segments this one waited for,
+charged per segment (a request that ends inside an interleaved pass carries the segments before it; never the passes it
+got), `passes`, `committed_tokens`, `finish_detail`, `forced_think_ends`) beside the usual `qwen38` fields;
 `/health.lanes` has the live counts (active, free, waiting, passes, admissions, interleaved passes, the stall total, the
 budget) and `READY.lanes` the geometry, the DRAM admission and growth, the budget and the startup gate.  A request ends at a pass boundary
 (EOS, a stop string, `max_tokens`, the deadline, a hang-up) and frees its lane -- these are exact: the answer equals
@@ -203,7 +209,13 @@ emitted token): the reasoning and `</think>` equal on 6 of 6, the answers byte-i
 request twice on the lanes is byte-identical (8 of 8 repeats, the lanes' own determinism gate).  No prompt-prefix reuse
 in this wave: every request prefills from position 0, so `qwen38.snapshot_schedule` is `chunked` (the admission's own
 schedule: a prefill of exactly the prompt's ids from position 0) and `qwen38.snapshot_captured` is false (a lane leaves
-no prompt-end snapshot; the single stream's restore does not exist here).
+no prompt-end snapshot; the single stream's restore does not exist here).  Image parts are served on the lanes as on
+the single stream (2026-09-29): the tower runs inside the lane admission as its first segment
+(`qwen38.lanes.admission.tower`; the decoding lanes' pass may run between it and the chunks), the prompt prefills
+through the chunk driver with its positions and feature rows, and the lane takes the prompt's rotary shift; a lane's
+image stream is the single stream's byte for byte (the four fixtures at once on four lanes and a mixed text + image
+wave, 19 of 19 rows, `docs/NUMERICS.md`), and an image admission costs a text admission of the same length plus the
+tower (0.05 s at 1,024 patches, 0.2 s at 4,096, 1.15 s at 11,008).
 
 At start a `--lanes` server allocates the lane states before any capture (the lanes' DRAM admission on the live
 allocator, refused with the shortfall named; `lanes_capacity_admission`), captures its three lane traces after the

@@ -65,9 +65,10 @@ WARM_TOKEN_ID = 1  # any exact vocabulary id for the warm passes' rows
 # The admission prefill's event cadence in prompt rows: one event (and one ``between`` call, the scheduler's yield
 # point) per 128-row chunk, or per four 32-row chunks, so the decoding lanes' passes can run between chunk groups.
 ADMISSION_EVENT_ROWS = LONG_CHUNK_ROWS
-# The admission's segments as ``between`` names them: the chunk groups of the prefill, the forced last step and the
-# row read, the eviction into the host slot; the import into the lane ends the admission.
-ADMISSION_SEGMENTS = ("chunks", "prefilled", "evicted")
+# The admission's segments as ``between`` names them: an image prompt's images through the tower, the chunk groups
+# of the prefill, the forced last step and the row read, the eviction into the host slot; the import into the lane
+# ends the admission.
+ADMISSION_SEGMENTS = ("tower", "chunks", "prefilled", "evicted")
 
 
 class Qwen38LanesSessionError(RuntimeError):
@@ -93,6 +94,10 @@ class Qwen38LanesSession:
     marker: Callable[[str], Any]
     admission: dict[str, Any] = field(default_factory=dict)  # lanes_capacity_admission's record (the server fills it)
     clock_ns: Callable[[], int] = time.perf_counter_ns
+    # The resident tower's request path (the server's ``vision_prompt_for``: prompt ids, rotary positions, decoded
+    # images -> the splice's prompt object and the request's record), set once the tower is resident; None on a
+    # text-only process, where an image ticket never reaches the driver (the handler refuses it).
+    tower: Callable[..., tuple[Any, dict[str, Any]]] | None = None
     rows: int = field(init=False)
     chain: Any = None
     session: Any = None
@@ -340,14 +345,17 @@ class Qwen38LanesSession:
         """The request's prompt prefilled on the traced chain (the session's own prefill section: the reset, the
         chunked prefill of all but the last token when the prompt admits it, the last token forced, the model's next
         token read from the row), the generic and alignment states evicted into the host slots, the image imported
-        into ``lane``.
+        into ``lane``.  An image prompt (``ticket.images``) runs its images through the resident tower first (the
+        ``"tower"`` segment) and prefills through the chunk driver with its rotary positions and feature rows, as
+        the single stream does; the lane takes the prompt's rotary shift at the import (the decode shift the
+        single stream sets at its hand-off), 0 for text.
 
-        ``between`` is the scheduler's yield point between the admission's device segments: called after every
-        128 prompt rows of the chunked prefill (``"chunks"``, with the rows consumed and the rows of the prefill),
-        after the forced last step and its row read (``"prefilled"``) and after the eviction (``"evicted"``), each
-        time with the device idle and every chunk input for the next segment prepared but not uploaded; it returns
-        the seconds it spent (the decoding lanes' passes), which the segment records below exclude.  None: the
-        admission runs whole (the single-stream event cadence)."""
+        ``between`` is the scheduler's yield point between the admission's device segments: called after the
+        tower (``"tower"``), after every 128 prompt rows of the chunked prefill (``"chunks"``, with the rows consumed
+        and the rows of the prefill), after the forced last step and its row read (``"prefilled"``) and after the
+        eviction (``"evicted"``), each time with the device idle and every chunk input for the next segment prepared
+        but not uploaded; it returns the seconds it spent (the decoding lanes' passes), which the segment records
+        below exclude.  None: the admission runs whole (the single-stream event cadence)."""
 
         session, chain, model = self.session, self.chain, self.model
         if session is None or self.lane_chain is None:
@@ -361,15 +369,32 @@ class Qwen38LanesSession:
             nonlocal spent
             spent += float(between("chunks", done, total))
 
+        vision = vision_record = None
+        tower_seconds = 0.0
+        if ticket.images:
+            # The tower on this (device) thread, before the prefill: the feature rows and the splice's prompt object
+            # (validated against the prompt); a text-only process never sees an image ticket.
+            if self.tower is None:
+                raise Qwen38LanesSessionError("an image prompt reached the lanes without a resident tower")
+            tower_started = self.clock_ns()
+            vision, vision_record = self.tower(ids, ticket.vision_positions, ticket.images)
+            tower_seconds = (self.clock_ns() - tower_started) / 1e9
+            if between is not None:
+                between("tower", len(ids), len(ids))
         started = self.clock_ns()
         session.reset()
         suffix = list(ids)
         chunked = None
+        if vision is not None and (
+            session.prefill_mode != "chunked" or session.chunk_prefill_rows(len(suffix) - 1) < CHUNK_PREFILL_MIN_ROWS
+        ):
+            raise Qwen38LanesSessionError("an image prompt needs the chunked prefill (its pads never take 1-row steps)")
         if session.prefill_mode == "chunked" and session.chunk_prefill_rows(len(suffix) - 1) >= CHUNK_PREFILL_MIN_ROWS:
             chunked = session._prefill_chunked(
                 suffix[:-1],
                 suffix[-1],
                 None,
+                vision,
                 between_chunks=None if between is None else between_chunks,
                 event_rows=None if between is None else ADMISSION_EVENT_ROWS,
             )
@@ -396,6 +421,9 @@ class Qwen38LanesSession:
             between("evicted", len(ids), len(ids))
         import_started = self.clock_ns()
         gdn_layers = sum(1 for layer in model.layers if isinstance(layer.attention, gdn_module.Qwen38TTNNGDN))
+        # The lane's rotary shift: the prompt's (the chunk driver's hand-off set the same on the traced chain; the
+        # prompt ends in text after its last image, so the shift is within the position's block start), 0 for text.
+        rope_shift = 0 if vision is None else min(vision.positions.shift_at(position), position & ~3)
         mtp_lanes.import_lane_state(
             model,
             self.verify,
@@ -407,19 +435,24 @@ class Qwen38LanesSession:
             backbone_pager=self.backbone_pager,
             alignment_slot=self.alignment_pool.slots[0],
             alignment_pager=self.alignment_pager,
+            rope_shift=rope_shift,
         )
         ttnn.synchronize_device(self.mesh)
         imported = self.clock_ns()
         timing = None if chunked is None else chunked.timing
+        seconds = {
+            "prefill": (prefilled - started) / 1e9 - spent,
+            "evict": (evicted - evict_started) / 1e9,
+            "import": (imported - import_started) / 1e9,
+        }
+        if vision is not None:
+            seconds = {"tower": tower_seconds, **seconds}
         return Qwen38LaneAdmitted(
             pending=pending,
             position=position,
             ple_context=ple_context,
-            seconds={
-                "prefill": (prefilled - started) / 1e9 - spent,
-                "evict": (evicted - evict_started) / 1e9,
-                "import": (imported - import_started) / 1e9,
-            },
+            seconds=seconds,
+            vision=vision_record,
             prefill={
                 "mode": "teacher_forced" if chunked is None else "chunked",
                 "tokens": len(ids),

@@ -4,6 +4,7 @@
 (``smart_resize``, grids, the ``detail`` cap), decoding and digests.  No device, no checkpoint."""
 
 import base64
+import hashlib
 import io
 
 import pytest
@@ -179,3 +180,20 @@ def test_render_prompt_expands_the_pads_by_the_grids():
         tokenizer, _user({"type": "text", "text": "Hi"}), None, enable_thinking=False, reasoning_effort="medium"
     )
     assert IMAGE_TOKEN_ID not in text_only
+
+
+def test_image_digests_key_each_image_and_the_request_digest_is_their_hash() -> None:
+    from types import SimpleNamespace
+
+    grid = Qwen38ImageGrid(1, 32, 32)
+    a = SimpleNamespace(sha256="aa", detail="auto", grid=grid)
+    b = SimpleNamespace(sha256="bb", detail="low", grid=grid)
+    keys = inputs.image_digests([a, b])
+    assert keys == ("aa:auto:(1, 32, 32)", "bb:low:(1, 32, 32)")
+    assert inputs.request_digest([a, b]) == hashlib.sha256("".join(f"{k};" for k in keys).encode()).hexdigest()
+    # two images of one grid render identical pad ids: the bytes' digest in the key is what tells them apart
+    other = SimpleNamespace(sha256="cc", detail="auto", grid=grid)
+    assert (
+        inputs.image_digests([a]) != inputs.image_digests([other])
+        and inputs.request_digest([]) == hashlib.sha256().hexdigest()
+    )

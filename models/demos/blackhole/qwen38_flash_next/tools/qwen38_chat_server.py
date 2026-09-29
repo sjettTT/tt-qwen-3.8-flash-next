@@ -7,7 +7,7 @@
 ``reasoning_content``, stop strings, a per-request thinking budget; with
 ``--sampling`` also sampling with the OpenAI fields plus ``top_k``, ``min_p``,
 ``repetition_penalty`` and ``greedy``, ``seed`` echoed, ``logprobs`` from the
-candidate row), ``GET /v1/models``, ``GET /health``.  On a sampling server a
+candidate row), ``GET /v1/models`` and ``GET /v1/models/<id>``, ``GET /health``.  On a sampling server a
 request naming no sampling field, ``temperature 0`` or ``greedy`` is the bitwise
 greedy loop (the argmax the TAIL resolves; the candidate row is never read); a
 request with ``temperature > 0`` samples with it and one naming another sampling
@@ -50,7 +50,7 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import ttnn
 from models.demos.blackhole.qwen38_flash_next.chat import (
@@ -87,6 +87,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import 
 from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_rows_scan as gdn_rows_scan_module
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
+    CHUNK_PREFILL_MIN_ROWS,
     DEFAULT_PREFILL_MODE,
     LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES,
     MAX_TOKENS_BOUND,
@@ -653,12 +654,10 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
         self.fatal: BaseException | None = None
 
     def vision_refusal(self, images: Sequence[Any]) -> str | None:
-        """Why an image request cannot be served now (None = it can): the lanes server (the lane admission's prefill
-        has no image form in this landing), a process whose tower is not resident (the admission's shortfall), or an
-        image above the largest prewarmed row bucket.  The HTTP 400 text."""
+        """Why an image request cannot be served now (None = it can): a process whose tower is not resident (the
+        admission's shortfall), or an image above the largest prewarmed row bucket.  The HTTP 400 text.  The lanes
+        server serves images like the single stream (the tower runs inside the lane admission)."""
 
-        if self.lanes is not None:
-            return "image parts are not served under --lanes in this landing (the single-stream server serves them)"
         if self.vision is None:
             return "the vision tower is not resident in this process"
         for image in images:
@@ -701,7 +700,10 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
                 }
             )
         prompt = vision_splice.Qwen38VisionPrompt(
-            positions, torch.cat(rows), digest=vision_inputs.request_digest(images)
+            positions,
+            torch.cat(rows),
+            digest=vision_inputs.request_digest(images),
+            image_digests=vision_inputs.image_digests(images),
         )
         prompt.validate_prompt(prompt_ids)
         record = {
@@ -853,10 +855,15 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
         # Every read and write on the connection is bounded (StreamRequestHandler applies ``timeout`` to the socket):
         # a reader that stopped draining raises TimeoutError, an OSError, and the request ends as "disconnected".
         self.timeout = self.server.socket_timeout_seconds
+        self.error_body: dict[str, Any] | None = None  # the error document this connection answered, for the http event
         super().setup()
 
     def log_message(self, format: str, *args: Any) -> None:
-        _log("http", client=self.address_string(), line=format % args)
+        # The stdlib's request line and status; a refusal's body (its message, code and param) beside them, so the
+        # log says WHY a 400 or 503 was answered, not only that it was (an operator reading a client's failure
+        # otherwise has the status alone: the client keeps the body).
+        fields = {} if self.error_body is None else {"error": self.error_body}
+        _log("http", client=self.address_string(), line=format % args, **fields)
 
     def _peer_closed(self) -> bool:
         """The client hung up: its socket is readable with nothing left to read (FIN) or reset.  A client that sent
@@ -905,35 +912,45 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
     def _send_error_json(
         self, status: int, message: str, kind: str, *, code: str | None = None, param: str | None = None, **headers: str
     ) -> None:
-        self._send_json(
-            status, {"error": {"message": message, "type": kind, "param": param, "code": code or kind}}, **headers
-        )
+        self.error_body = {"message": message, "type": kind, "param": param, "code": code or kind}
+        self._send_json(status, {"error": self.error_body}, **headers)
+
+    def _model_document(self, session: Qwen38ChatSession) -> dict[str, Any]:
+        """The model object of ``/v1/models`` (its one entry) and of ``/v1/models/<id>``: OpenAI clients read the
+        context length from the object by id, so both routes serve the same document."""
+
+        return {
+            "id": MODEL_ID,
+            "object": "model",
+            "created": self.server.created,
+            "owned_by": "tenstorrent",
+            "context_length": session.context_limit,
+            "max_model_len": session.context_limit,
+            "limits": {
+                **MAX_TOKENS_RULE,
+                "thinking_token_caps": protocol.THINKING_TOKEN_CAPS,
+                "answer_reserve_tokens": protocol.ANSWER_RESERVE_TOKENS,
+            },
+        }
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         session = self.server.session
         if path == "/v1/models":
-            self._send_json(
-                200,
-                {
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": MODEL_ID,
-                            "object": "model",
-                            "created": self.server.created,
-                            "owned_by": "tenstorrent",
-                            "context_length": session.context_limit,
-                            "max_model_len": session.context_limit,
-                            "limits": {
-                                **MAX_TOKENS_RULE,
-                                "thinking_token_caps": protocol.THINKING_TOKEN_CAPS,
-                                "answer_reserve_tokens": protocol.ANSWER_RESERVE_TOKENS,
-                            },
-                        }
-                    ],
-                },
-            )
+            self._send_json(200, {"object": "list", "data": [self._model_document(session)]})
+        elif path.startswith("/v1/models/"):
+            # The model by id (the id's slash literal or percent-encoded); another id is 404 in the OpenAI shape.
+            wanted = unquote(path[len("/v1/models/") :])
+            if wanted == MODEL_ID:
+                self._send_json(200, self._model_document(session))
+            else:
+                self._send_error_json(
+                    404,
+                    f"no such model: {wanted!r} (this server serves {MODEL_ID})",
+                    "invalid_request_error",
+                    code="model_not_found",
+                    param="model",
+                )
         elif path == "/health":
             self._send_json(
                 200,
@@ -1053,6 +1070,23 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 request["vision_positions"] = mrope.mrope_positions(
                     prompt_ids, [image.grid for image in request["images"]]
                 )
+                # What the device section requires of an image prompt, checked here so a shape it cannot take is a
+                # 400 and never a device-thread failure: the chunked prefill (image pads never take 1-row steps), a
+                # prompt long enough for the chunk trace from position 0, a text tail after the last image.
+                if session.prefill_mode != "chunked":
+                    raise Qwen38ChatRequestRejected(
+                        "image prompts need the chunked prefill mode (their pads never take 1-row steps)",
+                        param="messages",
+                        code="vision_unavailable",
+                    )
+                if len(prompt_ids) - 1 < CHUNK_PREFILL_MIN_ROWS:
+                    raise Qwen38ChatRequestRejected("image prompt too short for the chunked prefill", param="messages")
+                if not request["vision_positions"].tail_is_plain(len(prompt_ids)):
+                    raise Qwen38ChatRequestRejected(
+                        "an image ends within the last index block of the prompt: the prompt must end with text "
+                        "after its last image (the chat template's assistant header does)",
+                        param="messages",
+                    )
             else:
                 prompt_ids = session.render(
                     request["messages"],
@@ -1427,6 +1461,10 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             max_tokens=request["max_tokens"],
             stop_ids=() if request["ignore_eos"] else tuple(EOS_TOKEN_IDS),
             think_budget=request["think_budget"],
+            # An image prompt's decoded images and rotary positions: the driver thread runs the tower inside the
+            # admission (the "tower" segment) and prefills with the feature rows; the lane takes the prompt's shift.
+            images=list(request.get("images") or ()),
+            vision_positions=request.get("vision_positions"),
         )
         try:
             scheduler.submit(ticket)
@@ -1585,6 +1623,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 "passes": ticket.passes,
                 "tokens_per_pass": None if not ticket.passes else round(ticket.committed / ticket.passes, 3),
             },
+            **({} if ticket.vision is None else {"vision": ticket.vision}),
             "lanes": {
                 "lane": ticket.lane,
                 "admission_seconds": round(ticket.admission_seconds, 4),
@@ -2767,6 +2806,9 @@ def main() -> int:
         session = Qwen38ChatSession(chain, template, prefill_mode=args.prefill_mode)
         if server is not None:
             server.vision = vision_state["residency"]
+            if lanes_session is not None:
+                # the driver thread runs the resident tower inside an image admission (the lanes session's "tower" segment)
+                lanes_session.tower = server.vision_prompt_for
         if os.environ.get(DEVICE_ACCEPT_DUMP_VARIABLE):
             session.device_accept_dump = Path(os.environ[DEVICE_ACCEPT_DUMP_VARIABLE])
             session.device_accept_dump.mkdir(parents=True, exist_ok=True)

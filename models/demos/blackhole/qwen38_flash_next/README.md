@@ -162,13 +162,14 @@ The command-line client:
 
     python_env/bin/python -m models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_cli --url http://<host>:8000/v1 --thinking --tools
 
-`POST /v1/chat/completions` (streaming or one document), `GET /v1/models`, `GET /health`.  The request rules in short
+`POST /v1/chat/completions` (streaming or one document), `GET /v1/models` and `GET /v1/models/<id>`, `GET /health`.  The request rules in short
 (`docs/SERVER.md` has them in full):
 
 | request | rule |
 |---|---|
 | `messages` | the prompt, exactly: the server adds no system prompt, and the device prompt is the reference render (`tokenizer.apply_chat_template`), so `usage.prompt_tokens` is the count the client computes itself |
-| `messages` content parts | `text` and `image_url` (`data:` URLs only; `detail` low / auto / high; 64 .. 16,384 image tokens per image, counted in `usage.prompt_tokens`); video parts get HTTP 400; on a server whose tower is not resident, or under `--lanes`, image parts get HTTP 400 `vision_unavailable` naming the reason (`docs/SERVER.md`) |
+| `messages` content parts | `text` and `image_url` (`data:` URLs only; `detail` low / auto / high; 64 .. 16,384 image tokens per image, counted in `usage.prompt_tokens`; also under `--lanes`); video parts get HTTP 400; on a server whose tower is not resident, image parts get HTTP 400 `vision_unavailable` naming the reason (`docs/SERVER.md`) |
+| `GET /v1/models/<id>` | the model object (`context_length`, `max_model_len`, the limits), the same document as the list's entry; another id is 404 `model_not_found` |
 | `max_tokens` / `max_completion_tokens` | default and limit: the remaining context (the context limit less the prompt); a prompt over the limit gets HTTP 400 `context_length_exceeded` |
 | `stream`, `stop`, `ignore_eos`, `seed`, `logprobs` | as in OpenAI; `logprobs` are relative to the read candidate row, not the vocabulary |
 | `tools` / `tool_choice` | OpenAI shape, `tool_calls` finish reason; arguments are typed by the tool's parameter schema |
@@ -253,7 +254,7 @@ Run the tests from the repository root (`docs/TESTING.md` has the regression har
 - One request decodes at a time by default (the traced chain is single-stream); the queue holds four more.  `--lanes B`
   (2..8, needs `--mtp`, greedy only) serves B at once through the MTP lane chain; an admission's prefill runs in segments
   between the other lanes' passes under `--lanes-stall-budget` (`docs/SERVER.md`).
-- Images: `image_url` parts of at most 16,384 image tokens each (the stock 4096 x 4096 px maximum); refused under `--lanes`; every
+- Images: `image_url` parts of at most 16,384 image tokens each (the stock 4096 x 4096 px maximum); served under `--lanes` too (2026-09-29, byte-identical to the single stream); every
   start runs the tower's eight row buckets once (about 44 s of READY, about 100 s more on a host whose kernel cache has none of the
   tower's programs); a DRAM shortfall starts the server text-only and says so in READY and `/health` (`docs/SERVER.md`).
 - The first start is long (the 69 GB expert conversion); a host that kills long jobs needs `--prepare-only

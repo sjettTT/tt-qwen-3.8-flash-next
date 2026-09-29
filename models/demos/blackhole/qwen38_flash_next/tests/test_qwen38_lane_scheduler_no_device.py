@@ -158,12 +158,18 @@ class FakeLanesDevice:
         self.sequence[lane] = list(ticket.prompt_ids)
         self.last_rows[lane] = None
         self.positions[lane] = len(ticket.prompt_ids)
+        seconds = {"prefill": self.admit_seconds, "evict": 0.0, "import": 0.0}
+        vision = None
+        if ticket.images:  # an image prompt: the tower segment before the prefill, the request's record
+            seconds = {"tower": 0.05 * len(ticket.images), **seconds}
+            vision = {"images": len(ticket.images), "positions": ticket.vision_positions}
         return Qwen38LaneAdmitted(
             pending=next_token(self.sequence[lane]),
             position=len(ticket.prompt_ids),
             ple_context=(1, 2),
-            seconds={"prefill": self.admit_seconds, "evict": 0.0, "import": 0.0},
+            seconds=seconds,
             prefill={"mode": "chunked"},
+            vision=vision,
         )
 
     def write_counts(self, counts):
@@ -572,8 +578,10 @@ def test_admissions_interleave_the_decoding_lanes_passes_under_the_budget(stall_
         assert second.admission_wall_seconds >= second.admission_seconds
     for ticket in tickets:
         assert ticket.admission_seconds == pytest.approx(1.2)
-    # the decoding lane's stall is the admission segments only (1.2 s per admission it lived through)
-    assert first.stalled_seconds == pytest.approx(1.2) or first.stalled_seconds == pytest.approx(2.4)
+    # the decoding lane's stall is the admission segments only, charged per segment (0.4 s each): the whole 1.2 s of
+    # the second admission it lived through, plus whichever segments of the third it was still active for
+    assert 1.2 - 1e-9 <= first.stalled_seconds <= 2.4 + 1e-9
+    assert first.stalled_seconds == pytest.approx(0.4 * round(first.stalled_seconds / 0.4))
     assert scheduler.stalled_seconds_total == pytest.approx(sum(t.stalled_seconds for t in tickets))
     assert scheduler.status()["stall_budget_seconds"] == stall_budget_seconds
     assert scheduler.status()["interleaved_passes"] == scheduler.interleaved_passes
@@ -597,6 +605,52 @@ def test_the_budget_counts_admission_work_since_the_decoding_lanes_last_pass() -
     # no clock time, so the fourth admission's segments reach 0.2 only
     assert [t.interleaved_passes for t in tickets] == [0, 0, 1, 0]
     assert scheduler.interleaved_passes == 1
+
+
+def test_a_lane_ending_inside_an_interleaved_pass_is_charged_the_segments_it_waited_for() -> None:
+    """The stall charge is per segment: a decoding lane whose request ends in the pass run between two segments of
+    another request's admission carries the segments before that pass and none after (the whole-admission charge at
+    the end credited it nothing, an under-count of one admission's segments on that request's record)."""
+
+    clock = FakeClock()
+    device = FakeLanesDevice(2, admit_seconds=1.2, segments=3, clock=clock)
+    # alpha's stream start delivers the row's token; its first pass runs inside beta's admission (budget 0: a pass
+    # at every yield point) and ends it at max_tokens 2, so alpha waited for beta's first segment only
+    alpha = _ticket("alpha", PROMPTS["alpha"], max_tokens=2, stop_ids=())
+    beta = _ticket("beta", PROMPTS["beta"], max_tokens=12, stop_ids=())
+    scheduler = _run(device, [alpha, beta], lanes=2, stall_budget_seconds=0.0, clock=clock)
+    for ticket in (alpha, beta):
+        expected, finish = reference_stream(
+            ticket.prompt_ids, max_tokens=ticket.max_tokens, stop_ids=(), think_budget=None
+        )
+        assert _delivered(ticket) == expected and ticket.finish == finish
+    assert alpha.finish == "length" and alpha.passes == 1 and beta.interleaved_passes >= 1
+    assert alpha.stalled_seconds == pytest.approx(0.4)  # one of beta's three 0.4 s segments
+    assert beta.stalled_seconds == 0.0 and beta.admission_seconds == pytest.approx(1.2)
+    assert scheduler.stalled_seconds_total == pytest.approx(0.4)
+
+
+def test_an_image_ticket_carries_its_images_to_the_admission_and_takes_the_tower_segment_and_record() -> None:
+    """An image request's ticket carries the decoded images and the prompt's rotary positions to the device's
+    admit (the driver thread runs the tower there); the admission's tower segment counts in the admission seconds
+    the decoding lanes wait for, and its vision record reaches the ticket; a text ticket carries none."""
+
+    device = FakeLanesDevice(2, admit_seconds=0.3)
+    text = _ticket("alpha", PROMPTS["alpha"], max_tokens=12, stop_ids=())
+    image = _ticket("beta", PROMPTS["beta"], max_tokens=12, stop_ids=())
+    image.images = ["image-a", "image-b"]
+    image.vision_positions = "positions"
+    _run(device, [text, image], lanes=2)
+    for ticket in (text, image):
+        expected, finish = reference_stream(ticket.prompt_ids, max_tokens=12, stop_ids=(), think_budget=None)
+        assert _delivered(ticket) == expected and ticket.finish == finish
+    assert text.vision is None and "tower" not in text.admission_segments
+    assert image.vision == {"images": 2, "positions": "positions"}
+    assert image.admission_segments["tower"] == pytest.approx(0.1)
+    assert image.admission_seconds == pytest.approx(0.3 + 0.1)
+    # the lane decoding through the image admission waited for the tower too
+    assert text.stalled_seconds == pytest.approx(0.4)
+    assert Qwen38LaneTicket("x", [1], 1, (), None).images == [] and Qwen38LaneAdmitted(1, 1, None, {}).vision is None
 
 
 def test_stall_budget_is_none_or_a_non_negative_number() -> None:

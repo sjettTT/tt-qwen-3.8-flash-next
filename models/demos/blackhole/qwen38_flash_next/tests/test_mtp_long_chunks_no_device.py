@@ -132,18 +132,39 @@ def _extension_fixtures(monkeypatch):
     layer = _FakeLayer()
     alignment = _alignment(layer)
     embedding = _FakeEmbedding()
-    model = SimpleNamespace(model_io=SimpleNamespace(embedding=embedding), mesh_device="mesh")
+    copies: list = []
+
+    def allocate_feature_rows(rows: int):
+        return SimpleNamespace(tensor=SimpleNamespace(shape=(1, 1, rows, 640), name="features"), rows=rows, clean=True)
+
+    def write_feature_rows(feature_rows, host_rows) -> None:
+        # the model's rule: an image's rows land, a text chunk after an image restores the clean rows, else nothing
+        if host_rows is not None:
+            copies.append((host_rows, feature_rows.tensor))
+            feature_rows.clean = False
+        elif not feature_rows.clean:
+            copies.append(("clean", feature_rows.tensor))
+            feature_rows.clean = True
+
+    model = SimpleNamespace(
+        model_io=SimpleNamespace(embedding=embedding),
+        mesh_device="mesh",
+        _allocate_chunk_feature_rows=allocate_feature_rows,
+        host_chunk_feature_rows=lambda image: image,
+        write_chunk_feature_rows=write_feature_rows,
+    )
     verify = SimpleNamespace(alignment=alignment)
     monkeypatch.setattr(mtp_v2, "_validate_verify_state", lambda model, verify: None)
     monkeypatch.setattr(mtp_v2, "_shape", lambda tensor: tuple(tensor.shape))
     monkeypatch.setattr(mtp_v2, "tensor_metadata", lambda tensor: tuple(tensor.shape))
     monkeypatch.setattr(mtp_v2, "_deallocate", lambda *tensors: None)
-    copies: list[torch.Tensor] = []
     fake_ttnn = SimpleNamespace(
         from_torch=lambda host, **kwargs: host,
         copy_host_to_device_tensor=lambda host, target: copies.append((host, target)),
+        add=lambda rows, features, **kwargs: SimpleNamespace(shape=tuple(rows.shape), name="spliced"),
         float32="float32",
         TILE_LAYOUT="tile",
+        DRAM_MEMORY_CONFIG="dram",
         deallocate=lambda *tensors: None,
     )
     monkeypatch.setattr(mtp_v2, "ttnn", fake_ttnn)
@@ -201,6 +222,32 @@ def test_extension_128_row_twin_writes_128_tokens_runs_128_row_roots_and_refuses
     assert target is ext128.token_row and host.shape == (1, 1, 4, 32) and host.reshape(-1).tolist() == tokens
     ext32.write_tokens(model, tokens[:CHUNK_ROWS])
     assert copies[-1][0].shape == (1, 1, 1, 32)
+    # an image prompt's tokens ahead: the pads embed the zero sentinel and the feature rows carry the tower's rows
+    # there (the backbone chunk's form one position ahead); the next text chunk restores the clean rows once
+    from models.demos.blackhole.qwen38_flash_next.mrope import IMAGE_TOKEN_ID
+    from models.demos.blackhole.qwen38_flash_next.vision_splice import (
+        IMAGE_LANE_SENTINEL_TOKEN,
+        NEGATIVE_ZERO_BF16_BITS,
+    )
+
+    image_tokens = tokens[:CHUNK_ROWS]
+    image_tokens[5:9] = [IMAGE_TOKEN_ID] * 4
+    features = torch.arange(4 * 2560, dtype=torch.float32).reshape(4, 2560).to(torch.bfloat16)
+    ext32.write_tokens(model, image_tokens, features=features)
+    (token_host, token_target), (feature_host, feature_target) = copies[-2:]
+    assert token_target is ext32.token_row and token_host.reshape(-1)[5:9].tolist() == [IMAGE_LANE_SENTINEL_TOKEN] * 4
+    assert token_host.reshape(-1)[:5].tolist() == image_tokens[:5]
+    assert feature_target is ext32.feature_rows.tensor and feature_host.shape == (1, 1, CHUNK_ROWS, 2560)
+    assert torch.equal(feature_host[0, 0, 5:9], features) and ext32.feature_rows.clean is False
+    assert feature_host[0, 0, 0].view(torch.int16).tolist() == [NEGATIVE_ZERO_BF16_BITS] * 2560
+    ext32.write_tokens(model, tokens[:CHUNK_ROWS])
+    assert copies[-1] == ("clean", ext32.feature_rows.tensor) and ext32.feature_rows.clean is True
+    cleans = len(copies)
+    ext32.write_tokens(model, tokens[:CHUNK_ROWS])
+    # a text chunk after a text chunk copies its token row and no feature rows
+    assert len(copies) == cleans + 1 and copies[-1][1] is ext32.token_row
+    with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
+        ext32.write_tokens(model, image_tokens, features=features[:3])
     with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
         ext128.write_tokens(model, tokens[:CHUNK_ROWS])
     with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
@@ -301,9 +348,11 @@ class _Extension:
     def reset_chunk(self) -> None:
         self.log.append(("mtp_reset", self.rows))
 
-    def write_tokens(self, model, token_ids) -> None:
+    def write_tokens(self, model, token_ids, features=None) -> None:
         assert len(token_ids) == self.rows
         self.log.append(("mtp_tokens", self.rows, tuple(int(token) for token in token_ids)))
+        if features is not None:
+            self.log.append(("mtp_features", self.rows, int(features.shape[0])))
 
     def finish_chunk(self, model, *, prefilled: int) -> None:
         self.log.append(("mtp_finish", self.rows, prefilled))
