@@ -84,7 +84,7 @@ def checkpoint_category(name: str) -> str:
     """Classify every known checkpoint tensor into an explicit load domain."""
 
     if name.startswith("model.visual."):
-        return "vision_omitted"
+        return "vision"
     if ".ple.ple_embedding.ngram_embedding.shard_" in name:
         return "ple_host_table"
     if ".ple.ple_embedding." in name:
@@ -128,6 +128,74 @@ def bfp_tile_storage_bytes(record: TensorRecord, tile_bytes: int) -> int:
     return record.elements // TILE_ELEMENTS * tile_bytes
 
 
+VISION_DEPTH = 27
+VISION_HIDDEN = 1152
+VISION_HEADS = 16
+VISION_HEAD_DIM = VISION_HIDDEN // VISION_HEADS  # 72
+VISION_PADDED_HEAD_DIM = 96  # the tile-aligned head width the device tower runs (72 zero-padded)
+VISION_INTERMEDIATE = 4304
+VISION_PADDED_INTERMEDIATE = 4320  # 4304 zero-padded to a tile multiple
+VISION_PATCH_DIM = 3 * 2 * 16 * 16
+VISION_MERGED_HIDDEN = VISION_HIDDEN * 4
+VISION_OUT_HIDDEN = 2560
+VISION_POSITIONS = 2304
+
+
+def _tile_vector_bytes(length: int) -> int:
+    """A bias / norm vector uploaded as one tile row: ``[32, ceil32(length)]`` BF16."""
+
+    return 32 * (-(-length // 32) * 32) * BF16_BYTES
+
+
+def _tile_matrix_bytes(rows: int, columns: int) -> int:
+    return (-(-rows // 32) * 32) * (-(-columns // 32) * 32) * BF16_BYTES
+
+
+def vision_resident_layout(*, mesh_size: int = 4) -> dict[str, int]:
+    """Per-device BF16 bytes of the device tower's resident weights (``ttnn/vision.py``'s layout, MODELED from shapes).
+
+    Everything is replicated on every device except the merger's second linear, whose output columns are sharded
+    over the mesh (each device produces its 640 hidden columns).  Head dim 72 is zero-padded to 96 in the fused
+    q/k/v projection (its output columns) and the attention output projection (its input rows); the MLP width 4304
+    is padded to 4320.  The position table stays on the host (its per-grid resampling is host work).
+    """
+
+    if mesh_size <= 0 or VISION_OUT_HIDDEN % mesh_size:
+        raise ValueError(f"the merger output width {VISION_OUT_HIDDEN} must split over the mesh, got {mesh_size}")
+    qkv_columns = 3 * VISION_HEADS * VISION_PADDED_HEAD_DIM
+    proj_rows = VISION_HEADS * VISION_PADDED_HEAD_DIM
+    block = (
+        2 * _tile_vector_bytes(VISION_HIDDEN)  # norm1 weight, bias
+        + _tile_matrix_bytes(VISION_HIDDEN, qkv_columns)
+        + _tile_vector_bytes(qkv_columns)
+        + _tile_matrix_bytes(proj_rows, VISION_HIDDEN)
+        + _tile_vector_bytes(VISION_HIDDEN)
+        + 2 * _tile_vector_bytes(VISION_HIDDEN)  # norm2 weight, bias
+        + _tile_matrix_bytes(VISION_HIDDEN, VISION_PADDED_INTERMEDIATE)
+        + _tile_vector_bytes(VISION_PADDED_INTERMEDIATE)
+        + _tile_matrix_bytes(VISION_PADDED_INTERMEDIATE, VISION_HIDDEN)
+        + _tile_vector_bytes(VISION_HIDDEN)
+    )
+    merger = (
+        2 * _tile_vector_bytes(VISION_HIDDEN)
+        + _tile_matrix_bytes(VISION_MERGED_HIDDEN, VISION_MERGED_HIDDEN)
+        + _tile_vector_bytes(VISION_MERGED_HIDDEN)
+        + _tile_matrix_bytes(VISION_MERGED_HIDDEN, VISION_OUT_HIDDEN // mesh_size)
+        + _tile_vector_bytes(VISION_OUT_HIDDEN // mesh_size)
+    )
+    layout = {
+        "patch_embed": _tile_matrix_bytes(VISION_PATCH_DIM, VISION_HIDDEN) + _tile_vector_bytes(VISION_HIDDEN),
+        "blocks": VISION_DEPTH * block,
+        "merger": merger,
+        "rotary_transformation": _tile_matrix_bytes(32, 32),
+        "host_position_table": VISION_POSITIONS * VISION_HIDDEN * BF16_BYTES,
+    }
+    layout["device_total"] = (
+        layout["patch_embed"] + layout["blocks"] + layout["merger"] + layout["rotary_transformation"]
+    )
+    return layout
+
+
 def _is_qsa_kv_projection(name: str) -> bool:
     return name.endswith(".self_attn.k_proj.weight") or name.endswith(".self_attn.v_proj.weight")
 
@@ -137,7 +205,7 @@ def _is_qsa_index_projection(name: str) -> bool:
 
 
 def plan_a_per_device_weight_bytes(
-    records: list[TensorRecord], *, mesh_size: int = 4, ring_size: int
+    records: list[TensorRecord], *, mesh_size: int = 4, ring_size: int, vision_resident: bool = False
 ) -> dict[str, int]:
     """Account for the conservative baseline weight placement on each device.
 
@@ -146,6 +214,9 @@ def plan_a_per_device_weight_bytes(
     uses BF8_B. QSA's two KV heads use two head groups, with each head replicated
     on two devices. The one-head indexer key is replicated while its four query
     heads are sharded. One-dimensional parameters are conservatively replicated.
+    The vision tower is omitted unless ``vision_resident``: then its device layout
+    (``vision_resident_layout``) is added as ``vision_bf16_resident`` and joins the
+    device total, with its position table under ``host_only``.
     """
 
     if mesh_size != 4:
@@ -160,15 +231,19 @@ def plan_a_per_device_weight_bytes(
         "tp4_bf16": 0,
         "host_only": 0,
         "vision_omitted": 0,
+        "vision_bf16_resident": 0,
     }
     routed_layer_bytes: dict[str, int] = defaultdict(int)
+    vision_bytes = 0
     for record in records:
         category = checkpoint_category(record.name)
         if category in {"ple_host_table", "ple_host_metadata"}:
             totals["host_only"] += record.data_bytes
             continue
-        if category == "vision_omitted":
-            totals["vision_omitted"] += record.data_bytes
+        if category == "vision":
+            vision_bytes += record.data_bytes
+            if not vision_resident:
+                totals["vision_omitted"] += record.data_bytes
             continue
         if record.dtype != "BF16":
             raise ValueError(f"unexpected device-resident dtype for {record.name}: {record.dtype}")
@@ -205,6 +280,10 @@ def plan_a_per_device_weight_bytes(
             raise ValueError(f"{record.name}: BF16 payload is not evenly TP4-shardable")
         totals["tp4_bf16"] += record.data_bytes // mesh_size
 
+    if vision_resident and vision_bytes:
+        layout = vision_resident_layout(mesh_size=mesh_size)
+        totals["vision_bf16_resident"] = layout["device_total"]
+        totals["host_only"] += layout["host_position_table"]
     totals["device_weight_total"] = sum(
         totals[key]
         for key in (
@@ -213,6 +292,7 @@ def plan_a_per_device_weight_bytes(
             "qsa_indexer_split_bf16",
             "replicated_bf16",
             "tp4_bf16",
+            "vision_bf16_resident",
         )
     )
     totals["routed_expert_bf4_stream_slot"] = max(routed_layer_bytes.values(), default=0)
@@ -267,7 +347,7 @@ def validate_target_checkpoint(records: list[TensorRecord]) -> None:
         "routed_down": 49,
         "routed_gate_up": 49,
         "token_embedding": 1,
-        "vision_omitted": 333,
+        "vision": 333,
     }
     actual_category_counts = {name: values["tensors"] for name, values in categories.items()}
     if actual_category_counts != expected_category_counts:

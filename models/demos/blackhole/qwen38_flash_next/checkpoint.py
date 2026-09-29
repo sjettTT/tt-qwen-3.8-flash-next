@@ -29,6 +29,11 @@ EXPECTED_TENSORS = 1658
 EXPECTED_TENSOR_BYTES = 359_999_963_128
 EXPECTED_FILE_BYTES = 360_000_192_888
 EXPECTED_INT64_ELEMENTS = 35
+# The vision tower (model.visual.*): 333 BF16 tensors, all in the first shard, read only when the tower is requested.
+VISION_TENSOR_PREFIX = "model.visual."
+VISION_TENSOR_COUNT = 333
+VISION_TENSOR_BYTES = 897_862_112
+VISION_SHARD = "model-00001-of-00131.safetensors"
 
 _DTYPE_BYTES = {
     "BOOL": 1,
@@ -195,6 +200,44 @@ class Qwen38Checkpoint:
 
     def names_with_prefix(self, prefix: str) -> tuple[str, ...]:
         return tuple(sorted(name for name in self.weight_map if name.startswith(prefix)))
+
+    def vision_tensor_names(self) -> tuple[str, ...]:
+        """The vision load domain: every ``model.visual.*`` tensor, proven to be the 333 BF16 tensors of shard 1."""
+
+        names = self.names_with_prefix(VISION_TENSOR_PREFIX)
+        if len(names) != VISION_TENSOR_COUNT:
+            raise ValueError(f"expected {VISION_TENSOR_COUNT} vision tensors, got {len(names)}")
+        total = 0
+        for name in names:
+            metadata = self.metadata(name)
+            if metadata.shard != VISION_SHARD or metadata.dtype != "BF16":
+                raise ValueError(
+                    f"{name}: vision tensors are BF16 in {VISION_SHARD}, got {metadata.dtype} in {metadata.shard}"
+                )
+            total += metadata.data_bytes
+        if total != VISION_TENSOR_BYTES:
+            raise ValueError(f"vision tensor bytes {total} differ from the pinned {VISION_TENSOR_BYTES}")
+        return names
+
+    def vision_state_dict(self) -> dict[str, torch.Tensor]:
+        """Host BF16 ``{name without the model.visual. prefix: tensor}`` of the whole tower from one open of shard 1.
+
+        Nothing of the tower is read unless this is called: the text-only paths keep the domain omitted."""
+
+        names = self.vision_tensor_names()
+        path = self.root / VISION_SHARD
+        stable_path = self._guard(path, "before-vision-read")
+        tensors: dict[str, torch.Tensor] = {}
+        try:
+            with safe_open(stable_path, framework="pt", device="cpu") as handle:
+                for name in names:
+                    tensor = handle.get_tensor(name)
+                    if tuple(tensor.shape) != self.metadata(name).shape or tensor.dtype != torch.bfloat16:
+                        raise ValueError(f"loaded shape or dtype disagrees with header for {name}")
+                    tensors[name[len(VISION_TENSOR_PREFIX) :]] = tensor
+        finally:
+            self._guard(path, "after-vision-read")
+        return tensors
 
     def tensor(self, name: str) -> torch.Tensor:
         metadata = self.metadata(name)

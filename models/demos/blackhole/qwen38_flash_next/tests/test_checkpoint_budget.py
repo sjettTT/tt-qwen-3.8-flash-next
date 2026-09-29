@@ -9,6 +9,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.checkpoint_budget import (
     bfp_tile_storage_bytes,
     checkpoint_category,
     plan_a_per_device_weight_bytes,
+    vision_resident_layout,
 )
 
 
@@ -23,7 +24,7 @@ def _tensor(name: str, shape: tuple[int, ...], *, dtype: str = "BF16") -> Tensor
 class CheckpointBudgetTest(unittest.TestCase):
     def test_every_checkpoint_domain_is_explicit(self):
         cases = {
-            "model.visual.blocks.0.norm1.weight": "vision_omitted",
+            "model.visual.blocks.0.norm1.weight": "vision",
             "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight": "ple_host_table",
             "model.language_model.layers.1.ple.ple_embedding.layer_multipliers": "ple_host_metadata",
             "model.language_model.layers.1.ple.key_proj.weight": "ple_device_non_table",
@@ -80,6 +81,24 @@ class CheckpointBudgetTest(unittest.TestCase):
         self.assertEqual(result["tp4_bf16"], 7_864_320)
         self.assertEqual(result["host_only"], 800_003_840)
         self.assertEqual(result["vision_omitted"], 5_308_416)
+        self.assertEqual(result["vision_bf16_resident"], 0)
+
+        resident = plan_a_per_device_weight_bytes(records, mesh_size=4, ring_size=8, vision_resident=True)
+        layout = vision_resident_layout(mesh_size=4)
+        self.assertEqual(resident["vision_omitted"], 0)
+        self.assertEqual(resident["vision_bf16_resident"], layout["device_total"])
+        self.assertEqual(resident["host_only"], 800_003_840 + layout["host_position_table"])
+        self.assertEqual(resident["device_weight_total"], result["device_weight_total"] + layout["device_total"])
+
+    def test_vision_resident_layout_is_the_tile_padded_device_tower(self):
+        layout = vision_resident_layout(mesh_size=4)
+        # 27 blocks: qkv 1152 x 4608, proj 1536 x 1152, fc1 1152 x 4320, fc2 4320 x 1152 (BF16), plus the vectors.
+        block_matrices = 27 * 2 * (1152 * 4608 + 1536 * 1152 + 1152 * 4320 + 4320 * 1152)
+        self.assertGreater(layout["blocks"], block_matrices)
+        self.assertLess(layout["blocks"] - block_matrices, 27 * 32 * 2 * (4 * 1152 + 4608 + 1152 + 4320 + 1152) + 1)
+        self.assertEqual(layout["host_position_table"], 2304 * 1152 * 2)
+        self.assertEqual(layout["device_total"], layout["patch_embed"] + layout["blocks"] + layout["merger"] + 2048)
+        self.assertGreater(vision_resident_layout(mesh_size=1)["merger"], layout["merger"])
 
     def test_expert_parallel_fails_if_expert_axis_is_not_divisible(self):
         record = _tensor("mtp.layers.0.mlp.experts.down_proj", (510, 2560, 640))
