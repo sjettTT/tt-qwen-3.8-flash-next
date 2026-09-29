@@ -98,12 +98,10 @@ def test_model_chunk_body_derives_everything_on_device_and_advances_by_32_last()
     order = (
         "gdn_module.build_rows_selectors(chunk_state.accepted, chunk_state.rows_constants)",
         "if rows == CHUNK_ROWS",
-        "state.position.index_row()",
-        "chunk_state.qsa_chunk_constants.arange32_lanes",
-        "chunk_state.qsa_chunk_constants.block_start_lanes",
-        "self.rope_table.rows_chunk(index_rows, block_start_rows)",
+        "rope = chunk_state.rope_rows",
         "qsa_module.derive_qsa_chunk_inputs(",
-        "self._embed_residual_rows_from_device_token(chunk_state.token_row)",
+        "self._embed_residual_rows_from_device_token(",
+        "chunk_state.token_row, feature_rows=chunk_state.feature_rows.tensor",
         "for layer_index in range(BACKBONE_LAYERS):",
         "layer.forward_chunk_generic(",
         "prepared_ple_rows=chunk_state.ple_rows if layer_index == PLE_CHECKPOINT_LAYER else None",
@@ -130,9 +128,12 @@ def test_model_chunk_state_is_allocated_before_capture_with_host_written_inputs(
         "token_row",
         "ple_rows",
         "accepted",
+        "rope_rows",
+        "feature_rows",
         "_owner",
         "rows",
         "local_combine_output",
+        "position",
     )
     allocate = inspect.getsource(Qwen38TTNNTextModel.allocate_chunk_state)
     assert "gdn.allocate_rows_constants(rows)" in allocate
@@ -153,14 +154,18 @@ def test_model_chunk_state_is_allocated_before_capture_with_host_written_inputs(
     prepare = inspect.getsource(Qwen38TTNNTextModel.prepare_chunk_inputs)
     assert "ttnn.copy_host_to_device_tensor(" not in prepare and "device=" not in prepare
     assert "self.model_io.embedding.host_token_rows(token_ids)" in prepare
-    assert "ple.host_rows(token_ids, ple_context)" in prepare and prepare.count("ttnn.from_torch(") == 2
+    # the token rows (the zero sentinel at image lanes), the PLE rows (raw ids) and the feature rows of an image chunk;
+    # the four RoPE rows come from chunk_rope_host_rows
+    assert "ple.host_rows(token_ids, ple_context)" in prepare and prepare.count("ttnn.from_torch(") == 3
+    assert "vision_splice.sentinel_token_rows(self.model_io.embedding.host_token_rows(token_ids), lanes)" in prepare
+    assert "self.chunk_rope_host_rows(chunk_state, positions)" in prepare
     upload = inspect.getsource(Qwen38TTNNTextModel.upload_chunk_inputs)
-    assert upload.count("ttnn.copy_host_to_device_tensor(") == 2
+    assert upload.count("ttnn.copy_host_to_device_tensor(") == 5
     assert "chunk_state.token_row)" in upload and "chunk_state.ple_rows.embedding_rows)" in upload
+    assert "(rope.cos, rope.sin, rope.block_start_cos, rope.block_start_sin)" in upload
+    assert "features.clean = False" in upload and "features.clean = True" in upload
     inputs = inspect.getsource(Qwen38TTNNTextModel.write_chunk_inputs)
-    assert inputs.index("self.prepare_chunk_inputs(chunk_state, token_ids, ple_context=ple_context)") < inputs.index(
-        "self.upload_chunk_inputs(chunk_state, prepared)"
-    )
+    assert inputs.index("self.prepare_chunk_inputs(") < inputs.index("self.upload_chunk_inputs(chunk_state, prepared)")
     reset = inspect.getsource(Qwen38TTNNTextModel.reset_chunk_state_inplace)
     assert "layer.reset_chunk_state_inplace(layer_chunk, layer_state)" in reset
     assert (

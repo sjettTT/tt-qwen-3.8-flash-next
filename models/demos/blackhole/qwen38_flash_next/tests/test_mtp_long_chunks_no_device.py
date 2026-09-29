@@ -243,14 +243,12 @@ def test_model_chunk_body_takes_the_extension_of_the_chunk_state_form() -> None:
     # the extension's rows run after layer 47 with the chunk's selectors (None at 128 rows), before the roots go
     assert body.index("mtp.forward_chunk_rows(") < body.index("_deallocate_unique(residual)")
     # the slab form (2026-09-26): a slab with drafting takes the 128-row twin allocated with the slab's row count and
-    # runs it over the slab's residual from the slab body's own index rows, which stay alive until then
+    # runs it over the slab's residual from the slab body's host-written RoPE rows (the chunk state's persistent rows)
     assert "slab_mtp = mtp is not None and is_slab_rows(chunk_state.rows)" in body
     assert "if slab_mtp and not (mtp.rows == LONG_CHUNK_ROWS and mtp.slab_rows == chunk_state.rows):" in body
     assert body.index("mtp.forward_slab_rows(") < body.index("_deallocate_unique(residual)")
-    assert "*(() if slab_mtp else (index_rows, block_start_rows))" in body
-    assert body.index("position_scalar=state.position.scalar,") < body.index(
-        "_deallocate_unique(index_rows, block_start_rows)"
-    )
+    assert "rope = chunk_state.rope_rows" in body
+    assert "mtp.forward_slab_rows(self, residual, rope_rows=rope, position_scalar=state.position.scalar)" in body
     extension = inspect.getsource(mtp_v2.Qwen38TTNNMTPChunkExtension)
     assert "rows: int = CHUNK_ROWS" in extension
     assert "token_row = model.model_io.embedding.upload_token_rows(rows)" in extension
@@ -276,7 +274,7 @@ class _DriverModel:
     def write_chunk_accepted(self, chunk_state, accepted: int) -> None:
         self.calls.append(("accepted", chunk_state.rows, accepted))
 
-    def prepare_chunk_inputs(self, chunk_state, token_ids, *, ple_context):
+    def prepare_chunk_inputs(self, chunk_state, token_ids, *, ple_context, positions=None, features=None):
         tokens = list(token_ids)
         assert len(tokens) == chunk_state.rows
         contexts = [ple_context]
@@ -288,7 +286,7 @@ class _DriverModel:
     def upload_chunk_inputs(self, chunk_state, prepared) -> None:
         assert prepared.rows == chunk_state.rows
 
-    def finish_prefill(self, state, chunk_state, prefilled: int) -> None:
+    def finish_prefill(self, state, chunk_state, prefilled: int, *, rope_shift: int = 0) -> None:
         self.calls.append(("finish", chunk_state.rows, prefilled))
 
     def forward_prefill_chunk_generic(self, chunk_state, state, *, gdn_step_anchor: bool = False, mtp=None) -> None:

@@ -44,7 +44,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 import ttnn
+from models.demos.blackhole.qwen38_flash_next import mrope, vision_splice
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import CHUNK_ROWS, LONG_CHUNK_ROWS, is_slab_rows
 from ttnn.unsafe_allocation_tracker import UnsafeAllocationTracker
 
@@ -203,6 +205,27 @@ class Qwen38ChunkPrefill:
         if blocking:
             ttnn.synchronize_device(self.mesh)
 
+    @staticmethod
+    def _chunk_positions(
+        positions: mrope.Qwen38MRoPEPositions | None, chunk_start: int, rows: Sequence[int]
+    ) -> torch.Tensor:
+        """The (t, h, w) rotary positions of a chunk's rows (int64 ``[3, rows]``): the prompt's from ``positions``
+        for the real rows, the plain continuation for a padded tail (its rows are never read past the accept
+        count); the plain positions ``chunk_start ..`` without ``positions``."""
+
+        count = len(rows)
+        if positions is None:
+            plain = torch.arange(chunk_start, chunk_start + count, dtype=torch.int64)
+            return plain.reshape(1, -1).expand(3, -1).contiguous()
+        real = max(0, min(count, positions.length - chunk_start))
+        axes = torch.empty((3, count), dtype=torch.int64)
+        if real:
+            axes[:, :real] = positions.rows(chunk_start, chunk_start + real)
+        if real < count:
+            after = int(axes[:, real - 1].max().item()) + 1 if real else chunk_start - positions.shift_at(chunk_start)
+            axes[:, real:] = torch.arange(count - real, dtype=torch.int64) + after
+        return axes
+
     def _extension(self, kind: str) -> Any:
         """The MTP chunk extension of a chunk kind: the 32-row one for ``short``, the 128-row twin for ``long`` and, in
         its slab form, for ``slab`` (none at all on a plain chain)."""
@@ -218,12 +241,21 @@ class Qwen38ChunkPrefill:
         time_each_chunk: bool = False,
         following_token: int | None = None,
         should_stop: Callable[[], str | None] | None = None,
+        positions: mrope.Qwen38MRoPEPositions | None = None,
+        features: torch.Tensor | None = None,
     ) -> Qwen38PrefillResult:
         """Prefill ``token_ids`` at positions ``start_position ..``; the caller's first decode replay consumes the
         token after them (``following_token``, the MTP token of the last prefilled position when the chain drafts).
         Returns the position after the prefill and the committed stream's n-gram context.  ``should_stop`` is
         polled at every event sync: a reason ends the prefill after the chunks already replayed (the hand-off runs
-        at that position; ``stopped`` carries the reason, ``position`` what was consumed)."""
+        at that position; ``stopped`` carries the reason, ``position`` what was consumed).
+
+        An image prompt passes ``positions`` (the whole sequence's (t, h, w) rotary positions, ``mrope``; the rows of
+        ``start_position ..`` are this prefill's) and ``features`` (the tower's rows, one per ``<|image_pad|>`` of
+        ``token_ids`` in order): every chunk writes its rows' RoPE rows and its pads' feature rows, and the hand-off
+        sets the rotary shift the decode subtracts.  Image pads never take the alignment steps (the 1-row body has
+        no feature input): a prefill whose alignment window holds one is refused, so the caller prefills from a
+        32-aligned position (a reset).  Without ``positions`` the rows are plain text positions."""
 
         tokens = [int(token) for token in token_ids]
         if isinstance(start_position, bool) or type(start_position) is not int or start_position < 0:
@@ -237,6 +269,24 @@ class Qwen38ChunkPrefill:
             )
         started_ns = time.perf_counter_ns()
         aligned = alignment_steps(start_position, len(tokens))
+        image_pads = len(vision_splice.image_lanes(tokens))
+        feature_count = 0 if features is None else int(features.shape[0])
+        if image_pads != feature_count:
+            raise ValueError(f"{image_pads} image pads in the prefill vs {feature_count} feature rows")
+        if positions is None:
+            if image_pads:
+                raise ValueError("image pads need the prompt's rotary positions (mrope) and their feature rows")
+        else:
+            if positions.length < start_position + len(tokens):
+                raise ValueError(
+                    f"{positions.length} rotary positions for a prefill ending at {start_position + len(tokens)}"
+                )
+            if vision_splice.image_lanes(tokens[:aligned]):
+                raise ValueError(
+                    f"image pads in the {aligned} alignment steps from position {start_position}: an image prompt "
+                    "prefills from a 32-aligned position"
+                )
+        feature_cursor = 0
         for token in tokens[:aligned]:
             ple_context = self.forced_step(token, ple_context)
         position = start_position + aligned
@@ -332,7 +382,11 @@ class Qwen38ChunkPrefill:
                 if accepted is not None and accepted != CHUNK_ROWS - 1:
                     self.model.write_chunk_accepted(self.chunk_state, accepted)
                     rows = rows + [self.pad_token_id] * (CHUNK_ROWS - real_rows)
-                prepared = self.model.prepare_chunk_inputs(chunk_state, rows, ple_context=ple_context)
+                chunk_positions = self._chunk_positions(positions, position + start, rows)
+                chunk_features, feature_cursor = vision_splice.split_features(rows, features, feature_cursor)
+                prepared = self.model.prepare_chunk_inputs(
+                    chunk_state, rows, ple_context=ple_context, positions=chunk_positions, features=chunk_features
+                )
                 ple_context = prepared.contexts[real_rows]
                 upload_started_ns = time.perf_counter_ns()
                 self.model.upload_chunk_inputs(chunk_state, prepared)
@@ -381,7 +435,11 @@ class Qwen38ChunkPrefill:
             position += consumed
             handoff_started_ns = time.perf_counter_ns()
             ttnn.synchronize_device(self.mesh)
-            self.model.finish_prefill(self.state, self.chunk_state, position)
+            # The decode's shift after the prefill; a prompt that ends in text (Qwen38VisionPrompt.validate_prompt)
+            # keeps it within the next position's block start.  A stop inside an image leaves a state no request
+            # decodes from (an image prompt always resets), so its shift is clamped to a valid value.
+            rope_shift = 0 if positions is None else min(positions.shift_at(position), position & ~3)
+            self.model.finish_prefill(self.state, self.chunk_state, position, rope_shift=rope_shift)
             if self.mtp is not None:
                 self.mtp.finish_chunk(self.model, prefilled=position)
             ttnn.synchronize_device(self.mesh)

@@ -1011,6 +1011,8 @@ def test_committed_pins_load_and_cover_the_four_metric_families():
                 "/program_cache_delta",
                 "/handoff_pass",
                 "/equals_single_stream",  # the lanes' exactness gate: every lane stream equals the single-stream replay
+                "/score_in_top5",  # the image class bound: every device token inside the CPU top-5 under teacher forcing
+                "/score_max_gap",  # ... and no CPU log-prob gap above 2.0 nats
             )
         )
     }

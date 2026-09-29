@@ -92,6 +92,7 @@ from models.demos.blackhole.qwen38_flash_next.tools.live_decode_diagnostic impor
     Qwen38LiveDecodeConstruction,
     construct_live_decode_diagnostic,
 )
+from models.demos.blackhole.qwen38_flash_next import vision_splice
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_prefill_driver import (
     Qwen38ChunkPrefill,
     Qwen38PrefillResult,
@@ -322,6 +323,8 @@ def mtp_capacity_admission(
     components_shared: bool = False,
     gdn_rows_scan: bool = False,
     slab_rows: int | None = None,
+    vision_resident_bytes_per_bank: int = 0,
+    vision_peak_activation_bytes_per_bank: int = 0,
 ) -> dict[str, Any]:
     """Whether the MTP chain fits beside the resident build at ``allocated_context`` with ``drafts`` drafts per pass
     and ``verify_forms`` captured verify forms (1..:data:`MTP_VERIFY_FORMS_MAX`).  The required side is the estimate
@@ -352,7 +355,15 @@ def mtp_capacity_admission(
     (:func:`fold_prefix_states_bytes_per_bank`),
     with the same margin; the traces remainder stays the wrap's (an over-estimate under the fold).  The term is per
     chain: a second drafting chain (``components_shared``) allocates its own GDN rows states, so its admission
-    charges its own ``drafts + 1`` rows."""
+    charges its own ``drafts + 1`` rows.
+
+    ``vision_resident_bytes_per_bank`` (a server with the vision tower resident: the tower's BF16 weights, replicated
+    per die, loaded in the chain's warm hook after the resident build and before any capture; the tower's
+    ``resident_bytes_per_bank()``, 125.2 MB measured on the line at 2026-09-29) comes off the free side where the
+    reading predates the load (the table, the live ``after_build`` read), not off an ``after_captures`` read that
+    holds it.  ``vision_peak_activation_bytes_per_bank`` (the tower's transient DRAM per bank for the largest image
+    the server admits, ``peak_activation_bytes_per_bank(patches)``) is a required-side part with the growth margin:
+    an image request allocates it after every resident allocation, so it must stay free beside the MTP chain."""
 
     if isinstance(drafts, bool) or type(drafts) is not int or not 1 <= drafts < CHUNK_ROWS:
         raise ValueError(f"MTP drafts must be an int in [1, {CHUNK_ROWS - 1}], got {drafts!r}")
@@ -370,7 +381,15 @@ def mtp_capacity_admission(
         raise ValueError(f"gdn_rows_scan must be a bool, got {gdn_rows_scan!r}")
     if slab_rows is not None and (not is_slab_rows(slab_rows) or not long_chunks):
         raise ValueError(f"slab_rows takes a slab row count with long_chunks, got {slab_rows!r}")
+    for name, value in (
+        ("vision_resident_bytes_per_bank", vision_resident_bytes_per_bank),
+        ("vision_peak_activation_bytes_per_bank", vision_peak_activation_bytes_per_bank),
+    ):
+        if isinstance(value, bool) or type(value) is not int or value < 0:
+            raise ValueError(f"{name} must be a non-negative int, got {value!r}")
     long_chunks_bytes = LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES if long_chunks else 0
+    # The tower loads in the warm hook: after the build's read, before the captures (so in an after-captures read).
+    pre_capture_bytes = long_chunks_bytes + vision_resident_bytes_per_bank
     if live is None:
         # A context below the smallest measured one (8,192: the batched lanes' small context) is admitted against the
         # smallest measured context's readings: its resident build leaves more room, so the admission is conservative.
@@ -378,9 +397,9 @@ def mtp_capacity_admission(
         if not measured_at:
             raise ValueError(f"no free-bytes-after-captures measurement at or above {context} tokens")
         free, largest = RESIDENT_FREE_BYTES_PER_BANK_AFTER_CAPTURES[measured_at[0]]
-        # The table's build had no 128-row chunk state or trace: they come off its free bytes and, as an upper bound
-        # on what they take from the largest contiguous block, off that block too.
-        free, largest = free - long_chunks_bytes, max(largest - long_chunks_bytes, 0)
+        # The table's build had no 128-row chunk state or trace (nor a tower): they come off its free bytes and, as
+        # an upper bound on what they take from the largest contiguous block, off that block too.
+        free, largest = free - pre_capture_bytes, max(largest - pre_capture_bytes, 0)
         source: dict[str, Any] = {
             "free_bytes_source": "table_2026-09-04",
             "free_bytes_measured_at_context": measured_at[0],
@@ -398,7 +417,7 @@ def mtp_capacity_admission(
         # After the build the 128-row chunk state and trace are still to come (they are allocated with the chunk
         # states and captured after the chunk trace): with the resident's own remaining allocations, off both readings.
         remaining = (
-            resident_post_build_bytes_per_bank(context) + long_chunks_bytes if live_point == "after_build" else 0
+            resident_post_build_bytes_per_bank(context) + pre_capture_bytes if live_point == "after_build" else 0
         )
         free, largest = live_free - remaining, max(live_largest - remaining, 0)
         source = {
@@ -446,6 +465,9 @@ def mtp_capacity_admission(
         ),
         "traces": with_margin(remainders["traces"]),
     }
+    if vision_peak_activation_bytes_per_bank:
+        # A part only on a server with the tower: the records of every other server keep their three parts.
+        estimate["vision_activation"] = with_margin(vision_peak_activation_bytes_per_bank)
     required = sum(estimate.values())
     contiguous = (
         RESIDENT_MIN_CONTIGUOUS_BYTES_PER_BANK
@@ -479,6 +501,8 @@ def mtp_capacity_admission(
         "mtp_slab_form_bytes_per_bank": slab_form,
         "slab_rows": slab_rows,
         "mtp_gdn_prefix_states_bytes_per_bank": prefix_states,
+        "vision_resident_bytes_per_bank": vision_resident_bytes_per_bank,
+        "vision_peak_activation_bytes_per_bank": vision_peak_activation_bytes_per_bank,
         "free_bytes_per_bank_after_captures": free,
         "largest_contiguous_bytes_free_per_bank_after_captures": largest,
         "resident_pair_bytes_per_bank": w01_per_bank + w2_per_bank,
@@ -494,7 +518,8 @@ def mtp_capacity_admission(
         "decided_by": {
             "free_side": source["free_bytes_source"],
             "required_side": f"estimate k={drafts} moe_rows={moe_rows} verify_forms={verify_forms}"
-            + (" gdn_rows_scan" if gdn_rows_scan else ""),
+            + (" gdn_rows_scan" if gdn_rows_scan else "")
+            + (" vision" if vision_resident_bytes_per_bank or vision_peak_activation_bytes_per_bank else ""),
             "shortfalls": shortfalls,
         },
         "fits": not shortfalls,
@@ -937,6 +962,7 @@ class Qwen38ChatSession:
         self.last_finish: str | None = None
         self.row_unconsumed = False  # the next token sits in the row (after length, disconnected, a hook stop)
         self.row_token: int | None = None  # a length finish's last token: read, delivered to the client, not committed
+        self.committed_vision_digest: str | None = None  # the committed prompt's images (None: a text prompt)
         self.requests_served = 0
         # The device acceptance's diagnostics (QWEN38_MTP_DEVICE_ACCEPT_DUMP, dev): with a dump directory every
         # device-decided pass records the rows it decided on and complete() writes one JSON per request for
@@ -1061,7 +1087,11 @@ class Qwen38ChatSession:
         return count - alignment_steps(len(self.committed), count) if count > 0 else 0
 
     def _prefill_chunked(
-        self, token_ids: Sequence[int], following_token: int, should_stop: Callable[[], str | None] | None
+        self,
+        token_ids: Sequence[int],
+        following_token: int,
+        should_stop: Callable[[], str | None] | None,
+        vision: vision_splice.Qwen38VisionPrompt | None = None,
     ) -> Qwen38PrefillResult:
         """The chunk driver over ``token_ids`` from the committed position; its alignment steps are this session's
         forced steps (with the prefill event cadence).  Runs outside the loop guard: the seed and the hand-off
@@ -1084,6 +1114,8 @@ class Qwen38ChatSession:
                 self.chain.event_synchronize(self.chain.record_event())
             return self.ple_context
 
+        # An image prompt's rotary positions and feature rows ride along; a text prompt's call is the one it always was.
+        vision_inputs = {} if vision is None else {"positions": vision.positions, "features": vision.features}
         result = self.chain.chunk_prefill(
             token_ids,
             start_position=start,
@@ -1091,6 +1123,7 @@ class Qwen38ChatSession:
             forced_step=forced_step,
             following_token=following_token,
             should_stop=should_stop,
+            **vision_inputs,
         )
         if result.timing.alignment_steps != forced:
             raise Qwen38ChatChainError(f"chunk prefill forced {forced} alignment steps, reported {result.timing}")
@@ -1480,6 +1513,7 @@ class Qwen38ChatSession:
         self.last_finish = None
         self.row_unconsumed = False
         self.row_token = None
+        self.committed_vision_digest = None
 
     def reusable_prefix(self, token_ids: Sequence[int]) -> tuple[int, str]:
         """How the device meets ``token_ids``: ``(n, "extends")`` when they extend the committed ``n`` ids (or repeat
@@ -1546,9 +1580,15 @@ class Qwen38ChatSession:
         speculative: bool = True,
         verify_each_step: bool = False,
         mtp_drafts: int | None = None,
+        vision: vision_splice.Qwen38VisionPrompt | None = None,
     ) -> Qwen38ChatCompletion:
         """Prefill what the device does not already hold, then generate up to ``max_tokens`` tokens (the remaining
         context when ``None``; ``require_budget``).
+
+        ``vision`` carries an image prompt's rotary positions and feature rows (``token_ids`` are the expanded ids:
+        one ``<|image_pad|>`` per merged image token); such a prompt always prefills from position 0 through the
+        chunk trace (no prefix reuse, no prompt-end snapshot: the committed ids alone do not identify the pixels),
+        and a text prompt never reuses a committed image prompt's state.
 
         Any failure inside the device section leaves the chain's queue and the
         model owner in an unknown state: the session is poisoned and must not
@@ -1578,6 +1618,22 @@ class Qwen38ChatSession:
             raise Qwen38ChatRequestError("prompt token ids must be a nonempty list of vocabulary ids")
         max_tokens = self.require_budget(len(token_ids), max_tokens)
         mode = self.resolve_prefill_mode(prefill_mode)
+        has_image_pads = bool(vision_splice.image_lanes(token_ids))
+        if vision is not None:
+            try:
+                vision.validate_prompt(token_ids)
+            except ValueError as error:
+                raise Qwen38ChatRequestError(f"image prompt: {error}") from error
+            if mode != "chunked":
+                raise Qwen38ChatRequestError(
+                    "image prompts need the chunked prefill mode (their pads never take 1-row steps)"
+                )
+            # An image prompt prefills from position 0 (below): all but its last token must fill the chunk trace's
+            # minimum (a real image prompt is at least 66 tokens: 64 pads and the two markers).
+            if len(token_ids) - 1 < CHUNK_PREFILL_MIN_ROWS:
+                raise Qwen38ChatRequestError("image prompt too short for the chunked prefill")
+        elif has_image_pads:
+            raise Qwen38ChatRequestError("the prompt holds image pads but no vision inputs")
         if sampling is not None and self.sampling is None:
             raise Qwen38ChatRequestError("sampling is unavailable: this chain captured no candidate row (greedy only)")
         if self.poisoned:
@@ -1597,6 +1653,10 @@ class Qwen38ChatSession:
         drafting = self.mtp is not None and speculative and mode == "chunked"
         started_ns = self.clock_ns()
         common, reuse = self.reusable_prefix(token_ids)
+        if vision is not None or self.committed_vision_digest is not None:
+            # Stage 1 of the image path: an image prompt prefills from position 0, and the committed state of an
+            # image prompt serves no later request (the ids do not identify the pixels).
+            common, reuse = 0, "reset"
         # The device sampler's per-request writes (the policy, the greedy flag, the first draw) precede every
         # prompt step: the last prompt TAIL chooses the first token under this request's policy.
         device_loop = False
@@ -1643,8 +1703,13 @@ class Qwen38ChatSession:
             # steps; the last one is the first decode replay and is always teacher-forced inside the guard.  The
             # prompt-end snapshot is taken before that last token: after the hand-off, or inside the forced prefill.
             before_last: Callable[[], None] | None = capture
+            if vision is not None:
+                # No prompt-end snapshot of an image prompt (its record would match a later prompt by ids alone).
+                before_last = None
+                capture = lambda: None  # noqa: E731
             if mode == "chunked" and self.chunk_prefill_rows(len(suffix) - 1) >= CHUNK_PREFILL_MIN_ROWS:
-                chunked = self._prefill_chunked(suffix[:-1], suffix[-1], should_stop)
+                chunked = self._prefill_chunked(suffix[:-1], suffix[-1], should_stop, vision)
+                self.committed_vision_digest = None if vision is None else vision.digest
                 suffix = suffix[-1:]
                 before_last = None
                 if chunked.stopped is None:
@@ -2339,11 +2404,14 @@ class Qwen38TracedChain:
         forced_step: Callable[[int, tuple[int, int] | None], tuple[int, int] | None],
         following_token: int | None = None,
         should_stop: Callable[[], str | None] | None = None,
+        positions=None,
+        features=None,
     ) -> Qwen38PrefillResult:
         """The chunk driver on this chain (the full-model gate's prefill path): alignment steps through
         ``forced_step``, the seed, chunk replays (``should_stop`` polled at their event syncs), the padded tail,
         the hand-off.  Not under the loop guard.  ``following_token`` is the MTP layer's token at the last
-        prefilled position (MTP chains)."""
+        prefilled position (MTP chains).  ``positions`` / ``features`` are an image prompt's rotary positions and
+        feature rows (``Qwen38ChunkPrefill.run``)."""
 
         if self.chunk_trace_id is None:
             raise Qwen38ChatChainError("the chain was opened without the chunk trace")
@@ -2368,6 +2436,8 @@ class Qwen38TracedChain:
             ple_context=ple_context,
             following_token=following_token,
             should_stop=should_stop,
+            positions=positions,
+            features=features,
         )
 
     # -- the MTP pass loop primitives (mtp chains) ---------------------------------------------

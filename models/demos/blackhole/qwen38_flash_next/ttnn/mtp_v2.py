@@ -85,7 +85,11 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.layer import (
     Qwen38TTNNLayerNamespace,
     Qwen38TTNNLayerType,
 )
-from models.demos.blackhole.qwen38_flash_next.ttnn.model import Qwen38TTNNTextModel, Qwen38TTNNTextModelGenericState
+from models.demos.blackhole.qwen38_flash_next.ttnn.model import (
+    Qwen38TTNNRoPEInputs,
+    Qwen38TTNNTextModel,
+    Qwen38TTNNTextModelGenericState,
+)
 from models.demos.blackhole.qwen38_flash_next.ttnn.moe import SUPPORTED_ROWS, TARGET_VERIFIER_ROWS, Qwen38TTNNMoE
 from models.demos.blackhole.qwen38_flash_next.ttnn.mtp import Qwen38TTNNMTPInput
 from models.demos.blackhole.qwen38_flash_next.ttnn.ple import (
@@ -1408,11 +1412,13 @@ def forward_verify(
     try:
         selectors = gdn_module.build_rows_selectors(verify.accepted, verify.rows_constants) if catch_up else None
         index_row = state.position.index_row()
-        index_rows = ttnn.add(index_row, chunk_constants.arange32_lanes, memory_config=dram)
-        block_start_row = state.position.block_start_index_row(index_row)
+        # The RoPE rows read the table at the rows' positions less the sequence's rotary shift (0 for text).
+        rope_index_row = state.position.rope_index_row(index_row)
+        index_rows = ttnn.add(rope_index_row, chunk_constants.arange32_lanes, memory_config=dram)
+        block_start_row = state.position.rope_block_start_index_row(index_row)
         block_start_rows = ttnn.add(block_start_row, chunk_constants.block_start_lanes, memory_config=dram)
         rope = model.rope_table.rows_chunk(index_rows, block_start_rows)
-        _deallocate(index_row, index_rows, block_start_row, block_start_rows)
+        _deallocate(index_row, rope_index_row, index_rows, block_start_row, block_start_rows)
         qsa_verify = qsa_module.derive_qsa_verify_inputs(
             state.position.scalar, model.qsa_position_constants, verify.qsa_verify_constants
         )
@@ -1592,11 +1598,13 @@ def _split_prologue(model: Qwen38TTNNTextModel, verify: Qwen38TTNNVerifyState, s
     chunk_constants = verify.qsa_chunk_constants
     selectors = gdn_module.build_rows_selectors(verify.accepted, verify.rows_constants) if catch_up else None
     index_row = state.position.index_row()
-    index_rows = ttnn.add(index_row, chunk_constants.arange32_lanes, memory_config=dram)
-    block_start_row = state.position.block_start_index_row(index_row)
+    # The RoPE rows read the table at the rows' positions less the sequence's rotary shift (0 for text).
+    rope_index_row = state.position.rope_index_row(index_row)
+    index_rows = ttnn.add(rope_index_row, chunk_constants.arange32_lanes, memory_config=dram)
+    block_start_row = state.position.rope_block_start_index_row(index_row)
     block_start_rows = ttnn.add(block_start_row, chunk_constants.block_start_lanes, memory_config=dram)
     rope = model.rope_table.rows_chunk(index_rows, block_start_rows)
-    _deallocate(index_row, index_rows, block_start_row, block_start_rows)
+    _deallocate(index_row, rope_index_row, index_rows, block_start_row, block_start_rows)
     qsa_verify = qsa_module.derive_qsa_verify_inputs(
         state.position.scalar, model.qsa_position_constants, verify.qsa_verify_constants
     )
@@ -2363,11 +2371,12 @@ def forward_draft(
                 qsa.commit_verify(draft.qsa_state, draft.advance_selectors)  # the previous draft row joins the history
             position = ttnn.add(state.position.scalar, row, memory_config=dram)
             index_row = ttnn.multiply(state.position.ones_row, position, memory_config=dram)
-            block_start_row = state.position.block_start_index_row(index_row)
-            index_rows = ttnn.add(index_row, chunk_constants.arange32_lanes, memory_config=dram)
+            rope_index_row = state.position.rope_index_row(index_row)
+            block_start_row = state.position.rope_block_start_index_row(index_row)
+            index_rows = ttnn.add(rope_index_row, chunk_constants.arange32_lanes, memory_config=dram)
             block_start_rows = ttnn.add(block_start_row, chunk_constants.block_start_lanes, memory_config=dram)
             rope = model.rope_table.rows_chunk(index_rows, block_start_rows)
-            _deallocate(index_row, block_start_row, index_rows, block_start_rows)
+            _deallocate(index_row, rope_index_row, block_start_row, index_rows, block_start_rows)
             qsa_inputs = qsa_module.derive_qsa_verify_inputs(
                 position, model.qsa_position_constants, draft.qsa_constants, single_row=True
             )
@@ -3239,16 +3248,14 @@ class Qwen38TTNNMTPChunkExtension:
                 tile,
             )
 
-    def forward_slab_rows(
-        self, model: Qwen38TTNNTextModel, residual_rows, *, index_rows, block_start_rows, position_scalar
-    ):
+    def forward_slab_rows(self, model: Qwen38TTNNTextModel, residual_rows, *, rope_rows, position_scalar):
         """The MTP layer's rows of a slab, inside the slab body after layer 47: ``slab_rows / 128`` slices, each the
         128-row form of :meth:`forward_chunk_rows` exactly -- the slice's residual rows cut from the slab's ``[1,4,S,640]``
-        layer-47 residual (not consumed), its RoPE rows from the slab body's ``index_rows`` ``[1,1,S/32,32]`` and
-        ``block_start_rows`` ``[1,1,S/128,32]`` (the four index tiles and the one block-start tile of the slice: the
-        128-row body's own rows at ``P + 128 i``, exact UINT32), its QSA chunk inputs derived from the position scalar
-        plus ``128 i`` with the 128-row chunk constants, its MTP tokens from the slice's tile of ``slab_token_rows``.
-        The MTP layer's KV rows land at the same positions the 128-row chunks would write them."""
+        layer-47 residual (not consumed), its RoPE rows cut from the slab body's host-written rows ``rope_rows``
+        (cos / sin ``[1,1,S,64]`` and the block-start rows ``[1,1,S/4,64]``: the slice's 128 rows and its 32 block
+        starts, the 128-row body's own rows), its QSA chunk inputs derived from the position scalar plus ``128 i``
+        with the 128-row chunk constants, its MTP tokens from the slice's tile of ``slab_token_rows``.  The MTP
+        layer's KV rows land at the same positions the 128-row chunks would write them."""
 
         if self.rows != LONG_CHUNK_ROWS or not self.slab_rows:
             raise ValueError("the slab form runs on the 128-row MTP chunk extension allocated with slab_rows")
@@ -3256,14 +3263,17 @@ class Qwen38TTNNMTPChunkExtension:
         if _shape(residual_rows) != residual_shape:
             raise RuntimeError(f"MTP slab roots must be {residual_shape}, got {tensor_metadata(residual_rows)}")
         slices = self.slab_rows // LONG_CHUNK_ROWS
-        tiles_per_slice = LONG_CHUNK_ROWS // ttnn.TILE_SIZE
-        index_shape = (1, 1, slices * tiles_per_slice, ttnn.TILE_SIZE)
-        block_shape = (1, 1, slices, ttnn.TILE_SIZE)
-        if _shape(index_rows) != index_shape or _shape(block_start_rows) != block_shape:
-            raise RuntimeError(
-                f"MTP slab index rows must be {index_shape} and block starts {block_shape}, got "
-                f"{tensor_metadata(index_rows)} and {tensor_metadata(block_start_rows)}"
-            )
+        blocks_per_slice = LONG_CHUNK_ROWS // qsa_module.COMPRESS_RATIO
+        rows_shape = (1, 1, self.slab_rows, qsa_module.ROPE_DIM)
+        block_shape = (1, 1, slices * blocks_per_slice, qsa_module.ROPE_DIM)
+        for name, tensor, shape in (
+            ("cos", rope_rows.cos, rows_shape),
+            ("sin", rope_rows.sin, rows_shape),
+            ("block-start cos", rope_rows.block_start_cos, block_shape),
+            ("block-start sin", rope_rows.block_start_sin, block_shape),
+        ):
+            if _shape(tensor) != shape:
+                raise RuntimeError(f"MTP slab RoPE {name} rows must be {shape}, got {tensor_metadata(tensor)}")
         dram = ttnn.DRAM_MEMORY_CONFIG
         for index in range(slices):
             first_row = index * LONG_CHUNK_ROWS
@@ -3273,36 +3283,37 @@ class Qwen38TTNNMTPChunkExtension:
                 (1, RESIDUAL_BRANCHES, first_row + LONG_CHUNK_ROWS, LOCAL_HIDDEN_SIZE),
                 memory_config=dram,
             )
-            index_slice = ttnn.slice(
-                index_rows,
-                (0, 0, index * tiles_per_slice, 0),
-                (1, 1, (index + 1) * tiles_per_slice, ttnn.TILE_SIZE),
-                memory_config=dram,
-            )
-            block_slice = ttnn.slice(
-                block_start_rows, (0, 0, index, 0), (1, 1, index + 1, ttnn.TILE_SIZE), memory_config=dram
-            )
+            first_block = index * blocks_per_slice
+            rope_slices = [
+                ttnn.slice(tensor, (0, 0, start, 0), (1, 1, start + count, qsa_module.ROPE_DIM), memory_config=dram)
+                for tensor, start, count in (
+                    (rope_rows.cos, first_row, LONG_CHUNK_ROWS),
+                    (rope_rows.sin, first_row, LONG_CHUNK_ROWS),
+                    (rope_rows.block_start_cos, first_block, blocks_per_slice),
+                    (rope_rows.block_start_sin, first_block, blocks_per_slice),
+                )
+            ]
             scalar = (
                 position_scalar
                 if index == 0
                 else ttnn.add(position_scalar, self.slab_position_offsets[index - 1], memory_config=dram)
             )
-            rope_rows = model.rope_table.rows_chunk(index_slice, block_slice)
+            rope_slice = Qwen38TTNNRoPEInputs(None, *rope_slices)
             qsa_chunk = qsa_module.derive_qsa_chunk_inputs(
                 scalar, model.qsa_position_constants, self.qsa_chunk_constants
             )
             self.forward_chunk_rows(
                 model,
                 residual_slice,
-                rope_rows=rope_rows,
+                rope_rows=rope_slice,
                 qsa_chunk=qsa_chunk,
                 qsa_chunk_constants=self.qsa_chunk_constants,
                 selectors=None,
                 token_row=self.slab_token_rows[index],
             )
             qsa_chunk.deallocate()
-            rope_rows.deallocate()
-            _deallocate(residual_slice, index_slice, block_slice)
+            rope_slice.deallocate()
+            _deallocate(residual_slice)
             if index:
                 _deallocate(scalar)
 

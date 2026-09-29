@@ -93,6 +93,16 @@
     "reasoning_effort": "medium",
     "temperature": 0
    }
+  },
+  "vision-chunked-32k": {
+   "description": "image prompts on the served default chain with the device vision tower's features: chunked prefill through the 32-row chunk trace (the 128-row form is bitwise on these streams), sampling on, MTP off, 32768 context; the fixtures are tests/fixtures/vision_fixture.py's grid32 (512x512, 256 image tokens), grid24x40 (384x640, 240), grid64 (1024x1024, 1024) and models/sample_data/demo.jpeg (2048x1365, 2752), each asked to describe the image in one sentence with thinking off, 32 greedy tokens against the CPU reference (Qwen4ExpForConditionalGeneration bf16)",
+   "server": {
+    "allocated_context": 32768,
+    "mtp": null,
+    "prefill_mode": "chunked",
+    "sampling": true,
+    "vision": true
+   }
   }
  },
  "default_tolerance": 0.15,
@@ -529,6 +539,41 @@
    "rule": "exact",
    "status": "active",
    "target": 0
+  },
+  "A3/vision-chunked-32k/device_token_ids_sha256": {
+   "baseline": true,
+   "note": "a differing image stream without an earlier index is a change inside the image class: scored before merge",
+   "rule": "exact",
+   "severity": "info",
+   "status": "todo"
+  },
+  "A3/vision-chunked-32k/divergence_index": {
+   "baseline": true,
+   "note": "per image fixture the first index where the device stream leaves the CPU greedy stream; null is the largest; never earlier than the baseline",
+   "rule": "not_earlier",
+   "status": "todo"
+  },
+  "A3/vision-chunked-32k/score_in_top5": {
+   "note": "the image class bound, first half: every device token inside the CPU top-5 under teacher forcing (the scoring pass of the CPU reference tool)",
+   "rule": "exact",
+   "status": "active",
+   "target": {
+    "grid32": true,
+    "grid24x40": true,
+    "grid64": true,
+    "demo": true
+   }
+  },
+  "A3/vision-chunked-32k/score_max_gap": {
+   "note": "the image class bound, second half: the largest CPU log-prob gap of a device token at most 2.0 nats (the CPU argmax's log-prob minus the device token's)",
+   "rule": "at_most",
+   "status": "active",
+   "target": {
+    "grid32": 2.0,
+    "grid24x40": 2.0,
+    "grid64": 2.0,
+    "demo": 2.0
+   }
   },
   "C1/thinking-medium/item_pass": {
    "baseline": true,

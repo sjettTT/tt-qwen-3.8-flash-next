@@ -864,6 +864,57 @@ second uniform, no division); the response's `mtp_acceptance_arithmetic` names `
 host-decided pass, the host sampler's fp32 law) and the fingerprint carries `-device-accept`: one seed reproduces one
 stream per arithmetic; the law gate runs per arithmetic (2026-09-26).
 
+## Image prompts: a tolerance class against the CPU reference (2026-09-29)
+
+An image prompt's device stream is compared with the CPU stream of `Qwen4ExpForConditionalGeneration` (transformers
+5.16.1, bf16, the same processor render and pixels, greedy) by two quantities that are not the same: the divergence
+index -- the first token where the device leaves the CPU's free-running greedy stream, as the text records are judged --
+and the teacher-forced ranks and gaps -- the CPU model re-run on the prompt plus the device's own tokens, and at every
+position the rank of the device token in the CPU distribution and the CPU log-prob of the CPU argmax minus the device
+token's, in nats.  A near-tie can leave one stream at index 2 and another at 6 while every device token stays the CPU's
+first or second choice.  The three-axis positions and the delta are exact against the reference on every record; the
+tower's features against the FP32 reference are the tower's own record (PCC 0.995-0.998, mean absolute difference 0.002
+on these fixtures).
+
+The class table (one 1x4 p150 line, 32k, chunked prefill, greedy, 32 tokens per fixture; the fixtures are the
+deterministic synthetic images of `tests/fixtures/vision_fixture.py` and `models/sample_data/demo.jpeg`, each asked to
+describe the image in one sentence with thinking off):
+
+| fixture | image tokens | features | device tokens in the CPU top-1 / top-2 / top-5 | worst rank | max gap (nats) | mean gap | divergence index |
+|---|---|---|---|---|---|---|---|
+| synthetic 512 x 512 | 256 | CPU tower | 29 / 32 / 32 | 1 | 0.375 | 0.027 | 6 |
+| synthetic 384 x 640 | 240 | CPU tower | 26 / 30 / 32 | 3 | 2.0 | 0.164 | 5 |
+| synthetic 1024 x 1024 | 1,024 | CPU tower | 29 / 30 / 32 | 2 | 1.5 | 0.106 | 1 |
+| demo.jpeg 2048 x 1365 | 2,752 | CPU tower | 30 / 32 / 32 | 1 | 0.5 | 0.023 | 11 |
+| synthetic 512 x 512 | 256 | device tower | 22 / 25 / 27 (EOS at 27) | 3 | 1.75 | 0.171 | 6 |
+| synthetic 384 x 640 | 240 | device tower | 25 / 30 / 32 | 3 | 1.25 | 0.191 | 2 |
+| synthetic 1024 x 1024 | 1,024 | device tower | 29 / 32 / 32 | 1 | 0.875 | 0.059 | 2 |
+| demo.jpeg 2048 x 1365 | 2,752 | device tower | 30 / 32 / 32 | 1 | 0.5 | 0.023 | 11 |
+
+The class bound: every device token inside the CPU top-5 and no gap above 2.0 nats.
+
+The pins (`tools/ci/pins.json`, configuration `vision-chunked-32k`; `tools/ci/baselines/A3-vision-chunked-32k-*.json`)
+are seeded from the served form with the device tower's features -- chunked prefill through the 32-row chunk trace, on
+which the 128-row form is bitwise -- per fixture: the divergence index (6, 2, 2, 11) under the text records' rule
+(`not_earlier`: it may not move earlier), the stream's token sha (`exact`, information: a changed stream past its index
+is reported, not failed), and the class bound as a hard floor (`score_in_top5`, `score_max_gap`), judged by the
+teacher-forcing pass of the CPU reference tool.  Comparisons against an earlier run or against the CPU tower's features
+are information in the record.
+
+The forms (the same fixtures; every hold under six minutes): `--long-chunks` gives the four image streams bitwise the
+32-row form's; `--mtp 4` gives them bitwise too, with 2.3-2.6 accepted tokens per pass against the chat control's 2.77
+on the same chain (about 90 %); `--prefill-slab 2048` gives three bitwise and leaves the 32-row stream on demo.jpeg at
+token 14 (the slab's tolerance class; scored 30 / 32 / 32, worst rank 1, max gap 1.0).  Time to first token of an image
+prompt is the same-length text prompt's or less on every form (0.55 vs 0.59 s at 277 tokens and 3.72 vs 3.75 s at 2,773
+tokens with `--long-chunks`; 1.81 vs 1.87 s with the slab), the tower's own time apart (40-45 ms at 256 image tokens,
+156-184 ms at 1,024, 643-653 ms at 2,752, beside the live chain).
+
+Text requests on the same build are unchanged: the fused position derive at a zero shift is bitwise the previous rows
+(194 device cases), the acceptance control leaves the CPU record at its pinned index before and after the image requests
+in every form, and the previous head's chat stream is the same stream token for token; a text chunk reads the resident
+table's rows bit for bit, the feature buffer's text lanes hold -0.0 (the identity of the add) and the decode shift is
+zero.
+
 ## The teacher-forced table
 
 `tools/ci/baselines/A3-forced-32k-divergence_index.json` pins the startup replay with the teacher-forced prefill

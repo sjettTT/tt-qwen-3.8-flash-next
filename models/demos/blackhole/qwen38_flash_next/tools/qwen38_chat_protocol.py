@@ -17,10 +17,13 @@ streamed and the non-streamed message agree.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 import secrets
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import jinja2
@@ -47,6 +50,27 @@ EFFORT_LEVELS = {"minimal": "low", "low": "low", "medium": "medium", "high": "xh
 # within the request's max_tokens, which defaults to the remaining context; the model card wants 32k of output room).
 THINKING_TOKEN_CAPS = {"low": 4096, "medium": 16_384, "xhigh": None}
 ANSWER_RESERVE_TOKENS = 256
+# Image parts (OpenAI content-part shape): ``data:`` URLs only in this release (the server fetches nothing); the
+# ``detail`` field is honoured (``low`` caps the pixel count, ``auto`` / ``high`` run the stock processor).  Video
+# parts are refused in every spelling; so are images outside user messages and unknown part types.
+IMAGE_DETAILS = ("auto", "low", "high")
+IMAGE_MEDIA_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp")
+MAX_IMAGE_BYTES = 16 << 20  # decoded bytes of one image (the request body cap bounds the base64 form)
+VIDEO_PART_SPELLINGS = ("video", "video_url", "input_video")
+_DATA_URL = re.compile(
+    r"^data:(?P<media>[a-z]+/[a-z0-9.+-]+)(?P<params>(?:;[a-z0-9-]+=[^;,]*)*);base64,(?P<payload>.*)$", re.S | re.I
+)
+
+
+@dataclass(frozen=True)
+class Qwen38ImagePart:
+    """One image of a request: the decoded bytes, their media type, the ``detail`` level and where the part sat."""
+
+    data: bytes
+    media_type: str
+    detail: str
+    message_index: int
+    part_index: int
 
 
 class Qwen38ChatRequestRejected(ValueError):
@@ -61,25 +85,107 @@ class Qwen38ChatRequestRejected(ValueError):
 # -- request side --------------------------------------------------------------------------------
 
 
-def _text_content(value: Any, where: str) -> str | list[dict[str, str]]:
+def _image_part(item: Mapping[str, Any], where: str, *, message_index: int, part_index: int) -> Qwen38ImagePart:
+    """An ``image_url`` part: ``{"type": "image_url", "image_url": {"url": "data:...;base64,...", "detail": ...}}``
+    (or the string shorthand for ``image_url``); only ``data:`` URLs, an image media type, a decodable payload."""
+
+    source = item.get("image_url")
+    if isinstance(source, str):
+        source = {"url": source}
+    if not isinstance(source, Mapping) or not isinstance(source.get("url"), str):
+        raise Qwen38ChatRequestRejected(
+            f"{where}.image_url must be {{'url': str, 'detail'?: str}} or the url string, got {source!r}",
+            param=f"{where}.image_url",
+        )
+    detail = source.get("detail", "auto")
+    if detail not in IMAGE_DETAILS:
+        raise Qwen38ChatRequestRejected(
+            f"{where}.image_url.detail must be one of {IMAGE_DETAILS}, got {detail!r}",
+            param=f"{where}.image_url.detail",
+        )
+    url = source["url"]
+    if url[:5].lower() != "data:":
+        raise Qwen38ChatRequestRejected(
+            f"{where}.image_url.url must be a data: URL (this server fetches no remote images), got {url[:24]!r}...",
+            param=f"{where}.image_url.url",
+        )
+    match = _DATA_URL.match(url)
+    if match is None or match.group("media").lower() not in IMAGE_MEDIA_TYPES:
+        raise Qwen38ChatRequestRejected(
+            f"{where}.image_url.url must be data:<{'|'.join(IMAGE_MEDIA_TYPES)}>;base64,<payload>",
+            param=f"{where}.image_url.url",
+        )
+    payload = match.group("payload")
+    if len(payload) > (MAX_IMAGE_BYTES * 4) // 3 + 4:
+        raise Qwen38ChatRequestRejected(
+            f"{where}.image_url.url decodes past the {MAX_IMAGE_BYTES} byte image limit", param=f"{where}.image_url.url"
+        )
+    try:
+        data = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise Qwen38ChatRequestRejected(
+            f"{where}.image_url.url is not valid base64: {error}", param=f"{where}.image_url.url"
+        ) from error
+    if not data:
+        raise Qwen38ChatRequestRejected(f"{where}.image_url.url holds an empty image", param=f"{where}.image_url.url")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise Qwen38ChatRequestRejected(
+            f"{where}.image_url.url decodes to {len(data)} bytes, over the {MAX_IMAGE_BYTES} byte image limit",
+            param=f"{where}.image_url.url",
+        )
+    return Qwen38ImagePart(data, match.group("media").lower(), detail, message_index, part_index)
+
+
+def _content(
+    value: Any, where: str, *, role: str, message_index: int, images: list[Qwen38ImagePart] | None
+) -> str | list[dict[str, str]]:
+    """A message's content for the template: a string, or a list of ``text`` items and (user messages, when the
+    caller collects ``images``) ``image`` items, one per accepted ``image_url`` part, in order.  Video parts and
+    unknown part types are refused, never dropped."""
+
     if value is None:
         return ""
     if isinstance(value, str):
         return value
     if not isinstance(value, list):
         raise Qwen38ChatRequestRejected(
-            f"{where}.content must be a string, null or a list of text items, got {type(value).__name__}",
+            f"{where}.content must be a string, null or a list of content parts, got {type(value).__name__}",
             param=f"{where}.content",
         )
     items = []
     for index, item in enumerate(value):
-        if not isinstance(item, Mapping) or item.get("type") != "text" or not isinstance(item.get("text"), str):
-            raise Qwen38ChatRequestRejected(
-                f"{where}.content[{index}] must be {{'type': 'text', 'text': str}} (text-only server), got {item!r}",
-                param=f"{where}.content[{index}]",
-            )
-        items.append({"type": "text", "text": item["text"]})
+        part = f"{where}.content[{index}]"
+        if not isinstance(item, Mapping):
+            raise Qwen38ChatRequestRejected(f"{part} must be a content part object, got {item!r}", param=part)
+        kind = item.get("type")
+        if kind in VIDEO_PART_SPELLINGS or any(key in item for key in VIDEO_PART_SPELLINGS):
+            raise Qwen38ChatRequestRejected(f"{part}: video parts are not supported by this server", param=part)
+        if kind == "text":
+            if not isinstance(item.get("text"), str):
+                raise Qwen38ChatRequestRejected(
+                    f"{part} must be {{'type': 'text', 'text': str}}, got {item!r}", param=part
+                )
+            items.append({"type": "text", "text": item["text"]})
+            continue
+        if kind == "image_url":
+            if images is None:
+                raise Qwen38ChatRequestRejected(f"{part}: image parts are not accepted here (text-only)", param=part)
+            if role != "user":
+                raise Qwen38ChatRequestRejected(f"{part}: image parts belong to user messages, not {role}", param=part)
+            images.append(_image_part(item, part, message_index=message_index, part_index=index))
+            items.append({"type": "image"})
+            continue
+        raise Qwen38ChatRequestRejected(
+            f"{part}.type must be 'text' or 'image_url', got {kind!r} (video and other parts are not supported)",
+            param=part,
+        )
     return items
+
+
+def _text_content(value: Any, where: str) -> str | list[dict[str, str]]:
+    """Text parts only (the callers that take no images)."""
+
+    return _content(value, where, role="user", message_index=0, images=None)
 
 
 def _tool_call(call: Any, where: str) -> dict[str, Any]:
@@ -107,9 +213,12 @@ def _tool_call(call: Any, where: str) -> dict[str, Any]:
     return {"type": "function", "function": {"name": name, "arguments": dict(arguments)}}
 
 
-def normalize_messages(messages: Any) -> list[dict[str, Any]]:
+def normalize_messages(messages: Any, *, images: list[Qwen38ImagePart] | None = None) -> list[dict[str, Any]]:
     """The template's message schema from the client's: roles and order checked, ``content: null`` -> "",
-    string ``arguments`` -> dict; ``id``, ``name`` and ``tool_call_id`` dropped (the template ignores them)."""
+    string ``arguments`` -> dict; ``id``, ``name`` and ``tool_call_id`` dropped (the template ignores them).
+    ``images`` (a list the caller owns) collects the user messages' ``image_url`` parts as :class:`Qwen38ImagePart`
+    in prompt order, each rendered as one ``image`` item (the template's one ``<|image_pad|>``); without it an image
+    part is refused."""
 
     if not isinstance(messages, list) or not messages:
         raise Qwen38ChatRequestRejected(
@@ -127,7 +236,10 @@ def normalize_messages(messages: Any) -> list[dict[str, Any]]:
             raise Qwen38ChatRequestRejected(
                 f"{where}.role is system; the system message must be first", param=f"{where}.role"
             )
-        copied: dict[str, Any] = {"role": role, "content": _text_content(message.get("content"), where)}
+        copied: dict[str, Any] = {
+            "role": role,
+            "content": _content(message.get("content"), where, role=role, message_index=index, images=images),
+        }
         if role == "assistant":
             reasoning = message.get("reasoning_content")
             if reasoning is not None:
@@ -259,20 +371,40 @@ def encode_chat(tokenizer: Any, text: str) -> list[int]:
 
 
 def render_prompt(
-    tokenizer: Any, messages: Any, tools: Any, *, enable_thinking: bool, reasoning_effort: str
+    tokenizer: Any,
+    messages: Any,
+    tools: Any,
+    *,
+    enable_thinking: bool,
+    reasoning_effort: str,
+    images: list[Qwen38ImagePart] | None = None,
+    image_grids: Sequence[Any] = (),
 ) -> list[int]:
-    """Prompt ids of a client request: normalise, validate, render with the generation prompt, encode."""
+    """Prompt ids of a client request: normalise, validate, render with the generation prompt, encode; with images,
+    the template's one ``<|image_pad|>`` per image is expanded to the grid's merged-token count
+    (``mrope.expand_image_pads``; ``image_grids`` are the images' grids in prompt order, one per collected part)."""
 
     text = render_chat(
         tokenizer,
-        normalize_messages(messages),
+        normalize_messages(messages, images=images),
         validate_tools(tools),
         enable_thinking=enable_thinking,
         reasoning_effort=reasoning_effort,
     )
     if not text.endswith("<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"):
         raise Qwen38ChatFormatError(f"official template generation suffix drifted: {text[-40:]!r}")
-    return encode_chat(tokenizer, text)
+    ids = encode_chat(tokenizer, text)
+    grids = list(image_grids)
+    if grids or images:
+        from models.demos.blackhole.qwen38_flash_next import mrope
+
+        if images is not None and len(grids) != len(images):
+            raise Qwen38ChatFormatError(f"{len(images)} image parts but {len(grids)} image grids")
+        try:
+            ids = mrope.expand_image_pads(ids, grids)
+        except ValueError as error:
+            raise Qwen38ChatFormatError(f"image pad expansion: {error}") from error
+    return ids
 
 
 # -- reply side ----------------------------------------------------------------------------------

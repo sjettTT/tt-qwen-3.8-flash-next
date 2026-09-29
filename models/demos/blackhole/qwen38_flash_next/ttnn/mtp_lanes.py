@@ -39,6 +39,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn import gdn as gdn_module
 from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2
 from models.demos.blackhole.qwen38_flash_next.ttnn import qsa as qsa_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import (
+    require_rope_shift,
     BLOCK_START_LANE_MASK,
     CHUNK_ROWS,
     MESH_SHAPE,
@@ -112,6 +113,8 @@ def kv_scratch_rows(allocated_context: int) -> int:
             f"lane KV context {allocated_context} is not a whole number of {chunk}-row import chunks of two blocks"
         )
     return chunk
+
+
 PAD_DRAFT_COUNT = 64.0  # a running accept count no pad column reaches: its prefix flag is 0
 READBACK_FIXED_LANES = ("accepted", "next_token", "first_draft")
 
@@ -302,6 +305,12 @@ class Qwen38TTNNMTPLanePositions:
     positions: list[int]
     mesh_device: Any = field(repr=False, compare=False)
     mesh_contract: Qwen38MeshContract = field(repr=False, compare=False)
+    # Lane u's rotary shift ``S_u`` (UINT32 ROW_MAJOR ``[1,1,1,32]``, the pad lanes 0; ``S_u <= P_u & ~3``) and its
+    # host mirror: the RoPE table row of lane u's token at P_u is ``P_u - S_u`` (``mrope.Qwen38MRoPEPositions.shift``;
+    # 0 for text); the caches and masks stay on P_u.  Written with the position at an admission; a rewind keeps it.
+    # None: a row built without one (a text-only stand-in): the rotary rows are the plain rows.
+    shift_row: Any = None
+    shifts: list[int] = field(default_factory=list)
 
     @staticmethod
     def _lane_values(positions: Sequence[int], lanes: int) -> list[int]:
@@ -310,11 +319,34 @@ class Qwen38TTNNMTPLanePositions:
             raise ValueError(f"lane positions need {lanes} ints in [0, 2^32), got {positions!r}")
         return values
 
+    @staticmethod
+    def _lane_shifts(shifts: Sequence[int] | None, positions: Sequence[int], lanes: int) -> list[int]:
+        """The lanes' rotary shifts (None: all 0), each an int in ``[0, P_u]`` so ``P_u - S_u`` never wraps."""
+
+        values = [0] * lanes if shifts is None else [int(value) for value in shifts]
+        if len(values) != lanes:
+            raise ValueError(f"lane shifts need {lanes} ints, got {shifts!r}")
+        for shift, position in zip(values, positions):
+            require_rope_shift(shift, int(position))  # the lane's block-start row (P_u & ~3) - S_u stays >= 0
+        return values
+
+    def _host_row(self, values: Sequence[int], pad: int) -> torch.Tensor:
+        return _uint32_row(list(values) + [pad] * (CHUNK_ROWS - self.lanes))
+
     @classmethod
-    def allocate(cls, mesh_device, mesh_contract: Qwen38MeshContract, positions: Sequence[int], *, lanes: int):
+    def allocate(
+        cls,
+        mesh_device,
+        mesh_contract: Qwen38MeshContract,
+        positions: Sequence[int],
+        *,
+        lanes: int,
+        shifts: Sequence[int] | None = None,
+    ):
         mesh_contract.validate_mesh(mesh_device)
         lanes = require_lane_count(lanes, label="MTP lane positions lanes")
         values = cls._lane_values(positions, lanes)
+        shift_values = cls._lane_shifts(shifts, values, lanes)
         row = _upload_replicated(
             mesh_device,
             mesh_contract,
@@ -323,6 +355,7 @@ class Qwen38TTNNMTPLanePositions:
             ttnn.ROW_MAJOR_LAYOUT,
             label="lane positions",
         )
+        owned = [row]
         try:
             mask = _upload_replicated(
                 mesh_device,
@@ -332,34 +365,54 @@ class Qwen38TTNNMTPLanePositions:
                 ttnn.ROW_MAJOR_LAYOUT,
                 label="lane block-start mask row",
             )
-        except BaseException:
-            _deallocate(row)
-            raise
-        return cls(row, mask, lanes, values, mesh_device, mesh_contract)
-
-    def write(self, positions: Sequence[int]) -> None:
-        """Host write of every lane's position (outside any trace)."""
-
-        values = self._lane_values(positions, self.lanes)
-        ttnn.copy_host_to_device_tensor(
-            _host_row_tensor(
-                self.mesh_device,
-                _uint32_row(values + [values[0]] * (CHUNK_ROWS - self.lanes)),
+            owned.append(mask)
+            shift_row = _upload_replicated(
+                mesh_device,
+                mesh_contract,
+                _uint32_row(shift_values + [0] * (CHUNK_ROWS - lanes)),
                 ttnn.uint32,
                 ttnn.ROW_MAJOR_LAYOUT,
-            ),
+                label="lane rotary shifts",
+            )
+        except BaseException:
+            _deallocate(*owned)
+            raise
+        return cls(row, mask, lanes, values, mesh_device, mesh_contract, shift_row, shift_values)
+
+    def write(self, positions: Sequence[int], shifts: Sequence[int] | None = None) -> None:
+        """Host write of every lane's position, and of every lane's rotary shift when ``shifts`` is given (outside
+        any trace); a rewind of the positions alone keeps the shifts (a request's shift is fixed at its admission)."""
+
+        values = self._lane_values(positions, self.lanes)
+        current = list(self.shifts) if self.shifts else [0] * self.lanes
+        shift_values = current if shifts is None else self._lane_shifts(shifts, values, self.lanes)
+        self._lane_shifts(shift_values, values, self.lanes)
+        ttnn.copy_host_to_device_tensor(
+            _host_row_tensor(self.mesh_device, self._host_row(values, values[0]), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
             self.row,
         )
+        if self.shift_row is None:
+            if any(shift_values):
+                raise RuntimeError("these lane positions carry no rotary shift row")
+        elif shifts is not None or shift_values != current:
+            ttnn.copy_host_to_device_tensor(
+                _host_row_tensor(self.mesh_device, self._host_row(shift_values, 0), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT),
+                self.shift_row,
+            )
         self.positions = values
+        self.shifts = shift_values
 
-    def write_lane(self, lane: int, position: int) -> None:
-        """Host write of one lane's position (an admission; outside any trace): the row from the updated mirror."""
+    def write_lane(self, lane: int, position: int, rope_shift: int = 0) -> None:
+        """Host write of one lane's position and rotary shift (an admission; outside any trace): the rows from the
+        updated mirrors."""
 
         if isinstance(lane, bool) or type(lane) is not int or not 0 <= lane < self.lanes:
             raise ValueError(f"lane must be an int in [0, {self.lanes}), got {lane!r}")
         values = list(self.positions)
         values[lane] = int(position)
-        self.write(values)
+        shifts = list(self.shifts)
+        shifts[lane] = int(rope_shift)
+        self.write(values, shifts)
 
     def advance_mirror(self, committed: Sequence[int]) -> None:
         """The mirror after a body advanced lane u by ``committed[u]`` rows."""
@@ -374,8 +427,30 @@ class Qwen38TTNNMTPLanePositions:
         values = ttnn.to_torch(ttnn.get_device_tensors(self.row)[0]).reshape(-1).to(torch.int64) & (UINT32_LIMIT - 1)
         return [int(value) for value in values.tolist()[: self.lanes]]
 
+    def read_shifts(self) -> list[int]:
+        """Diagnostic readback of the B lanes' rotary shifts from coordinate 0 (outside any trace)."""
+
+        values = ttnn.to_torch(ttnn.get_device_tensors(self.shift_row)[0]).reshape(-1).to(torch.int64)
+        return [int(value) & (UINT32_LIMIT - 1) for value in values.tolist()[: self.lanes]]
+
+    def rope_rows(self, row_positions, block_start_rows, lane_of_row, block_lane_of_row):
+        """The RoPE index rows of the verify rows: ``row_positions`` (UINT32 ``[1,1,1,32]``, row r = P_u + d_r) and
+        ``block_start_rows`` (row r = (P_u & ~3) + 4 i) less the shift of the row's lane (gathered like the
+        positions were, ``lane_of_row`` / ``block_lane_of_row``): exact UINT32 subtracts.  Returns the two rows;
+        the caller deallocates them."""
+
+        dram = ttnn.DRAM_MEMORY_CONFIG
+        if self.shift_row is None:  # no shift row: the plain rows, as fresh tensors (the caller releases them)
+            return ttnn.add(row_positions, 0, memory_config=dram), ttnn.add(block_start_rows, 0, memory_config=dram)
+        row_shifts = ttnn.gather(self.shift_row, 3, lane_of_row, memory_config=dram)
+        block_shifts = ttnn.gather(self.shift_row, 3, block_lane_of_row, memory_config=dram)
+        rope_rows = ttnn.subtract(row_positions, row_shifts, memory_config=dram)
+        rope_block_rows = ttnn.subtract(block_start_rows, block_shifts, memory_config=dram)
+        _deallocate(row_shifts, block_shifts)
+        return rope_rows, rope_block_rows
+
     def deallocate(self) -> None:
-        _deallocate(self.row, self.block_start_mask_row)
+        _deallocate(self.row, self.block_start_mask_row, *(() if self.shift_row is None else (self.shift_row,)))
 
 
 # --------------------------------------------------------------------------- states
@@ -1044,20 +1119,23 @@ def import_lane_state(
     backbone_pager: Qwen38TTNNLanePager,
     alignment_slot: Qwen38LaneHostSlot,
     alignment_pager: Qwen38TTNNLanePager,
+    rope_shift: int = 0,
 ) -> None:
     """Admit a prefilled sequence into lane ``lane`` from its 1-lane images: the pager's host slot of the generic
     state (``model.generic_lane_layout``) and of the alignment layer's generic state, evicted after the prompt's
     prefill at host-known ``position``; ``gdn_phases`` are the generic GDN states' ring phases at that moment (in
     GDN-layer order).  Device -> device through the pagers' pack buffers, every family landing in lane u alone; the
     phase-bound families are converted at P into the MTP-lane families (the B=1 seed forms of ``mtp_v2`` per lane).
-    Then the lane's position and n-gram context.  Eager, never traced; the caller writes the lane's accept count
-    (-1: the next commit keeps everything) and active flag, and warms every (lane) variant before the captures."""
+    Then the lane's position, rotary shift (``rope_shift``: the prompt's ``mrope`` shift, 0 for text) and n-gram
+    context.  Eager, never traced; the caller writes the lane's accept count (-1: the next commit keeps everything)
+    and active flag, and warms every (lane) variant before the captures."""
 
     _validate_lane_verify_state(model, verify)
     if isinstance(lane, bool) or type(lane) is not int or not 0 <= lane < verify.lanes:
         raise ValueError(f"lane must be an int in [0, {verify.lanes}), got {lane!r}")
     if isinstance(position, bool) or type(position) is not int or position < 0:
         raise ValueError(f"position must be a non-negative int, got {position!r}")
+    require_rope_shift(rope_shift, position)
     gdn_layers = [layer for layer in model.layers if isinstance(layer.attention, Qwen38TTNNGDN)]
     if len(gdn_phases) != len(gdn_layers):
         raise ValueError(f"gdn_phases needs one ring phase per GDN layer ({len(gdn_layers)}), got {len(gdn_phases)}")
@@ -1104,7 +1182,7 @@ def import_lane_state(
         lane=lane,
         allocated_context=context,
     )
-    verify.positions.write_lane(lane, position)
+    verify.positions.write_lane(lane, position, rope_shift)
     verify.pass_contexts[lane] = (ple_context,) * (verify.rows + 1)
 
 
@@ -1424,8 +1502,12 @@ def forward_verify_lanes(
         block_start_lanes = ttnn.bitwise_and(positions.row, positions.block_start_mask_row, memory_config=dram)
         block_lane_starts = ttnn.gather(block_start_lanes, 3, lane_verify.block_lane_of_row, memory_config=dram)
         block_start_rows = ttnn.add(block_lane_starts, lane_verify.block_offset_row, memory_config=dram)
-        rope = model.rope_table.rows_chunk(row_positions, block_start_rows)
-        _deallocate(lane_rows, block_start_lanes, block_lane_starts, block_start_rows)
+        # The RoPE rows read the table at the rows' positions less their lanes' rotary shifts (0 for text).
+        rope_rows, rope_block_rows = positions.rope_rows(
+            row_positions, block_start_rows, lane_verify.lane_of_row, lane_verify.block_lane_of_row
+        )
+        rope = model.rope_table.rows_chunk(rope_rows, rope_block_rows)
+        _deallocate(lane_rows, block_start_lanes, block_lane_starts, block_start_rows, rope_rows, rope_block_rows)
         qsa_inputs = qsa_module.derive_qsa_lane_verify_inputs(
             positions.row,
             verify.active_row,
@@ -1695,7 +1777,10 @@ def _validate_lane_draft_state(
         )
     if draft.qsa_verify_constants.rows != 1 or draft.qsa_lane_verify_constants.rows != 1:
         raise ValueError("lane draft constants must be the rows = 1 forms")
-    if draft.qsa_chunk_constants is not verify.qsa_chunk_constants or draft.qsa_lane_constants is not verify.qsa_lane_constants:
+    if (
+        draft.qsa_chunk_constants is not verify.qsa_chunk_constants
+        or draft.qsa_lane_constants is not verify.qsa_lane_constants
+    ):
         raise ValueError("lane draft state must share the verify state's chunk and lane constants")
     alignment = verify.alignment
     if draft.layer_state.attention_state is not alignment.layer_state.attention_state:
@@ -1703,7 +1788,9 @@ def _validate_lane_draft_state(
     if draft.layer_state.attention_rows is not draft.qsa_state or draft.layer_state.ple is not None:
         raise ValueError("lane draft layer state must run the draft QSA lane state through the MTP layer, no PLE")
     if len(draft.step_offset_rows) != draft.drafts - 1:
-        raise ValueError(f"lane draft state needs {draft.drafts - 1} step offset rows, got {len(draft.step_offset_rows)}")
+        raise ValueError(
+            f"lane draft state needs {draft.drafts - 1} step offset rows, got {len(draft.step_offset_rows)}"
+        )
     for name, tensor, shape in (
         ("lane draft sentinel tail", draft.sentinel_tail, (1, 1, 1, CHUNK_ROWS - draft.lanes)),
         ("lane draft sentinel lane", draft.sentinel_lane, (1, 1, 1, 1)),
@@ -1938,8 +2025,11 @@ def forward_draft_lanes(
             block_start_lanes = ttnn.bitwise_and(position_row, positions.block_start_mask_row, memory_config=dram)
             block_lane_starts = ttnn.gather(block_start_lanes, 3, lane_verify.block_lane_of_row, memory_config=dram)
             block_start_rows = ttnn.add(block_lane_starts, lane_verify.block_offset_row, memory_config=dram)
-            rope = model.rope_table.rows_chunk(row_positions, block_start_rows)
-            _deallocate(lane_rows, block_start_lanes, block_lane_starts, block_start_rows)
+            rope_rows, rope_block_rows = positions.rope_rows(
+                row_positions, block_start_rows, lane_verify.lane_of_row, lane_verify.block_lane_of_row
+            )
+            rope = model.rope_table.rows_chunk(rope_rows, rope_block_rows)
+            _deallocate(lane_rows, block_start_lanes, block_lane_starts, block_start_rows, rope_rows, rope_block_rows)
             qsa_inputs = qsa_module.derive_qsa_lane_verify_inputs(
                 position_row,
                 verify.active_row,
@@ -2015,7 +2105,9 @@ def forward_draft_lanes(
         _land(draft_lanes, verify.draft_lanes, label="assembled lane draft lanes")
         pieces = {_tensor_key(piece): piece for piece in (*token_pieces, *draft_pieces)}
         pieces.pop(_tensor_key(draft.sentinel_lane), None)
-        _deallocate(token_lanes, token_tile, draft_lanes, pass_row, next_token, first_draft, *pieces.values(), *step_rows)
+        _deallocate(
+            token_lanes, token_tile, draft_lanes, pass_row, next_token, first_draft, *pieces.values(), *step_rows
+        )
         stage("assemble")
     except BaseException as error:
         model._mark_poisoned("forward_draft_lanes", processed_rows, error)
@@ -2135,7 +2227,9 @@ class Qwen38TTNNMTPLaneChain:
         self.replay, self.enqueue, self.clock_ns, self.observer = replay, enqueue, clock_ns, observer
         self.records: list[Qwen38TTNNMTPLanePassRecord] = []
         self.active: list[int] = [1] * verify.lanes  # the host's copy of the device masks (:meth:`set_active`)
-        self.commit_mask: list[int] = [1] * verify.lanes  # the device's commit mask: the mask of the pass being committed
+        self.commit_mask: list[int] = [
+            1
+        ] * verify.lanes  # the device's commit mask: the mask of the pass being committed
         # ``next_tokens``: the tokens an earlier (eager) pass assembled; the chain then continues with ``step``
         # (its commit replay commits that pass) instead of a bootstrap.
         self.next_tokens: tuple[tuple[int, ...], ...] | None = (
@@ -2245,7 +2339,9 @@ class Qwen38TTNNMTPLaneChain:
             # pass's (the host write queues behind the commit on the same command queue).  Left stale, a parked lane's
             # junk pass would be committed and an admitted lane's first pass never (mtp-b4-s4-lifecycle, 1b81ca8b).
             self._timed(
-                segments, "mask_refresh", lambda: write_lane_active(self.model, self.verify, self.active, commit=self.active)
+                segments,
+                "mask_refresh",
+                lambda: write_lane_active(self.model, self.verify, self.active, commit=self.active),
             )
             self.commit_mask = list(self.active)
         self._timed(segments, "ple_rows", lambda: write_lane_ple_rows(self.model, self.verify, tokens))
@@ -2285,6 +2381,7 @@ class Qwen38MTPLaneImage:
     alignment_compressed: list[torch.Tensor]
     alignment_raw_history: list[torch.Tensor]
     ple_history: list[torch.Tensor]
+    rope_shift: int = 0  # the lane's rotary shift (mrope; 0 for text)
 
     def digest(self) -> str:
         """sha256 over the committed state's bytes and the host record: the KV rows below the position, the compressed
@@ -2292,7 +2389,9 @@ class Qwen38MTPLaneImage:
         the lane's next pass, and a parked lane's redirected verify pools junk into them), the recurrent states and the
         history rows whole.  Two images of one committed state are equal iff equal here."""
 
-        digest = hashlib.sha256(f"{self.position}:{self.kv_rows}:{self.ple_context}:{self.accepted}".encode())
+        digest = hashlib.sha256(
+            f"{self.position}:{self.kv_rows}:{self.ple_context}:{self.accepted}:{self.rope_shift}".encode()
+        )
         blocks = self.position // qsa_module.COMPRESS_RATIO
 
         def update(shard: torch.Tensor) -> None:
@@ -2304,7 +2403,13 @@ class Qwen38MTPLaneImage:
         for shards in (*self.compressed, self.alignment_compressed):
             for shard in shards:
                 update(shard[:, :, :blocks])
-        for family in (self.recurrent, self.gdn_history, self.raw_history, [self.alignment_raw_history], [self.ple_history]):
+        for family in (
+            self.recurrent,
+            self.gdn_history,
+            self.raw_history,
+            [self.alignment_raw_history],
+            [self.ple_history],
+        ):
             for shards in family:
                 for shard in shards:
                     update(shard)
@@ -2360,7 +2465,9 @@ def _gdn_lane_layers(verify: Qwen38TTNNMTPLaneVerifyState) -> list[Qwen38TTNNMTP
     return [s for s in verify.layers if not isinstance(s.attention_state, qsa_module.Qwen38TTNNQSALaneState)]
 
 
-def evict_lane(model: Qwen38TTNNTextModel, verify: Qwen38TTNNMTPLaneVerifyState, lane: int, *, accepted: int) -> Qwen38MTPLaneImage:
+def evict_lane(
+    model: Qwen38TTNNTextModel, verify: Qwen38TTNNMTPLaneVerifyState, lane: int, *, accepted: int
+) -> Qwen38MTPLaneImage:
     """Lane ``lane``'s image to the host (outside any trace, between passes, after the host commit of the last pass
     the lane ran): its KV prefix rows, compressed caches, recurrent states, FIR / raw / PLE history rows, position,
     n-gram context and ``accepted`` (the accept count the lane parks with: -1 for a lane whose last pass is already
@@ -2390,10 +2497,13 @@ def evict_lane(model: Qwen38TTNNTextModel, verify: Qwen38TTNNMTPLaneVerifyState,
         kv_rows=kv_rows,
         ple_context=ple_state.token_contexts[lane],
         accepted=int(accepted),
+        rope_shift=int(verify.positions.shifts[lane]),
         kv=[kv_rows_of(s.attention_state) for s in qsa_layers],
         compressed=[_read_shards(_lane_slice(s.attention_state.compressed_index_cache, 0, lane)) for s in qsa_layers],
         recurrent=[_read_shards(_lane_slice(s.attention_state.recurrent, 0, lane)) for s in gdn_layers],
-        gdn_history=[_read_shards(_lane_slice(s.attention_rows.history, 1, lane, rows=history_rows)) for s in gdn_layers],
+        gdn_history=[
+            _read_shards(_lane_slice(s.attention_rows.history, 1, lane, rows=history_rows)) for s in gdn_layers
+        ],
         raw_history=[raw_history_of(s.attention_rows) for s in qsa_layers],
         alignment_kv=kv_rows_of(alignment.attention_state),
         alignment_compressed=_read_shards(_lane_slice(alignment.attention_state.compressed_index_cache, 0, lane)),
@@ -2481,7 +2591,9 @@ def readmit_lane(
     alignment = verify.alignment.layer_state
     land_kv(alignment.attention_state, image.alignment_kv)
     part = _upload_shards(mesh, image.alignment_compressed, bf16, tile, None)
-    _fill_lane(alignment.attention_state.compressed_index_cache, part, lane, label=f"lane {lane} image alignment compressed")
+    _fill_lane(
+        alignment.attention_state.compressed_index_cache, part, lane, label=f"lane {lane} image alignment compressed"
+    )
     _deallocate(part)
     land_rows(
         alignment.attention_rows.raw_history,
@@ -2503,5 +2615,5 @@ def readmit_lane(
     contexts[lane] = None if image.ple_context is None else tuple(int(v) for v in image.ple_context)
     ple_state.token_contexts = tuple(contexts)
     ple_state.validate()
-    verify.positions.write_lane(lane, image.position)
+    verify.positions.write_lane(lane, image.position, image.rope_shift)
     verify.pass_contexts[lane] = (contexts[lane],) * (verify.rows + 1)

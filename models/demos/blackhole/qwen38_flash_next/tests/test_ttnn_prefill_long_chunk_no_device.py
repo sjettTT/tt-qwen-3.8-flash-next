@@ -385,7 +385,7 @@ class _FakeModel:
     def write_chunk_accepted(self, chunk_state, accepted: int) -> None:
         self.calls.append(("accepted", chunk_state, accepted))
 
-    def prepare_chunk_inputs(self, chunk_state, token_ids, *, ple_context):
+    def prepare_chunk_inputs(self, chunk_state, token_ids, *, ple_context, positions=None, features=None):
         tokens = list(token_ids)
         assert len(tokens) == {"chunk_state": 32, "long_state": 128}[chunk_state]
         contexts = [ple_context]
@@ -397,7 +397,7 @@ class _FakeModel:
     def upload_chunk_inputs(self, chunk_state, prepared) -> None:
         assert prepared.chunk_state == chunk_state  # the upload lands in the state the rows were prepared for
 
-    def finish_prefill(self, state, chunk_state, prefilled: int) -> None:
+    def finish_prefill(self, state, chunk_state, prefilled: int, *, rope_shift: int = 0) -> None:
         self.calls.append(("finish", chunk_state, prefilled))
 
     def forward_prefill_chunk_generic(self, chunk_state, state, *, gdn_step_anchor: bool = False) -> None:
@@ -525,9 +525,7 @@ def test_long_chunk_source_pins() -> None:
     )
     assert 'raise ValueError("the GDN step anchor is a 32-row chunk option")' in layer
     model = inspect.getsource(model_module.Qwen38TTNNTextModel.forward_prefill_chunk_generic)
-    assert (
-        "ttnn.concat([index_row] * chunk_row_tiles(rows), dim=2" in model and "state.position.advance_by(rows)" in model
-    )
+    assert "rope = chunk_state.rope_rows" in model and "state.position.advance_by(rows)" in model
     allocate = inspect.getsource(model_module.Qwen38TTNNTextModel.allocate_chunk_state)
     assert (
         "moe_module.allocate_local_combine_output(" in allocate

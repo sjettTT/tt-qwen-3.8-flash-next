@@ -489,16 +489,27 @@ class Qwen38TTNNDevicePosition:
     # QWEN38_FUSED=position_advance binds ttnn/fused/position_derive.advance (P += count as one in-place program) in
     # allocate(); None runs the chain's add + copy.
     _fused_advance: Any = field(default=None, repr=False, compare=False)
+    # The rotary shift ``S`` (UINT32 ``[1,1,1,1]``): the rotary index of the token at ``P`` is ``P - S`` on every
+    # axis (``mrope.Qwen38MRoPEPositions.shift``: 0 for text, the images' accumulated ``max(h, w) // 2 - h * w // 4``
+    # otherwise), ``S <= P & ~3``.  Host-written with the position (:meth:`reset`); the cache, the KV row, the block
+    # index and the masks stay on ``P``.  ``rope_shift`` is its host mirror.  None: a position built without one (a
+    # text-only stand-in): the rotary rows are the plain rows.
+    shift: Any = None
+    rope_shift: int = 0
 
     @classmethod
-    def allocate(cls, mesh_device, mesh_contract: Qwen38MeshContract, *, position: int = 0) -> Qwen38TTNNDevicePosition:
+    def allocate(
+        cls, mesh_device, mesh_contract: Qwen38MeshContract, *, position: int = 0, rope_shift: int = 0
+    ) -> Qwen38TTNNDevicePosition:
         mesh_contract.validate_mesh(mesh_device)
+        require_rope_shift(rope_shift, position)
         uploaded: list[Any] = []
         try:
             for shape, value, label in (
                 (POSITION_SCALAR_SHAPE, position, "device position"),
                 (POSITION_INDEX_ROW_SHAPE, 1, "device position ones row"),
                 (POSITION_INDEX_ROW_SHAPE, BLOCK_START_LANE_MASK, "device position block-start mask row"),
+                (POSITION_SCALAR_SHAPE, rope_shift, "device rotary shift"),
             ):
                 tensor = ttnn.from_torch(
                     _host_uint32(shape, value, label=label),
@@ -519,11 +530,20 @@ class Qwen38TTNNDevicePosition:
         fused_advance = None
         if fused_kernels.enabled("position_advance"):
             fused_advance = fused_kernels.kernel("position_advance").fused
-        return cls(uploaded[0], uploaded[1], uploaded[2], mesh_device, mesh_contract, fused_advance)
+        return cls(
+            uploaded[0], uploaded[1], uploaded[2], mesh_device, mesh_contract, fused_advance, uploaded[3], rope_shift
+        )
 
-    def reset(self, position: int) -> None:
-        """Host write of ``P`` (outside any trace); the only host path into ``scalar``."""
+    def reset(self, position: int, rope_shift: int | None = None) -> None:
+        """Host write of ``P`` and of the rotary shift ``S`` (outside any trace); the only host path into ``scalar``
+        and ``shift``.  ``rope_shift`` None keeps the mirrored shift (a position rewind inside one request); a new
+        sequence passes its shift (0 for text)."""
 
+        if rope_shift is None:
+            rope_shift = self.rope_shift
+        require_rope_shift(rope_shift, position)
+        if self.shift is None and rope_shift:
+            raise RuntimeError("this device position carries no rotary shift tensor")
         host = ttnn.from_torch(
             _host_uint32(POSITION_SCALAR_SHAPE, position, label="device position"),
             dtype=ttnn.uint32,
@@ -531,6 +551,15 @@ class Qwen38TTNNDevicePosition:
             mesh_mapper=replicate_tensor_2d_mesh_mapper(self.mesh_device),
         )
         ttnn.copy_host_to_device_tensor(host, self.scalar)
+        if rope_shift != self.rope_shift:  # the shift changes only between sequences: one more write then
+            shift_host = ttnn.from_torch(
+                _host_uint32(POSITION_SCALAR_SHAPE, rope_shift, label="device rotary shift"),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=replicate_tensor_2d_mesh_mapper(self.mesh_device),
+            )
+            ttnn.copy_host_to_device_tensor(shift_host, self.shift)
+            object.__setattr__(self, "rope_shift", rope_shift)  # the frozen dataclass's mirror (as the fused hook)
 
     def advance(self) -> None:
         """In-trace ``P += 1``; must be the last op of the model body."""
@@ -582,14 +611,57 @@ class Qwen38TTNNDevicePosition:
         _require_uint32_row(row, POSITION_INDEX_ROW_SHAPE, self.mesh_contract, label="device position block-start row")
         return row
 
+    def rope_index_row(self, index_row):
+        """``[1,1,1,32]`` UINT32 row with every lane ``= P - S``: the RoPE table row of the token at ``P`` (an exact
+        UINT32 subtract; ``S <= P`` by construction of the shift)."""
+
+        if self.shift is None:  # no shift tensor: the plain row, as a fresh tensor (the callers release it)
+            row = ttnn.add(index_row, 0, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        else:
+            row = ttnn.subtract(index_row, self.shift, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _require_uint32_row(row, POSITION_INDEX_ROW_SHAPE, self.mesh_contract, label="device rotary index row")
+        return row
+
+    def rope_block_start_index_row(self, index_row):
+        """``[1,1,1,32]`` UINT32 row with every lane ``= (P & ~3) - S``: the RoPE table row of the token at the
+        current index block's first position (a text token of this sequence, so its shift is ``S``)."""
+
+        block_start_row = self.block_start_index_row(index_row)
+        if self.shift is None:
+            return block_start_row
+        row = ttnn.subtract(block_start_row, self.shift, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(block_start_row)
+        _require_uint32_row(row, POSITION_INDEX_ROW_SHAPE, self.mesh_contract, label="device rotary block-start row")
+        return row
+
     def read(self) -> int:
         """Diagnostic readback of ``P`` from coordinate 0 (outside any trace)."""
 
         return int(ttnn.to_torch(ttnn.get_device_tensors(self.scalar)[0]).reshape(-1)[0].item())
 
+    def read_shift(self) -> int:
+        """Diagnostic readback of ``S`` from coordinate 0 (outside any trace)."""
+
+        return int(ttnn.to_torch(ttnn.get_device_tensors(self.shift)[0]).reshape(-1)[0].item())
+
     def deallocate(self) -> None:
-        for tensor in (self.scalar, self.ones_row, self.block_start_mask_row):
-            ttnn.deallocate(tensor)
+        for tensor in (self.scalar, self.ones_row, self.block_start_mask_row, self.shift):
+            if tensor is not None:
+                ttnn.deallocate(tensor)
+
+
+def require_rope_shift(rope_shift, position) -> int:
+    """The rotary shift: an exact int in ``[0, P & ~3]``, so neither the token's rotary index ``P - S`` nor its index
+    block's first token's ``(P & ~3) - S`` wraps (the block's first token is a text token of this sequence whose
+    rotary position is non-negative; ``mrope.Qwen38MRoPEPositions.tail_is_plain`` is the prompt-side form of the
+    same rule)."""
+
+    value = _exact_integer(rope_shift, label="rotary shift", error_type=ValueError)
+    position = _exact_integer(position, label="device position", error_type=ValueError)
+    limit = max(position, 0) & BLOCK_START_LANE_MASK
+    if not 0 <= value <= limit:
+        raise ValueError(f"rotary shift must be in [0, {limit}] (the position's index block start), got {value}")
+    return value
 
 
 @dataclass
@@ -614,6 +686,22 @@ class Qwen38TTNNDevicePositionRow:
     positions: list[int]
     mesh_device: Any = field(repr=False, compare=False)
     mesh_contract: Qwen38MeshContract = field(repr=False, compare=False)
+    # Lane u's rotary shift ``S_u`` (UINT32 ``[1,1,1,32]``; idle lanes 0; ``S_u <= P_u & ~3``) and its host mirror:
+    # the RoPE table row of lane u's token at ``P_u`` is ``P_u - S_u`` (see ``Qwen38TTNNDevicePosition.shift``).
+    # None: a row built without one (a text-only stand-in): the rotary rows are the plain rows.
+    shift_row: Any = None
+    shifts: list[int] = field(default_factory=lambda: [0] * MAX_LANES)
+
+    @staticmethod
+    def _lane_shifts(shifts, positions: list[int], *, lanes: int) -> list[int]:
+        """The 32 lane shifts (active lanes as given, 0 when None, idle lanes 0), each in ``[0, P_u]``."""
+
+        values = [0] * lanes if shifts is None else [int(value) for value in shifts]
+        if len(values) != lanes:
+            raise ValueError(f"shift row needs one shift per active lane: got {len(values)}, expected {lanes}")
+        for lane, value in enumerate(values):
+            require_rope_shift(value, positions[lane])
+        return values + [0] * (MAX_LANES - lanes)
 
     @staticmethod
     def _lane_positions(positions, *, lanes: int) -> list[int]:
@@ -643,11 +731,12 @@ class Qwen38TTNNDevicePositionRow:
 
     @classmethod
     def allocate(
-        cls, mesh_device, mesh_contract: Qwen38MeshContract, positions, *, lanes: int
+        cls, mesh_device, mesh_contract: Qwen38MeshContract, positions, *, lanes: int, shifts=None
     ) -> Qwen38TTNNDevicePositionRow:
         mesh_contract.validate_mesh(mesh_device)
         lanes = require_lane_count(lanes, label="position row lanes")
         values = cls._lane_positions(positions, lanes=lanes)
+        shift_values = cls._lane_shifts(shifts, values, lanes=lanes)
         uploaded: list[Any] = []
         try:
             for host, label in (
@@ -658,6 +747,7 @@ class Qwen38TTNNDevicePositionRow:
                     ),
                     "device position block-start mask row",
                 ),
+                (cls._host_row(shift_values), "device rotary shift row"),
             ):
                 tensor = ttnn.from_torch(
                     host,
@@ -673,37 +763,52 @@ class Qwen38TTNNDevicePositionRow:
             for tensor in uploaded:
                 ttnn.deallocate(tensor)
             raise
-        return cls(uploaded[0], uploaded[1], lanes, values, mesh_device, mesh_contract)
+        return cls(uploaded[0], uploaded[1], lanes, values, mesh_device, mesh_contract, uploaded[2], shift_values)
 
     @property
     def residue(self) -> int:
         return self.positions[0] % GDN_RESIDUE_CLASSES
 
     def validate(self) -> None:
-        if len(self.positions) != MAX_LANES:
+        if len(self.positions) != MAX_LANES or len(self.shifts) != MAX_LANES:
             raise RuntimeError(f"position row mirror holds {len(self.positions)} lanes, expected {MAX_LANES}")
         self._lane_positions(self.positions[: self.lanes], lanes=self.lanes)
+        self._lane_shifts(self.shifts[: self.lanes], self.positions, lanes=self.lanes)
         _require_uint32_row(self.row, POSITION_INDEX_ROW_SHAPE, self.mesh_contract, label="device position row")
+        if self.shift_row is not None:
+            _require_uint32_row(
+                self.shift_row, POSITION_INDEX_ROW_SHAPE, self.mesh_contract, label="device rotary shift row"
+            )
 
     def _write_mirror(self) -> None:
-        """Host write of the whole row from the mirror (outside any trace); the only host path into ``row``."""
+        """Host write of the whole position row and shift row from the mirrors (outside any trace); the only host
+        path into ``row`` and ``shift_row``."""
 
-        host = ttnn.from_torch(
-            self._host_row(self.positions),
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            mesh_mapper=replicate_tensor_2d_mesh_mapper(self.mesh_device),
-        )
-        ttnn.copy_host_to_device_tensor(host, self.row)
+        targets = [(self.positions, self.row)]
+        if self.shift_row is not None:
+            targets.append((self.shifts, self.shift_row))
+        elif any(self.shifts):
+            raise RuntimeError("this position row carries no rotary shift row")
+        for values, tensor in targets:
+            host = ttnn.from_torch(
+                self._host_row(values),
+                dtype=ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                mesh_mapper=replicate_tensor_2d_mesh_mapper(self.mesh_device),
+            )
+            ttnn.copy_host_to_device_tensor(host, tensor)
 
-    def reset(self, positions) -> None:
-        """Rewrite every active lane (a new batch); the lanes must share one residue."""
+    def reset(self, positions, shifts=None) -> None:
+        """Rewrite every active lane (a new batch); the lanes must share one residue.  ``shifts`` are the lanes'
+        rotary shifts (None: text, all 0)."""
 
         self.positions = self._lane_positions(positions, lanes=self.lanes)
+        self.shifts = self._lane_shifts(shifts, self.positions, lanes=self.lanes)
         self._write_mirror()
 
-    def admit(self, lane: int, position: int) -> None:
-        """Rewrite one lane at a step of its residue class: ``position mod 4`` must equal :attr:`residue`."""
+    def admit(self, lane: int, position: int, rope_shift: int = 0) -> None:
+        """Rewrite one lane at a step of its residue class: ``position mod 4`` must equal :attr:`residue`.
+        ``rope_shift`` is the lane's rotary shift (0 for a text prompt)."""
 
         lane = _exact_integer(lane, label="admitted lane", error_type=ValueError)
         if not 0 <= lane < self.lanes:
@@ -717,7 +822,9 @@ class Qwen38TTNNDevicePositionRow:
                 f"lane {lane} admission at position {value} has residue {value % GDN_RESIDUE_CLASSES}, expected the "
                 f"row's residue {self.residue}; admit it {wait} steps later"
             )
+        shift = require_rope_shift(rope_shift, value)
         self.positions[lane] = value
+        self.shifts[lane] = shift
         self._write_mirror()
 
     def advance(self) -> None:
@@ -753,6 +860,29 @@ class Qwen38TTNNDevicePositionRow:
         )
         return row
 
+    def rope_index_row(self, index_row):
+        """``[1,1,1,32]`` UINT32 row with lane ``u = P_u - S_u``: lane u's RoPE table row."""
+
+        if self.shift_row is None:
+            row = ttnn.add(index_row, 0, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        else:
+            row = ttnn.subtract(index_row, self.shift_row, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        _require_uint32_row(row, POSITION_INDEX_ROW_SHAPE, self.mesh_contract, label="device rotary lane index row")
+        return row
+
+    def rope_block_start_index_row(self, index_row):
+        """``[1,1,1,32]`` UINT32 row with lane ``u = (P_u & ~3) - S_u``: the RoPE table row of lane u's block start."""
+
+        block_start_row = self.block_start_index_row(index_row)
+        if self.shift_row is None:
+            return block_start_row
+        row = ttnn.subtract(block_start_row, self.shift_row, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(block_start_row)
+        _require_uint32_row(
+            row, POSITION_INDEX_ROW_SHAPE, self.mesh_contract, label="device rotary lane block-start row"
+        )
+        return row
+
     def read(self) -> list[int]:
         """Diagnostic readback of the 32 lanes from coordinate 0 (outside any trace)."""
 
@@ -760,5 +890,6 @@ class Qwen38TTNNDevicePositionRow:
         return [int(value) for value in values.tolist()]
 
     def deallocate(self) -> None:
-        for tensor in (self.row, self.block_start_mask_row):
-            ttnn.deallocate(tensor)
+        for tensor in (self.row, self.block_start_mask_row, self.shift_row):
+            if tensor is not None:
+                ttnn.deallocate(tensor)

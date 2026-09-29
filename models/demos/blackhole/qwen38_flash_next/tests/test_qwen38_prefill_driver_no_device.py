@@ -37,6 +37,7 @@ class _FakeModel:
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
+        self.vision: list[tuple] = []  # (positions, features) per chunk and ("finish", rope_shift) at the hand-off
 
     def reset_chunk_state_inplace(self, state, chunk_state) -> None:
         self.calls.append(("reset_chunk_state_inplace", state, chunk_state))
@@ -44,20 +45,22 @@ class _FakeModel:
     def write_chunk_accepted(self, chunk_state, accepted: int) -> None:
         self.calls.append(("write_chunk_accepted", accepted))
 
-    def prepare_chunk_inputs(self, chunk_state, token_ids, *, ple_context):
+    def prepare_chunk_inputs(self, chunk_state, token_ids, *, ple_context, positions=None, features=None):
         tokens = list(token_ids)
         assert len(tokens) == CHUNK_ROWS
         contexts = [ple_context]
         for token in tokens:
             contexts.append(_next_context(contexts[-1], token))
         self.calls.append(("prepare_chunk_inputs", tuple(tokens), ple_context))
+        self.vision.append((positions, features))
         return SimpleNamespace(tokens=tuple(tokens), contexts=tuple(contexts))
 
     def upload_chunk_inputs(self, chunk_state, prepared) -> None:
         self.calls.append(("upload_chunk_inputs", prepared.tokens))
 
-    def finish_prefill(self, state, chunk_state, prefilled: int) -> None:
+    def finish_prefill(self, state, chunk_state, prefilled: int, *, rope_shift: int = 0) -> None:
         self.calls.append(("finish_prefill", prefilled))
+        self.vision.append(("finish", rope_shift))
 
     def forward_prefill_chunk_generic(self, chunk_state, state, *, gdn_step_anchor: bool = False, mtp=None) -> None:
         self.calls.append(("eager_chunk", gdn_step_anchor))
@@ -244,13 +247,13 @@ def test_driver_source_pins() -> None:
         "self.model.reset_chunk_state_inplace(self.state, self.chunk_state)",
         "verify_before_replay",
         "self.model.write_chunk_accepted(self.chunk_state, accepted)",
-        "prepared = self.model.prepare_chunk_inputs(chunk_state, rows, ple_context=ple_context)",
+        "prepared = self.model.prepare_chunk_inputs(",
         "ple_context = prepared.contexts[real_rows]",
         "self.model.upload_chunk_inputs(chunk_state, prepared)",
         "self._run_chunk(blocking=True, kind=kind)",
         "self._run_chunk(blocking=False, kind=kind)",
         "ttnn.event_synchronize(ttnn.record_event(self.mesh, cq_id=0))",
-        "self.model.finish_prefill(self.state, self.chunk_state, position)",
+        "self.model.finish_prefill(self.state, self.chunk_state, position, rope_shift=rope_shift)",
     )
     positions = [run.index(fragment) for fragment in order]
     assert positions == sorted(positions)
@@ -276,3 +279,84 @@ def test_driver_source_pins() -> None:
     assert 'return {"short": self.mtp, "long": self.long_mtp, "slab": self.long_mtp}[kind]' in extension
     assert 'short = kind == "short"' in chunk
     assert CHUNK_PAD_TOKEN_ID == 0 and driver_module.CHUNK_EVENT_INTERVAL == 4
+
+
+# -- image prompts -------------------------------------------------------------------------------------------------
+
+
+def _image_prompt(committed: int = 0):
+    """A 48-token prefill after ``committed`` text tokens the device already holds: 10 text tokens,
+    <|vision_start|>, a 16-pad image (grid 8x8: span 4, shift 12), <|vision_end|>, 20 text tokens.  The positions
+    cover the whole sequence by device index (the committed prefix included), as the session builds them."""
+
+    import torch
+
+    from models.demos.blackhole.qwen38_flash_next import mrope
+
+    grid = mrope.Qwen38ImageGrid(1, 8, 8)
+    tokens = (
+        [1000 + i for i in range(10)]
+        + [mrope.VISION_START_TOKEN_ID]
+        + [mrope.IMAGE_TOKEN_ID] * grid.merged_tokens
+        + [mrope.VISION_END_TOKEN_ID]
+        + [2000 + i for i in range(20)]
+    )
+    positions = mrope.mrope_positions([3000 + i for i in range(committed)] + tokens, [grid])
+    features = torch.zeros((grid.merged_tokens, 2560), dtype=torch.bfloat16)
+    features[:, 0] = torch.arange(grid.merged_tokens, dtype=torch.float32).to(torch.bfloat16)
+    return tokens, positions, features
+
+
+def test_image_prompt_rows_take_their_positions_and_features_and_the_handoff_sets_the_shift(harness) -> None:
+    import torch
+
+    tokens, positions, features = _image_prompt()
+    result = harness.prefill.run(tokens, start_position=0, ple_context=None, positions=positions, features=features)
+    assert result.position == len(tokens) == 48
+    prepared = [entry for entry in harness.model.vision if entry[0] != "finish"]
+    assert len(prepared) == 2  # a full chunk and the 16-row padded tail
+    first_positions, first_features = prepared[0]
+    assert torch.equal(first_positions, positions.rows(0, 32))
+    assert first_features is not None and torch.equal(first_features, features)  # the 16 pads sit at rows 11..26
+    tail_positions, tail_features = prepared[1]
+    assert tail_features is None and tuple(tail_positions.shape) == (3, 32)
+    assert torch.equal(tail_positions[:, :16], positions.rows(32, 48))
+    # the padded rows continue the plain positions past the last real row (never read past the accept count)
+    last = int(positions.rows(32, 48)[:, -1].max())
+    assert tail_positions[:, 16:].tolist() == [[last + 1 + i for i in range(16)]] * 3
+    assert ("finish", positions.shift) in harness.model.vision and positions.shift == 12
+    assert positions.shift <= (48 & ~3)
+
+
+def test_image_pads_never_take_the_alignment_steps(harness) -> None:
+    """From position 5 the driver would force 27 tokens through the 1-row body: the pads (the prefill's tokens
+    11..26) are among them, so the prefill is refused before any device call (the session prefills such a prompt
+    from position 0)."""
+
+    import torch
+
+    tokens, positions, features = _image_prompt(committed=5)
+    with pytest.raises(ValueError, match="image pads in the 27 alignment steps"):
+        harness.prefill.run(tokens, start_position=5, ple_context=None, positions=positions, features=features)
+    assert harness.log == []
+    # text before the pads may take the alignment steps as long as no pad does: from position 22, 10 steps
+    # cover the prefill's tokens 0..9 (text); the pads start at its token 11.
+    tokens, positions, features = _image_prompt(committed=22)
+    result = harness.prefill.run(tokens, start_position=22, ple_context=None, positions=positions, features=features)
+    assert result.position == 22 + 48 and result.timing.alignment_steps == 10
+    forced = [entry for entry in harness.log if entry[0] == "forced_step"]
+    assert [entry[1] for entry in forced] == tokens[:10]
+    first_positions, first_features = [entry for entry in harness.model.vision if entry[0] != "finish"][0]
+    assert torch.equal(first_positions, positions.rows(32, 64)) and first_features is not None
+    assert ("finish", positions.shift_at(70)) in harness.model.vision
+
+
+def test_image_prompt_refusals(harness) -> None:
+    tokens, positions, features = _image_prompt()
+    with pytest.raises(ValueError, match="16 image pads in the prefill vs 15 feature rows"):
+        harness.prefill.run(tokens, start_position=0, ple_context=None, positions=positions, features=features[:15])
+    with pytest.raises(ValueError, match="rotary positions"):
+        harness.prefill.run(tokens, start_position=0, ple_context=None, features=features)
+    with pytest.raises(ValueError, match="rotary positions for a prefill ending at"):
+        harness.prefill.run(tokens + [5], start_position=0, ple_context=None, positions=positions, features=features)
+    assert harness.log == []

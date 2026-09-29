@@ -296,7 +296,7 @@ def test_handoff_order_and_the_traced_bodies_never_reach_it() -> None:
         finish,
         (
             "qsa_module.chunk_handoff_ring_select_rows(prefilled)",
-            "state.position.reset(prefilled)",
+            "state.position.reset(prefilled, rope_shift)",
             "layer.finish_chunk_state_inplace(",
             "_deallocate_unique(ring_select)",
             "self.write_chunk_accepted(chunk_state, CHUNK_ROWS - 1)",

@@ -107,6 +107,17 @@ read candidate row, not the vocabulary (`logprobs_normalizer` in `/health` and `
 decodes at a time; up to four wait in the queue (`queue_wait_seconds` in `usage`), the fifth gets HTTP 503.  A prompt
 over the context limit gets HTTP 400 `context_length_exceeded`.
 
+Image parts (2026-09-29).  A user message `content` part of type `image_url` is recognised by the request validator and
+refused with HTTP 400 ("image parts are not accepted here (text-only)", `param` naming the part) until the image request
+path lands; video parts (`video`, `video_url`, `input_video`, a `video` key) and unknown part types are refused the same
+way.  The served chain builds no vision tower, and its startup, READY record, DRAM per bank and text streams are
+unchanged by the image work (the acceptance records reproduce bit for bit).  The image path itself -- the vision tower
+on the device, the three-axis rotary rows, the feature splice into the prompt embeddings, the decode rotary shift -- is
+measured on the line through the model's development tools only (`docs/NUMERICS.md`, the image class) and waits for
+the server's image request path: the tower in the chain's warm hook behind a flag, the request's images through the
+checkpoint's processor to the prompt, `usage.prompt_tokens` counting the image tokens, the admission's tower terms fed
+from the tower.
+
 ### Several requests at once: `--lanes B` (opt-in, greedy only)
 
 `--lanes B` (B in 2..8 with B x (k + 1) <= 32 rows; needs `--mtp`; off by default) serves up to B requests at once

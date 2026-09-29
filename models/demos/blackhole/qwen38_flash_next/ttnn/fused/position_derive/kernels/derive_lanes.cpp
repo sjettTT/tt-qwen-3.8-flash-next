@@ -8,12 +8,13 @@
 // and the kv_block_start row (P & ~31) of all 32 lanes.  The same NoC-assembled templates as derive.cpp (rows cut at
 // the 64-byte DRAM read grain, boundary lanes stored by the RISC); no compute kernel.
 // Named compile-time args: blocks, slots, block_topk, kv_row_mask, ring_mask, kv_block_start_mask, lane_block_mask,
-// all_ones, one_bf16, rope_dim, cb_stage.  Compile-time args: TensorAccessorArgs for the 16 tensors below, chained
+// all_ones, one_bf16, rope_dim, cb_stage.  Compile-time args: TensorAccessorArgs for the 19 tensors below, chained
 // from 0.  Runtime args: 0 position row, 1 lane offsets row (u * C for the active lanes), 2 bf16 templates [zeros |
 // mask], 3 uint32 templates [zeros | ones], 4 tile templates [zero tile, ones-column tile], 5 cos table, 6 sin table,
 // 7 kv_block_start row, 8 kv_row_hit tiles, 9 indexer_neg_mask rows, 10 row_keep_bits rows, 11 row_fill rows,
-// 12 index_row, 13 block_start_row, 14 cos tiles, 15 sin tiles, 16 block-start cos tiles, 17 block-start sin tiles
-// (buffer addresses), 18 lane, 19 lane count (lanes with a kv_row_hit tile).
+// 12 index_row, 13 block_start_row, 14 cos tiles, 15 sin tiles, 16 block-start cos tiles, 17 block-start sin tiles,
+// 18 the rotary shift row (lane u's S_u; the RoPE table rows read are P_u - S_u and (P_u & ~3) - S_u, S_u <= P_u by
+// the host's check) (buffer addresses), 19 lane, 20 lane count (lanes with a kv_row_hit tile).
 
 #include <cstdint>
 
@@ -49,8 +50,8 @@ constexpr uint32_t STAGE_BF16 = 0;
 constexpr uint32_t STAGE_U32 = STAGE_BF16 + BF16_ROW_BYTES;
 constexpr uint32_t STAGE_TILE = STAGE_U32 + ((U32_ROW_BYTES + 63) & ~63u);
 constexpr uint32_t STAGE_ROPE = STAGE_TILE + TILE_BYTES;
-constexpr uint32_t STAGE_ROWS = STAGE_ROPE + 4 * ROPE_ROW_BYTES;  // the position row, the offsets row, three output rows
-constexpr uint32_t STAGE_BYTES = STAGE_ROWS + 5 * 128;
+constexpr uint32_t STAGE_ROWS = STAGE_ROPE + 4 * ROPE_ROW_BYTES;  // the position, offsets and shift rows, three output rows
+constexpr uint32_t STAGE_BYTES = STAGE_ROWS + 6 * 128;
 
 template <typename A>
 FORCE_INLINE void read_bytes(Noc& noc, const A& src, DataflowBuffer& dfb, uint32_t bytes, uint32_t page, uint32_t page_offset, uint32_t l1_offset) {
@@ -88,6 +89,7 @@ void kernel_main() {
     constexpr auto a_osin = TensorAccessorArgs<a_ocos.next_compile_time_args_offset()>();
     constexpr auto a_obcos = TensorAccessorArgs<a_osin.next_compile_time_args_offset()>();
     constexpr auto a_obsin = TensorAccessorArgs<a_obcos.next_compile_time_args_offset()>();
+    constexpr auto a_shift = TensorAccessorArgs<a_obsin.next_compile_time_args_offset()>();
 
     const auto p_in = TensorAccessor(a_p, get_arg_val<uint32_t>(0));
     const auto off_in = TensorAccessor(a_off, get_arg_val<uint32_t>(1));
@@ -107,8 +109,9 @@ void kernel_main() {
     const auto o_sin = TensorAccessor(a_osin, get_arg_val<uint32_t>(15));
     const auto o_bcos = TensorAccessor(a_obcos, get_arg_val<uint32_t>(16));
     const auto o_bsin = TensorAccessor(a_obsin, get_arg_val<uint32_t>(17));
-    const uint32_t lane = get_arg_val<uint32_t>(18);
-    const uint32_t lane_count = get_arg_val<uint32_t>(19);
+    const auto shift_in = TensorAccessor(a_shift, get_arg_val<uint32_t>(18));
+    const uint32_t lane = get_arg_val<uint32_t>(19);
+    const uint32_t lane_count = get_arg_val<uint32_t>(20);
 
     Noc noc;
     DataflowBuffer stage(CB_STAGE);
@@ -117,13 +120,14 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* words = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(base);
     volatile tt_l1_ptr uint16_t* halves = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(base);
     constexpr uint32_t ROW_P = STAGE_ROWS, ROW_OFF = STAGE_ROWS + 128, ROW_I = STAGE_ROWS + 256, ROW_B = STAGE_ROWS + 384,
-                       ROW_KV = STAGE_ROWS + 512;
+                       ROW_KV = STAGE_ROWS + 512, ROW_SH = STAGE_ROWS + 640;
 
     {
         FUSED_ZONE("fz_pd_rl_setup");
-        // the position row, the offsets row and the whole template rows / tile in one batch of reads
+        // the position row, the offsets row, the shift row and the whole template rows / tile in one batch of reads
         read_bytes(noc, p_in, stage, 128, 0, 0, ROW_P);
         read_bytes(noc, off_in, stage, 128, 0, 0, ROW_OFF);
+        read_bytes(noc, shift_in, stage, 128, 0, 0, ROW_SH);
         read_bytes(noc, bf16_tpl, stage, BF16_ROW_BYTES, 0, BF16_ROW_BYTES, STAGE_BF16);  // the MASK half
         read_bytes(noc, tile_tpl, stage, TILE_BYTES, 0, 0, STAGE_TILE);                   // zero tile
         noc.async_read_barrier();
@@ -139,6 +143,10 @@ void kernel_main() {
     const uint32_t hi = lo + (context & RING_MASK);
     const uint32_t tail_shift = (complete_blocks - selected) << 2;
     const uint32_t block_start = p & LANE_BLOCK_MASK;
+    // the RoPE table rows of this lane: P_u - S_u and (P_u & ~3) - S_u
+    const uint32_t shift = words[ROW_SH / 4 + lane];
+    const uint32_t rope_p = p - shift;
+    const uint32_t rope_block_start = block_start - shift;
 
     {
         FUSED_ZONE("fz_pd_rl_main");
@@ -203,11 +211,12 @@ void kernel_main() {
         }
         write_bytes(noc, stage, o_fill, U32_ROW_BYTES, STAGE_U32, lane, 0);
 
-        // RoPE rows: table rows P and P & ~3 into row `lane` of the two output tiles (faces (lane >> 4) * 2 and + 1)
-        read_bytes(noc, cos_tbl, stage, ROPE_ROW_BYTES, p, 0, STAGE_ROPE);
-        read_bytes(noc, sin_tbl, stage, ROPE_ROW_BYTES, p, 0, STAGE_ROPE + ROPE_ROW_BYTES);
-        read_bytes(noc, cos_tbl, stage, ROPE_ROW_BYTES, block_start, 0, STAGE_ROPE + 2 * ROPE_ROW_BYTES);
-        read_bytes(noc, sin_tbl, stage, ROPE_ROW_BYTES, block_start, 0, STAGE_ROPE + 3 * ROPE_ROW_BYTES);
+        // RoPE rows: table rows P_u - S_u and (P_u & ~3) - S_u into row `lane` of the two output tiles (faces
+        // (lane >> 4) * 2 and + 1)
+        read_bytes(noc, cos_tbl, stage, ROPE_ROW_BYTES, rope_p, 0, STAGE_ROPE);
+        read_bytes(noc, sin_tbl, stage, ROPE_ROW_BYTES, rope_p, 0, STAGE_ROPE + ROPE_ROW_BYTES);
+        read_bytes(noc, cos_tbl, stage, ROPE_ROW_BYTES, rope_block_start, 0, STAGE_ROPE + 2 * ROPE_ROW_BYTES);
+        read_bytes(noc, sin_tbl, stage, ROPE_ROW_BYTES, rope_block_start, 0, STAGE_ROPE + 3 * ROPE_ROW_BYTES);
         noc.async_read_barrier();
         const uint32_t rope_src[4] = {
             STAGE_ROPE, STAGE_ROPE + ROPE_ROW_BYTES, STAGE_ROPE + 2 * ROPE_ROW_BYTES, STAGE_ROPE + 3 * ROPE_ROW_BYTES};

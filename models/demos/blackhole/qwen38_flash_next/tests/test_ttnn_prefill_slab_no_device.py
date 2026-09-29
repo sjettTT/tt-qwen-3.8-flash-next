@@ -490,7 +490,7 @@ class _FakeModel:
     def write_chunk_accepted(self, chunk_state, accepted: int) -> None:
         self.calls.append(("accepted", accepted))
 
-    def prepare_chunk_inputs(self, chunk_state, token_ids, *, ple_context):
+    def prepare_chunk_inputs(self, chunk_state, token_ids, *, ple_context, positions=None, features=None):
         tokens = list(token_ids)
         assert len(tokens) == chunk_state.rows
         self.calls.append(("write", chunk_state.rows, tuple(tokens)))
@@ -500,7 +500,7 @@ class _FakeModel:
         assert prepared.rows == chunk_state.rows
         self.calls.append(("upload", chunk_state.rows))
 
-    def finish_prefill(self, state, chunk_state, prefilled: int) -> None:
+    def finish_prefill(self, state, chunk_state, prefilled: int, *, rope_shift: int = 0) -> None:
         self.calls.append(("finish", prefilled))
 
     def forward_prefill_chunk_generic(self, chunk_state, state, *, gdn_step_anchor: bool = False, mtp=None) -> None:
@@ -778,12 +778,17 @@ def _moe_buffer_fakes(monkeypatch):
         from_torch=lambda tensor, **kwargs: _FakeBuffer(tensor.shape),
         deallocate=lambda tensor: None,
         ROW_MAJOR_LAYOUT="row-major",
+        TILE_LAYOUT="tile",
+        TILE_SIZE=32,
         bfloat16="bf16",
         DRAM_MEMORY_CONFIG="dram",
+        ShardTensor2dMesh=lambda device, *, mesh_shape, dims: "shard",
     )
     monkeypatch.setattr(moe_module, "ttnn", fake_ttnn)
     monkeypatch.setattr(moe_module, "replicate_tensor_2d_mesh_mapper", lambda device: "replicate", raising=False)
-    contract = SimpleNamespace(validate_tensor=lambda tensor, placement: validated.append((tensor.shape, placement)))
+    contract = SimpleNamespace(
+        validate_tensor=lambda tensor, placement, **kwargs: validated.append((tensor.shape, placement))
+    )
     return SimpleNamespace(ttnn=fake_ttnn, contract=contract, validated=validated)
 
 
@@ -810,7 +815,11 @@ def _fake_text_model_for_chunk_state(monkeypatch, fakes):
     monkeypatch.setattr(
         qsa_module.Qwen38TTNNQSAChunkConstants,
         "build",
-        classmethod(lambda cls, mesh, contract, blocks, *, rows: releasable()),
+        classmethod(
+            lambda cls, mesh, contract, blocks, *, rows: SimpleNamespace(
+                deallocate=lambda: None, block_tiles=max(1, rows // LONG_CHUNK_ROWS)
+            )
+        ),
     )
     monkeypatch.setattr(model_module, "ttnn", fakes.ttnn)
     monkeypatch.setattr(model_module, "replicate_tensor_2d_mesh_mapper", lambda device: "replicate", raising=False)
@@ -840,6 +849,11 @@ def _fake_text_model_for_chunk_state(monkeypatch, fakes):
         _state_owner=owner,
         _validate_generic_state=lambda state: None,
         _validate_chunk_state=lambda state: None,
+        # the chunk's host-written RoPE rows and vision feature rows (model.py allocates them beside the token rows)
+        _allocate_chunk_rope_rows=lambda rows, block_tiles: SimpleNamespace(deallocate=lambda: None),
+        _allocate_chunk_feature_rows=lambda rows: SimpleNamespace(
+            tensor=_FakeBuffer((1, 1, rows, 640)), rows=rows, clean=True
+        ),
     )
     base = SimpleNamespace(rows=CHUNK_ROWS, layers=(SimpleNamespace(), SimpleNamespace()))
     return model, base
@@ -858,7 +872,8 @@ def test_slab_chunk_state_allocates_the_combine_buffer_the_slab_writes(monkeypat
         monkeypatch.setenv(moe_module.MOE_SLAB_ONE_CALL_ENV, "0")
     fakes = _moe_buffer_fakes(monkeypatch)
     model, base = _fake_text_model_for_chunk_state(monkeypatch, fakes)
-    state = model_module.Qwen38TTNNTextModel.allocate_chunk_state(model, "generic-state", rows=SLAB, base=base)
+    generic_state = SimpleNamespace(position=SimpleNamespace(read=lambda: 0))
+    state = model_module.Qwen38TTNNTextModel.allocate_chunk_state(model, generic_state, rows=SLAB, base=base)
     expected_rows = SLAB if one_call else LONG_CHUNK_ROWS
     assert moe_module.routed_tokens_per_call_for(SLAB) == expected_rows
     assert state.rows == SLAB and state.local_combine_output.shape == (
@@ -867,7 +882,8 @@ def test_slab_chunk_state_allocates_the_combine_buffer_the_slab_writes(monkeypat
         moe_module.HIDDEN_SIZE,
     )
     assert all(layer_state.local_combine_output is state.local_combine_output for layer_state in state.layers)
-    assert [shape[1] for shape, _ in fakes.validated] == [expected_rows]
+    # the combine buffer's validation (the chunk's RoPE rows and feature rows validate their own 4-D shapes too)
+    assert [shape[1] for shape, _ in fakes.validated if len(shape) == 3] == [expected_rows]
     # the model allocates that buffer with exactly this expression (the chain's path), and moe admits slab rows there
     allocate = inspect.getsource(model_module.Qwen38TTNNTextModel.allocate_chunk_state)
     assert (

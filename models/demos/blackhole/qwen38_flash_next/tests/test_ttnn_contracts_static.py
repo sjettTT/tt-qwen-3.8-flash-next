@@ -258,9 +258,10 @@ def test_device_position_allocates_three_replicated_uint32_row_major_constants(m
 
     position = Qwen38TTNNDevicePosition.allocate("mesh", contract, position=7)
 
-    assert [tuple(host.shape) for host, _ in uploads] == [(1, 1, 1, 1), (1, 1, 1, 32), (1, 1, 1, 32)]
+    # the position, the ones row, the block-start mask row and the rotary shift (0: a text sequence)
+    assert [tuple(host.shape) for host, _ in uploads] == [(1, 1, 1, 1), (1, 1, 1, 32), (1, 1, 1, 32), (1, 1, 1, 1)]
     assert all(host.dtype == torch.uint32 for host, _ in uploads)
-    assert [int(host.reshape(-1)[0].to(torch.int64)) for host, _ in uploads] == [7, 1, BLOCK_START_LANE_MASK]
+    assert [int(host.reshape(-1)[0].to(torch.int64)) for host, _ in uploads] == [7, 1, BLOCK_START_LANE_MASK, 0]
     assert all(bool(torch.all(host == host.reshape(-1)[0])) for host, _ in uploads)
     for _, kwargs in uploads:
         assert kwargs["dtype"] == ttnn.uint32
@@ -273,7 +274,8 @@ def test_device_position_allocates_three_replicated_uint32_row_major_constants(m
         POSITION_INDEX_ROW_SHAPE,
         POSITION_INDEX_ROW_SHAPE,
     )
-    assert [placement for _, placement in contract.validated] == [TensorPlacement.REPLICATED] * 3
+    assert position.shift.shape == POSITION_SCALAR_SHAPE and position.rope_shift == 0
+    assert [placement for _, placement in contract.validated] == [TensorPlacement.REPLICATED] * 4
     assert BLOCK_START_LANE_MASK == 0xFFFFFFFC and BLOCK_START_LANE_MASK >= 2**31
 
 
@@ -309,6 +311,56 @@ def test_device_position_reset_is_one_host_write_into_the_resident_scalar(monkey
     source = inspect.getsource(Qwen38TTNNDevicePosition.reset)
     assert "ttnn.copy_host_to_device_tensor(host, self.scalar)" in source
     assert "ttnn.copy(" not in source and "ttnn.add(" not in source
+
+
+def test_device_position_reset_writes_the_rotary_shift_when_it_changes(monkeypatch) -> None:
+    """An image prompt's hand-off: finish_prefill -> reset(P, S) writes the shift tensor and its mirror on the frozen
+    dataclass (the escaped bug: a plain attribute assignment raised FrozenInstanceError inside the hand-off); a rewind
+    inside the request keeps the shift with one write; a new text sequence writes it back to 0; the block-start rule
+    refuses S > P & ~3 before any write; a stand-in without a shift tensor refuses a nonzero shift before any write."""
+
+    uploads = []
+    _patch_uploads(monkeypatch, uploads)
+    writes = []
+    monkeypatch.setattr(
+        contracts_module.ttnn, "copy_host_to_device_tensor", lambda host, device: writes.append((host, device))
+    )
+    position = Qwen38TTNNDevicePosition.allocate("mesh", _RecordingContract())
+    assert position.rope_shift == 0 and int(uploads[-1][0].reshape(-1)[0].to(torch.int64)) == 0
+    uploads.clear()
+
+    position.reset(48, 12)  # the hand-off of an image prompt: 48 tokens, shift 12
+    assert [device for _, device in writes] == [position.scalar, position.shift]
+    assert [int(host.host.reshape(-1)[0].to(torch.int64)) for host, _ in writes] == [48, 12]  # the uploads' hosts
+    assert position.rope_shift == 12
+    writes.clear()
+
+    position.reset(50)  # a rewind inside the request: the shift is kept, one write
+    assert [device for _, device in writes] == [position.scalar] and position.rope_shift == 12
+    writes.clear()
+
+    position.reset(0, 0)  # a new text sequence
+    assert [device for _, device in writes] == [position.scalar, position.shift] and position.rope_shift == 0
+    writes.clear()
+
+    for bad_position, bad_shift in ((1, 1), (7, 5), (48, 49), (0, 1)):
+        with pytest.raises(ValueError, match="rotary shift must be in"):
+            position.reset(bad_position, bad_shift)
+    assert writes == []
+    assert position.reset(7, 4) is None and position.rope_shift == 4  # S == P & ~3: the limit is admitted
+    writes.clear()
+
+    stand_in = Qwen38TTNNDevicePosition(
+        position.scalar, position.ones_row, position.block_start_mask_row, "mesh", _RecordingContract()
+    )
+    assert stand_in.shift is None and stand_in.rope_shift == 0
+    with pytest.raises(RuntimeError, match="no rotary shift tensor"):
+        stand_in.reset(8, 4)
+    assert writes == []  # refused before the position write
+    stand_in.reset(8)  # a text stand-in resets its position alone
+    assert [device for _, device in writes] == [position.scalar]
+    source = inspect.getsource(Qwen38TTNNDevicePosition.reset)
+    assert 'object.__setattr__(self, "rope_shift", rope_shift)' in source  # the frozen dataclass's mirror
 
 
 def test_device_position_advance_adds_one_then_copies_in_place_as_its_last_op(monkeypatch) -> None:
@@ -400,4 +452,4 @@ def test_device_position_read_takes_coordinate_zero_only(monkeypatch) -> None:
     released = []
     monkeypatch.setattr(contracts_module.ttnn, "deallocate", released.append)
     position.deallocate()
-    assert released == [position.scalar, position.ones_row, position.block_start_mask_row]
+    assert released == [position.scalar, position.ones_row, position.block_start_mask_row, position.shift]

@@ -183,8 +183,18 @@ def test_tail_derives_the_position_consumes_the_ple_row_first_and_advances_last(
 
     assert isinstance(output, Qwen38TTNNGenericDecodeOutput) and output.logits.tensor == "logits-tensor"
     names = [entry[0] for entry in log]
-    assert names[:6] == ["validate-head", "index_row", "block_start_index_row", "rows", "deallocate", "derive"]
-    assert names[6:53] == ["forward"] * 47 and names[53:] == TAIL_EPILOGUE_NAMES
+    # The RoPE index rows are the device position's rows less its rotary shift (an image prompt's decode reads the
+    # table at P - S); the cache, block and mask inputs stay on P.
+    assert names[:7] == [
+        "validate-head",
+        "index_row",
+        "rope_index_row",
+        "rope_block_start_index_row",
+        "rows",
+        "deallocate",
+        "derive",
+    ]
+    assert names[7:54] == ["forward"] * 47 and names[54:] == TAIL_EPILOGUE_NAMES
     forwards = [entry for entry in log if entry[0] == "forward"]
     assert [entry[1] for entry in forwards] == list(range(GENERIC_HEAD_LAYERS, 48))
     assert forwards[0][2] == "residual-0"

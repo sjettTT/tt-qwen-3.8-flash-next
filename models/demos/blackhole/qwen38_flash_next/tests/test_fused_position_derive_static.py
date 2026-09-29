@@ -53,10 +53,15 @@ def test_registered_bitwise():
 
 
 def test_runtime_and_compile_time_arg_contract():
-    assert len(pd.RUNTIME_ARGS) == 21 and pd.QSA_OUTPUTS == pd.RUNTIME_ARGS[6:15]
+    # 21 tensors of the chain plus the rotary shift appended as the last input (arg 21): the output addresses keep
+    # their argument numbers and the shift is read beside P
+    assert len(pd.RUNTIME_ARGS) == 22 and pd.QSA_OUTPUTS == pd.RUNTIME_ARGS[6:15]
+    assert pd.OUTPUT_ARGS == pd.RUNTIME_ARGS[6:21] and pd.RUNTIME_ARGS[21] == "rope_shift"
     used = sorted({int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d+)\)", SOURCE)})
-    assert used == list(range(21))
-    assert "TensorAccessorArgs<0>()" in SOURCE and SOURCE.count("next_compile_time_args_offset()") == 20
+    assert used == list(range(22))
+    assert "TensorAccessorArgs<0>()" in SOURCE and SOURCE.count("next_compile_time_args_offset()") == 21
+    assert "const uint32_t rope_p = p - shift;" in SOURCE and "rope_block_start = block_start - shift;" in SOURCE
+    assert SOURCE.count("ROPE_ROW_BYTES, rope_p, 0,") == 2 and SOURCE.count("ROPE_ROW_BYTES, rope_block_start, 0,") == 2
     named = set(re.findall(r'get_named_compile_time_arg_val\("([a-z_0-9]+)"\)', SOURCE))
     python_named = set(
         re.findall(r'"([a-z_0-9]+)": ', inspect.getsource(pd.position_derive).split("named = {")[1].split("}")[0])
@@ -64,7 +69,7 @@ def test_runtime_and_compile_time_arg_contract():
     assert named == python_named, named ^ python_named
     source = re.sub(r"\s+", "", inspect.getsource(pd.position_derive))
     assert (
-        "tensors=[position,bf16_tpl,u32_tpl,tile_tpl,cos_table,sin_table]+[outs[name]fornameinRUNTIME_ARGS[6:]]"
+        "tensors=([position,bf16_tpl,u32_tpl,tile_tpl,cos_table,sin_table]+[outs[name]fornameinOUTPUT_ARGS]+[rope_shift])"
         in source
     )
     assert "[(core,[t.buffer_address()fortintensors])]" in source
@@ -186,7 +191,11 @@ def test_advance_hook_is_pinned_in_contracts():
     assert "    _fused_advance: Any = field(default=None, repr=False, compare=False)" in source
     assert 'if fused_kernels.enabled("position_advance"):' in source
     assert 'fused_advance = fused_kernels.kernel("position_advance").fused' in source
-    assert "return cls(uploaded[0], uploaded[1], uploaded[2], mesh_device, mesh_contract, fused_advance)" in source
+    # the position, the ones row, the block-start mask row, the rotary shift and its host mirror, then the hook
+    assert (
+        "uploaded[0], uploaded[1], uploaded[2], mesh_device, mesh_contract, fused_advance, uploaded[3], rope_shift"
+        in source
+    )
     fused_branch = (
         "        if self._fused_advance is not None:\n            self._advance_fused({})\n            return\n"
     )
@@ -212,18 +221,20 @@ def test_composed_is_the_model_bodys_derive_lines():
     body = source[source.index("index_row = state.position.index_row()") :]
     body = body[: body.index("residual = head.residual")]
     for line in (
-        "block_start_row = state.position.block_start_index_row(index_row)",
-        "rope = self.rope_table.rows(index_row, block_start_row)",
-        "_deallocate_unique(index_row, block_start_row)",
+        "rope_index_row = state.position.rope_index_row(index_row)",
+        "rope_block_start_row = state.position.rope_block_start_index_row(index_row)",
+        "rope = self.rope_table.rows(rope_index_row, rope_block_start_row)",
+        "_deallocate_unique(index_row, rope_index_row, rope_block_start_row)",
         "derive_qsa_position_inputs(state.position.scalar, self.qsa_position_constants)",
     ):
         assert line in body, line
     composed = inspect.getsource(pd.derive_composed)
     for call in (
         "state.position.index_row()",
-        "state.position.block_start_index_row(index_row)",
-        "model.rope_table.rows(index_row, block_start_row)",
-        "_deallocate_unique(index_row, block_start_row)",
+        "state.position.rope_index_row(index_row)",
+        "state.position.rope_block_start_index_row(index_row)",
+        "model.rope_table.rows(rope_index_row, rope_block_start_row)",
+        "_deallocate_unique(index_row, rope_index_row, rope_block_start_row)",
         "derive_qsa_position_inputs(state.position.scalar, model.qsa_position_constants)",
     ):
         assert call in composed, call
@@ -245,14 +256,20 @@ def test_templates_are_the_chains_constants():
 
 
 def test_lane_form_runtime_and_compile_time_arg_contract():
-    """derive_lanes.cpp: 18 tensors then the lane and the lane count; the same named constants as derive.cpp; one
+    """derive_lanes.cpp: 19 tensors (the lanes' rotary shift row last) then the lane and the lane count; the same named constants as derive.cpp; one
     core per lane row; the lane offsets ride the fill's tail ids; the model's lane body binds it only with the six QSA
     programs (its outputs are the fused QSA lane body's inputs)."""
 
-    assert len(pd.LANES_RUNTIME_ARGS) == 18 and pd.LANES_QSA_OUTPUTS == pd.LANES_RUNTIME_ARGS[7:12]
+    assert len(pd.LANES_RUNTIME_ARGS) == 19 and pd.LANES_QSA_OUTPUTS == pd.LANES_RUNTIME_ARGS[7:12]
+    assert pd.LANES_OUTPUT_ARGS == pd.LANES_RUNTIME_ARGS[7:18] and pd.LANES_RUNTIME_ARGS[18] == "rope_shift_row"
     used = sorted({int(i) for i in re.findall(r"get_arg_val<uint32_t>\((\d+)\)", LANES_SOURCE)})
-    assert used == list(range(20))
-    assert "TensorAccessorArgs<0>()" in LANES_SOURCE and LANES_SOURCE.count("next_compile_time_args_offset()") == 17
+    assert used == list(range(21))
+    assert "TensorAccessorArgs<0>()" in LANES_SOURCE and LANES_SOURCE.count("next_compile_time_args_offset()") == 18
+    assert "const uint32_t shift = words[ROW_SH / 4 + lane];" in LANES_SOURCE
+    assert (
+        LANES_SOURCE.count("ROPE_ROW_BYTES, rope_p, 0,") == 2
+        and LANES_SOURCE.count("ROPE_ROW_BYTES, rope_block_start, 0,") == 2
+    )
     named = set(re.findall(r'get_named_compile_time_arg_val\("([a-z_0-9]+)"\)', LANES_SOURCE))
     assert named == set(re.findall(r'get_named_compile_time_arg_val\("([a-z_0-9]+)"\)', SOURCE))
     python_named = set(
@@ -269,8 +286,9 @@ def test_lane_form_runtime_and_compile_time_arg_contract():
     composed = inspect.getsource(pd.derive_lanes_composed)
     for call in (
         "state.position.index_row()",
-        "state.position.block_start_index_row(index_row)",
-        "model.rope_table.rows_chunk(index_row, block_start_row)",
+        "state.position.rope_index_row(index_row)",
+        "state.position.rope_block_start_index_row(index_row)",
+        "model.rope_table.rows_chunk(rope_index_row, rope_block_start_row)",
         "derive_qsa_lane_inputs(",
     ):
         assert call in composed, call

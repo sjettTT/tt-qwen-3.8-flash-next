@@ -1265,6 +1265,7 @@ def _generic_model(monkeypatch, log: list):
 
     class FakePosition:
         scalar = "position-scalar"
+        rope_shift = 0  # the rotary shift's host mirror (a text stand-in: 0)
 
         def index_row(self):
             log.append(("index_row",))
@@ -1274,10 +1275,18 @@ def _generic_model(monkeypatch, log: list):
             log.append(("block_start_index_row", index_row))
             return "block-start-row"
 
+        def rope_index_row(self, index_row):
+            log.append(("rope_index_row", index_row))
+            return "rope-index-row"
+
+        def rope_block_start_index_row(self, index_row):
+            log.append(("rope_block_start_index_row", index_row))
+            return "rope-block-start-row"
+
         def advance(self) -> None:
             log.append(("advance",))
 
-        def reset(self, position: int) -> None:
+        def reset(self, position: int, rope_shift: int | None = None) -> None:
             log.append(("position-reset", position))
 
         def deallocate(self) -> None:
@@ -1355,11 +1364,19 @@ def test_generic_model_body_reads_the_position_first_derives_once_and_advances_l
     forwards = [entry for entry in log if entry[0] == "forward"]
     # HEAD: embed + layer 0 (no position read); TAIL: derive the position inputs, layers 1-47, advance last.
     head_names = ["embed", "forward", "validate-head"]
-    derive_names = ["validate-head", "index_row", "block_start_index_row", "rows", "deallocate", "derive"]
+    derive_names = [
+        "validate-head",
+        "index_row",
+        "rope_index_row",
+        "rope_block_start_index_row",
+        "rows",
+        "deallocate",
+        "derive",
+    ]
     assert names[: len(head_names)] == head_names
-    assert names[3:9] == derive_names
-    assert names[9:56] == ["forward"] * 47
-    assert names[56:] == [
+    assert names[3:10] == derive_names
+    assert names[10:57] == ["forward"] * 47
+    assert names[57:] == [
         "qsa-position-deallocate",
         "rope-deallocate",
         "final-mixer",
@@ -1370,10 +1387,11 @@ def test_generic_model_body_reads_the_position_first_derives_once_and_advances_l
     ]
     assert log[0] == ("embed", "token-row")
     assert log[2] == ("validate-head", "residual-0", True)
-    assert log[5] == ("block_start_index_row", "index-row")
-    assert log[6] == ("rows", "index-row", "block-start-row")
-    assert log[7] == ("deallocate", ("index-row", "block-start-row"))
-    assert log[8] == ("derive", "position-scalar", "qsa-constants")
+    assert log[5] == ("rope_index_row", "index-row")
+    assert log[6] == ("rope_block_start_index_row", "index-row")
+    assert log[7] == ("rows", "rope-index-row", "rope-block-start-row")
+    assert log[8] == ("deallocate", ("index-row", "rope-index-row", "rope-block-start-row"))
+    assert log[9] == ("derive", "position-scalar", "qsa-constants")
     assert [entry[1] for entry in forwards] == list(range(48))
     assert forwards[0][2] == "residual-in" and forwards[1][2] == "residual-0"
     # Layer 0 (HEAD) gets no PLE row, RoPE rows or position inputs; the TAIL layers share one of each.
@@ -1426,7 +1444,7 @@ def test_generic_model_prologue_is_a_position_reset_plus_in_place_layer_resets(m
     assert log == [*(("release", index) for index in reversed(range(48))), ("position-deallocate",)]
 
     reset = inspect.getsource(Qwen38TTNNTextModel.reset_generic_state_inplace)
-    assert "state.position.reset(0)" in reset
+    assert "state.position.reset(0, 0)" in reset
     assert "layer.reset_generic_state_inplace(layer_state)" in reset
     for forbidden in ("allocate_state(", "reset_state(", "allocate_generic_state(", "snapshot"):
         assert forbidden not in reset
@@ -1524,8 +1542,9 @@ def test_generic_model_body_source_has_no_host_position_and_advances_as_its_last
     )
     order = [
         "state.position.index_row()",
-        "state.position.block_start_index_row(index_row)",
-        "self.rope_table.rows(index_row, block_start_row)",
+        "state.position.rope_index_row(index_row)",
+        "state.position.rope_block_start_index_row(index_row)",
+        "self.rope_table.rows(rope_index_row, rope_block_start_row)",
         "qsa_module.derive_qsa_position_inputs(state.position.scalar, self.qsa_position_constants)",
         "layer.forward_decode_generic(",
         "qsa_position.deallocate()",

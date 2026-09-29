@@ -601,7 +601,7 @@ def test_layer_and_model_lane_bodies_are_the_generic_walk_over_lanes() -> None:
     assert "state.position.residue != residue or set(phases.values()) != {residue}" in capture
     assert "ttnn.corruptible_allocation_scope" in capture and "GENERIC_TRACE_PARTS_SINGLE" in capture
     admit = inspect.getsource(model_module.Qwen38TTNNTextModel.admit_lane)
-    assert admit.index("state.position.admit(lane, position)") < admit.index(
+    assert admit.index("state.position.admit(lane, position, rope_shift)") < admit.index(
         "layer.reset_lane_inplace(layer_state, lane)"
     )
     # The generic 1-row model body is untouched.

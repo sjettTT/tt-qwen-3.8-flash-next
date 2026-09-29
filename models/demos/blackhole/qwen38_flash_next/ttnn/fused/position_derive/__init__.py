@@ -3,9 +3,11 @@
 
 """``position_derive``: the decode step's position-derived tensors as one program; ``position_advance`` (this module's
 second kernel, ``advance.cpp``): the step's closing ``P += 1`` as one in-place program.  From the uint32 position ``P``
-(``[1,1,1,1]`` ROW_MAJOR): the two uint32 index rows (``P`` and ``P & ~3`` in 32 lanes), the four RoPE rows (cos/sin
-table rows ``P`` and ``P & ~3``) and the nine QSA inputs of ``derive_qsa_position_inputs`` -- the chain's 40 programs
-(two uint32 row ops, four ``embedding`` gathers, 33 integer / 0-1 mask ops).
+(``[1,1,1,1]`` ROW_MAJOR) and the uint32 rotary shift ``S`` (``[1,1,1,1]``; 0 for text, the images' accumulated
+shift otherwise, ``S <= P`` by the host's check): the two uint32 index rows (``P`` and ``P & ~3`` in 32 lanes), the
+four RoPE rows (cos/sin table rows ``P - S`` and ``(P & ~3) - S``) and the nine QSA inputs of
+``derive_qsa_position_inputs`` -- the chain's 42 programs (two uint32 row ops, two uint32 subtracts, four ``embedding``
+gathers, 33 integer / 0-1 mask ops).
 
 Every output is a step function of ``P``: the kernel (``kernels/derive.cpp``, one data-movement RISC, no compute)
 assembles each row in L1 from constant template rows (zeros | MASK, zeros | ALL_ONES, a zero tile and a ones-column
@@ -58,8 +60,10 @@ RUNTIME_ARGS = (
     "sin",
     "block_start_cos",
     "block_start_sin",
+    "rope_shift",  # the last input: appended so the output addresses keep their argument numbers
 )
 QSA_OUTPUTS = RUNTIME_ARGS[6:15]
+OUTPUT_ARGS = RUNTIME_ARGS[6:21]
 LANES_RUNTIME_ARGS = (
     "position_row",
     "lane_offsets",
@@ -79,8 +83,10 @@ LANES_RUNTIME_ARGS = (
     "sin",
     "block_start_cos",
     "block_start_sin",
+    "rope_shift_row",  # the last input (lane u's shift S_u): appended as above
 )
 LANES_QSA_OUTPUTS = LANES_RUNTIME_ARGS[7:12]  # the fused QSA lane body's position inputs
+LANES_OUTPUT_ARGS = LANES_RUNTIME_ARGS[7:18]
 LANES_STAGE_PAGES = 26  # >= derive_lanes.cpp's STAGE_BYTES (bf16 row 16 KB + uint32 row 8.3 KB + a tile + rows)
 _TEMPLATES: dict[tuple[int, int], tuple] = {}
 
@@ -160,18 +166,26 @@ def outputs(mesh, blocks: int, memory_config=ttnn.DRAM_MEMORY_CONFIG) -> dict:
     }
 
 
-def position_derive(position, cos_table, sin_table, *, blocks: int, memory_config=ttnn.DRAM_MEMORY_CONFIG) -> dict:
-    """All fifteen position-derived tensors of one decode step, by name (``RUNTIME_ARGS[6:]``)."""
+def position_derive(
+    position, cos_table, sin_table, *, blocks: int, rope_shift, memory_config=ttnn.DRAM_MEMORY_CONFIG
+) -> dict:
+    """All fifteen position-derived tensors of one decode step, by name (``OUTPUT_ARGS``); ``rope_shift`` is the
+    uint32 ``[1,1,1,1]`` rotary shift the four RoPE table reads subtract from ``P`` and ``P & ~3``."""
 
     qsa, contracts = _qsa(), _contracts()
     _expect(position, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, "position")
+    _expect(rope_shift, (1, 1, 1, 1), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, "rotary shift")
     for name, table in (("cos table", cos_table), ("sin table", sin_table)):
         if table.dtype != ttnn.bfloat16 or table.layout != ttnn.ROW_MAJOR_LAYOUT or int(table.shape[-1]) != ROPE_DIM:
             raise ValueError(f"position_derive {name} must be bf16 ROW_MAJOR [1,1,ctx,{ROPE_DIM}]")
     mesh = position.device()
     bf16_tpl, u32_tpl, tile_tpl = prepare(mesh, blocks)
     outs = outputs(mesh, blocks, memory_config)
-    tensors = [position, bf16_tpl, u32_tpl, tile_tpl, cos_table, sin_table] + [outs[name] for name in RUNTIME_ARGS[6:]]
+    tensors = (
+        [position, bf16_tpl, u32_tpl, tile_tpl, cos_table, sin_table]
+        + [outs[name] for name in OUTPUT_ARGS]
+        + [rope_shift]
+    )
     core = ttnn.CoreCoord(0, 0)
     grid = ttnn.CoreRangeSet([ttnn.CoreRange(core, core)])
     named = {
@@ -196,7 +210,7 @@ def position_derive(position, cos_table, sin_table, *, blocks: int, memory_confi
         NAME,
         "derive",
         1,
-        reads=(position, bf16_tpl, u32_tpl, tile_tpl),
+        reads=(position, bf16_tpl, u32_tpl, tile_tpl, rope_shift),
         writes=tuple(outs.values()),
         dram_bytes=4 * ROPE_DIM * 2,
         cores=1,
@@ -231,19 +245,29 @@ def lanes_outputs(mesh, blocks: int, lanes: int, memory_config=ttnn.DRAM_MEMORY_
 
 
 def position_derive_lanes(
-    position_row, lane_offsets, cos_table, sin_table, *, blocks: int, lanes: int, memory_config=ttnn.DRAM_MEMORY_CONFIG
+    position_row,
+    lane_offsets,
+    cos_table,
+    sin_table,
+    *,
+    blocks: int,
+    lanes: int,
+    rope_shift_row,
+    memory_config=ttnn.DRAM_MEMORY_CONFIG,
 ) -> dict:
     """The lane body's position-derived tensors from the uint32 position row ``[1,1,1,32]`` (lane u = P_u; the idle
     lanes at the row's residue, as the chain derives them too): one program, one core per lane row.  Row u of every
     row tensor is the 1-row derive at P_u (the fill's tail ids carry ``lane_offsets[u]``, lane u's KV region start, as
     the chain's ``block_offsets_lanes`` / ``arange_slots_lanes`` do); the four RoPE tiles hold the table rows P_u and
-    P_u & ~3 in row u; ``kv_row_hit`` is the ``lanes`` active lanes' one-hot tiles; the index row, the block-start
-    row and ``kv_block_start`` are the 32-lane rows.  By name (``LANES_RUNTIME_ARGS[7:]``)."""
+    P_u & ~3, each less lane u's rotary shift ``rope_shift_row[u]``, in row u; ``kv_row_hit`` is the ``lanes``
+    active lanes' one-hot tiles; the index row, the block-start row and ``kv_block_start`` are the 32-lane rows.  By
+    name (``LANES_OUTPUT_ARGS``)."""
 
     qsa, contracts = _qsa(), _contracts()
     lanes = contracts.require_lane_count(lanes, label="position derive lanes")
     _expect(position_row, (1, 1, 1, TILE), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, "position row")
     _expect(lane_offsets, (1, 1, 1, TILE), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, "lane offsets row")
+    _expect(rope_shift_row, (1, 1, 1, TILE), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, "rotary shift row")
     for name, table in (("cos table", cos_table), ("sin table", sin_table)):
         if table.dtype != ttnn.bfloat16 or table.layout != ttnn.ROW_MAJOR_LAYOUT or int(table.shape[-1]) != ROPE_DIM:
             raise ValueError(f"position_derive {name} must be bf16 ROW_MAJOR [1,1,ctx,{ROPE_DIM}]")
@@ -253,9 +277,11 @@ def position_derive_lanes(
         raise ValueError(f"position_derive lanes needs an {LANE_COLUMNS} x {TILE // LANE_COLUMNS} core grid")
     bf16_tpl, u32_tpl, tile_tpl = prepare(mesh, blocks)
     outs = lanes_outputs(mesh, blocks, lanes, memory_config)
-    tensors = [position_row, lane_offsets, bf16_tpl, u32_tpl, tile_tpl, cos_table, sin_table] + [
-        outs[name] for name in LANES_RUNTIME_ARGS[7:]
-    ]
+    tensors = (
+        [position_row, lane_offsets, bf16_tpl, u32_tpl, tile_tpl, cos_table, sin_table]
+        + [outs[name] for name in LANES_OUTPUT_ARGS]
+        + [rope_shift_row]
+    )
     cores = [ttnn.CoreCoord(u % LANE_COLUMNS, u // LANE_COLUMNS) for u in range(TILE)]
     grid_set = ttnn.CoreRangeSet(
         [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(LANE_COLUMNS - 1, TILE // LANE_COLUMNS - 1))]
@@ -295,6 +321,7 @@ def position_derive_lanes(
             + fp.tensor_bytes(bf16_tpl)
             + fp.tensor_bytes(u32_tpl)
             + fp.tensor_bytes(tile_tpl)
+            + fp.tensor_bytes(rope_shift_row)
             + 4 * ROPE_DIM * 2
         ),
         cores=TILE,
@@ -319,8 +346,9 @@ def derive_lanes_fused(model, state):
         model.rope_table.sin_table,
         blocks=model.qsa_position_constants.allocated_compressed_blocks,
         lanes=state.lanes,
+        rope_shift_row=state.position.shift_row,
     )
-    for name in LANES_RUNTIME_ARGS[7:]:
+    for name in LANES_OUTPUT_ARGS:
         model.mesh_contract.validate_tensor(outs[name], placement=TensorPlacement.REPLICATED)
     ttnn.deallocate(outs["index_row"])
     ttnn.deallocate(outs["block_start_row"])
@@ -335,9 +363,10 @@ def derive_lanes_composed(model, state):
     from models.demos.blackhole.qwen38_flash_next.ttnn.model import _deallocate_unique
 
     index_row = state.position.index_row()
-    block_start_row = state.position.block_start_index_row(index_row)
-    rope = model.rope_table.rows_chunk(index_row, block_start_row)
-    _deallocate_unique(index_row, block_start_row)
+    rope_index_row = state.position.rope_index_row(index_row)
+    rope_block_start_row = state.position.rope_block_start_index_row(index_row)
+    rope = model.rope_table.rows_chunk(rope_index_row, rope_block_start_row)
+    _deallocate_unique(index_row, rope_index_row, rope_block_start_row)
     return rope, _qsa().derive_qsa_lane_inputs(
         state.position.row, model.qsa_position_constants, state.qsa_chunk_constants, state.qsa_lane_constants
     )
@@ -378,18 +407,21 @@ def composed_constants(mesh, blocks: int):
 
 
 def position_derive_composed(
-    position, cos_table, sin_table, *, blocks: int, memory_config=ttnn.DRAM_MEMORY_CONFIG
+    position, cos_table, sin_table, *, blocks: int, rope_shift, memory_config=ttnn.DRAM_MEMORY_CONFIG
 ) -> dict:
-    """The chain op for op (``Qwen38DevicePosition.index_row`` / ``block_start_index_row``, ``Qwen38TTNNRoPETable.rows``,
-    ``derive_qsa_position_inputs``) on the same tensors, with resident constants (``composed_constants``)."""
+    """The chain op for op (``Qwen38DevicePosition.index_row`` / ``block_start_index_row`` / ``rope_index_row`` /
+    ``rope_block_start_index_row``, ``Qwen38TTNNRoPETable.rows``, ``derive_qsa_position_inputs``) on the same tensors,
+    with resident constants (``composed_constants``)."""
 
     qsa = _qsa()
     dram = ttnn.DRAM_MEMORY_CONFIG
     ones_row, mask_row, constants = composed_constants(position.device(), blocks)
     index_row = ttnn.multiply(ones_row, position, memory_config=dram)
     block_start_row = ttnn.bitwise_and(index_row, mask_row, memory_config=dram)
-    indices = ttnn.reshape(index_row, (1, 1, TILE))
-    block_indices = ttnn.reshape(block_start_row, (1, 1, TILE))
+    rope_index_row = ttnn.subtract(index_row, rope_shift, memory_config=dram)
+    rope_block_start_row = ttnn.subtract(block_start_row, rope_shift, memory_config=dram)
+    indices = ttnn.reshape(rope_index_row, (1, 1, TILE))
+    block_indices = ttnn.reshape(rope_block_start_row, (1, 1, TILE))
     padded = ttnn.Shape((1, 1, TILE, ROPE_DIM))
 
     def lookup(table_indices, table):
@@ -405,6 +437,8 @@ def position_derive_composed(
         "block_start_cos": lookup(block_indices, cos_table),
         "block_start_sin": lookup(block_indices, sin_table),
     }
+    ttnn.deallocate(rope_index_row)
+    ttnn.deallocate(rope_block_start_row)
     derived = qsa.derive_qsa_position_inputs(position, constants)
     outs.update({name: getattr(derived, name) for name in QSA_OUTPUTS})
     return outs
@@ -422,6 +456,7 @@ def derive_fused(model, state):
         model.rope_table.cos_table,
         model.rope_table.sin_table,
         blocks=model.qsa_position_constants.allocated_compressed_blocks,
+        rope_shift=state.position.shift,
     )
     for name in (
         "cos",
@@ -446,9 +481,10 @@ def derive_composed(model, state):
     from models.demos.blackhole.qwen38_flash_next.ttnn.model import _deallocate_unique
 
     index_row = state.position.index_row()
-    block_start_row = state.position.block_start_index_row(index_row)
-    rope = model.rope_table.rows(index_row, block_start_row)
-    _deallocate_unique(index_row, block_start_row)
+    rope_index_row = state.position.rope_index_row(index_row)
+    rope_block_start_row = state.position.rope_block_start_index_row(index_row)
+    rope = model.rope_table.rows(rope_index_row, rope_block_start_row)
+    _deallocate_unique(index_row, rope_index_row, rope_block_start_row)
     return rope, _qsa().derive_qsa_position_inputs(state.position.scalar, model.qsa_position_constants)
 
 
@@ -503,7 +539,7 @@ register(
 register(
     FusedKernel(
         name=NAME,
-        replaces="index_row, block_start_index_row, the four RoPE embedding gathers and derive_qsa_position_inputs (40 programs per step); "
+        replaces="index_row, block_start_index_row, the rotary-shift subtracts, the four RoPE embedding gathers and derive_qsa_position_inputs (42 programs per step); "
         "the lanes' index rows, RoPE row tiles and derive_qsa_lane_inputs (the fused QSA lane body's five inputs) as one program",
         tolerance=BITWISE,
         fused=derive_fused,
