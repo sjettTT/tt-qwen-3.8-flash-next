@@ -60,7 +60,16 @@ from models.demos.blackhole.qwen38_flash_next.chat import (
     Qwen38OfficialChatTemplate,
 )
 from models.demos.blackhole.qwen38_flash_next.tools import hardware_profiles
+from models.demos.blackhole.qwen38_flash_next import mrope, vision_splice
 from models.demos.blackhole.qwen38_flash_next.tools import qwen38_chat_protocol as protocol
+from models.demos.blackhole.qwen38_flash_next.tools import qwen38_vision_inputs as vision_inputs
+from models.demos.blackhole.qwen38_flash_next.tools.checkpoint_budget import vision_resident_layout
+from models.demos.blackhole.qwen38_flash_next.ttnn.vision_residency import (
+    PEAK_ACTIVATION_BYTES_PER_ROW_PER_DIE,
+    VISION_ROW_BUCKETS,
+    Qwen38VisionResidencyError,
+    compose_warm_hooks,
+)
 from models.demos.blackhole.qwen38_flash_next.tools import qwen38_reference_corpus as reference_corpus
 from models.demos.blackhole.qwen38_flash_next.tools import qwen38_sampling_step as sampling_step
 from models.demos.blackhole.qwen38_flash_next.tools import resident_decode, runtime_admission
@@ -354,7 +363,17 @@ def parse_chat_request(
                 param=f"chat_template_kwargs.{key}",
             )
     document = {**{key: template_kwargs[key] for key in TEMPLATE_KWARGS[:2] if key in template_kwargs}, **document}
-    messages = protocol.normalize_messages(document.get("messages"))
+    # The user messages' image_url parts (data: URLs; video refused by the protocol), decoded here so a bad image
+    # is a 400 naming its part; the tower runs on the device thread later, the grid decides the prompt's pads.
+    image_parts: list[protocol.Qwen38ImagePart] = []
+    messages = protocol.normalize_messages(document.get("messages"), images=image_parts)
+    images: list[vision_inputs.Qwen38DecodedImage] = []
+    for part in image_parts:
+        where = f"messages[{part.message_index}].content[{part.part_index}].image_url"
+        try:
+            images.append(vision_inputs.decode_image(part.data, part.detail))
+        except vision_inputs.Qwen38ImageError as error:
+            raise Qwen38ChatRequestRejected(f"{where}: {error}", param=where, code="invalid_image") from error
     tool_choice = document.get("tool_choice", "auto")
     if tool_choice not in protocol.TOOL_CHOICES:
         raise Qwen38ChatRequestRejected(
@@ -461,6 +480,8 @@ def parse_chat_request(
         sampling = None
     return {
         "messages": messages,
+        "raw_messages": document.get("messages"),
+        "images": images,
         "tools": tools,
         "stream": stream,
         "max_tokens": max_tokens,
@@ -551,6 +572,16 @@ class Qwen38ClientGone(RuntimeError):
     """The client hung up while its request waited for the device: the ticket is dropped, nothing is generated."""
 
 
+def _vision_health(residency: Any) -> dict[str, Any]:
+    """The ``/health.vision`` form: the residency decision and the buckets (READY carries the whole record)."""
+
+    summary = residency.vision_summary()
+    return {
+        key: summary[key]
+        for key in ("resident", "shortfall", "shortfall_bytes_per_bank", "buckets", "resident_bytes_per_bank")
+    }
+
+
 class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
     """Threaded accept, parse and validate; one device at a time through a bounded FIFO turnstile.
 
@@ -593,6 +624,7 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
             self.server_close()
             raise
         self.session = session
+        self.vision = None  # the tower's residency (ttnn.vision_residency), attached after the chain's warm hook
         self.ledger = ledger
         self.queue_limit = queue_limit
         self.request_deadline_seconds = request_deadline_seconds
@@ -619,6 +651,70 @@ class Qwen38ChatHTTPServer(http.server.ThreadingHTTPServer):
         self.stopping = False  # the stop signal came: new and queued requests get 503, the in-flight one ends
         self.last_prefill_ms_per_token: float | None = None
         self.fatal: BaseException | None = None
+
+    def vision_refusal(self, images: Sequence[Any]) -> str | None:
+        """Why an image request cannot be served now (None = it can): the lanes server (the lane admission's prefill
+        has no image form in this landing), a process whose tower is not resident (the admission's shortfall), or an
+        image above the largest prewarmed row bucket.  The HTTP 400 text."""
+
+        if self.lanes is not None:
+            return "image parts are not served under --lanes in this landing (the single-stream server serves them)"
+        if self.vision is None:
+            return "the vision tower is not resident in this process"
+        for image in images:
+            grid = image.grid
+            reason = self.vision.refusal_reason(grid.t * grid.h * grid.w)
+            if reason is not None:
+                return reason
+        return None
+
+    def vision_prompt_for(
+        self, prompt_ids: Sequence[int], positions: Any, images: Sequence[Any]
+    ) -> tuple[Any, dict[str, Any]]:
+        """On the device thread: every image through the resident tower in its row bucket (the processor's pixel
+        patches, the merged feature rows in prompt order) and the splice's prompt object; the request's record."""
+
+        import torch
+
+        rows: list[torch.Tensor] = []
+        per_image: list[dict[str, Any]] = []
+        started = time.perf_counter()
+        for image in images:
+            patches = vision_inputs.pixel_patches(image)
+            grid_thw = torch.tensor([list(image.grid.as_tuple())], dtype=torch.long)
+            image_started = time.perf_counter()
+            output = self.vision.run_image_in_bucket(patches, grid_thw)
+            features = self.vision.tower.features_to_torch(output).to(torch.bfloat16)
+            ttnn.deallocate(output.features)
+            rows.append(features)
+            per_image.append(
+                {
+                    "width": image.width,
+                    "height": image.height,
+                    "detail": image.detail,
+                    "grid_thw": list(image.grid.as_tuple()),
+                    "patches": output.patches,
+                    "rows": output.rows,
+                    "tokens": output.tokens,
+                    "tower_seconds": round(time.perf_counter() - image_started, 4),
+                    "device_seconds": round(output.timing["device_s"], 4),
+                }
+            )
+        prompt = vision_splice.Qwen38VisionPrompt(
+            positions, torch.cat(rows), digest=vision_inputs.request_digest(images)
+        )
+        prompt.validate_prompt(prompt_ids)
+        record = {
+            "images": per_image,
+            "image_tokens": sum(row["tokens"] for row in per_image),
+            "tower_seconds": round(time.perf_counter() - started, 4),
+            "rope_delta": positions.delta,
+            "digest": prompt.digest,
+        }
+        _log(
+            "vision_request", **{key: value for key, value in record.items() if key != "images"}, images=len(per_image)
+        )
+        return prompt, record
 
     @property
     def queue_depth(self) -> int:
@@ -847,6 +943,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                     "busy": self.server.device_busy,
                     "queue_depth": self.server.queue_depth,
                     "lanes": None if self.server.lanes is None else self.server.lanes.status(),
+                    "vision": None if self.server.vision is None else _vision_health(self.server.vision),
                     "current_request": self.server.current_request(),
                     "committed_tokens": len(session.committed),
                     "requests_served": session.requests_served,
@@ -938,12 +1035,31 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             # The reference render is the device prompt (usage.prompt_tokens is the client's own count); it validates
             # the whole request and resolves the budget (the remaining context when max_tokens is absent) before any
             # queueing.  The thinking budget is carved out of that.
-            prompt_ids = session.render(
-                request["messages"],
-                tools=request["tools"],
-                enable_thinking=request["enable_thinking"],
-                reasoning_effort=request["reasoning_effort"],
-            )
+            if request.get("images"):
+                # An image request needs the resident tower (refused with the reason otherwise: text keeps serving)
+                # and renders with the images' grids: one <|image_pad|> per merged token, the 3-axis rotary positions.
+                refusal = self.server.vision_refusal(request["images"])
+                if refusal is not None:
+                    raise Qwen38ChatRequestRejected(refusal, param="messages", code="vision_unavailable")
+                prompt_ids = protocol.render_prompt(
+                    session.template.tokenizer,
+                    request["raw_messages"],
+                    request["tools"],
+                    enable_thinking=request["enable_thinking"],
+                    reasoning_effort=request["reasoning_effort"],
+                    images=[],
+                    image_grids=[image.grid for image in request["images"]],
+                )
+                request["vision_positions"] = mrope.mrope_positions(
+                    prompt_ids, [image.grid for image in request["images"]]
+                )
+            else:
+                prompt_ids = session.render(
+                    request["messages"],
+                    tools=request["tools"],
+                    enable_thinking=request["enable_thinking"],
+                    reasoning_effort=request["reasoning_effort"],
+                )
             max_tokens = session.require_budget(len(prompt_ids), request["max_tokens"])
         except (ValueError, UnicodeDecodeError) as error:
             code = getattr(error, "code", None)
@@ -1153,7 +1269,16 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 wire.event(chunk({"delta": delta, "finish_reason": None}))
 
         failure: BaseException | None = None
+        vision_record: dict[str, Any] | None = None
         try:
+            vision_inputs_kw: dict[str, Any] = {}
+            if request.get("images"):
+                # The tower on this (device) thread: one forward per image in its row bucket, the feature rows for
+                # the splice; then the prompt through the chain with its 3-axis positions.
+                vision_prompt, vision_record = self.server.vision_prompt_for(
+                    prompt_ids, request["vision_positions"], request["images"]
+                )
+                vision_inputs_kw = {"vision": vision_prompt}
             completion = session.complete(
                 prompt_ids,
                 request["max_tokens"],
@@ -1164,6 +1289,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 prefill_mode=request["prefill_mode"],
                 sampling=sampling,
                 mtp_drafts=request["mtp_drafts"],
+                **vision_inputs_kw,
             )
             final_deltas = assembler.finish()
         except Exception as error:  # noqa: BLE001  the device loop failed: report, then end the server
@@ -1188,6 +1314,8 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 1e3 * completion.prefill_seconds / completion.prefill_tokens, 3
             )
         extension = extension_of(completion)
+        if vision_record is not None:  # an image request: the images, their tokens and the tower's time
+            extension["vision"] = vision_record
         # The evidence (the ledger line, the log line) cannot cost the reply: a full disk or a lost evidence directory
         # loses the record, never the answer the device already produced.
         try:
@@ -2359,6 +2487,11 @@ def main() -> int:
             moe_rows=mtp_moe_rows,
             gdn_rows_scan=fused_module.enabled(gdn_rows_scan_module.NAME),
             slab_rows=args.prefill_slab,
+            # the tower's MODELED terms (the image path is the default path; the live decision is the warm hook's)
+            vision_resident_bytes_per_bank=-(-vision_resident_layout(mesh_size=4)["device_total"] // 8),
+            vision_peak_activation_bytes_per_bank=-(
+                -VISION_ROW_BUCKETS[-1] * PEAK_ACTIVATION_BYTES_PER_ROW_PER_DIE // 8
+            ),
         )
     )
     if mtp_admission_table is not None:
@@ -2439,6 +2572,8 @@ def main() -> int:
                 "admission": None,
             }
         ),
+        # the vision tower's residency: decided and made in the chain's warm hook (ttnn/vision_residency), None until then
+        "vision": None,
         "fused_kernels": sorted(fused.enabled_names()),
         # What a seed reproduces against: the source head and the runtime; with the pass loop drafting for sampled
         # requests the draw order is the pass's, so the switch and k are part of the identity.
@@ -2574,6 +2709,38 @@ def main() -> int:
                     )
                 lanes_session.prepare(opened_chain)
 
+        vision_state: dict[str, Any] = {"residency": None}
+
+        def vision_warm_hook(opened_chain) -> None:
+            # The image path is the default path: the tower's residency is decided on the live allocator here (after
+            # the resident build, the MTP states, the warm pass and the lanes' allocations; before any capture) and
+            # made here (the weights resident, one forward per row bucket compiled).  A shortfall leaves the process
+            # text-only with the reason on READY / health and on every image refusal.
+            reserved = RESIDENT_POST_BUILD_BYTES_PER_BANK_UPPER_BOUND
+            if opened_chain.mtp is not None:
+                reserved += int(opened_chain.mtp.admission["mtp_growth_estimate_bytes_per_bank"]["traces"])
+            if bool(args.long_chunks) or args.prefill_slab is not None:
+                reserved += LONG_CHUNKS_BYTES_PER_BANK_AFTER_CAPTURES
+            residency = opened_chain.construction.builder.enable_vision(
+                lambda: hardware_profiles.symmetric_mesh_dram_memory(mesh, hardware_profile.route),
+                reserved_bytes_per_bank=reserved,
+            )
+            residency.vision_warm_hook(opened_chain)
+            vision_state["residency"] = residency
+            summary["vision"] = residency.vision_summary()
+            _log(
+                "vision_residency",
+                **{
+                    key: value
+                    for key, value in summary["vision"].items()
+                    if key
+                    not in ("prewarm", "prewarm_plan_modeled", "ladders", "dram_after_load", "dram_after_prewarm")
+                },
+                prewarm_seconds=[round(row["ready_seconds_measured"], 2) for row in summary["vision"]["prewarm"]],
+            )
+
+        warm_hook = compose_warm_hooks(warm_hook, vision_warm_hook)
+
         chain = construct_chain(
             prepared,
             mesh,
@@ -2598,6 +2765,8 @@ def main() -> int:
                 f"chain allocated context {chain.allocated_context} vs requested {resident_context.allocated_context}"
             )
         session = Qwen38ChatSession(chain, template, prefill_mode=args.prefill_mode)
+        if server is not None:
+            server.vision = vision_state["residency"]
         if os.environ.get(DEVICE_ACCEPT_DUMP_VARIABLE):
             session.device_accept_dump = Path(os.environ[DEVICE_ACCEPT_DUMP_VARIABLE])
             session.device_accept_dump.mkdir(parents=True, exist_ok=True)
@@ -2798,6 +2967,7 @@ def main() -> int:
                 "route": list(hardware_profile.route),
                 "route_derivation": route_derivation["route_derivation"],
                 "mode": summary["mode"],
+                "vision": summary["vision"],
                 "lanes": (
                     None
                     if lanes_session is None

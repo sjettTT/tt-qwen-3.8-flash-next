@@ -66,7 +66,7 @@ class VisionHostInputs:
     position_embedding: torch.Tensor  # [1, 1, rows, hidden]
     cos: torch.Tensor  # [1, 1, rows, PADDED_HEAD_DIM]
     sin: torch.Tensor
-    windows: torch.Tensor | None  # int32 cumulative attention window boundaries, None = one window without padding
+    windows: torch.Tensor  # int32 cumulative attention window boundaries [0, .., patches(, rows)]
     patches: int
     rows: int
     tokens: int
@@ -259,7 +259,10 @@ class VisionTower:
     # Host preparation
     # ------------------------------------------------------------------------------------------------------------------
 
-    def prepare(self, pixel_patches: torch.Tensor, grid_thw: torch.Tensor) -> VisionHostInputs:
+    def prepare(self, pixel_patches: torch.Tensor, grid_thw: torch.Tensor, rows: int | None = None) -> VisionHostInputs:
+        """The host side of one image.  ``rows`` (a tile multiple of at least the patch count; default the smallest)
+        is the padded row count the device programs are compiled for: a served process passes its bucket."""
+
         config = self.config
         if pixel_patches.ndim != 2 or pixel_patches.shape[1] != config.patch_dim:
             raise ValueError(f"pixel patches must be [N, {config.patch_dim}], got {tuple(pixel_patches.shape)}")
@@ -271,19 +274,22 @@ class VisionTower:
             )
         if patches % config.merge_unit:
             raise ValueError(f"{patches} patches are not a multiple of the merge unit {config.merge_unit}")
-        rows = padded_rows(patches)
+        rows = padded_rows(patches) if rows is None else int(rows)
+        if rows < patches or rows % TILE:
+            raise ValueError(f"rows {rows} must be a tile multiple of at least the {patches} patches")
         pixels = torch.zeros(rows, config.patch_dim, dtype=torch.float32)
         pixels[:patches] = pixel_patches.to(torch.float32)
         position = torch.zeros(rows, config.hidden_size, dtype=torch.float32)
         position[:patches] = interpolated_pos_embed(self.position_table, grid_thw, config)
         cos, sin = rotary_cos_sin(vision_position_ids(grid_thw, config), config)
         cos_dev, sin_dev = device_cos_sin(cos, sin, rows=rows)
-        windows = None
-        if len(segments) > 1 or rows != patches:
-            boundaries = [0] + [end for _, end in segments]
-            if rows != patches:
-                boundaries.append(rows)
-            windows = torch.tensor(boundaries, dtype=torch.int32)
+        # The attention windows are always given (one segment per frame, the padded rows their own window), so a
+        # row count has ONE compiled program set whether or not an image fills it: the prewarmed bucket serves
+        # every image that pads to it.
+        boundaries = [0] + [end for _, end in segments]
+        if rows != patches:
+            boundaries.append(rows)
+        windows = torch.tensor(boundaries, dtype=torch.int32)
         return VisionHostInputs(
             pixels=pixels.reshape(1, 1, rows, config.patch_dim),
             position_embedding=position.reshape(1, 1, rows, config.hidden_size),
@@ -492,12 +498,13 @@ class VisionTower:
         *,
         trace: bool = False,
         probe: Callable[[str], None] | None = None,
+        rows: int | None = None,
     ) -> VisionTowerOutput:
         """One image.  ``trace`` keeps the block-0 input and every block output on device for the tests; ``probe``
-        is called with a stage name after each stage (allocator sampling)."""
+        is called with a stage name after each stage (allocator sampling); ``rows`` is the served row bucket."""
 
         started = time.perf_counter()
-        inputs = self.prepare(pixel_patches, grid_thw)
+        inputs = self.prepare(pixel_patches, grid_thw, rows)
         prepared = time.perf_counter()
         device_inputs = self._upload_inputs(inputs)
         uploaded = time.perf_counter()
@@ -536,6 +543,24 @@ class VisionTower:
     # ------------------------------------------------------------------------------------------------------------------
     # Host views (tests, diagnostics)
     # ------------------------------------------------------------------------------------------------------------------
+
+    def prewarm_rows(self, rows: int) -> dict[str, float]:
+        """Compile the served program set of one row bucket: two zero images, one whose grid fills ``rows`` exactly
+        (2 x rows/2 patches; the attention windows ``[0, rows]``) and one four patches short of it (2 x (rows/2 - 2);
+        the windows ``[0, rows - 4, rows]``), since the windowed attention's program is keyed on the window tensor's
+        shape as well as the rows: every image of the bucket is one of the two forms.  The outputs are released;
+        returns the two forwards' timings summed."""
+
+        if rows % (2 * TILE) or rows < 2 * TILE:
+            raise ValueError(f"a prewarm bucket must be a positive multiple of {2 * TILE} rows, got {rows}")
+        timing: dict[str, float] = {}
+        for patches in (rows, rows - 4):
+            grid_thw = torch.tensor([[1, 2, patches // 2]], dtype=torch.long)
+            output = self.run_image(torch.zeros(patches, self.config.patch_dim), grid_thw, rows=rows)
+            ttnn.deallocate(output.features)
+            for key, value in output.timing.items():
+                timing[key] = timing.get(key, 0.0) + value
+        return timing
 
     def features_to_torch(self, output: VisionTowerOutput) -> torch.Tensor:
         """``[T, out_hidden]`` FP32: the dies' column shards concatenated in mesh order, the padding rows dropped."""

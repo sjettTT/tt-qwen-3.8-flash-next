@@ -109,16 +109,45 @@ read candidate row, not the vocabulary (`logprobs_normalizer` in `/health` and `
 decodes at a time; up to four wait in the queue (`queue_wait_seconds` in `usage`), the fifth gets HTTP 503.  A prompt
 over the context limit gets HTTP 400 `context_length_exceeded`.
 
-Image parts (2026-09-29).  A user message `content` part of type `image_url` is recognised by the request validator and
-refused with HTTP 400 ("image parts are not accepted here (text-only)", `param` naming the part) until the image request
-path lands; video parts (`video`, `video_url`, `input_video`, a `video` key) and unknown part types are refused the same
-way.  The served chain builds no vision tower, and its startup, READY record, DRAM per bank and text streams are
-unchanged by the image work (the acceptance records reproduce bit for bit).  The image path itself -- the vision tower
-on the device, the three-axis rotary rows, the feature splice into the prompt embeddings, the decode rotary shift -- is
-measured on the line through the model's development tools only (`docs/NUMERICS.md`, the image class) and waits for
-the server's image request path: the tower in the chain's warm hook behind a flag, the request's images through the
-checkpoint's processor to the prompt, `usage.prompt_tokens` counting the image tokens, the admission's tower terms fed
-from the tower.
+Image parts (2026-09-29).  A user message's `content` list may hold `{"type": "image_url", "image_url": {"url":
+"data:image/...;base64,..."}}` parts beside its text parts; only `data:` URLs are accepted (the server fetches nothing).
+The optional `detail` field is honoured: `auto` and `high` run the checkpoint's stock image processor (each side rounded
+to a multiple of 32 px, the pixel count kept within 65,536 .. 16,777,216, so an image is 64 .. 16,384 prompt tokens);
+`low` caps the pixel count at 262,144 (512 x 512: at most 256 tokens).  Video parts are refused in every spelling
+(`video`, `video_url`, `input_video`, a `video` key) with HTTP 400 ("video parts are not supported by this server",
+`param` naming the part); so are images in a system message and unknown part types; image bytes that do not decode get
+HTTP 400 `invalid_image` naming the part.  `usage.prompt_tokens` counts the image tokens (one per merged 16 x 16 patch
+pair), so it is no longer the client's own tokenizer count; the reply's `qwen38.vision` gives per request the images'
+grids, `image_tokens` and the tower time.  Images per request are bounded by the context only
+(`context_length_exceeded` as for text).
+
+The vision tower.  The server loads the tower (the checkpoint's 333 BF16 tensors, 125 MB per DRAM bank, replicated on
+every die) in the chain construction's warm hook, before the traces capture, when the DRAM admission allows it: the
+weights plus the activation peak of the largest row bucket (65,536 patch rows x 18 KB per die, with a 10 percent
+margin) against the live free bytes per bank and the largest contiguous span.  Images are padded up to eight row
+buckets (512, 1,024, ..., 65,536 patch rows; 65,536 patches is the stock maximum image, 4096 x 4096 px = 16,384 image
+tokens) and both attention window forms of every bucket run once at start, so no served image compiles a program (the
+padded patches are their own attention window and cost the linear layers only).  `READY.vision` and `/health` `vision`
+carry `resident`, `buckets` and `resident_bytes_per_bank`, and on a shortfall `shortfall` (the reason) with
+`shortfall_bytes_per_bank`; READY also carries the admission's numbers and the per-bucket prewarm seconds.  A shortfall
+starts the server text-only: image parts then get HTTP 400 `vision_unavailable` ("the vision tower is not resident in
+this process" with the shortfall's reason); an image above the largest bucket gets the same code ("an image of N patches
+exceeds the largest row bucket 65536 ..."), and so do image parts under `--lanes` ("image parts are not served under
+--lanes in this landing"; the single-stream server serves them).  Every start pays the prewarm (MEASURED 2026-09-29:
+42-44 s with the tower's programs in the host's kernel cache; 103-125 s on a host's first start, when they compile), and
+the text path is unchanged: with the tower resident the acceptance replay reproduces every pinned record.
+
+State reuse.  A request with images is prefilled from position 0 through the chunk trace and leaves no prompt-end
+snapshot; a later request never reuses a committed image prompt's state, and a text request never extends one: the
+committed ids alone do not identify the pixels (two images of one size render identical ids).  Reuse across turns of an
+image conversation keyed on the images' digest is a follow-up item; until it lands, every image request pays its full
+prefill.
+
+Positions.  Image tokens take the model's three-axis rotary positions (the reference's `get_rope_index`: text advances
+all axes together, an image's tokens sit on their (t, h, w) grid from the position the image starts at, the next text
+token continues at that position plus the larger merged side, and the generated tokens follow at token index plus the
+accumulated delta).  The device keeps its caches and masks on the token index and shifts only the rotary rows; text
+requests are unchanged bit for bit (the shift is zero and the rows are the resident table's).
 
 ### Several requests at once: `--lanes B` (opt-in, greedy only)
 

@@ -640,6 +640,11 @@ def test_server_admits_long_chunks_with_mtp_and_reports_the_twin() -> None:
         "            moe_rows=mtp_moe_rows,\n"  # the verify MoE row count knob (QWEN38_MTP_MOE_ROWS) sits beside it
         "            gdn_rows_scan=fused_module.enabled(gdn_rows_scan_module.NAME),\n"
         "            slab_rows=args.prefill_slab,\n"
+        "            # the tower's MODELED terms (the image path is the default path; the live decision is the warm hook's)\n"
+        '            vision_resident_bytes_per_bank=-(-vision_resident_layout(mesh_size=4)["device_total"] // 8),\n'
+        "            vision_peak_activation_bytes_per_bank=-(\n"
+        "                -VISION_ROW_BUCKETS[-1] * PEAK_ACTIVATION_BYTES_PER_ROW_PER_DIE // 8\n"
+        "            ),\n"
         "        )"
     ) in server
     assert '"long_chunk_extension": chain.mtp.long_chunk_extension is not None,' in server

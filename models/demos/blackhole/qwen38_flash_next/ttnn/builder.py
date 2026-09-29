@@ -86,6 +86,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.moe import (
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.mtp import Qwen38TTNNMTPInput, Qwen38TTNNMTPInputWeights
 from models.demos.blackhole.qwen38_flash_next.ttnn.ple import Qwen38TTNNPLE, Qwen38TTNNPLEWeights
+from models.demos.blackhole.qwen38_flash_next.ttnn.vision_residency import VISION_ROW_BUCKETS, Qwen38VisionResidency
 from models.demos.blackhole.qwen38_flash_next.ttnn.prefill_dense import (
     Qwen38PrefillDensePolicy,
     Qwen38TTNNPrefillDense,
@@ -749,6 +750,9 @@ class Qwen38TTNNBuilder:
     # The numbers the resident prefill weights were admitted on (prefill_dense.admit_prefill_dense_dram); None when
     # the policy allocates nothing or the build runs no slab.
     prefill_dense_admission: dict | None = None
+    # The vision tower's residency in this process (enable_vision, before the chain is constructed); None = no
+    # image path: nothing of the tower is read, allocated or compiled.
+    vision_residency: Qwen38VisionResidency | None = None
 
     def __init__(
         self,
@@ -913,6 +917,28 @@ class Qwen38TTNNBuilder:
         """Operation, cause, teardown requirement, publication, and owner cleanup."""
 
         return self._resident_build_failure
+
+    def enable_vision(
+        self, dram_view, *, reserved_bytes_per_bank: int = 0, buckets=VISION_ROW_BUCKETS
+    ) -> Qwen38VisionResidency:
+        """Give this process the vision tower: the checkpoint's 333 tower tensors read from the host now (BF16), the
+        residency decided and made in the chain's warm hook (``vision_residency.vision_warm_hook`` goes to
+        ``construct_chain(warm_hook=...)``, composed with any other hook): the admission on the live allocator, the
+        weights resident, one forward per row bucket compiled before the captures.  ``dram_view`` reads the mesh's
+        DRAM view (the server's symmetric probe bound to its route); ``reserved_bytes_per_bank`` is what the chain
+        allocates after the hook (its traces).  Called at most once per builder; the tower is never rebuilt."""
+
+        self._assert_resident_builder_usable()
+        if self.vision_residency is not None:
+            raise RuntimeError("the vision tower is already enabled on this builder")
+        self.vision_residency = Qwen38VisionResidency(
+            mesh_device=self.mesh_device,
+            state_dict=self.checkpoint.vision_state_dict(),
+            dram_view=dram_view,
+            reserved_bytes_per_bank=reserved_bytes_per_bank,
+            buckets=tuple(buckets),
+        )
+        return self.vision_residency
 
     def _close_resident_after_build_failure(self, operation: str, primary_error: BaseException) -> None:
         owner = self.expert_streamer
