@@ -45,8 +45,8 @@ from models.demos.blackhole.qwen38_flash_next.checkpoint import (
 from models.demos.blackhole.qwen38_flash_next.config import CONFIG_SHA256, LAYER_PATTERN, Qwen38Placement
 from models.demos.blackhole.qwen38_flash_next.tt.ple import Qwen38HostPLEEmbedding
 from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import (
-    BF4CleanupError,
     BF4CacheIdentity,
+    BF4CleanupError,
     BF4LayerRecord,
     Qwen38BF4Cache,
     Qwen38BF4ResidentSet,
@@ -55,9 +55,10 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.bf4 import (
     qualify_live_bf4_ring,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import MESH_SHAPE, Qwen38MeshContract, is_slab_rows
-from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (
-    DenseWeightPlan,
+from models.demos.blackhole.qwen38_flash_next.ttnn.decode_matmul import (  # noqa: E402  (the placement source, READY)
     TWO_READER_QUALIFIED_DTYPES,
+    DenseWeightPlan,
+    decode_dram_workers_placement,
     default_decode_dram_workers,
     default_dense_weight_plan,
     dense_dtype_tag,
@@ -86,7 +87,6 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.moe import (
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.mtp import Qwen38TTNNMTPInput, Qwen38TTNNMTPInputWeights
 from models.demos.blackhole.qwen38_flash_next.ttnn.ple import Qwen38TTNNPLE, Qwen38TTNNPLEWeights
-from models.demos.blackhole.qwen38_flash_next.ttnn.vision_residency import VISION_ROW_BUCKETS, Qwen38VisionResidency
 from models.demos.blackhole.qwen38_flash_next.ttnn.prefill_dense import (
     Qwen38PrefillDensePolicy,
     Qwen38TTNNPrefillDense,
@@ -106,6 +106,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.qsa import (
     Qwen38TTNNQSAWeights,
     validate_qsa_cache_capacity,
 )
+from models.demos.blackhole.qwen38_flash_next.ttnn.vision_residency import VISION_ROW_BUCKETS, Qwen38VisionResidency
 from models.tt_transformers.tt.ccl import TT_CCL
 
 TP_SIZE = 4
@@ -886,6 +887,11 @@ class Qwen38TTNNBuilder:
         self.qsa_cache_capacity = qsa_cache_capacity
         self.decode_dram_workers_per_bank = decode_dram_workers_per_bank
         self.decode_dram_workers_fallback = decode_dram_workers_fallback  # None, or why the mesh runs one reader
+        # the two-reader programs' shared placement source ("identical", or the reference coordinate + the dies whose
+        # own optimal readers differ); None with one reader
+        self.decode_dram_workers_placement = (
+            decode_dram_workers_placement(mesh_device) if decode_dram_workers_per_bank != 1 else None
+        )
         self.dense_weight_plan = dense_weight_plan
         self.identity = live_identity
         self.component_cache_root = component_cache_root

@@ -13,7 +13,7 @@ No prebuilt archive, no pinned binary, no host-specific configuration.
 |---|---|---|
 | QuietBox, 4x p150c (fw 19.4.1.0) | `tt-quietbox` | verified 2026-09-04 (startup acceptance 96/96 against the CPU, 19.6 tokens/s at 32k) and 2026-09-06 from a fresh clone; `docs/PROOFS.md` |
 | 4x p150 in one host, ethernet line | `p150-line` | the numbers below were measured on it; no fresh-clone run is recorded (section 9, `docs/PROOFS.md`) |
-| QuietBox 2, 2x p300c (4 dies) | `qb2` | verified 2026-09-19 (acceptance identical to the 4x p150 boxes) and 2026-09-23 (the compact expert layout); section 7, `docs/PROOFS.md` |
+| QuietBox 2, 2x p300c (4 dies) | `qb2` | verified 2026-09-19 (acceptance identical to the 4x p150 boxes), 2026-09-23 (the compact expert layout) and 2026-09-29 (two DRAM readers per bank on its mixed-harvest dies: the 4x p150 rows, 68.7 tok/s on the 560-token chat prompt with `--mtp 4`); section 7, `docs/PROOFS.md` |
 
 ## Performance (4x p150)
 
@@ -212,8 +212,16 @@ The profile exports `tools/qb2_p300_1x4_line_mesh_graph_descriptor.textproto` (a
 links, two channels per link as in tt-metal's `p300_x2` descriptor): tt-metal classifies a p300 cluster that is not
 exactly two or four dies as CUSTOM and refuses to open without one.  The route is derived at start from the fabric's
 chip order and recorded in `READY` beside the ring walk (our box: `(1, 0, 3, 2)` where the walk gives `(0, 1, 2, 3)`).
-Its dies are harvested differently, so the server reads each DRAM bank with one core there: two readers need every die
-to share one bank-to-worker assignment, checked at start, the fallback and its reason in `READY` (`dram_workers_fallback`).
+Its dies are harvested differently (one serves four of its banks from another worker column), so until 2026-09-29 the
+server read each DRAM bank with one core there.  The two-reader form is now stock on such a mesh: the first die's
+bank-to-worker placement is shared by every die (a reader addresses its bank by id, so the odd die reads those banks from
+a worker one to three NoC hops further), recorded in `READY` (`dram_workers_per_bank`, `dram_workers_placement`) and warned
+once by tt-metal; one reader remains only where the placement cannot be validated (a die with another worker or DRAM
+grid, or a bank count other than eight), the reason in `READY` (`dram_workers_fallback`).  Measured on our box 2026-09-29
+with the release container's arguments (`--mtp 4 --long-chunks --prefill-slab 2048`, host load 1-2.4): one reader 63.9
+tok/s on the 560-token chat prompt, two readers 68.7 (the 4x p150 line's 68.3); json 105.2 -> 113.1, multi-turn 59.9 ->
+64.8, prose 46.6 -> 50.3, code 97.6 -> 104.9; plain decode 38.5 -> 40.5; the 13-record startup replay identical
+(`docs/NUMERICS.md`).
 Verified on our box on 2026-09-19 (`READY` 194 s after launch, `json` 96/96, the divergence table identical to the 4x
 p150 boxes) and 2026-09-23 (the compact expert layout: 9.17 GB more free per device), and on a contributor's box from
 a fresh clone on 2026-09-07 (`docs/PROOFS.md`).

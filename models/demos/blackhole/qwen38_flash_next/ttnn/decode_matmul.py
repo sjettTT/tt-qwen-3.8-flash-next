@@ -208,15 +208,52 @@ def mesh_dram_bank_worker_signatures(mesh_device) -> dict[tuple[int, int], tuple
     return signatures
 
 
+def mesh_device_geometries(mesh_device) -> tuple[tuple[int, int], ...]:
+    """Per mesh coordinate (row-major), (DRAM bank count, the row extent max y + 1 of the device's optimal bank reader
+    cores): the geometry one shared DRAM-sharded placement must find on every device, read from the per-coordinate
+    bank -> worker assignment Python has (a MeshDevice exposes no per-device handle).  Harvesting moves columns, not
+    rows, so dies harvested in different columns share this geometry; a device whose worker grid differs in its rows
+    or bank count is refused here, one whose columns differ is refused by tt-metal's geometry check at the first
+    program build."""
+
+    signatures = mesh_dram_bank_worker_signatures(mesh_device)
+    out = []
+    for coordinate in sorted(signatures):
+        cores = signatures[coordinate]
+        out.append((len(cores), max(y for _, y in cores) + 1))
+    return tuple(out)
+
+
+def decode_dram_workers_placement(mesh_device) -> str:
+    """Where the two-reader programs' shared bank -> worker placement comes from: ``"identical"`` when every device
+    reports the same optimal assignment, else ``"reference (r, c); other optimal readers at [...]"`` (tt-metal places
+    the reference device's assignment on every device; the named devices read those banks from a further worker)."""
+
+    signatures = mesh_dram_bank_worker_signatures(mesh_device)
+    if len(set(signatures.values())) == 1:
+        return "identical"
+    reference_coordinate = min(signatures)
+    differing = sorted(
+        coordinate for coordinate, signature in signatures.items() if signature != signatures[reference_coordinate]
+    )
+    return f"reference {reference_coordinate}; other optimal readers at {differing}"
+
+
 def qualify_decode_dram_workers(mesh_device, requested: int) -> tuple[int, str | None]:
     """The readers per DRAM bank this mesh admits: ``requested``, or 1 with the reason.
 
-    One DRAM-sharded matmul program is placed on every device of the mesh, so more than one reader per bank requires
-    every device to report the same bank -> worker assignment (tt-metal ``get_dram_bank_reader_assignments``: "identical
-    local device geometry and primary readers", a TT_FATAL after the weights are on the device).  Dies harvested in
-    different columns (a QuietBox 2, 2026-09-18) serve their banks from different worker columns, so they run one
-    reader per bank; the caller records the reason.  The two-reader table (``TWO_WORKER_PROJECTIONS``) was qualified on
-    eight banks, so a board with another bank count (a seven-bank Blackhole DRAM ring) runs one reader too.
+    One DRAM-sharded matmul program is placed on every device of the mesh (tt-metal ``get_dram_bank_reader_assignments``):
+    the reference (first) device's optimal bank -> worker assignment is the placement everywhere.  The DRAM-sharded
+    readers address their shard by bank id, so any worker core can read any bank and the assignment is a locality
+    choice.  The shared placement is valid when every device has the reference device's worker grid and DRAM grid; a
+    mesh of dies harvested in different columns (a QuietBox 2: one die serves banks 4-7 from another worker column,
+    2026-09-29) then runs two readers with the odd dies reading those banks from a worker one or more NoC hops further
+    (``decode_dram_workers_placement`` names them, the READY record carries it, tt-metal warns once per program build
+    with the largest hop deviation; the acceptance replay is bitwise the one-reader stream, the rows of record in
+    NUMERICS).  One reader per bank remains for the cases the placement cannot be validated: a device whose DRAM bank
+    count or worker-row extent differs from the reference device's (another die geometry; a worker grid differing in
+    its columns is refused by tt-metal at the first program build), and a mesh whose bank count is not the eight the
+    two-reader table (``TWO_WORKER_PROJECTIONS``) was qualified on (a seven-bank Blackhole ring).
     """
 
     validate_decode_dram_workers(requested)
@@ -227,17 +264,15 @@ def qualify_decode_dram_workers(mesh_device, requested: int) -> tuple[int, str |
         return 1, (
             f"one reader per DRAM bank: the two-reader projections were qualified on 8 DRAM banks, this mesh has {banks}"
         )
-    signatures = mesh_dram_bank_worker_signatures(mesh_device)
-    if len(set(signatures.values())) == 1:
-        return requested, None
-    reference_coordinate = min(signatures)
-    differing = sorted(
-        coordinate for coordinate, signature in signatures.items() if signature != signatures[reference_coordinate]
-    )
-    return 1, (
-        f"one reader per DRAM bank: {requested} readers need every device to share one bank -> worker assignment, "
-        f"and the devices at mesh coordinates {differing} differ from {reference_coordinate} (differently harvested dies)"
-    )
+    geometries = mesh_device_geometries(mesh_device)
+    if len(set(geometries)) > 1:
+        differing = sorted(index for index, geometry in enumerate(geometries) if geometry != geometries[0])
+        return 1, (
+            f"one reader per DRAM bank: the shared two-reader placement cannot be validated, the devices at mesh indices "
+            f"{differing} have another DRAM bank count or worker-row extent than device 0 ({geometries[0]} vs "
+            f"{[geometries[index] for index in differing]})"
+        )
+    return requested, None
 
 
 def bank_tiles(mesh_device, k: int, n: int, num_workers_per_dram_bank: int = 1) -> int:

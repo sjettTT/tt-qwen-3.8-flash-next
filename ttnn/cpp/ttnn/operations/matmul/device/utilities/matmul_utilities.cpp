@@ -425,9 +425,13 @@ std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
         "Multiple readers per DRAM bank currently require a NOC0 data-movement kernel");
 
     const auto worker_grid = device->compute_with_storage_grid_size();
-    // Program placement is shared by every device in a mesh. The hop-distance
-    // API takes a physical device (or a unit mesh), so validate that one common
-    // placement is exact before evaluating costs on the local devices.
+    // Program placement is shared by every device in a mesh: the reference (first) device's optimal bank ->
+    // worker assignment is the placement on every device.  The DRAM-sharded readers address their shard by
+    // bank id (AllocatorBank<DRAM>), so any worker core can read any bank and the assignment is a locality
+    // choice: it is valid on every device whose worker grid and DRAM geometry equal the reference device's.
+    // A mesh of differently harvested dies (a QuietBox 2) reports other optimal readers on some devices;
+    // those devices read the affected banks from the shared placement one or more NoC hops further away,
+    // reported once per program build together with the largest hop deviation of a secondary reader.
     std::vector<tt::tt_metal::IDevice*> placement_devices{device};
     if (auto* mesh = dynamic_cast<tt::tt_metal::distributed::MeshDevice*>(device)) {
         placement_devices = mesh->get_devices();
@@ -436,16 +440,30 @@ std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
             "Multiple readers per DRAM bank require a fully local mesh");
     }
     const auto* reference_device = placement_devices.front();
-    for (auto* local_device : placement_devices) {
+    std::vector<size_t> other_primary_devices;
+    for (size_t device_index = 0; device_index < placement_devices.size(); ++device_index) {
+        auto* local_device = placement_devices[device_index];
         TT_FATAL(
             local_device->arch() == reference_device->arch() &&
                 local_device->grid_size() == reference_device->grid_size() &&
                 local_device->compute_with_storage_grid_size() == worker_grid &&
                 local_device->dram_grid_size() == reference_device->dram_grid_size() &&
-                local_device->num_dram_channels() == reference_device->num_dram_channels() &&
-                local_device->get_optimal_dram_bank_to_logical_worker_assignment(noc) == primary_workers,
-            "Multiple readers per DRAM bank require identical local device geometry and primary readers");
+                local_device->num_dram_channels() == reference_device->num_dram_channels(),
+            "Multiple readers per DRAM bank require identical local device geometry");
+        if (local_device->get_optimal_dram_bank_to_logical_worker_assignment(noc) != primary_workers) {
+            other_primary_devices.push_back(device_index);
+        }
     }
+    for (const auto& primary : primary_workers) {
+        TT_FATAL(
+            primary.x < worker_grid.x && primary.y < worker_grid.y,
+            "DRAM bank reader {} lies outside the shared worker grid {}x{}",
+            primary.str(),
+            worker_grid.x,
+            worker_grid.y);
+    }
+    uint32_t hop_deviation = 0;
+    std::vector<size_t> hop_devices;
     std::set<tt::tt_metal::CoreCoord> used(primary_workers.begin(), primary_workers.end());
 
     for (uint32_t bank = 0; bank < primary_workers.size(); ++bank) {
@@ -468,10 +486,18 @@ std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
                     const uint32_t cost = tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
                         placement_devices.front(), candidate, primary_workers[bank], noc);
                     for (size_t device_index = 1; device_index < placement_devices.size(); ++device_index) {
-                        TT_FATAL(
-                            tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
-                                placement_devices[device_index], candidate, primary_workers[bank], noc) == cost,
-                            "Multiple readers per DRAM bank require identical local worker hop distances");
+                        const uint32_t local_cost = tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
+                            placement_devices[device_index], candidate, primary_workers[bank], noc);
+                        if (local_cost != cost) {
+                            // the placement is chosen on the reference device; another device may see another hop
+                            // count for the same pair (harvesting moves its physical columns even when its logical
+                            // primary readers equal the reference's): a locality deviation, recorded and warned below
+                            hop_deviation =
+                                std::max(hop_deviation, local_cost > cost ? local_cost - cost : cost - local_cost);
+                            if (std::find(hop_devices.begin(), hop_devices.end(), device_index) == hop_devices.end()) {
+                                hop_devices.push_back(device_index);
+                            }
+                        }
                     }
                     // Equal-cost candidates use the same endpoint and hop count. Keep the first candidate in ascending
                     // x/y scan order so that the assignment is deterministic without adding a second routing objective.
@@ -486,6 +512,25 @@ std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
             used.insert(best_worker);
             assignments.push_back({best_worker, bank, worker_index});
         }
+    }
+    if (!other_primary_devices.empty() || !hop_devices.empty()) {
+        std::string devices_text, hop_text;
+        for (size_t device_index : other_primary_devices) {
+            devices_text += (devices_text.empty() ? "" : ",") + std::to_string(device_index);
+        }
+        for (size_t device_index : hop_devices) {
+            hop_text += (hop_text.empty() ? "" : ",") + std::to_string(device_index);
+        }
+        log_warning(
+            tt::LogOp,
+            "Multiple readers per DRAM bank on a mesh of differently harvested dies: devices [{}] report other optimal "
+            "bank "
+            "readers than the reference device, devices [{}] other secondary-reader hop counts (largest deviation {} "
+            "hops); "
+            "the shared placement is the reference device's (readers address their bank by id; locality only)",
+            devices_text,
+            hop_text,
+            hop_deviation);
     }
     return assignments;
 }

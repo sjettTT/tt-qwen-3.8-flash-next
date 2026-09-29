@@ -274,6 +274,48 @@ prompt tokens, so no slab fires on them) and the slab record (`document`, 2,228 
 index 12 (stream sha 9beadb60...) under `--mtp 4`, against 12 (7d56a970...) for the plain slab: the only pin
 exercising a slab body under MTP.
 
+### Two readers per bank on a mixed-harvest mesh (QuietBox 2, 2026-09-29)
+
+One DRAM-sharded matmul program is placed on every device of the mesh; until 2026-09-29 tt-metal's two-reader placement
+required every device to report the same optimal bank -> worker assignment, and a QuietBox 2, whose dies are harvested
+in different columns (one die serves banks 4-7 from another worker column), fell back to one reader per bank
+(`READY` `dram_workers_fallback`).  A DRAM-sharded reader addresses its shard by bank id, so any worker can read any
+bank and the assignment is a locality choice: the placement is now the first device's on every device
+(`ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.cpp`, `get_dram_bank_reader_assignments`), the
+devices whose own optimal readers or hop counts differ are named once in a warning with the largest hop deviation, and
+`READY` carries `dram_workers_placement` ("identical", or the reference coordinate with the differing dies).  One
+reader remains where the placement cannot be validated: a device whose worker or DRAM grid differs from the first
+device's, or a mesh whose bank count is not the eight the table was qualified on.  Numerics: bitwise by construction
+(data movement only); measured below.
+
+Measured 2026-09-29 on a QuietBox 2 (2x p300c, harvested columns 7+9 / 0+9 / 6+13 / 1+9, one 1x4 line, the placement
+`reference (0, 0); other optimal readers at [(0, 1), (0, 2)]`, largest hop deviation 3; host Ryzen 7 9700X, cpufreq
+powersave, load 1.0-2.4; each arm its own hold, the fork launcher with `--profile qb2 --acceptance --require-json-96`,
+the rows the like-for-like client's EOS-honoured medians of 3 after a warm-up, the sampled TPOT 6 chats x 200 tokens):
+
+| form | 1 reader per bank (the fallback) | 2 readers per bank | 4x p150 line (2026-09-28 card) |
+|---|---|---|---|
+| `--mtp 4 --long-chunks --prefill-slab 2048`, greedy: 560-token chat / multi-turn / code / json / prose tok/s | 63.92 / 59.93 / 97.57 / 105.17 / 46.62 | 68.73 / 64.75 / 104.88 / 113.05 / 50.28 | 68.3 / 64.2 / 104.3 / 111.0 / 50.0 |
+| the same, tokens per pass | 2.9425 / 2.6842 / 4.4483 / 4.75 / 2.0857 | identical | 2.94 / 2.68 / 4.45 / 4.75 / 2.09 |
+| the same, sampled TPOT non-thinking / thinking ms | 17.81 / 19.30 | 16.50 / 18.08 | 16.7 / 18.3 |
+| plain decode (no `--mtp`), greedy 560-token chat tok/s; sampled TPOT ms | 38.54; 25.27 | 40.52; 23.96 | (38.6; 2026-09-26 row) |
+| the 13-record startup replay (A3-slab2048-mtp4 form) and the 12-record plain replay | the pins | identical to the one-reader arm, record by record | the pins |
+
+Where the one-reader gap sat (the MTP pass decomposition and the device census on the same box, chat560, the fold form,
+one reader; the line's fold-form census of 2026-09-26 as the reference): pass wall 46.19 ms pipelined against the line's
+41.95; blocking replays verify 36.03 + draft 8.23 + commit 0.96; the exposed host 1.16 ms (smaller than the line's
+1.5-2.2: PLE lookup 0.96 + upload 0.21); per program class on chip 0, Matmul 7.76 + 3.91 (verify + draft) against the
+line's 5.62 + 2.52 = +3.5 ms, MoECompute 5.37 against ~4.3 expected at this head (~+1.0), the fused programs ~+0.7,
+AllGather 1.88 against 1.82 and the reduce-scatters 2.54 against 3.19 (the ring's two-channel links are not a term),
+host<->device transfers one 6.4 KB write and one 268 B readback per pass (per-call latencies 3-4x below the line's
+2026-09-03 record).  With two readers the rows read the line's.
+
+The image's `TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES=0` (pinned host memory not cached, set for the translated-IOMMU
+long-pin hazard) costs the SAMPLED pass on this host: the split verify's tiny decision writes (three 4-byte host
+tensors per pass) take 57 us at the median but 2.9 ms at the 90th percentile, `decision_write` 3.62 ms per pass, the
+sampled pass 50.92 ms against 47.81 with the cache unset (the greedy pass unchanged, 46.19 / 46.07).  The line
+measured no effect of the setting either way; the serving default is the release's decision.
+
 ## The slab's block-shared attention (`QWEN38_FUSED=sparse_sdpa_tiled`, 2026-09-25)
 
 A tolerance-class fused kernel, opt-in: `sparse_sdpa_tiled` replaces the prefill slab's block-id expansion, zero V

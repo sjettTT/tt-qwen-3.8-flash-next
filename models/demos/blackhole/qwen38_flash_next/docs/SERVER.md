@@ -511,7 +511,8 @@ through `tt-model serve` with `c32k-quietbox2` and with the default `c32k` (the 
 warm caches (241 s with cold component caches); sampled decode under the serving default (the checkpoint's
 generation_config profile, temperature 1.0, top_k 20, top_p 0.95) 44 to 46 ms per token on streamed 128-, 200- and
 256-token requests, about 22 tokens/s, TTFT 0.21 s on a 17-token prompt; one DRAM reader per bank on the mixed-harvest
-dies.
+dies at that date (two readers, the stock form since 2026-09-29: `docs/NUMERICS.md`, "Two readers per bank on a
+mixed-harvest mesh").
 
 Cost: this server's greedy loop is 50 ms per token; under vLLM every step adds the full-vocabulary gather, vLLM's
 sampler and its step overhead: 56.7 ms per token greedy and 79 ms sampled, measured on 4x p150 (2026-09-09).  The

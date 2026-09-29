@@ -190,3 +190,61 @@ def test_the_mtp_verify_rows_run_the_same_one_tile_row_linears() -> None:
     assert head.count("ttnn.linear(") == 1 and "program_config=program_config" in head
     verify = inspect.getsource(mtp_v2_module)
     assert "layer.attention.forward_rows(" in verify and "logits = lm_head(head_rows)" in verify
+
+
+def _signatures(*columns: int) -> dict[tuple[int, int], tuple[tuple[int, int], ...]]:
+    """One 1x4 line's per-coordinate bank -> worker signatures: bank 0-3 from worker column 0, banks 4-7 from ``column``
+    (the QuietBox 2 of 2026-09-07: three dies column 6, one die column 5)."""
+
+    rows = ((9, 0, 7, 3), (9, 1, 6, 4))
+    return {
+        (0, index): tuple((0, y) for y in rows[0]) + tuple((column, y) for y in rows[1])
+        for index, column in enumerate(columns)
+    }
+
+
+def test_a_mixed_harvest_mesh_runs_two_readers_on_the_reference_placement(monkeypatch) -> None:
+    """The two-reader form is stock: every eight-bank mesh whose devices share one worker and DRAM grid runs the
+    requested readers on the reference device's placement, dies with other optimal readers included; the placement
+    record names them.  One reader remains only where the placement cannot be validated (other grids) or the bank
+    count is not eight."""
+
+    monkeypatch.setattr(dm, "mesh_dram_bank_worker_signatures", lambda mesh: _signatures(6, 6, 6, 6))
+    assert dm.mesh_device_geometries(_mesh()) == ((8, 10),) * 4
+    assert dm.qualify_decode_dram_workers(_mesh(), 2) == (2, None)
+    assert dm.decode_dram_workers_placement(_mesh()) == "identical"
+    # the QuietBox 2: dies serving banks 4-7 from column 5 instead of 6 share the geometry (harvesting moves columns)
+    monkeypatch.setattr(dm, "mesh_dram_bank_worker_signatures", lambda mesh: _signatures(6, 5, 5, 6))
+    assert dm.mesh_device_geometries(_mesh()) == ((8, 10),) * 4
+    assert dm.qualify_decode_dram_workers(_mesh(), 2) == (2, None)
+    assert dm.decode_dram_workers_placement(_mesh()) == "reference (0, 0); other optimal readers at [(0, 1), (0, 2)]"
+    assert dm.qualify_decode_dram_workers(_mesh(), 1) == (1, None)
+    # a device with another worker-row extent (its readers end at row 8): the placement cannot be validated
+    odd = _signatures(6, 6, 6, 6)
+    odd[(0, 3)] = tuple((x, min(y, 8)) for x, y in odd[(0, 3)])
+    monkeypatch.setattr(dm, "mesh_dram_bank_worker_signatures", lambda mesh: odd)
+    readers, reason = dm.qualify_decode_dram_workers(_mesh(), 2)
+    assert readers == 1 and "cannot be validated" in reason and "[3]" in reason and "(8, 9)" in reason
+    # a seven-bank ring: the table was qualified on eight banks
+    readers, reason = dm.qualify_decode_dram_workers(_mesh(banks=7), 2)
+    assert readers == 1 and "qualified on 8 DRAM banks, this mesh has 7" in reason
+
+
+def test_the_ready_record_and_the_program_placement_carry_the_reader_placement() -> None:
+    """The builder records the placement source with the reader count, the chat server's READY record carries it,
+    and the DRAM-sharded matmul's placement rule is the reference device's with the geometry check kept."""
+
+    builder_source = inspect.getsource(builder_module)
+    assert "decode_dram_workers_placement(mesh_device) if decode_dram_workers_per_bank != 1 else None" in builder_source
+    from models.demos.blackhole.qwen38_flash_next.tools import qwen38_chat_server
+
+    server_source = inspect.getsource(qwen38_chat_server)
+    assert '"dram_workers_placement": chain.construction.builder.decode_dram_workers_placement' in server_source
+    assert '"dram_workers_placement": report["chain"].get("dram_workers_placement")' in server_source
+    from pathlib import Path
+
+    repo_root = Path(builder_module.__file__).resolve().parents[5]
+    utilities = (repo_root / "ttnn/cpp/ttnn/operations/matmul/device/utilities/matmul_utilities.cpp").read_text()
+    assert "Multiple readers per DRAM bank require identical local device geometry" in utilities
+    assert "Multiple readers per DRAM bank on a mesh of differently harvested dies" in utilities
+    assert "identical local device geometry and primary readers" not in utilities

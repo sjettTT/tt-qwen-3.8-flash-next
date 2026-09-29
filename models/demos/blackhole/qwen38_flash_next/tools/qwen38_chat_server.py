@@ -53,6 +53,7 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import unquote, urlsplit
 
 import ttnn
+from models.demos.blackhole.qwen38_flash_next import mrope, vision_splice
 from models.demos.blackhole.qwen38_flash_next.chat import (
     EOS_TOKEN_IDS,
     PINNED_TOKENIZER_ARTIFACTS,
@@ -60,19 +61,12 @@ from models.demos.blackhole.qwen38_flash_next.chat import (
     Qwen38OfficialChatTemplate,
 )
 from models.demos.blackhole.qwen38_flash_next.tools import hardware_profiles
-from models.demos.blackhole.qwen38_flash_next import mrope, vision_splice
 from models.demos.blackhole.qwen38_flash_next.tools import qwen38_chat_protocol as protocol
-from models.demos.blackhole.qwen38_flash_next.tools import qwen38_vision_inputs as vision_inputs
-from models.demos.blackhole.qwen38_flash_next.tools.checkpoint_budget import vision_resident_layout
-from models.demos.blackhole.qwen38_flash_next.ttnn.vision_residency import (
-    PEAK_ACTIVATION_BYTES_PER_ROW_PER_DIE,
-    VISION_ROW_BUCKETS,
-    Qwen38VisionResidencyError,
-    compose_warm_hooks,
-)
 from models.demos.blackhole.qwen38_flash_next.tools import qwen38_reference_corpus as reference_corpus
 from models.demos.blackhole.qwen38_flash_next.tools import qwen38_sampling_step as sampling_step
+from models.demos.blackhole.qwen38_flash_next.tools import qwen38_vision_inputs as vision_inputs
 from models.demos.blackhole.qwen38_flash_next.tools import resident_decode, runtime_admission
+from models.demos.blackhole.qwen38_flash_next.tools.checkpoint_budget import vision_resident_layout
 from models.demos.blackhole.qwen38_flash_next.tools.evidence_records import (
     append_marker,
     append_phase_record,
@@ -84,8 +78,6 @@ from models.demos.blackhole.qwen38_flash_next.tools.live_decode_diagnostic impor
     missing_bf4_layers,
 )
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_protocol import Qwen38ChatRequestRejected
-from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_module
-from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_rows_scan as gdn_rows_scan_module
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_chat_session import (
     CHUNK_PREFILL_MIN_ROWS,
     DEFAULT_PREFILL_MODE,
@@ -114,17 +106,25 @@ from models.demos.blackhole.qwen38_flash_next.tools.qwen38_lane_scheduler import
 )
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_mtp_device_accept import SWITCH as DEVICE_ACCEPT_SWITCH
 from models.demos.blackhole.qwen38_flash_next.tools.qwen38_mtp_device_accept import device_accept_switch
-from models.demos.blackhole.qwen38_flash_next.ttnn import fused, mtp_v2
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused
+from models.demos.blackhole.qwen38_flash_next.ttnn import fused as fused_module
+from models.demos.blackhole.qwen38_flash_next.ttnn import mtp_v2
 from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
     RESIDENT_MAX_QSA_CACHE_CAPACITY,
     RESIDENT_QSA_CACHE_CAPACITIES,
     Qwen38ResidentContext,
 )
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
+from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_rows_scan as gdn_rows_scan_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.moe import (
     admit_slab_moe_switches,
     moe_local_output_enabled,
     moe_rows_form,
+)
+from models.demos.blackhole.qwen38_flash_next.ttnn.vision_residency import (
+    PEAK_ACTIVATION_BYTES_PER_ROW_PER_DIE,
+    VISION_ROW_BUCKETS,
+    compose_warm_hooks,
 )
 
 MODEL_ID = "Qwen/Qwen3.8-Flash-Next"
@@ -2573,7 +2573,9 @@ def main() -> int:
         "sampling": (
             "candidate_row_device_sampler"
             if args.device_sampler
-            else "candidate_row_host_sampler" if args.sampling else "greedy"
+            else "candidate_row_host_sampler"
+            if args.sampling
+            else "greedy"
         ),
         "sampling_discriminator": bool(args.sampling_discriminator),
         "agreement": (
@@ -2860,6 +2862,7 @@ def main() -> int:
             "sampling": chain.sampling is not None,
             "dram_workers_per_bank": chain.construction.builder.decode_dram_workers_per_bank,
             "dram_workers_fallback": chain.construction.builder.decode_dram_workers_fallback,
+            "dram_workers_placement": chain.construction.builder.decode_dram_workers_placement,
             "dense_weight_dtype": chain.construction.builder.dense_weight_plan.describe(),
             "mtp": (
                 None
@@ -3005,6 +3008,7 @@ def main() -> int:
                 "moe_local_output": moe_local_output_enabled(),
                 "moe_rows_form": moe_rows_form(),
                 "dram_workers_fallback": report["chain"]["dram_workers_fallback"],
+                "dram_workers_placement": report["chain"].get("dram_workers_placement"),
                 "dense_weight_dtype": report["chain"]["dense_weight_dtype"],
                 "route": list(hardware_profile.route),
                 "route_derivation": route_derivation["route_derivation"],
