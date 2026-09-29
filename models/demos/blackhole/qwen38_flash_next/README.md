@@ -215,7 +215,8 @@ chip order and recorded in `READY` beside the ring walk (our box: `(1, 0, 3, 2)`
 Its dies are harvested differently (one serves four of its banks from another worker column), so until 2026-09-29 the
 server read each DRAM bank with one core there.  The two-reader form is now stock on such a mesh: the first die's
 bank-to-worker placement is shared by every die (a reader addresses its bank by id, so the odd die reads those banks from
-a worker one to three NoC hops further), recorded in `READY` (`dram_workers_per_bank`, `dram_workers_placement`) and warned
+a worker one to three NoC hops further), recorded in `READY` (`dram_workers_per_bank`, `dram_workers_placement`, which
+also names the second reader's placement rule, `row+x` since 2026-09-29: `docs/NUMERICS.md`) and warned
 once by tt-metal; one reader remains only where the placement cannot be validated (a die with another worker or DRAM
 grid, or a bank count other than eight), the reason in `READY` (`dram_workers_fallback`).  Measured on our box 2026-09-29
 with the release container's arguments (`--mtp 4 --long-chunks --prefill-slab 2048`, host load 1-2.4): one reader 63.9

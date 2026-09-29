@@ -79,7 +79,12 @@ replay against the CPU (`NUMERICS.md`), then the server listens.
 
 The run directory (`<cache-root>/runs/<stamp>/`) holds `READY`, `phase-markers.jsonl`, `requests.jsonl`,
 `acceptance.json` and, at shutdown, `result.json` and `STOPPED`.  `result.json` and `/health` carry the runtime
-identity: the checkout's commit and tree, the extension's SHA-256, the route the mesh opened in.
+identity: the checkout's commit and tree, the extension's SHA-256, the route the mesh opened in.  `READY` carries the
+decode linears' DRAM reader form: `dram_workers_per_bank` (1 or 2), `dram_workers_placement` (`identical`, or the
+reference mesh coordinate with the dies whose optimal bank readers differ, then `; secondary readers row+x` or
+`noc-hops`: the rule the loaded runtime places a bank's second reader with, read from the library's audit marker, so
+an older runtime is named as such) and `dram_workers_fallback` (the reason when one reader per bank remains;
+`docs/NUMERICS.md`).
 
 `GET /health` reports the context limit (`context_limit`: the allocated context minus 64), the sampling mode and the
 sampling profile defaults (`sampling_defaults`), the free DRAM after the captures, the runtime identity, the defaults

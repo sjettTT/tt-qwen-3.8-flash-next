@@ -24,8 +24,10 @@ The readers per DRAM bank
 from __future__ import annotations
 
 import math
+import mmap
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
 
 import ttnn
@@ -194,6 +196,146 @@ def default_dense_weight_plan(environ: Mapping[str, str] | None = None) -> Dense
     return DenseWeightPlan(dtypes)
 
 
+# -- the secondary readers' placement (a fork rule in tt-metal's matmul_utilities.cpp, 2026-09-29) ------------------
+# ``get_dram_bank_reader_assignments`` places the second (and third) reader of a bank on the nearest admitted core of
+# the primary reader's row on its +x side (logical x+1 .. x+4; the activation storage cores are not admitted, as
+# before) and falls back to tt-metal's NOC_0 torus-hop metric when that row holds none.  Measured on a harvested
+# 11x10 p150 with every bank streaming the served two-reader pattern (reader-only kernel, device profiler): the row
+# placement streams 63.7 GB/s per bank = 509 GB/s per chip, the hop metric 46.2 (it puts half the secondaries directly
+# below their primary in the DRAM column, 39.3 on its own) = the served 44.5; one bank alone reaches 63.8 on any
+# placement, so the cap was a NOC_0 routing interaction between the reader streams, not bandwidth.  Readers address
+# their bank by id, so the placement is bitwise by construction (the DRAM stream study of 2026-09-29, docs/NUMERICS.md).
+# The READY record names the rule the runtime applies: ``row+x`` only when the loaded ttnn C++ library carries the
+# rule's audit marker, else ``noc-hops`` (a runtime built before the rule), so a served form is auditable from its
+# record alone.  The C++ carries the strict rule as its only behaviour; ``row+x-admit-storage`` (a secondary may also
+# sit on an activation storage core) and ``noc-hops`` are the study forms the Python twin below still models for the
+# reader-only bench (the placement note of 2026-09-29: the three forms measure alike on the served kernels).
+SECONDARY_PLACEMENT_ROW = "row+x"
+SECONDARY_PLACEMENT_ROW_ADMIT_STORAGE = "row+x-admit-storage"
+SECONDARY_PLACEMENT_NOC_HOPS = "noc-hops"
+SECONDARY_PLACEMENT_RULES = (
+    SECONDARY_PLACEMENT_ROW,
+    SECONDARY_PLACEMENT_ROW_ADMIT_STORAGE,
+    SECONDARY_PLACEMENT_NOC_HOPS,
+)
+SECONDARY_PLACEMENT_MARKER = b"dram-bank-secondary-readers:row+x"
+ROW_RULE_MAX_OFFSET = 4
+
+
+def loaded_ttnn_libraries() -> list[Path]:
+    """The ttnn shared objects this process has mapped (Linux ``/proc/self/maps``), the ops library ``_ttnncpp.so``
+    (where the placement rule lives) first; empty where the map cannot be read."""
+
+    try:
+        text = Path("/proc/self/maps").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    seen: list[Path] = []
+    for line in text.splitlines():
+        parts = line.split(maxsplit=5)
+        if len(parts) < 6:
+            continue
+        path = Path(parts[5].strip())
+        if path.suffix == ".so" and "ttnn" in path.name and path not in seen:
+            seen.append(path)
+    seen.sort(key=lambda p: (p.name != "_ttnncpp.so", p.name))
+    return seen
+
+
+def runtime_carries_row_rule(libraries=None) -> bool:
+    """True when one of ``libraries`` (default: the loaded ttnn libraries) carries the row rule's audit marker."""
+
+    for path in loaded_ttnn_libraries() if libraries is None else libraries:
+        try:
+            with open(path, "rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as view:
+                if view.find(SECONDARY_PLACEMENT_MARKER) != -1:
+                    return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def secondary_reader_placement_rule(*, libraries=None) -> str:
+    """The rule the runtime places the secondary readers with: ``row+x`` when the loaded ttnn library carries the row
+    rule's marker, else ``noc-hops``."""
+
+    return SECONDARY_PLACEMENT_ROW if runtime_carries_row_rule(libraries) else SECONDARY_PLACEMENT_NOC_HOPS
+
+
+def storage_grid_cores(num_cores: int, *, row: int = 0) -> tuple[tuple[int, int], ...]:
+    """The logical cores of a decode linear's activation storage grid (``dram_sharded_matmul_configs``): ``num_cores``
+    x 1 up to eight cores, else eight columns by ``num_cores / 8`` rows, from ``row`` down."""
+
+    if num_cores <= 8:
+        return tuple((x, row) for x in range(num_cores))
+    if num_cores % 8 == 0 and num_cores <= 64:
+        return tuple((x, row + y) for y in range(num_cores // 8) for x in range(8))
+    raise ValueError(f"decode matmul storage grid must be rectangular over 8 columns, got {num_cores} cores")
+
+
+def dram_bank_reader_placement(
+    primaries, grid: tuple[int, int], workers: int, *, excluded=(), rule: str = SECONDARY_PLACEMENT_ROW
+) -> list[tuple[tuple[int, int], int, int]]:
+    """The C++ placement in Python: ``[(core, bank, index), ...]`` in the factory's order (bank 0's primary, its
+    secondaries, bank 1, ...) for one device's ``primaries`` (its bank -> worker signature), the worker ``grid``
+    (x, y), ``workers`` per bank, the ``excluded`` cores (the activation storage cores) and the ``rule``.  The row rule
+    is exact; the hop-metric fallback is approximated in logical coordinates (NOC_0 torus hops, +x then +y, the first
+    candidate in ascending x/y scan order among equals) where the C++ measures physical ones, which agree up to the
+    harvested columns."""
+
+    if rule not in SECONDARY_PLACEMENT_RULES:
+        raise ValueError(f"placement rule must be one of {SECONDARY_PLACEMENT_RULES}, got {rule!r}")
+    grid_x, grid_y = grid
+    primaries = [tuple(int(v) for v in core) for core in primaries]
+    used = set(primaries)
+    excluded = {tuple(int(v) for v in core) for core in excluded}
+    out: list[tuple[tuple[int, int], int, int]] = []
+    for bank, primary in enumerate(primaries):
+        out.append((primary, bank, 0))
+        for index in range(1, workers):
+            best = None
+            if rule != SECONDARY_PLACEMENT_NOC_HOPS:
+                for dx in range(1, ROW_RULE_MAX_OFFSET + 1):
+                    candidate = (primary[0] + dx, primary[1])
+                    if candidate[0] >= grid_x or candidate in used:
+                        continue
+                    if rule == SECONDARY_PLACEMENT_ROW and candidate in excluded:
+                        continue
+                    best = candidate
+                    break
+            if best is None:
+                best_cost = None
+                for x in range(grid_x):
+                    for y in range(grid_y):
+                        candidate = (x, y)
+                        if candidate in used or candidate in excluded:
+                            continue
+                        cost = ((primary[0] - x) % grid_x) + ((primary[1] - y) % grid_y)
+                        if best_cost is None or cost < best_cost:
+                            best, best_cost = candidate, cost
+            if best is None:
+                raise ValueError(f"no free reader core for bank {bank} reader {index}")
+            used.add(best)
+            out.append((best, bank, index))
+    return out
+
+
+def row_placed_banks(placement) -> tuple[int, ...]:
+    """The banks whose secondaries all sit in their primary's row on the +x side (the rest fell back to the metric)."""
+
+    primaries = {bank: core for core, bank, index in placement if index == 0}
+    banks = sorted(primaries)
+    return tuple(
+        bank
+        for bank in banks
+        if all(
+            core[1] == primaries[bank][1] and 0 < core[0] - primaries[bank][0] <= ROW_RULE_MAX_OFFSET
+            for core, b, index in placement
+            if b == bank and index > 0
+        )
+    )
+
+
 def mesh_dram_bank_worker_signatures(mesh_device) -> dict[tuple[int, int], tuple[tuple[int, int], ...]]:
     """Per mesh coordinate, the DRAM bank -> worker core order the DRAM-sharded matmul reads in1 with (NOC 0)."""
 
@@ -224,19 +366,22 @@ def mesh_device_geometries(mesh_device) -> tuple[tuple[int, int], ...]:
     return tuple(out)
 
 
-def decode_dram_workers_placement(mesh_device) -> str:
-    """Where the two-reader programs' shared bank -> worker placement comes from: ``"identical"`` when every device
-    reports the same optimal assignment, else ``"reference (r, c); other optimal readers at [...]"`` (tt-metal places
-    the reference device's assignment on every device; the named devices read those banks from a further worker)."""
+def decode_dram_workers_placement(mesh_device, *, rule: str | None = None) -> str:
+    """Where the two-reader programs' shared bank -> worker placement comes from and how the secondaries are placed:
+    ``"identical"`` when every device reports the same optimal assignment, else ``"reference (r, c); other optimal
+    readers at [...]"`` (tt-metal places the reference device's assignment on every device; the named devices read
+    those banks from a further worker), then ``"; secondary readers <rule>"`` with the rule the runtime applies
+    (``secondary_reader_placement_rule``: ``row+x``, ``row+x-admit-storage`` or ``noc-hops``)."""
 
     signatures = mesh_dram_bank_worker_signatures(mesh_device)
+    rule = secondary_reader_placement_rule() if rule is None else rule
     if len(set(signatures.values())) == 1:
-        return "identical"
+        return f"identical; secondary readers {rule}"
     reference_coordinate = min(signatures)
     differing = sorted(
         coordinate for coordinate, signature in signatures.items() if signature != signatures[reference_coordinate]
     )
-    return f"reference {reference_coordinate}; other optimal readers at {differing}"
+    return f"reference {reference_coordinate}; other optimal readers at {differing}; secondary readers {rule}"
 
 
 def qualify_decode_dram_workers(mesh_device, requested: int) -> tuple[int, str | None]:

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <limits>
 #include <set>
+#include <string>
 
 #include "tt-metalium/allocator.hpp"
 #include "tt-metalium/experimental/device.hpp"
@@ -402,6 +403,33 @@ void get_optimal_dram_bank_to_reader_assignment(
     all_worker_cores = CoreRangeSet(all_cores_set);
 }
 
+namespace {
+
+// The placement of the DRAM-sharded matmul's secondary readers (workers_per_bank 2 or 3): a fork rule, 2026-09-29.
+// MEASURED on a harvested 11x10 p150 (8 DRAM banks, every bank streaming the served two-reader pattern, device
+// profiler, no compute): a secondary in the primary's ROW on its +x side (logical x+1 .. x+4, the nearest admitted
+// core first) streams 63.7 GB/s per bank = 509 GB/s per chip (99.5 percent of the datasheet peak); the same pair with
+// the secondary directly below the primary in the DRAM column 39.3; tt-metal's NOC_0 torus-hop metric, which picks
+// "below" for the banks whose primary is not at the bottom of its column and the far side of the row for the others,
+// 46.2 = the served two-reader in-proj (44.5).  One bank alone reaches 63.8 on any placement, so the ceiling is a
+// NOC_0 routing interaction between the reader streams (NOC_0 routes +x then +y; a secondary on the +x side receives
+// its responses without a wrap), not bandwidth.  Readers address their bank by id (AllocatorBank<DRAM>), so the
+// placement changes who reads a bank and never what is summed: bitwise by construction.  The caller's excluded cores
+// (the activation storage cores) stay excluded; the hop metric remains the fallback for a bank whose row holds no
+// admitted core on that side: a primary whose row is blocked by storage cores (bank 1's primary (0, 0) on the port's
+// row-0 storage grids) or a primary at the grid's right edge (x + 1 .. x + 4 beyond the worker grid; no wrap, since a
+// wrapped secondary is the far-side placement the study measured at 52 GB/s).  The candidates are logical worker
+// coordinates, and the geometry check below requires every device of the mesh to report the same worker grid, so a
+// candidate that exists on the reference device exists on every device (a mesh of differently harvested dies has one
+// dense logical grid; harvesting moves the physical columns underneath it, which is the locality deviation the
+// warning below reports).  The rule is logged once per process with the audit marker below, which the port's READY
+// record looks for in the loaded library before it names the rule.
+constexpr uint32_t kRowRuleMaxOffset = 4;
+constexpr const char* kRowRuleName = "row+x";
+constexpr const char* kSecondaryReaderRuleMarker = "dram-bank-secondary-readers:row+x";
+
+}  // namespace
+
 std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
     tt::tt_metal::IDevice* device,
     tt::tt_metal::NOC noc,
@@ -423,6 +451,18 @@ std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
     TT_FATAL(
         noc == tt::tt_metal::NOC::NOC_0,
         "Multiple readers per DRAM bank currently require a NOC0 data-movement kernel");
+
+    static const bool rule_logged = [] {
+        log_info(
+            tt::LogOp,
+            "DRAM-sharded matmul secondary readers: placement rule {} ({}; x+1..x+{} in the primary's row, then the NOC "
+            "hop metric)",
+            kRowRuleName,
+            kSecondaryReaderRuleMarker,
+            kRowRuleMaxOffset);
+        return true;
+    }();
+    (void)rule_logged;
 
     const auto worker_grid = device->compute_with_storage_grid_size();
     // Program placement is shared by every device in a mesh: the reference (first) device's optimal bank ->
@@ -464,7 +504,26 @@ std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
     }
     uint32_t hop_deviation = 0;
     std::vector<size_t> hop_devices;
+    // the placement is chosen on the reference device; another device may see another hop count for the same
+    // (secondary, primary) pair (harvesting moves its physical columns even when its logical primary readers equal
+    // the reference's): a locality deviation, recorded per chosen secondary and warned below
+    auto record_hop_deviation = [&](const tt::tt_metal::CoreCoord& secondary, const tt::tt_metal::CoreCoord& primary) {
+        const uint32_t cost = tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
+            placement_devices.front(), secondary, primary, noc);
+        for (size_t device_index = 1; device_index < placement_devices.size(); ++device_index) {
+            const uint32_t local_cost = tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
+                placement_devices[device_index], secondary, primary, noc);
+            if (local_cost != cost) {
+                hop_deviation = std::max(hop_deviation, local_cost > cost ? local_cost - cost : cost - local_cost);
+                if (std::find(hop_devices.begin(), hop_devices.end(), device_index) == hop_devices.end()) {
+                    hop_devices.push_back(device_index);
+                }
+            }
+        }
+    };
     std::set<tt::tt_metal::CoreCoord> used(primary_workers.begin(), primary_workers.end());
+    uint32_t row_placed = 0;
+    uint32_t metric_placed = 0;
 
     for (uint32_t bank = 0; bank < primary_workers.size(); ++bank) {
         const auto primary = primary_workers[bank];
@@ -472,47 +531,56 @@ std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
 
         for (uint32_t worker_index = 1; worker_index < workers_per_bank; ++worker_index) {
             bool found = false;
-            uint32_t best_cost = std::numeric_limits<uint32_t>::max();
             tt::tt_metal::CoreCoord best_worker{};
-            for (uint32_t x = 0; x < worker_grid.x; ++x) {
-                for (uint32_t y = 0; y < worker_grid.y; ++y) {
-                    const tt::tt_metal::CoreCoord candidate{x, y};
-                    if (used.contains(candidate) || secondary_reader_excluded_cores.contains(candidate)) {
-                        continue;
-                    }
-                    // All readers use AllocatorBank on the same NOC and therefore target the same
-                    // firmware-approved endpoint. Place additional readers near the bank's primary
-                    // reader to minimize NOC hops without routing one NOC to multiple endpoints.
-                    const uint32_t cost = tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
-                        placement_devices.front(), candidate, primary_workers[bank], noc);
-                    for (size_t device_index = 1; device_index < placement_devices.size(); ++device_index) {
-                        const uint32_t local_cost = tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
-                            placement_devices[device_index], candidate, primary_workers[bank], noc);
-                        if (local_cost != cost) {
-                            // the placement is chosen on the reference device; another device may see another hop
-                            // count for the same pair (harvesting moves its physical columns even when its logical
-                            // primary readers equal the reference's): a locality deviation, recorded and warned below
-                            hop_deviation =
-                                std::max(hop_deviation, local_cost > cost ? local_cost - cost : cost - local_cost);
-                            if (std::find(hop_devices.begin(), hop_devices.end(), device_index) == hop_devices.end()) {
-                                hop_devices.push_back(device_index);
-                            }
+            // the row rule: the nearest admitted core in the primary's row on its +x side (no wrap)
+            for (uint32_t dx = 1; dx <= kRowRuleMaxOffset && !found; ++dx) {
+                const tt::tt_metal::CoreCoord candidate{primary.x + dx, primary.y};
+                if (candidate.x >= worker_grid.x || used.contains(candidate) ||
+                    secondary_reader_excluded_cores.contains(candidate)) {
+                    continue;
+                }
+                found = true;
+                best_worker = candidate;
+                ++row_placed;
+            }
+            if (!found) {
+                // tt-metal's metric: the fewest NOC hops from the candidate to the primary (NOC_0: +x then +y, a
+                // torus), the first candidate in ascending x/y scan order among equals
+                uint32_t best_cost = std::numeric_limits<uint32_t>::max();
+                for (uint32_t x = 0; x < worker_grid.x; ++x) {
+                    for (uint32_t y = 0; y < worker_grid.y; ++y) {
+                        const tt::tt_metal::CoreCoord candidate{x, y};
+                        if (used.contains(candidate) || secondary_reader_excluded_cores.contains(candidate)) {
+                            continue;
+                        }
+                        // All readers use AllocatorBank on the same NOC and therefore target the same
+                        // firmware-approved endpoint. Place additional readers near the bank's primary
+                        // reader to minimize NOC hops without routing one NOC to multiple endpoints.
+                        const uint32_t cost = tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
+                            placement_devices.front(), candidate, primary, noc);
+                        if (cost < best_cost) {
+                            found = true;
+                            best_cost = cost;
+                            best_worker = candidate;
                         }
                     }
-                    // Equal-cost candidates use the same endpoint and hop count. Keep the first candidate in ascending
-                    // x/y scan order so that the assignment is deterministic without adding a second routing objective.
-                    if (cost < best_cost) {
-                        found = true;
-                        best_cost = cost;
-                        best_worker = candidate;
-                    }
+                }
+                if (found) {
+                    ++metric_placed;
                 }
             }
             TT_FATAL(found, "No free DRAM reader {} core for bank {}", worker_index, bank);
+            record_hop_deviation(best_worker, primary);
             used.insert(best_worker);
             assignments.push_back({best_worker, bank, worker_index});
         }
     }
+    log_debug(
+        tt::LogOp,
+        "DRAM-sharded matmul secondary readers ({}): {} placed in the primary's row, {} by the NOC hop metric",
+        kRowRuleName,
+        row_placed,
+        metric_placed);
     if (!other_primary_devices.empty() || !hop_devices.empty()) {
         std::string devices_text, hop_text;
         for (size_t device_index : other_primary_devices) {

@@ -316,6 +316,49 @@ tensors per pass) take 57 us at the median but 2.9 ms at the 90th percentile, `d
 sampled pass 50.92 ms against 47.81 with the cache unset (the greedy pass unchanged, 46.19 / 46.07).  The line
 measured no effect of the setting either way; the serving default is the release's decision.
 
+### The second reader's placement: the primary's row, +x side (2026-09-29)
+
+tt-metal placed a bank's second DRAM reader by its NOC_0 torus-hop metric, which puts the secondary directly below the primary in
+the DRAM column for half the banks and at the far side of the row for the rest.  Measured on one harvested 11x10 die with every
+bank streaming the served two-reader pattern and no compute (device profiler): that placement caps the pair at 46 GB/s per bank,
+the secondary below the primary at 39, and a secondary in the primary's row on its +x side at 63.7 GB/s per bank = 509 GB/s per
+chip, the rate one reader reaches alone; one bank alone reaches 63.8 on any placement, so the cap was a NOC_0 routing interaction
+between the reader streams, not bandwidth (the DRAM stream study of 2026-09-29 in the development notes).  The fork's
+`get_dram_bank_reader_assignments` (`matmul_utilities.cpp`) now places each secondary on the nearest admitted core of the
+primary's row on its +x side (x+1 .. x+4) and falls back to the hop metric only for a bank whose row holds none (a row blocked by
+the activation storage cores -- bank 1's primary (0, 0) on the row-0 storage grids -- or a primary at the grid's right edge); the
+mixed-harvest rule above is unchanged (the reference device's logical placement shared by every device; a candidate that exists
+on the reference device exists on every device of equal geometry).  `READY` names the rule the runtime applies
+(`dram_workers_placement` ends in `; secondary readers row+x`, or `noc-hops` for a runtime without the rule).
+
+Numerics: bitwise by construction (a reader addresses its bank by id; the placement changes who reads, never what is summed),
+and measured so: on the two-reader shapes (GDN in-proj 2560 x 4160, QSA query-gate 2560 x 3072, out-proj 1536 x 2560, the LM-head
+chunks 2560 x 8192 and 7040; one and two readers; rows 32 and 5; HiFi2, fp32 destination, bf8) every output digest equals the
+previous placement's (20 of 20), and the served startup replay against the A3-mtp4-32k pins is identical.
+
+Measured on the 1x4 p150 line (the study die's box; MEASURED, the 560-token chat prompt, greedy `--mtp 4`, the census tool in
+timing mode, 60 timed passes = n 107 pass walls per hold, both holds of the pair at a 1-min load under 2 with no other job of
+ours on the host):
+
+| | previous placement (hop metric) | row +x rule | delta |
+|---|---|---|---|
+| pass wall p50 / p90 / p10 ms (three quiet pairs, each its own two holds) | 42.162 / 43.187 / 41.642; 42.266 / 43.151 / 41.589; 42.536 / 43.278 / 41.746 | 41.717 / 42.765 / 40.966; 41.931 / 42.654 / 41.235; 41.822 / 42.621 / 41.185 | -0.445, -0.335, -0.714 p50 |
+| device-bound wait per pass (pipelined) ms | 40.515 / 40.500 / 40.567 | 40.115 / 40.061 / 40.100 | -0.40 / -0.44 / -0.47 |
+| blocking verify / draft / commit replay ms (first pair) | 32.926 / 6.889 / 0.985 | 32.507 / 6.839 / 0.973 | -0.42 / -0.05 / -0.01 (verify -0.43, -0.41 in the other two) |
+| `ttnn.linear` kernel span, 2 readers (in-proj / qg / out-proj / LM 8192 / LM 7040 us) | 35.2 / 23.7 / 15.8 / 67.6 / 64.4 | 35.5 / 24.0 / 15.0 / 66.2 / 63.7 | 0 / 0 / -0.8 / -1.4 / -0.7 |
+| served 560-token chat prompt, greedy `--mtp 4` tok/s (2.94 tokens per pass both) | 68.21 (the record of 2026-09-29) | 69.01 (the landed runtime: 68.76) | within the row's noise |
+| sampled thinking TPOT, median of 6 chats ms | 17.375 | 17.250 (the landed runtime: 17.133) | -0.13 |
+| the 12-record startup replay vs the A3-mtp4-32k pins | the pins | identical, record by record and by token-id digest | bitwise |
+| reader-only bench, served 2-reader pattern, GB/s per bank (chip) | 46.4 (371) | 63.65 (509) | the DRAM path's ceiling |
+
+The gain is a launch-overlap gain of the traced programs (the compact worker set), not a kernel-span gain: the device profiler's
+instrumented traces under-read it (verify trace span -0.09 ms per pass, Matmul kernel term -0.09), so per-program kernel tables
+are not the instrument for a placement lever.  The two-reader dense linears stay per-block paced (16 in0 activation blocks per
+call, fidelity- and placement-flat, every worker within 1 us); the out-proj on 8 storage cores with in0_block_w 6 (13.2 us from
+15.8) was measured and NOT taken: its output is not bitwise against the served configuration (the K regrouping moves a rounding
+point).  QuietBox 2 speed under the rule: unmeasured, its replay owed (the placement note of 2026-09-29 in the development
+notes carries the three placement forms measured, the per-core finding and the open QuietBox 2 row).
+
 ## The slab's block-shared attention (`QWEN38_FUSED=sparse_sdpa_tiled`, 2026-09-25)
 
 A tolerance-class fused kernel, opt-in: `sparse_sdpa_tiled` replaces the prefill slab's block-id expansion, zero V

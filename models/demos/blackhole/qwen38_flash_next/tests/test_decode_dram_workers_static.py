@@ -3,7 +3,9 @@
 
 """The decode linears' DRAM readers per bank without a device: the default and its switch, the qualified table, the
 bank layouts and the cache-name tag of the widened GDN input weight, the program configs (one tile row per call for
-decode, the lanes and the MTP verify rows), the builder identity and the MTP build."""
+decode, the lanes and the MTP verify rows), the builder identity and the MTP build, the secondary readers' placement
+rule (the row +x rule of 2026-09-29: its Python twin pinned on the harvested 11x10 die and the QuietBox 2 signatures,
+the runtime audit that names it in READY, the C++ text)."""
 
 import inspect
 import math
@@ -212,12 +214,18 @@ def test_a_mixed_harvest_mesh_runs_two_readers_on_the_reference_placement(monkey
     monkeypatch.setattr(dm, "mesh_dram_bank_worker_signatures", lambda mesh: _signatures(6, 6, 6, 6))
     assert dm.mesh_device_geometries(_mesh()) == ((8, 10),) * 4
     assert dm.qualify_decode_dram_workers(_mesh(), 2) == (2, None)
-    assert dm.decode_dram_workers_placement(_mesh()) == "identical"
+    assert dm.decode_dram_workers_placement(_mesh(), rule="row+x") == "identical; secondary readers row+x"
     # the QuietBox 2: dies serving banks 4-7 from column 5 instead of 6 share the geometry (harvesting moves columns)
     monkeypatch.setattr(dm, "mesh_dram_bank_worker_signatures", lambda mesh: _signatures(6, 5, 5, 6))
     assert dm.mesh_device_geometries(_mesh()) == ((8, 10),) * 4
     assert dm.qualify_decode_dram_workers(_mesh(), 2) == (2, None)
-    assert dm.decode_dram_workers_placement(_mesh()) == "reference (0, 0); other optimal readers at [(0, 1), (0, 2)]"
+    assert (
+        dm.decode_dram_workers_placement(_mesh(), rule="row+x")
+        == "reference (0, 0); other optimal readers at [(0, 1), (0, 2)]; secondary readers row+x"
+    )
+    # the rule comes from the runtime audit when the caller names none
+    monkeypatch.setattr(dm, "secondary_reader_placement_rule", lambda: "noc-hops")
+    assert dm.decode_dram_workers_placement(_mesh()).endswith("; secondary readers noc-hops")
     assert dm.qualify_decode_dram_workers(_mesh(), 1) == (1, None)
     # a device with another worker-row extent (its readers end at row 8): the placement cannot be validated
     odd = _signatures(6, 6, 6, 6)
@@ -248,3 +256,103 @@ def test_the_ready_record_and_the_program_placement_carry_the_reader_placement()
     assert "Multiple readers per DRAM bank require identical local device geometry" in utilities
     assert "Multiple readers per DRAM bank on a mesh of differently harvested dies" in utilities
     assert "identical local device geometry and primary readers" not in utilities
+    # the row +x rule (2026-09-29): the offsets, the env switch and the audit marker the READY record looks for
+    assert f"constexpr uint32_t kRowRuleMaxOffset = {dm.ROW_RULE_MAX_OFFSET};" in utilities
+    assert 'constexpr const char* kRowRuleName = "row+x";' in utilities
+    assert f'kSecondaryReaderRuleMarker = "{dm.SECONDARY_PLACEMENT_MARKER.decode()}";' in utilities
+    assert "getenv" not in utilities  # the rule is the only behaviour: no environment switch
+    assert "const tt::tt_metal::CoreCoord candidate{primary.x + dx, primary.y};" in utilities
+    assert "candidate.x >= worker_grid.x || used.contains(candidate) ||" in utilities
+    assert "secondary_reader_excluded_cores.contains(candidate)) {" in utilities
+    assert utilities.count("record_hop_deviation(best_worker, primary);") == 1
+
+
+# the harvested 11x10 die of the study (banks 0-3 from worker column 0, banks 4-7 from column 6) = the reference die
+# of the QuietBox 2 signatures above; the placement is chosen on the reference die and shared, so the QuietBox 2's odd
+# dies (column 5) run the same logical picks
+DIE_11X10 = _signatures(6)[(0, 0)]
+GRID_11X10 = (11, 10)
+
+
+def _secondaries(placement) -> dict[int, tuple[tuple[int, int], ...]]:
+    return {bank: tuple(core for core, b, index in placement if b == bank and index > 0) for bank in range(8)}
+
+
+def test_the_row_rule_places_the_secondary_readers_on_the_plus_x_side() -> None:
+    """The Python twin of the C++ rule on the 11x10 die: without storage cores every secondary sits at x+1 (x+2 for
+    a third reader); with the port's storage grids (row 0 for the 8-core shapes, rows 0-1 for 16, rows 0-4 for 40)
+    the banks whose row is blocked fall back to the hop metric (bank 1 at (0,0) on every shape, bank 3 at (0,3) on
+    the LM head), bank 5 / 7 in column 6 step over the storage core to x+2; admitting storage cores puts all eight
+    at x+1; the noc-hops rule reproduces tt-metal's metric (half the secondaries below their primary)."""
+
+    assert DIE_11X10 == ((0, 9), (0, 0), (0, 7), (0, 3), (6, 9), (6, 1), (6, 6), (6, 4))
+    two = dm.dram_bank_reader_placement(DIE_11X10, GRID_11X10, 2)
+    assert [index for _, _, index in two] == [0, 1] * 8 and [bank for _, bank, _ in two] == sorted(
+        [b for b in range(8)] * 2
+    )
+    assert _secondaries(two) == {bank: ((x + 1, y),) for bank, (x, y) in enumerate(DIE_11X10)}
+    three = dm.dram_bank_reader_placement(DIE_11X10, GRID_11X10, 3)
+    assert _secondaries(three) == {bank: ((x + 1, y), (x + 2, y)) for bank, (x, y) in enumerate(DIE_11X10)}
+    assert dm.row_placed_banks(two) == dm.row_placed_banks(three) == tuple(range(8))
+    # the served storage grids
+    assert dm.storage_grid_cores(8) == tuple((x, 0) for x in range(8))
+    assert dm.storage_grid_cores(16) == tuple((x, y) for y in range(2) for x in range(8))
+    assert len(dm.storage_grid_cores(40)) == 40 and dm.storage_grid_cores(40)[-1] == (7, 4)
+    assert dm.storage_grid_cores(8, row=2) == tuple((x, 2) for x in range(8))
+    expected = {
+        8: {0: (1, 9), 1: (10, 0), 2: (1, 7), 3: (1, 3), 4: (7, 9), 5: (7, 1), 6: (7, 6), 7: (7, 4)},
+        16: {0: (1, 9), 1: (10, 0), 2: (1, 7), 3: (1, 3), 4: (7, 9), 5: (8, 1), 6: (7, 6), 7: (7, 4)},
+        40: {0: (1, 9), 1: (10, 0), 2: (1, 7), 3: (10, 3), 4: (7, 9), 5: (8, 1), 6: (7, 6), 7: (8, 4)},
+    }
+    fallen = {8: (1,), 16: (1,), 40: (1, 3)}
+    for cores, picks in expected.items():
+        strict = dm.dram_bank_reader_placement(DIE_11X10, GRID_11X10, 2, excluded=dm.storage_grid_cores(cores))
+        assert _secondaries(strict) == {bank: (pick,) for bank, pick in picks.items()}, cores
+        assert dm.row_placed_banks(strict) == tuple(b for b in range(8) if b not in fallen[cores])
+        admit = dm.dram_bank_reader_placement(
+            DIE_11X10, GRID_11X10, 2, excluded=dm.storage_grid_cores(cores), rule="row+x-admit-storage"
+        )
+        assert _secondaries(admit) == {bank: ((x + 1, y),) for bank, (x, y) in enumerate(DIE_11X10)}
+    # an eight-core storage grid moved to a primary-free row (2, 5 or 8) leaves the strict rule every bank at x+1; the
+    # primary rows (0, 1, 3, 4, 6, 7, 9) leave no two adjacent free rows, so a 16-core grid at rows 2-3 blocks bank 3
+    for row in (2, 5, 8):
+        moved = dm.dram_bank_reader_placement(DIE_11X10, GRID_11X10, 2, excluded=dm.storage_grid_cores(8, row=row))
+        assert dm.row_placed_banks(moved) == tuple(range(8)), row
+    blocked = dm.dram_bank_reader_placement(DIE_11X10, GRID_11X10, 2, excluded=dm.storage_grid_cores(16, row=2))
+    assert dm.row_placed_banks(blocked) == (0, 1, 2, 4, 5, 6, 7)
+    # tt-metal's metric in the twin's logical form: bank 0's secondary directly below (0,8), bank 1's the far side
+    metric = dm.dram_bank_reader_placement(DIE_11X10, GRID_11X10, 2, rule="noc-hops")
+    assert _secondaries(metric)[0] == ((0, 8),) and _secondaries(metric)[1] == ((10, 0),)
+    assert dm.row_placed_banks(metric) == ()
+    # the QuietBox 2 dies share the reference placement: the twin over the reference signature is the mesh's
+    assert _signatures(6, 5, 5, 6)[(0, 0)] == DIE_11X10
+    for bad in ("row", "noc0", ""):
+        try:
+            dm.dram_bank_reader_placement(DIE_11X10, GRID_11X10, 2, rule=bad)
+        except ValueError as error:
+            assert "placement rule" in str(error)
+        else:
+            raise AssertionError(bad)
+
+
+def test_the_placement_rule_is_named_only_when_the_runtime_carries_it(tmp_path) -> None:
+    """READY names row+x only when the loaded ttnn library holds the C++ rule's marker; an older runtime reads noc-hops;
+    there is no environment switch (the admit-storage and noc-hops forms are study forms of the Python twin only)."""
+
+    assert dm.SECONDARY_PLACEMENT_RULES == ("row+x", "row+x-admit-storage", "noc-hops")
+    assert not hasattr(dm, "SECONDARY_PLACEMENT_ENV") and not hasattr(dm, "requested_secondary_reader_placement")
+    new = tmp_path / "_ttnncpp.so"
+    new.write_bytes(b"\0" * 4096 + dm.SECONDARY_PLACEMENT_MARKER + b"\0" * 4096)
+    old = tmp_path / "old_ttnncpp.so"
+    old.write_bytes(b"\0" * 8192)
+    empty = tmp_path / "empty.so"
+    empty.write_bytes(b"")
+    assert dm.runtime_carries_row_rule([new]) and not dm.runtime_carries_row_rule([old, empty, tmp_path / "missing.so"])
+    assert dm.secondary_reader_placement_rule(libraries=[new]) == "row+x"
+    assert dm.secondary_reader_placement_rule(libraries=[old]) == "noc-hops"
+    assert dm.secondary_reader_placement_rule(libraries=[]) == "noc-hops"
+    # the loaded-library scan reads /proc/self/maps where it exists and returns the ops library first
+    libraries = dm.loaded_ttnn_libraries()
+    assert all(path.suffix == ".so" and "ttnn" in path.name for path in libraries)
+    if libraries and any(path.name == "_ttnncpp.so" for path in libraries):
+        assert libraries[0].name == "_ttnncpp.so"
