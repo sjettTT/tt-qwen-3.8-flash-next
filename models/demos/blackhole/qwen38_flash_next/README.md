@@ -23,7 +23,6 @@ No prebuilt archive, no pinned binary, no host-specific configuration.
 | decode, one stream | 38.6 tok/s greedy, 36.5 tok/s sampled | 25.9 ms per token greedy (2026-09-26: the router tail's live-row exp and the MoE dense composite, bitwise: `docs/NUMERICS.md`), flat with depth; the sampled figure is the 2026-09-25 measurement; the defaults are listed below the table |
 | decode, 4 / 8 streams | 28.9 / 23.4 tok/s per user (116 / 187 aggregate) | the batched-decode lane body measured directly, 34.6 / 42.7 ms per step; the chat server serves one stream (2026-09-25, component class: `docs/NUMERICS.md`) |
 | decode with MTP (`--mtp 4`) | greedy 68.06 tok/s on a 560-token chat prompt, 64.16 on a 177-token multi-turn chat, 104.32 code (256-token answers), 111.40 json and 50.06 prose over their whole answers (153 / 218 tokens, EOS honoured; 2.94 / 4.75 / 2.68 / 2.09 / 4.45 tokens per pass; the stream leaves the CPU reference where plain decode does, 12 of 12 records) against 38.6 plain greedy; `--mtp 3` (2026-09-25) 45.5 / 55.4 / 60.6 / 30.7; `--mtp 5` opt-in (`docs/NUMERICS.md`); sampled 17.5 / 16.2 ms per token (the card profiles, thinking / non-thinking) | answers measured client-side with EOS honoured on the 4-chip p150 line (2026-09-28, the fork runtime built at `5eac9c778edb`; the served default set: the GDN verify-rows fold `gdn_rows_scan` with its gate scalars in one SFPU pass, the MoE rows programs on two rings, the gated-residual read's re-associated norm `gr_recip_last`; the pass p50 41.9 ms pipelined on the 560-token chat prompt; a 256-token row whose answer runs past 256 tokens is measured to 256, a row over a shorter answer stops at its end); speculative drafting with exact acceptance for greedy requests and, by default on an `--mtp --sampling` server, sampled ones; the fold against the wrap over 43 EOS-honoured prompts +2.44 % +- 1.09 % tokens per second (paired mean +1.36 +- 0.61, 2026-09-26); the fold program's gate scalars in one SFPU pass (2026-09-27) 111.0 -> 85.8 us per GDN layer and -1.16 ms per verify pass in the census, pins identical; the wrap stays the opt-out (`QWEN38_FUSED_OFF=gdn_rows_scan`: with the rings and `gr_recip_last` the wrap read 64.35 / 56.77 / 102.2 / 103.89 / 50.18 at 2.98 / 2.56 / 4.65 / 4.78 / 2.24 tokens per pass, sampled 17.6 / 19.3 ms, on 2026-09-27 on the same line class; `docs/NUMERICS.md`) |
-| Spec-Bench (Xia et al., ACL 2024), `--mtp 4` against plain decode | 3.27 accepted tokens per pass; speedup 1.82x in the decode phase (math 2.29x, RAG 1.97x, MT-bench 1.87x, summarization 1.67x, QA 1.66x, translation 1.48x), 1.66x in the benchmark's wall form | 2026-09-29 at `0908a319272c`, a 1x4 p150 line at 32k, the 480 prompts greedy to 1024 tokens per turn, thinking off; the speedup is hardware-dependent, not a leaderboard rank; sampled 2.90 tokens per pass on MT-bench + QA: `docs/NUMERICS.md` |
 | decode, 4 concurrent requests with MTP (`--lanes 4 --mtp 4`, opt-in, greedy only) | 132.2 tok/s aggregate on 4 x the 560-token chat prompt at once (36.5 / 39.4 / 42.9 / 47.1 per request) against 57.6 for the same four served in turn; the mixed acceptance batch 37.7 / 46.6 / 74.1 / 28.1 per user | 2026-09-29, a 1x4 p150 line at 32k, greedy, EOS honoured, byte-identical to the single stream's (13/13 rows); TTFT 1.10 / 2.27 / 3.47 / 4.65 s in a four-request burst against 0.91; an admission runs in segments between the other lanes' passes (`--lanes-stall-budget` 0.5 s: their longest pause 0.62 s, where the 2026-09-28 form froze them 1.35 s per admission at 134.0 tok/s aggregate); host load 0.9-1.6; `docs/SERVER.md`, `docs/NUMERICS.md` |
 | image prompt (512 x 512 PNG, 256 image tokens, 282 prompt tokens) | TTFT 0.59 s end to end, streamed (server-side 0.52 s: prefill 0.50 s; tower 0.048 s of which 0.030 s device) against 0.52 s for a 282-token text prompt on the same server | 2026-09-29, a 1x4 p150 line at 32k, greedy, thinking off, host load 2-5; the tower's eight row buckets add 42 s to READY with the host's kernel cache warm (both hosts 42-44 s, MEASURED); `docs/SERVER.md` |
 | contexts | 32k, 64k, 128k, 256k | 256k is single-user; MTP fits at 32k, 64k and 128k |
@@ -189,15 +188,9 @@ readers, deadlines, the stall watchdog and the `/health` fields: `docs/SERVER.md
 - `--allocated-context 65536` serves 65,472 tokens; `131072` and `262144` the same minus 64.  Each context has its own
   component and model I/O caches under `--cache-root` (the BF4 expert cache is shared); 256k leaves about 750 MB per
   device free and is single-user (`docs/PREFILL.md` has the long prompts' times to the first token).
-- The chunked prefill runs 128-row chunks where the prompt allows (the remainder in 32-row chunks) by default since
-  2026-09-29; `--long-chunks` is accepted and changes nothing (`--prefill-mode teacher_forced` has no chunks): 1.55 ms per
-  prompt token through the server (a 6942-token prompt in 10.8 s) against 3.3 with 32-row chunks alone, the same
-  tokens bitwise on all 48 layers.  With `--mtp` the MTP layer's rows run inside the 128-row chunks
-  as they do inside the 32-row ones (the remainder keeps its 32-row chunks); the gate is the MTP stream after either
-  prefill being the same (`docs/NUMERICS.md`).  Measured 2026-09-26 with `--mtp 4` on the 4-chip p150 line: a cold
-  560-token chat prompt 0.92 s to the first token (1.60 ms per prompt token) against 1.34 s (2.34) with 32-row chunks
-  alone, a 513-token prompt 0.79 s against 1.20 s; decode unchanged (58.2 tok/s greedy on the 560-token prompt,
-  the acceptance table 12/12, the served classes within 0.2 tok/s of the 32-row form's).
+- The chunked prefill runs 128-row chunks where the prompt allows (the remainder in 32-row chunks) by default since 2026-09-29;
+  `--long-chunks` changes nothing: 1.16 ms per prompt token through the server (a 6,874-token prompt in 8.0 s, 2026-09-30, three-ring
+  expert form) against 3.3 with 32-row chunks alone, the same tokens bitwise; the MTP stream is unchanged (`docs/NUMERICS.md`).
 - `--mtp 3|4|5` drafts K tokens per pass with exact acceptance; off by default.  It fits at 32k, 64k and 128k at any k,
   not at 256k (94 MB free per bank against the pair's 128 MiB contiguous).  The committed stream is not bitwise with plain decode
   on 3 of the 12 acceptance prompts: near-ties within one bf16 step, not a defect (`docs/NUMERICS.md` has the indices
@@ -271,6 +264,14 @@ Run the tests from the repository root (`docs/TESTING.md` has the regression har
   --bf4-stage-limit N` runs first.
 - Python 3.10 (`create_venv.sh` default); Linux x86_64.
 
+## 10. Speculative decoding on SPEED-Bench
+
+NVIDIA's SPEED-Bench (arXiv 2604.09557, the successor to Spec-Bench), scored by its own framework over the served endpoint
+(`--mtp 4`, greedy, thinking off, 4,096 tokens per turn, a 1x4 p150 line at 32k, 2026-09-30 at `f5dc3c0544`): mean acceptance
+length 3.25 tokens per step over 672 of the 880 prompts (math, humanities and STEM partial, their source being gated); coding 4.20,
+math 4.18, RAG 3.63, multilingual 3.49, reasoning 3.48, STEM 3.17, summarization 3.02, QA 2.97, writing 2.81, humanities 2.76,
+roleplay 2.24.  The paper's rows, the throughput split and the plain-decode arm: `docs/NUMERICS.md`.
+
 ## More
 
 - `docs/PROOFS.md`: the fresh-clone release proof of 2026-09-06 on the QuietBox (build, checkpoint, first start,
@@ -281,5 +282,4 @@ Run the tests from the repository root (`docs/TESTING.md` has the regression har
   `/health`, runtime admission, the BF4 cache identity, the n-gram table pre-warm, disk and memory.
 - `docs/TESTING.md`: the no-device tests, the reference corpus Q38-REF-v1 and its scorer, the regression harness
   (`tools/ci/q38_ci.py`), how to run the acceptance gate.
-- `docs/PREFILL.md`: the prefill chunk bodies and the opt-in 2048-row slab (`--prefill-slab`): what runs as one
-  matmul, its numerics class, what it costs and saves, the routed experts in one call, the served rates.
+- `docs/PREFILL.md`: the prefill chunk bodies and the 2048-row slab (`--prefill-slab`): what runs as one matmul, its numerics class, the expert forms, the served rates.
