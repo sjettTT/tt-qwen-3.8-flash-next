@@ -677,6 +677,40 @@ Per GDN layer on the 1x4 line (30 traced replays, quiet host): the verify forwar
 0.136 -> 0.051-0.058 against the chain (the wrap's 0.306 / 0.110), device operations 58 -> 10 and 12 -> 3.  The fold's
 DRAM stays the clause's (k + 1) x 786,432 bytes per GDN layer per device, 141.6 MB per device at k = 4, per drafting chain.
 
+## Spec-Bench (`--mtp 4` against plain decode), 2026-09-29
+
+The speculative-decoding benchmark of Xia et al. (Spec-Bench, ACL 2024 Findings): 480 prompts, 80 per category --
+MT-bench (two turns), translation, summarization, question answering, math reasoning, retrieval-augmented generation
+-- decoded greedily to at most 1024 tokens per turn, EOS honoured, thinking off, the second MT-bench turn after our
+own first reply; per category the benchmark's two quantities: the mean accepted tokens per decoding step (total
+committed tokens / total passes; plain decode reads 1.0) and the speedup, the mean over prompts of tokens per second
+with `--mtp 4` over the same mean with plain decode.  MEASURED 2026-09-29 at `0908a319272c` on the fork runtime built
+at `02e1453c2bcd`, a 1x4 p150 line at 32k, the served default set (`--mtp 4 --prefill-slab 2048` against
+`--prefill-slab 2048`), one streamed request at a time through the chat endpoint, client-side timing; host 1-minute
+load 1.5-4.9 with the server (median 2.3 / 2.6 for the two arms; 29 of the 1,120 requests read 5-8 during other tenants' host activity, listed in the development note; idle 1.3-3.1 at the holds' launch).  Not comparable to the benchmark's leaderboard (Vicuna-7B on one GPU): the acceptance is the model's
+and the speedup depends on the hardware's verify-to-decode cost ratio.
+
+| category | prompts | tokens per pass | `--mtp 4` tok/s (decode phase) | plain tok/s | speedup | answer tokens (`--mtp 4` / plain) | replies byte-equal |
+|---|---|---|---|---|---|---|---|
+| MT-bench | 80 | 3.19 | 77.5 | 41.4 | 1.87x | 1095 / 1113 | 6 of 80 |
+| translation | 80 | 3.32 | 66.7 | 45.2 | 1.48x | 26 / 26 | 80 of 80 |
+| summarization | 80 | 3.04 | 68.3 | 40.9 | 1.67x | 239 / 235 | 16 of 80 |
+| question answering | 80 | 3.03 | 70.7 | 42.6 | 1.66x | 361 / 359 | 15 of 80 |
+| math reasoning | 80 | 4.17 | 97.1 | 42.5 | 2.29x | 285 / 287 | 43 of 80 |
+| RAG | 80 | 3.50 | 81.1 | 41.2 | 1.97x | 150 / 155 | 40 of 80 |
+| overall | 480 | 3.27 | 76.9 | 42.3 | 1.82x | 359 / 362 | 200 of 480 |
+
+The tokens per second are the decode phase's ((completion - 1) / (last delta - first delta), the README rows' form);
+in the benchmark's own form (completion / wall, the prompt's prefill included) the overall speedup reads
+1.66x (59.2 against 35.6 tok/s), lower where the
+answers are short (translation 1.27x, RAG 1.52x).  The plain and
+`--mtp 4` arms answer 280 of the 480 prompts differently (the MTP stream is not bitwise plain decode's
+on near-ties, above; the answer lengths agree within 2 % per category), so the rates compare greedy texts of like
+length, not the same text.  Sampled requests (a `seed` alone, the card's non-thinking profile, exact speculative
+sampling) on MT-bench and question answering: 2.95 and 2.75 tokens per pass at
+66.1 and 59.7 tok/s (greedy 3.19 / 3.03 at 77.5 / 70.7), the mean acceptance
+probability 0.74, 0.36 % of the candidate draws falling back to the full vocabulary.
+
 ## The MTP pass decomposition (2026-09-25)
 
 Measured on the 4-chip p150 line (a shared host) at the landed head with the chain opened as the server opens it,
