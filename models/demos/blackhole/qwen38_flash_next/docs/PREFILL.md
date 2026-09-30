@@ -10,6 +10,19 @@ chunk sizes, the last prompt token is teacher-forced through the decode traces, 
 prompt-end snapshot see the same objects: the committed GDN recurrent state (fp32) and conv history, the QSA KV and
 compressed caches, the staging tile and raw-key ring, the PLE history and the device position.
 
+The routed experts' `moe_compute` launch form per instance (every served instance on the op's local output path since
+2026-09-30; the development note under the MoE rings study):
+
+| instance | rows per call | form | since |
+|---|---|---|---|
+| decode, the MTP verify rows and drafts, the lanes, the 32-row chunk | 1-32 (one row tile) | local output path, two rings (`QWEN38_MOE_ROWS_FORM`, default `rings2`; `docs/SERVER.md`) | 2026-09-27 |
+| the 128-row chunk (and the MTP layer's 128-row twin) | 128 | local output path, three rings (`MOE_CHUNK_ROWS_FORM` in `ttnn/moe.py`, a constant; the fused local combine before it) | 2026-09-30 |
+| the slab, one call | 256-4096 | local output path, three rings (`QWEN38_MOE_SLAB_RINGS`, default 3; *The routed experts in one call* below) | 2026-09-26 |
+| the slab's blocks (`QWEN38_MOE_SLAB_ONE_CALL=0`) | 128 per block | the 128-row worker's form | -- |
+
+The owned combine pages are bitwise across the forms (the same matmuls in the same order); the 128-row chunk's move to
+three rings takes 6-7 percent off the served time to the first token (*Served rates* below).
+
 ## The slab (`--prefill-slab 2048`)
 
 Inside a slab every layer runs its ROWS rows in one pass:
@@ -218,6 +231,17 @@ combine, both defaults since 2026-09-26; 14.25 s with the attention kernel alone
 long-context figures of 2026-09-04, through the 32-row chunk trace alone at about 3.2-3.5 ms per prompt token: a 40k
 prompt reached its first token in 125 s and a 200k prompt in 671 s, and decode stayed at 17-19 tokens/s to 256k (the
 decode of that day; the README's decode rows are the current step).
+
+The 128-row chunk on the three-ring expert stream (2026-09-30, one 1x4 p150 line, 32k context, chunked prefill,
+sampling on, MTP off; one server hold per arm minutes apart, every row a fresh prefill, the median of three requests
+after one warm one; the host's 1-minute load 1.7-3.3 during the rows, 1.0-1.7 at the launches): TTFT 2,117 tokens
+2.779 -> 2.613 s (-6.0 percent), 6,874 tokens 8.551 -> 7.995 s (-6.5 percent), 31,732 tokens 39.35 -> 36.57 s (-7.1
+percent); the server's prefill 1.294 / 1.238 / 1.237 -> 1.215 / 1.156 / 1.150 ms per prompt token (about 820-870
+prompt tokens per second against 770-810); two rings measured in the same way 2.632 / 8.052 / 36.82 s (-5.3 / -5.8 /
+-6.4 percent), 0.6-0.7 percent behind three.  The `A3-chunked-32k` replay 12/12 identical in every arm (divergence
+indices and token shas), the `vision-chunked-32k` pins held with the 128-row chunks in the chain, and on one die the
+owned pages of the ring forms are bitwise the fused local combine's over 48 calls of captured routing
+(the one-die development harness and the development note under the MoE rings study).
 
 The one-pass combine's served rows (4x p150, 32k context, `--prefill-slab 2048`, 2026-09-26, the block-shared
 attention on in both arms; TTFT the request's time to its first token):

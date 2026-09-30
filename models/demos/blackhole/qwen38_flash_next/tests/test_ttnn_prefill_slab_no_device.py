@@ -101,7 +101,7 @@ def test_slab_one_call_switch(monkeypatch) -> None:
         moe_module.moe_slab_prefill_rings()
     monkeypatch.delenv(moe_module.MOE_SLAB_RINGS_ENV)
     # the kwarg reaches the op from the one-call slab (its ring switch) and from the one-tile rows forms (their
-    # QWEN38_MOE_ROWS_FORM table); the 128-row chunk passes None (the op's default)
+    # QWEN38_MOE_ROWS_FORM table) and from the 128-row chunk (MOE_CHUNK_ROWS_FORM, three rings)
     partial = inspect.getsource(moe_module.Qwen38TTNNMoE._routed_partial)
     assert "prefill_rings=self.prefill_rings," in partial
     prop = inspect.getsource(moe_module.Qwen38TTNNMoE.prefill_rings.fget)

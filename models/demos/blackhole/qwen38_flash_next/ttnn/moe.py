@@ -83,7 +83,9 @@ MOE_SLAB_RINGS_REFUSED: dict[int, str] = {}
 # [10, rows, 2560] buffer, no combine kernels: 12 cores).  replay / rings2 / rings3: the local output path with
 # prefill_rings 1 / 2 / 3 -- the replay ring reads each expert's slice once; R rings are R x 8 ring cores, each ring
 # reading the slices of the experts it owns (a 1-chunk expert goes whole to the least-loaded ring), so the DRAM
-# banks have R readers and the compute R rings.  The 128-row chunk and the slab keep their own forms.
+# banks have R readers and the compute R rings.  The 128-row chunk takes MOE_CHUNK_ROWS_FORM (the local output path on
+# three rings, the one-call slab's ring form; its owned pages are bitwise the fused local combine's); the slab keeps
+# its own form.
 MOE_ROWS_FORM_ENV = "QWEN38_MOE_ROWS_FORM"
 MOE_ROWS_FORM_DEFAULT = "rings2"
 # form -> (local output path, prefill_rings passed to the op; None = the op's streaming ring)
@@ -94,6 +96,9 @@ MOE_ROWS_FORMS: dict[str, tuple[bool, int | None]] = {
     "rings2": (True, 2),
     "rings3": (True, 3),
 }
+# The 128-row chunk's launch form (a MOE_ROWS_FORMS name, no switch): the local output path on three rings, the ring
+# form the one-call slab runs; measured against the fused local combine in the development note under the MoE rings study (2026-09-30).
+MOE_CHUNK_ROWS_FORM = "rings3"
 # The one-call slab's weighted reduce runs in blocks of this many rows: the fused reduce keeps one score table per
 # row tile in L1 (512 rows admitted bitwise the 128-row form, 1024 refused) and the whole [10, rows, 2560] page set
 # tilized at once would not fit L1.
@@ -711,9 +716,14 @@ class Qwen38TTNNMoE:
         )
         ring_size = effective_matmul_ring_size(mesh_device)
         output_width_shard_dim = auto_output_width_shard_dim(HIDDEN_SIZE, matmul_ring_size=ring_size)
-        # The one-tile rows forms take QWEN38_MOE_ROWS_FORM; every other instance is fulllocal here (the slab's own
-        # local output path is slab_one_call below, the 128-row chunk keeps the fused local combine).
-        self.rows_form = moe_rows_form() if self.row_contract.row_tiles == 1 else "fulllocal"
+        # The one-tile rows forms take QWEN38_MOE_ROWS_FORM, the 128-row chunk MOE_CHUNK_ROWS_FORM; every other instance
+        # is fulllocal here (the slab's own local output path is slab_one_call below).
+        if self.row_contract.row_tiles == 1:
+            self.rows_form = moe_rows_form()
+        elif self.rows == LONG_PREFILL_CHUNK_ROWS:
+            self.rows_form = MOE_CHUNK_ROWS_FORM
+        else:
+            self.rows_form = "fulllocal"
         self.local_output = moe_local_output_enabled() or self.slab_one_call or MOE_ROWS_FORMS[self.rows_form][0]
         self.output_height_shard_dim = moe_compute_output_height_shard_dim(
             self.routed_tokens, matmul_ring_size=ring_size

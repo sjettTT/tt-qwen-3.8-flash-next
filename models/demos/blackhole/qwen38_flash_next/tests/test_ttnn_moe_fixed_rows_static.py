@@ -125,10 +125,13 @@ def test_rows_form_switch(monkeypatch) -> None:
     with pytest.raises(ValueError):  # allow-pytest.raises: pure contract test
         moe_module.moe_rows_form()
     monkeypatch.delenv(moe_module.MOE_ROWS_FORM_ENV)
-    # the instance: one-tile rows read the switch, every other instance is fulllocal there; the local output path
-    # and the kwargs follow the table
+    # the instance: one-tile rows read the switch, the 128-row chunk takes MOE_CHUNK_ROWS_FORM (three rings, no
+    # switch), every other instance is fulllocal there; the local output path and the kwargs follow the table
+    assert moe_module.MOE_CHUNK_ROWS_FORM == "rings3" and moe_module.MOE_CHUNK_ROWS_FORM in moe_module.MOE_ROWS_FORMS
     init = inspect.getsource(Qwen38TTNNMoE.__init__)
-    assert 'self.rows_form = moe_rows_form() if self.row_contract.row_tiles == 1 else "fulllocal"' in init
+    assert "if self.row_contract.row_tiles == 1:\n            self.rows_form = moe_rows_form()" in init
+    assert "elif self.rows == LONG_PREFILL_CHUNK_ROWS:\n            self.rows_form = MOE_CHUNK_ROWS_FORM" in init
+    assert 'else:\n            self.rows_form = "fulllocal"' in init
     assert (
         "self.local_output = moe_local_output_enabled() or self.slab_one_call or MOE_ROWS_FORMS[self.rows_form][0]"
         in init
@@ -151,6 +154,7 @@ def test_rows_form_switch(monkeypatch) -> None:
         (5, "localoutput", None, True, True),
         (5, "replay", 1, True, True),
         (32, "rings3", 3, True, False),
+        (128, moe_module.MOE_CHUNK_ROWS_FORM, 3, True, False),
     ):
         instance = _bare_moe(rows)
         instance.rows_form = form

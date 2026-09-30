@@ -117,6 +117,7 @@ from models.demos.blackhole.qwen38_flash_next.ttnn.builder import (
 from models.demos.blackhole.qwen38_flash_next.ttnn.contracts import is_slab_rows
 from models.demos.blackhole.qwen38_flash_next.ttnn.fused import gdn_rows_scan as gdn_rows_scan_module
 from models.demos.blackhole.qwen38_flash_next.ttnn.moe import (
+    MOE_CHUNK_ROWS_FORM,
     admit_slab_moe_switches,
     moe_local_output_enabled,
     moe_rows_form,
@@ -3007,6 +3008,7 @@ def main() -> int:
                 "dram_workers_per_bank": report["chain"]["dram_workers_per_bank"],
                 "moe_local_output": moe_local_output_enabled(),
                 "moe_rows_form": moe_rows_form(),
+                "moe_chunk_rows_form": MOE_CHUNK_ROWS_FORM,  # the 128-row chunk's form (a constant, no switch)
                 "dram_workers_fallback": report["chain"]["dram_workers_fallback"],
                 "dram_workers_placement": report["chain"].get("dram_workers_placement"),
                 "dense_weight_dtype": report["chain"]["dense_weight_dtype"],

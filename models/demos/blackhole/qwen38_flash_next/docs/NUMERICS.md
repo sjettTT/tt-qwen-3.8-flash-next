@@ -496,6 +496,39 @@ The 128-row chunk path gives the same tokens as 32-row chunks alone, bitwise on 
 (2026-09-06, before the gate fix) the acceptance replay with `--long-chunks` was identical to the plain start (`json`
 96/96, the same eleven divergence indices, 19.4-19.6 tokens/s).
 
+### The 128-row chunk on the three-ring expert stream (2026-09-30)
+
+The 128-row chunk's `moe_compute` call moved from the FullLocal form (the streaming ring with the fused local combine,
+the op's zero fill of the unowned rows) to the local output path on three rings (`MOE_CHUNK_ROWS_FORM` in
+`ttnn/moe.py`, a constant: the form of the one-call slab and, with two rings, of the one-tile rows).  The op refuses the
+zero fill with several rings, so the shared `[10, 128, 2560]` buffer keeps whatever the previous call left in the
+unowned slots (finite expert outputs; the reduce multiplies them by an exact 0) -- the one-call slab's page has worked
+this way since 2026-09-25.  Evidence, one 1x4 p150 line, the kit of record (the development note under the MoE rings study):
+
+- one die, 48 calls of 128 rows over three captured natural-text layers, seeded BF4 experts: the owned (k, row) pages
+  of the two- and three-ring forms and of the streaming local output path are bitwise the fused local combine's
+  (14,208 pages, 0 differ, one sha256 8d15a27df3e58ac1 for the four forms); the ring forms write nothing outside the
+  owned pages;
+- the startup acceptance replay (`A3-chunked-32k`) 12/12 divergence indices and 12/12 token shas identical in the
+  before arm, the three-ring arm and the two-ring arm (four holds, `json` 96/96 in each);
+- the `vision-chunked-32k` pins (four image fixtures, the device tower's features, the text control at the `chunked-32k`
+  pin) with the 128-row chunks in the chain (2 / 2 / 8 / 21 long chunks per fixture) on the changed tree and on the
+  head before it: divergence indices 6 / 2 / 2 / 11 = the pins, every stream sha = the pin, the text control at 56
+  before and after the images, the before and after trees' streams equal to each other;
+- served TTFT (chunked prefill, sampling on, MTP off, 32k; one hold per arm minutes apart, load at launch 1.0 / 1.2 /
+  1.7, the host's 1-minute load during the rows 1.7-2.1 / 2.2-3.0 / 2.0-2.9; every row a fresh prefill, the median of
+  three after one warm request):
+
+| prompt tokens | before (fused local combine) | three rings | two rings |
+|---|---|---|---|
+| 2,117-2,119 | 2.779 s | 2.613 s (-6.0 %) | 2.632 s (-5.3 %) |
+| 6,874-6,876 | 8.551 s | 7.995 s (-6.5 %) | 8.052 s (-5.8 %) |
+| 31,732-31,734 | 39.352 s | 36.573 s (-7.1 %) | 36.820 s (-6.4 %) |
+| prefill ms per prompt token | 1.294 / 1.238 / 1.237 | 1.215 / 1.156 / 1.150 | 1.223 / 1.164 / 1.158 |
+
+The READY record names the chunk's form (`moe_chunk_rows_form`).  The 32-row chunk, the slab and decode are
+unchanged.
+
 ## MTP (`--mtp 4`), 32k, 2026-09-25
 
 The MTP path leaves the CPU reference at plain decode's token on 12 of the 12 acceptance prompts and is bitwise plain
