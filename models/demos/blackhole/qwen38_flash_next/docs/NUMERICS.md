@@ -21,6 +21,65 @@ Every number here was measured on 4x p150 unless a date and host say otherwise.
   packer), and every start re-packs one routed expert of the first cached layer from the checkpoint and compares the
   bytes with the cache; a cache converted by different code is refused (`SERVER.md`).
 
+## The served tokenizer is `tokenizer.json` (2026-09-30)
+
+The chat template loader built its tokenizer through `AutoTokenizer`, which hands the checkpoint to the class
+`tokenizer_config.json` names (`Qwen2Tokenizer`).  A transformers release without the Qwen3.5 tokenizer class (5.12.1
+in the served environment) rebuilds that class's Rust backend from `vocab.json` and `merges.txt` under the class's own
+pre-tokenizer regex, `\p{L}+` for a run of letters where `tokenizer.json` has `[\p{L}\p{M}]+`; the vocabulary, the
+merges, the NFC normalizer and the added tokens are the file's, the pre-tokenizer and the decoder flags are not.  A
+word of a script whose letters carry combining marks splits at every mark.  The loader now builds the tokenizer from
+`tokenizer.json` itself and refuses a backend whose serialized form is not the file's (`SERVER.md`).
+
+Token counts of one sentence per script (`auto`: `AutoTokenizer` in the served environment, the loader before;
+`file`: `tokenizers.Tokenizer.from_file` on `tokenizer.json`, the form the model generates in; `served`: the loader
+now; `5.18`: the Qwen3.5 tokenizer class of transformers 5.18.0 under a scratch interpreter):
+
+| script | marks | auto | file | served | 5.18 |
+|---|---|---|---|---|---|
+| Thai | 11 | 23 | 8 | 8 | 8 |
+| Hindi (Devanagari) | 23 | 38 | 25 | 25 | 25 |
+| Bengali | 19 | 29 | 16 | 16 | 16 |
+| Arabic with tashkeel | 31 | 39 | 31 | 31 | 31 |
+| Vietnamese (precomposed) | 0 | 12 | 12 | 12 | 12 |
+| Hebrew with niqqud | 19 | 50 | 50 | 50 | 50 |
+| Korean, Japanese, Chinese | 0 | 12, 10, 5 | 12, 10, 5 | 12, 10, 5 | 12, 10, 5 |
+| Russian, German, English | 0 | 12, 10, 9 | 12, 10, 9 | 12, 10, 9 | 12, 10, 9 |
+| code | 0 | 26 | 26 | 26 | 26 |
+
+Thai `นักเรียน` was `น`, `ัก`, `เร`, `ียน`; it is one token.  Hebrew points are `\p{M}` too, but the vocabulary holds no
+merge across them, so the pieces agree.  Unchanged by the loader: the 13 shipped acceptance records' prompt ids
+re-encode to themselves and their replies decode to the recorded text (and re-encode to their own ids: the model
+generates in the file's form), `apply_chat_template` renders the same text over message shapes, tools, thinking flags
+and efforts, random id sequences decode identically, the special-token ids and sizes are the pinned ones.  The static
+`tests/test_chat_tokenizer_source_static.py` pins the table's ids.
+
+Served (one 1x4 p150 line, 32k context, greedy, thinking off, 96-token budget, one hold per tree, the host's 1-minute
+load 3.1-5.4 at the launches; `usage.prompt_tokens` of a one-sentence request asking for two more sentences, and the
+reply's length):
+
+| prompt | before: prompt tokens | after: prompt tokens (= `tokenizer.json`) | before: reply | after: reply |
+|---|---|---|---|---|
+| Thai | 49 | 29 | 18 tokens, stop | 23 tokens, stop |
+| Hindi | 80 | 59 | 90 tokens, stop | 96 tokens, length |
+| Bengali | 76 | 49 | 91 tokens, stop | 76 tokens, stop |
+| Arabic with tashkeel | 87 | 71 | 91 tokens, stop | 64 tokens, stop |
+| English (control) | 29 | 29 | 45 tokens, stop | 45 tokens, stop |
+
+The before rows are the class-rebuilt loader's counts (the file's counts are the after column); the replies differ between
+the trees on the four scripts (a different prompt id sequence is a different request), and the English control's reply is
+bitwise the same.  The startup replay in the `--mtp 4` mode against the `A3-mtp4-32k` pins and in the default mode against
+the `A3-chunked-32k` pins on the after tree: 12/12 divergence indices and 12/12 device token-id digests identical, json
+96/96, so the English pins are bitwise unchanged.
+
+Verified on the CPU, not yet applied to the Hub checkpoint: with `tokenizer_config.json`'s `tokenizer_class` set to
+`PreTrainedTokenizerFast` (nothing else changed), `AutoTokenizer.from_pretrained` under transformers 5.12.1 and 5.16.1
+builds a backend byte-identical to `tokenizer.json` (the 13-script table, the renders, the decodes and the special-token
+contract equal the served loader's); under 5.18.0 the key is inert (the class comes from `config.json`'s `model_type`,
+`Qwen3_5Tokenizer`, whose regex is the file's) and harmless.  That one-line checkpoint change is the fix path for the
+vLLM form, which tokenizes in the plugin; it changes a file this server pins by digest (`chat.PINNED_TOKENIZER_ARTIFACTS`,
+re-cut with it) and the checkpoint's byte identity with the release commit (`README.md`).
+
 ## The prompt-end snapshot restore (2026-09-28)
 
 The chat server's prompt-end snapshot (`docs/SERVER.md`) copies the recurrent buffers (GDN states and ring slots, PLE

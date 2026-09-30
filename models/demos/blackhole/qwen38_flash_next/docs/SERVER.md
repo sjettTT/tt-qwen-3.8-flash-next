@@ -340,6 +340,23 @@ prefills the whole conversation (3.3 ms per token of history, `qwen38.reset` tru
 the prefill that follows rewrites the caches from row 0, so a prefill stopped before its last token (a hang-up, a
 deadline) leaves nothing restorable and the next request of the earlier prompt prefills it whole.
 
+The tokenizer is the checkpoint's `tokenizer.json`, loaded as a file-backed fast tokenizer
+(`chat.load_checkpoint_tokenizer`), not the class `tokenizer_config.json` names: a transformers release without the
+Qwen3.5 tokenizer class (5.12.1 in the served environment) rebuilds that class's backend under a pre-tokenizer regex
+without `\p{M}`, which split Thai, Devanagari, Bengali and Arabic-with-tashkeel words at every combining mark into
+about twice the tokens the model was trained on and generates in (`docs/NUMERICS.md`, 2026-09-30).  The start refuses
+a backend whose serialized form is not the file's, naming the differing component and the transformers release, and a
+checkpoint without `tokenizer.json`; the chat template, the special-token ids and `decode` are the file's, so Latin,
+Cyrillic, CJK and Hangul prompts encode as before and every shipped record's ids are unchanged.
+
+Verified on the CPU, not yet applied to the Hub checkpoint: with `tokenizer_config.json`'s `tokenizer_class` set to
+`PreTrainedTokenizerFast` (nothing else changed), `AutoTokenizer.from_pretrained` under transformers 5.12.1 and 5.16.1
+builds a backend byte-identical to `tokenizer.json` (the 13-script table, the renders, the decodes and the special-token
+contract equal the served loader's); under 5.18.0 the key is inert (the class comes from `config.json`'s `model_type`,
+`Qwen3_5Tokenizer`, whose regex is the file's) and harmless.  That one-line checkpoint change is the fix path for the
+vLLM form, which tokenizes in the plugin; it changes a file this server pins by digest (`chat.PINNED_TOKENIZER_ARTIFACTS`,
+re-cut with it) and the checkpoint's byte identity with the release commit (`README.md`).
+
 The restore copies the snapshot's buffers back bitwise (the round trip is checked at every start), and the snapshot is
 exact for the path that produced it -- which is not always a fresh prefill's path.  `qwen38.snapshot_schedule`
 (null unless the request restored a snapshot) names that path: `chunked` = the snapshot came from a prefill of exactly
@@ -446,7 +463,11 @@ sampler.  The plugin owns the mesh, the scheduler, the tokenizer and the OpenAI 
 vLLM sampled, both return CPU fp32 `[1, 1, 248320]` logits with the 243 LM-head padding rows at `-inf` (under the
 plugin's device-sampling contract, below, a sampled decode step returns the token instead).  The venv is the plugin's
 `docs/install-vllm-tt.sh` over this checkout's `python_env` (vLLM 0.26.0 built with `VLLM_TARGET_DEVICE=empty`, the
-plugin editable), then `transformers==5.16.1` (the `qwen4_exp` config class).  From a built checkout `$REPO`:
+plugin editable), then `transformers==5.16.1` (the `qwen4_exp` config class).  Under vLLM the plugin tokenizes with
+`AutoTokenizer` in its own venv: transformers 5.16.1 loads this checkpoint as `Qwen2Tokenizer` and splits words with
+combining marks at every mark (the Thai sentence of `docs/NUMERICS.md`, 23 tokens for the file's 8); that venv needs a
+release with the Qwen3.5 tokenizer class (5.18.0 measured) or the checkpoint change of the prompt section above for those scripts, since
+this server's own loader (`chat.load_checkpoint_tokenizer`) is not on vLLM's path.  From a built checkout `$REPO`:
 
     export TT_METAL_HOME=$REPO PYTHONPATH=$REPO:$REPO/ttnn:$REPO/tools PYTHONNOUSERSITE=1 HF_HUB_OFFLINE=1
     export TT_VISIBLE_DEVICES=0,1,2,3 MESH_DEVICE="(1, 4)" TT_METAL_TRACE_ALLOC_TRACKING=1

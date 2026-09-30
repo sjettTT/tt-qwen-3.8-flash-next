@@ -183,6 +183,60 @@ class Qwen38RenderedPrompt:
     template_sha256: str
 
 
+TOKENIZER_COMPONENTS = ("normalizer", "pre_tokenizer", "post_processor", "decoder", "model", "added_tokens")
+
+
+def load_checkpoint_tokenizer(checkpoint_root: str | os.PathLike[str]) -> Any:
+    """The checkpoint's ``tokenizer.json`` as the served tokenizer, whatever transformers release is installed.
+
+    ``AutoTokenizer.from_pretrained`` hands the checkpoint to the class ``tokenizer_config.json`` names
+    (``Qwen2Tokenizer``).  A release without a Qwen3.5 tokenizer class (5.12.1 in the served environment) rebuilds
+    that class's Rust backend from ``vocab.json`` and ``merges.txt`` under the class's own pre-tokenizer regex, which
+    takes letters as ``\\p{L}+`` where the file takes ``[\\p{L}\\p{M}]+``: a word of a script with combining marks
+    (Thai, Devanagari, Bengali, Arabic with tashkeel, Hebrew with niqqud) splits at every mark into about twice the
+    tokens the model was trained on and generates in; Latin, Cyrillic, CJK and Hangul text encodes the same either
+    way.  This loader builds transformers' file-backed fast tokenizer from ``tokenizer.json`` itself (the chat
+    template, the special tokens and ``decode`` as before) and refuses a backend whose serialized form is not the
+    file's, so a release that rewrites the backend is refused, never served.  Loading a tokenizer is a host
+    formatting operation, not model inference: no network, no remote code.
+    """
+
+    root = Path(checkpoint_root)
+    tokenizer_file = root / "tokenizer.json"
+    config_file = root / "tokenizer_config.json"
+    template_file = root / "chat_template.jinja"
+    for path in (tokenizer_file, config_file, template_file):
+        _regular_file(path)
+    config = json.loads(config_file.read_text(encoding="utf-8"))
+    import transformers
+    from tokenizers import Tokenizer
+    from transformers import PreTrainedTokenizerFast
+
+    reference = Tokenizer.from_file(str(tokenizer_file)).to_str()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=str(tokenizer_file),
+        chat_template=template_file.read_text(encoding="utf-8"),
+        bos_token=config.get("bos_token"),
+        eos_token=config["eos_token"],
+        pad_token=config["pad_token"],
+        unk_token=config.get("unk_token"),
+        additional_special_tokens=list(config.get("additional_special_tokens", ())),
+        extra_special_tokens=dict(config.get("extra_special_tokens") or {}),
+        model_max_length=int(config["model_max_length"]),
+        clean_up_tokenization_spaces=bool(config.get("clean_up_tokenization_spaces", False)),
+        split_special_tokens=bool(config.get("split_special_tokens", False)),
+    )
+    built = tokenizer.backend_tokenizer.to_str()
+    if built != reference:
+        built_parts, file_parts = json.loads(built), json.loads(reference)
+        differing = [name for name in TOKENIZER_COMPONENTS if built_parts.get(name) != file_parts.get(name)]
+        raise Qwen38ChatFormatError(
+            f"the loaded tokenizer is not {tokenizer_file}: {', '.join(differing) or 'its serialized form'} "
+            f"differ(s) from the file (transformers {transformers.__version__} rewrote the backend); refusing to serve"
+        )
+    return tokenizer
+
+
 class Qwen38OfficialChatTemplate:
     """Hash-verified local tokenizer and the released Jinja chat template."""
 
@@ -199,15 +253,7 @@ class Qwen38OfficialChatTemplate:
                     f"pinned tokenizer artifact {name} has SHA-256 {actual}, expected {expected}"
                 )
 
-        # Loading a tokenizer is a host formatting operation, not model
-        # inference.  Network and remote-code execution are both disabled.
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            root,
-            local_files_only=True,
-            trust_remote_code=False,
-        )
+        tokenizer = load_checkpoint_tokenizer(root)
         # The model reserves 243 padded output rows above the released text
         # tokenizer.  Those rows are valid LM-head indices but are never prompt
         # tokens; do not conflate the two sizes.
