@@ -47,7 +47,8 @@ def test_cb_indices_agree_between_kernels_and_python():
 def test_kernel_argument_layouts():
     reader = (KERNELS / "reader.cpp").read_text()
     assert reader.count("TensorAccessorArgs<") == 12  # projected, 3 slots, 4 taps, dtna, norm, state, newest
-    assert reader.count("get_arg_val<uint32_t>(arg++)") == 13 + 2  # 12 addresses, items, then (lane, head)
+    # 12 addresses, items, receivers, the group rectangle x0 y0 x1 y1, the sender x y, role; then (lane, head, write flag)
+    assert reader.count("get_arg_val<uint32_t>(arg++)") == 21 + 3
     writer = (KERNELS / "writer.cpp").read_text()
     assert writer.count("TensorAccessorArgs<") == 3  # state, out, debug
     compute = (KERNELS / "compute.cpp").read_text()
@@ -186,3 +187,49 @@ def test_reference_step_matches_the_oracle_functions():
         )
         assert torch.equal(expected[0, :, 0], conv[lane])
     assert torch.all(decay > 0) and torch.all(decay <= 1) and torch.all((beta > 0) & (beta < 1))
+
+
+def test_head_groups_are_disjoint_rectangles_one_lane_per_core():
+    """The lanes form places the 12 x B items as twelve rectangles of B cores (lane j = position j, the first core the
+    sender), every core once, inside the grid; B = 1 is the linear order; B > 9 does not fit 110 cores (the fallback)."""
+
+    for gx, gy in ((11, 10), (13, 10), (14, 10)):
+        for rows in range(1, 10):
+            groups = module.head_groups(rows, gx, gy)
+            assert len(groups) == module.HEADS and all(len(g) == rows for g in groups)
+            cores = [c for g in groups for c in g]
+            assert len(set(cores)) == module.HEADS * rows and all(0 <= x < gx and 0 <= y < gy for x, y in cores)
+            for g in groups:
+                xs, ys = sorted({x for x, _ in g}), sorted({y for _, y in g})
+                assert len(xs) * len(ys) == rows and xs == list(range(xs[0], xs[-1] + 1)) and ys == list(range(ys[0], ys[-1] + 1))
+    assert module.head_groups(1, 11, 10) == [[(i // 10, i % 10)] for i in range(module.HEADS)]
+    try:
+        module.head_groups(10, 11, 10)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("120 items must not fit 110 cores")
+
+
+def test_head_groups_respect_a_noc_column_gap():
+    """A harvested column leaves a gap in the NoC x coordinates (the 11-column grid maps to x 1..6 and 11..15): a
+    rectangle may not span it.  B = 8 still fits (eleven strips and the 2 x 4 block in the first four columns); the
+    prime counts 7 and 9 need their twelfth group as one row's span across the gap (runs of 6 and 5 columns), so
+    they fall back to the linear split; 2..6 fit."""
+
+    noc_x = [1, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15]
+
+    def accepts(x0, x1, y0, y1):
+        return noc_x[x0 : x1 + 1] == list(range(noc_x[x0], noc_x[x0] + x1 - x0 + 1))
+
+    groups = module.head_groups(8, 11, 10, accepts)
+    assert len(groups) == 12 and groups[11] == [(0, 8), (0, 9), (1, 8), (1, 9), (2, 8), (2, 9), (3, 8), (3, 9)]
+    for rows in range(2, 7):
+        assert len(module.head_groups(rows, 11, 10, accepts)) == 12
+    for rows in (7, 9):
+        try:
+            module.head_groups(rows, 11, 10, accepts)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"a 1 x {rows} strip across the NoC gap must not be placed")

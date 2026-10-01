@@ -9,6 +9,11 @@ and the sigmoid gate: 49 programs, 119 us kernel / 213 us occupancy per layer in
 per (lane, value head) item; the state stays fp32 and is updated in place; the newest ring slot is written from the
 projection.  The 1-row body runs it at rows = 1 and the batched-lanes body at rows = B (``_forward_decode_lanes_fused``
 in ttnn/gdn.py: lane u = state slot u and ring row u, so B independent users are 12 B items of one program).
+At rows > 1 the B cores of one value head form one NoC rectangle: its first core reads the head's shared tiles (the
+projection, the ring slots, the taps, the constants, the norm: identical for every lane, since the B rows sit in one
+tile) once and multicasts them group by group into the others' CBs, each core reads only its own state, and one core
+per tile writes the newest ring slot (the lanes-scaling study of 2026-09-30: today's per-core re-read of those tiles
+made the reader's time a gradient over the NoC rows, 32 -> 89 us at B = 8).
 Rounding follows tt/gdn.py (the oracle), not today's chain, so the tolerance class is COMPONENT (note
 work/FUSE-GDN-STEP-20260913.md section 1).  ``reference_step`` is the kernel's arithmetic in torch for the tests.
 """
@@ -23,6 +28,7 @@ import torch.nn.functional as F
 import ttnn
 
 from .. import program as fp
+from .. import gr_read
 from ..registry import COMPONENT, FusedKernel, register
 
 NAME = "gdn_step"
@@ -128,6 +134,98 @@ def constant_tiles(mesh, dt_bias, neg_exp_A):
     )
 
 
+def head_groups(rows: int, gx: int, gy: int, accepts=None) -> list[list[tuple[int, int]]]:
+    """Twelve groups of ``rows`` logical cores, each one rectangle: vertical strips of ``rows`` first, then any
+    r x c = rows rectangle in the free cells (B = 8 on 11 x 10: eleven strips and one 2 x 4 block).  Group h is
+    value head h; position j in the group is lane j; the first core is the group's sender.  ``accepts(x0, x1, y0,
+    y1)`` admits a candidate rectangle (the NoC map's contiguity: a harvested column leaves a gap in the NoC x
+    coordinates, so a span across it is two rectangles to the multicast); None admits every one."""
+
+    free = [[True] * gy for _ in range(gx)]
+    shapes = [(rows, 1)] + [(r, rows // r) for r in range(rows - 1, 0, -1) if rows % r == 0]
+    groups = []
+    for _ in range(HEADS):
+        placed = None
+        for r, c in shapes:
+            if r > gy or c > gx:
+                continue
+            for x in range(gx - c + 1):
+                for y in range(gy - r + 1):
+                    if all(free[x + dx][y + dy] for dx in range(c) for dy in range(r)) and (
+                        accepts is None or accepts(x, x + c - 1, y, y + r - 1)
+                    ):
+                        placed = [(x + dx, y + dy) for dx in range(c) for dy in range(r)]
+                        break
+                if placed:
+                    break
+            if placed:
+                break
+        if not placed:
+            raise RuntimeError(f"no rectangle of {rows} cores left for a head group on a {gx}x{gy} grid")
+        for x, y in placed:
+            free[x][y] = False
+        groups.append(placed)
+    return groups
+
+
+def _noc_rectangle(cores, noc) -> tuple[int, int, int, int]:
+    xs = sorted({noc[c][0] for c in cores})
+    ys = sorted({noc[c][1] for c in cores})
+    if xs != list(range(xs[0], xs[-1] + 1)) or ys != list(range(ys[0], ys[-1] + 1)) or len(xs) * len(ys) != len(cores):
+        raise RuntimeError(f"head group {cores} is not one contiguous NoC rectangle: x {xs} y {ys}")
+    return xs[0], ys[0], xs[-1], ys[-1]
+
+
+def placement(rows: int, mesh):
+    """Per core: (core, [(lane, head, write_newest)], [receivers, x0, y0, x1, y1, sx, sy, role]) and the core
+    ranges.  Head groups (one item per core, the multicast form) when twelve rectangles of ``rows`` cores fit the
+    grid's NoC map, else the linear split with several items per core and no multicast; the newest ring slot is
+    written by lane 0's items either way."""
+
+    grid = mesh.compute_with_storage_grid_size()
+    if rows == 1:
+        # twelve single cores in the linear order (today's placement), two kernel-group ranges, nothing multicast:
+        # the single stream never runs the NoC probe
+        split = fp.split_work(HEADS, mesh)
+        work = [(w.core, [(0, head, 1)], [0] * 8) for head, w in enumerate(split)]
+        return work, fp.core_rectangle(split, mesh)
+    groups = None
+    if rows * HEADS <= grid.x * grid.y:
+        noc = gr_read.noc_map(mesh)
+        xs = [noc[(x, 0)][0] for x in range(grid.x)]
+        ys = [noc[(0, y)][1] for y in range(grid.y)]
+
+        def accepts(x0, x1, y0, y1):
+            return xs[x0 : x1 + 1] == list(range(xs[x0], xs[x0] + x1 - x0 + 1)) and ys[y0 : y1 + 1] == list(
+                range(ys[y0], ys[y0] + y1 - y0 + 1)
+            )
+
+        try:
+            groups = head_groups(rows, grid.x, grid.y, accepts)
+        except RuntimeError:
+            groups = None  # no twelve rectangles on this grid's NoC map: the linear split below
+    if groups is not None:
+        work, ranges = [], []
+        for head, cores in enumerate(groups):
+            x0, y0, x1, y1 = _noc_rectangle(cores, noc)
+            sx, sy = noc[cores[0]]
+            xs, ys = [x for x, _ in cores], [y for _, y in cores]
+            ranges.append(ttnn.CoreRange(ttnn.CoreCoord(min(xs), min(ys)), ttnn.CoreCoord(max(xs), max(ys))))
+            for lane, (x, y) in enumerate(cores):
+                role = 0 if lane == 0 else 1
+                work.append(
+                    (ttnn.CoreCoord(x, y), [(lane, head, 1 if role == 0 else 0)], [rows - 1, x0, y0, x1, y1, sx, sy, role])
+                )
+        return work, ttnn.CoreRangeSet(ranges)
+    items = [(lane, head) for lane in range(rows) for head in range(HEADS)]
+    split = fp.split_work(len(items), mesh)
+    work = [
+        (w.core, [(lane, head, 1 if lane == 0 else 0) for lane, head in items[w.start : w.start + w.count]], [0] * 8)
+        for w in split
+    ]
+    return work, fp.core_rectangle(split, mesh)
+
+
 def run(projected, older, newest, taps, constants, norm, recurrent, out, *, debug=None):
     """The program on explicit tensors (local shapes, one tile row): ``projected`` [1,1,rows,4160] bf16;
     ``older`` the three older ring slots and ``newest`` the slot this token lands in, [1,1,rows,2560] bf16;
@@ -145,12 +243,7 @@ def run(projected, older, newest, taps, constants, norm, recurrent, out, *, debu
     if len(older) != 3 or len(taps) != 4:
         raise ValueError("gdn_step takes three older ring slots and four taps")
     mesh = projected.device()
-    items = [(lane, head) for lane in range(rows) for head in range(HEADS)]
-    work = fp.split_work(len(items), mesh)
-    cores = fp.core_set(work)
-
-    def pairs(w):
-        return [value for item in items[w.start : w.start + w.count] for value in item]
+    work, cores = placement(rows, mesh)
 
     reader_cta = [rows]
     for tensor in (projected, *older, *taps, constants, norm, recurrent, newest):
@@ -185,15 +278,27 @@ def run(projected, older, newest, taps, constants, norm, recurrent, out, *, debu
         defines.append(("DEBUG_TAPS", "1"))
         cbs.append(fp.cb_descriptor(CB_DEBUG, FP32, fp.TILE_BYTES[FP32], DEBUG_TILES, cores))
 
-    reader = fp.reader_kernel(READER, cores, reader_cta, [(w.core, [*reader_addrs, w.count, *pairs(w)]) for w in work])
+    reader = fp.reader_kernel(
+        READER,
+        cores,
+        reader_cta,
+        [
+            (core, [*reader_addrs, len(items), *group, *(v for item in items for v in item)])
+            for core, items, group in work
+        ],
+    )
     writer = fp.writer_kernel(
-        WRITER, cores, writer_cta, [(w.core, [*writer_addrs, w.count, *pairs(w)]) for w in work], defines=defines
+        WRITER,
+        cores,
+        writer_cta,
+        [(core, [*writer_addrs, len(items), *(v for lane, head, _ in items for v in (lane, head))]) for core, items, _ in work],
+        defines=defines,
     )
     compute = fp.compute_kernel(
         COMPUTE,
         cores,
         [],
-        [(w.core, [w.count]) for w in work],
+        [(core, [len(items)]) for core, items, _ in work],
         defines=defines,
         fidelity=ttnn.MathFidelity.HiFi4,
         fp32_dest=True,
@@ -202,10 +307,10 @@ def run(projected, older, newest, taps, constants, norm, recurrent, out, *, debu
     io = [projected, *older, *taps, constants, norm, recurrent, newest]
     if debug is not None:
         io.append(debug)
-    # the projection, the ring slots and the taps once (each core its head's columns), the fp32 state read and
-    # written in place, the newest slot and the output written, the constant tiles once per core; per lane: the
-    # 4-tap conv, the two l2 norms, the fp32 delta-rule update (outer products, decay, delta) and read-out on 12
-    # heads of 128 x 128, the gated norm
+    # the projection, the ring slots and the taps once per head group (multicast to the group's lanes), the fp32
+    # state read and written in place per lane, the newest slot written once per tile, the constant tiles once per
+    # group; per lane: the 4-tap conv, the two l2 norms, the fp32 delta-rule update (outer products, decay, delta)
+    # and read-out on 12 heads of 128 x 128, the gated norm
     meta = fp.program_meta(
         NAME,
         "step",
@@ -216,7 +321,8 @@ def run(projected, older, newest, taps, constants, norm, recurrent, out, *, debu
         flops=rows * (2 * 4 * QKV_WIDTH + 6 * 2 * QK_WIDTH + 8 * HEADS * HEAD_DIM * HEAD_DIM + 6 * VALUE_WIDTH),
         cores=len(work),
     )
-    fp.run_program([*io, out], fp.program_descriptor([reader, writer, compute], cbs), meta=meta)
+    semaphores = [fp.semaphore_descriptor(0, cores), fp.semaphore_descriptor(1, cores)]
+    fp.run_program([*io, out], fp.program_descriptor([reader, writer, compute], cbs, semaphores), meta=meta)
     return out
 
 

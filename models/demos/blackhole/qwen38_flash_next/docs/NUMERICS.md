@@ -1156,6 +1156,48 @@ written: the single-stream comparator moved too (+2.6 %) between the two evening
 place but the landing's served figure at its stated load.  The development note of this change (the
 lane glue census and ablation) holds the census by code site, the single-stream comparison and every hold.
 
+### The GDN step's lanes form: one reader per head, the shared tiles multicast (2026-10-01)
+
+The fused GDN decode step (`ttnn/fused/gdn_step`, the one program per layer the single stream runs at one row and the
+batched lane body at B rows, one (lane, value head) item per core) re-read, on every core, tiles that are identical
+for every lane of a head: the B rows of a lane batch sit in one tile, so the projection's q/k/v/z/a/b tiles, the
+three ring slots, the four taps, the head's constants and the norm are the same pages for lane u and lane v of head
+h; only the a/b element, the row mask and the fp32 state are the lane's own.  At B = 8 that was 21 MB of re-reads
+against 12.3 MB of state per layer, and the reader's time on a core grew with its NoC row (32 us at the bottom of
+the grid, 89 at the top) while the kernel starts and the compute phases stayed flat: the program ended when the far
+rows' reads ended (75.9 -> 139.8 us per layer from B = 1 to 8 in the 2026-09-30 batch-scaling attribution).  Now the
+B cores of one head form one NoC rectangle; its first core reads the head's shared tiles once and multicasts them
+into the others' CBs group by group as they land (a counting semaphore, so a receiver's conv starts tile by tile like
+the sender's); every core reads only its own state; the newest ring slot is written by one core per tile; and a tap
+tile is read as its row 0 only (two 64-byte reads in place of 2 KB: the compute's row broadcast reads nothing else of
+it, proven with the rest of the tile poisoned with NaN).  At one row nothing is multicast (the single stream keeps the
+compact tap reads and the kernel-group ranges); more than nine lanes fall back to the linear split.
+
+**Bitwise.**  On one p150 die the new state, the gated output and the newest ring slot digest (sha256) the same as
+the former kernel at B = 1, 4 and 8 from the same initial state (every variant of the study, the production form
+included); on the line the single-stream replay pins hold (`A3-mtp4-32k` 12/12 by divergence index and sha, `json`
+96/96) and the lanes replay reads 12/12 equal to the single stream; the lane body's lane 0 equals the production body
+at every step of the sweep.  The class stays COMPONENT (the kernel's arithmetic is unchanged; only its data movement).
+
+| us per layer, one p150 die, traced medians | B = 1 | B = 4 | B = 8 |
+|---|---:|---:|---:|
+| the former kernel | 77.5 | 104.5 | 139.1 |
+| the lanes form | 73.7 | 81.9 | 98.4 |
+
+**Served pair** (a 1x4 p150 line at 32k, the kit of record, the two heads in holds three minutes apart in a quiet
+window, host 1-min load 1.4 at the launches, 3-7 during the replays): the plain lane body's step p50 over 200 traced replays B = 4 28.41 ->
+27.74 ms, B = 8 34.07 -> 32.72 ms (36.1 / 30.6 tok/s per user, 144 / 244
+aggregate; lane 0 equals the production body 225/225 at both); the `--lanes 4 --mtp 4` pass (the verify-rows fold,
+not this program) 60.35 -> 60.06 ms p50, unchanged within noise.  The pins, three passes of the
+`--lanes 4 --mtp 4` server (6d47a4c853 before the placement fix, the code head dfcd268bcdf0, and that head rebased
+onto 4fe7997e1cb4): the single-stream replay against both pinned tables 12/12 by divergence index and sha, `json`
+96/96; the lanes replay 12/12 = the single stream (at the code head READY 178 s, load 11 -> 3,
+108 passes, pass p50 58.9 ms); the 4 x chat-560 batch byte-equal to the single-stream
+server's 4/4 each time.  Head dfcd268bcdf0 (the code commits; rebased onto the unified head 4fe7997e1cb4, where the lanes replay ran again); the per-core nature, the ablation of every variant (kernel-group
+ranges, common runtime args, fewer cores with several items, per-lane launches, the coarse and the pipelined
+multicast, a DRAM-sharded state, three read orders, the compact taps, one newest writer, their combinations) and the
+evidence directories are in the development note of the study.
+
 ## The device sampler's law (2026-09-25)
 
 The on-device sampler (`sampler_tail`, one program on one core after the top-32 candidate row) is gated on its law, not
