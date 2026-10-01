@@ -322,11 +322,19 @@ def test_the_qg_shard_travels_as_its_own_argument_and_every_hook_asks_its_predic
     verify = inspect.getsource(qsa_module.Qwen38TTNNQSA.forward_verify_generic)
     assert "sparse_query, gate, qg_ws = self._main_tail_rows_step(" in verify
     assert "sparse_query=sparse_query, qg_ws=qg_ws" in verify
-    # the chunk body, the lanes and the lane verify never hand a qg shard: their gate stays the chain's
-    for method in ("forward_chunk_generic", "forward_decode_lanes", "forward_verify_lanes"):
+    # the chunk body and the plain lanes decode body never hand a qg shard: their gate stays the chain's
+    for method in ("forward_chunk_generic", "forward_decode_lanes"):
         source = inspect.getsource(getattr(qsa_module.Qwen38TTNNQSA, method))
         assert "self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)" in source, method
         assert "qg_ws=" not in source, method
+    # the lane verify hands the shard to program 5 when it is on (the qg linear's shard kept in the gate's slot) and
+    # builds the chain's gate from it otherwise; with the fused main tail on the lane tile the sparse query travels too
+    lanes_verify = inspect.getsource(qsa_module.Qwen38TTNNQSA.forward_verify_lanes)
+    assert "fused_gate = self._post_attention_rows is not None" in lanes_verify
+    assert "keep_qg_shard=fused_gate" in lanes_verify and "qg_ws=gate" in lanes_verify
+    assert "self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)" in lanes_verify
+    projection = inspect.getsource(qsa_module.Qwen38TTNNQSA._main_projection_rows)
+    assert "keep_qg_shard: bool = False" in projection and "gate = qg_ws" in projection
     score = inspect.getsource(qsa_module.Qwen38TTNNQSA._score_blocks_chunk)
     assert "self._score_pages_admits(local_scores, self.allocated_compressed_blocks)" in score
 

@@ -5512,11 +5512,15 @@ class Qwen38TTNNQSA:
                 configs[key] = self.prefill_dense.program_config(rows, k, n)
         return configs[key]
 
-    def _linear_rows(self, full_hidden, weight, program_config, hidden_tiles, *, dense: str | None = None):
+    def _linear_rows(
+        self, full_hidden, weight, program_config, hidden_tiles, *, dense: str | None = None, keep_shard_in=None
+    ):
         """A DRAM-sharded decode linear over the chunk rows: one call on the gathered shard at 32 rows, one
         call per row tile (``hidden_tiles``, from :meth:`_hidden_row_tiles`) at 128 rows, the outputs
         concatenated interleaved.  ``dense`` names the linear in the prefill dense policy (the slab's query-gate,
-        K, V, output projections); None is the exact set (the index projections), which the policy never touches."""
+        K, V, output projections); None is the exact set (the index projections), which the policy never touches.
+        ``keep_shard_in`` (a list; the one-tile form only): the linear's L1 shard is appended to it instead of being
+        released, for a caller that reads the shard itself (the lane verify's fused post-attention program)."""
 
         rows = _shape(full_hidden)[2]
         if is_slab_rows(rows):
@@ -5545,8 +5549,13 @@ class Qwen38TTNNQSA:
                 compute_kernel_config=self.projection_compute_config,
             )
             projected = ttnn.to_memory_config(projected_ws, ttnn.DRAM_MEMORY_CONFIG)
-            _deallocate(projected_ws)
+            if keep_shard_in is None:
+                _deallocate(projected_ws)
+            else:
+                keep_shard_in.append(projected_ws)
             return projected
+        if keep_shard_in is not None:
+            raise ValueError("the linear's shard is kept for the one-tile form only")
         projected_tiles = []
         for tile in hidden_tiles:
             projected_ws = ttnn.linear(
@@ -5943,9 +5952,34 @@ class Qwen38TTNNQSA:
         self.prefill_dense.retag_sharded(k, v, reference=full_hidden, shard_dim=3)
         return k, v
 
-    def _main_projection_rows(self, full_hidden, hidden_tiles, cos, sin, constants: Qwen38TTNNQSAChunkConstants):
+    def _main_projection_rows(
+        self,
+        full_hidden,
+        hidden_tiles,
+        cos,
+        sin,
+        constants: Qwen38TTNNQSAChunkConstants,
+        *,
+        keep_qg_shard: bool = False,
+    ):
+        """The chain's three main linears and their tails; with ``keep_qg_shard`` (the one-tile form only) the qg
+        linear's L1 shard is returned in the gate's slot for the fused post-attention program of the 32-row tile
+        (qsa_rows program 5, which reads the gates from the shard itself), the chain's six gate slices and their
+        concat skipped; the interleaved copy still feeds the query heads."""
+
         rows = constants.rows
-        qg = self._linear_rows(full_hidden, self.weights.qg, self.qg_program_config, hidden_tiles, dense="qg")
+        shards: list = []
+        if keep_qg_shard and (hidden_tiles is not None or is_slab_rows(rows)):
+            raise ValueError("the qg shard is kept for the one-tile form only")
+        qg = self._linear_rows(
+            full_hidden,
+            self.weights.qg,
+            self.qg_program_config,
+            hidden_tiles,
+            dense="qg",
+            keep_shard_in=shards if keep_qg_shard else None,
+        )
+        qg_ws = shards[0] if shards else None
         if is_slab_rows(rows) and self.prefill_dense.resident("kv") is not None:
             k, v = self._fused_kv_rows(full_hidden, rows)
         else:
@@ -5969,22 +6003,27 @@ class Qwen38TTNNQSA:
             q_heads.append(
                 ttnn.slice(qg, (0, 0, 0, start), (1, 1, rows, start + HEAD_DIM), memory_config=ttnn.DRAM_MEMORY_CONFIG)
             )
-            gate_heads.append(
-                ttnn.slice(
-                    qg,
-                    (0, 0, 0, start + HEAD_DIM),
-                    (1, 1, rows, start + 2 * HEAD_DIM),
-                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            if qg_ws is None:
+                gate_heads.append(
+                    ttnn.slice(
+                        qg,
+                        (0, 0, 0, start + HEAD_DIM),
+                        (1, 1, rows, start + 2 * HEAD_DIM),
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    )
                 )
-            )
         _deallocate(qg)
         q = ttnn.concat(q_heads, dim=1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        gate = ttnn.concat(gate_heads, dim=1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        _deallocate(*q_heads, *gate_heads)
+        _deallocate(*q_heads)
+        if qg_ws is None:
+            gate = ttnn.concat(gate_heads, dim=1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            _deallocate(*gate_heads)
+            _retag_tensor(gate, reference=full_hidden, shard_dim=1)
+            _require_shape(gate, (1, QUERY_HEADS_PER_DEVICE, rows, HEAD_DIM), "local QSA gate head rows")
+        else:
+            gate = qg_ws  # the shard in the gate's slot: the fused post-attention program reads the gates from it
         _retag_tensor(q, reference=full_hidden, shard_dim=1)
-        _retag_tensor(gate, reference=full_hidden, shard_dim=1)
         _require_shape(q, (1, QUERY_HEADS_PER_DEVICE, rows, HEAD_DIM), "local QSA query head rows")
-        _require_shape(gate, (1, QUERY_HEADS_PER_DEVICE, rows, HEAD_DIM), "local QSA gate head rows")
         _retag_tensor(k, reference=full_hidden, shard_dim=1)
         _retag_tensor(v, reference=full_hidden, shard_dim=1)
 
@@ -7312,10 +7351,14 @@ class Qwen38TTNNQSA:
         lanes: Qwen38TTNNQSALaneInputs,
         constants: Qwen38TTNNQSAChunkConstants,
         lane_constants: Qwen38TTNNQSALaneConstants,
+        *,
+        fused_selection: bool = False,
     ):
         # The chunk's row materialization with lane u's KV offset folded into its block-offset row: the expanded
         # ids and the tail ids (lanes.row_fill) address lane u's region of the flat cache; the sentinels are
-        # untouched (the offset rows are added before the keep mask and the OR).
+        # untouched (the offset rows are added before the keep mask and the OR).  ``fused_selection``: the lane
+        # verify takes the verify-rows family's selection program (the B=1 verify's form); the plain lanes decode
+        # body keeps the chain.
         block_ids = ttnn.experimental.topk_large_indices(masked_scores, k=BLOCK_TOPK)
         _deallocate(masked_scores)
         _require_shape(block_ids, (1, 1, MAX_LANES, BLOCK_TOPK), "top-k QSA lane block IDs")
@@ -7323,6 +7366,18 @@ class Qwen38TTNNQSA:
             raise RuntimeError(
                 f"topk_large_indices must return UINT32 ROW_MAJOR block IDs, got {tensor_metadata(block_ids)}"
             )
+        if fused_selection and self._rows_fused is not None:
+            # qsa_rows program 3 (the B=1 verify's form): the integer chain below as the decode selection program on
+            # the 32 rows, with the lanes' per-row block offsets (row u*R + j carries lane u's KV region start), the
+            # module's one-row sentinel pad and the pass's keep / fill rows
+            sparse_indices = self._rows_fused.selection_rows(
+                block_ids, self.sentinel_pad, lane_constants.block_offsets_lanes, lanes.row_keep_bits, lanes.row_fill
+            )
+            _deallocate(block_ids)
+            _require_shape(sparse_indices, (1, 1, MAX_LANES, SPARSE_INDEX_CAPACITY), "fused QSA lane sparse indices")
+            _retag_tensor(sparse_indices, reference=self.sentinel_pad, shard_dim=None)
+            self.mesh_contract.validate_tensor(sparse_indices, placement=TensorPlacement.REPLICATED)
+            return sparse_indices
         starts = ttnn.bitwise_left_shift(block_ids, 2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         _deallocate(block_ids)
         repeated = ttnn.repeat_interleave(starts, repeats=COMPRESS_RATIO, dim=3, memory_config=ttnn.DRAM_MEMORY_CONFIG)
@@ -7652,6 +7707,16 @@ class Qwen38TTNNQSA:
         self.mesh_contract.mark_local_partial(
             score_rows, replicated_reference=state.compressed_index_cache, expected_shape=(1, 1, CHUNK_ROWS, blocks)
         )
+        if self._rows_fused is not None:
+            # qsa_rows program 1 (the B=1 verify's form on the same 32-row tile): the all-reduce composite (5 programs)
+            # + the mask add as one all-gather + the fused merge over the rows; the lane rows and their per-row mask
+            # are the program's contract ([1,1,32,blocks] bf16 ROW_MAJOR, the mask of the rows' shape)
+            masked = self._rows_fused.score_blocks_rows(score_rows, inputs.indexer_neg_mask, cluster_axis=TP_AXIS)
+            _deallocate(score_rows)
+            _retag_tensor(masked, reference=state.compressed_index_cache, shard_dim=None)
+            self.mesh_contract.validate_tensor(masked, placement=TensorPlacement.REPLICATED)
+            _require_shape(masked, (1, 1, CHUNK_ROWS, blocks), "masked QSA lane verify block scores")
+            return masked
         scores = ttnn.all_reduce(
             score_rows,
             cluster_axis=TP_AXIS,
@@ -7772,11 +7837,24 @@ class Qwen38TTNNQSA:
         )
         masked_scores = self._score_blocks_lanes_verify(index_query, state, inputs, lane_verify)
         _deallocate(index_query)
-        sparse_indices = self._materialize_rows_lanes(masked_scores, inputs, constants, lane_verify)
+        sparse_indices = self._materialize_rows_lanes(
+            masked_scores, inputs, constants, lane_verify, fused_selection=True
+        )
 
-        query, gate, key, value = self._main_projection_rows(full_hidden, None, cos, sin, constants)
+        # qsa_rows program 5 (the B=1 verify's form): the qg shard travels in the gate's slot and the post-attention
+        # glue (the gate slices + concat, the heads' slice / tilize / sigmoid / multiply / slices / concat / move)
+        # runs as one program; with the program off the chain's gate is built from the shard (B=1's fallback).
+        fused_gate = self._post_attention_rows is not None
+        query, gate, key, value = self._main_projection_rows(
+            full_hidden, None, cos, sin, constants, keep_qg_shard=fused_gate
+        )
         self._write_packed_kv_lanes_verify(state, key, value, inputs)
-        local_attention = self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)
+        if fused_gate:
+            local_attention = self._sparse_value_attention_rows(
+                query, None, sparse_indices, state, constants, qg_ws=gate
+            )
+        else:
+            local_attention = self._sparse_value_attention_rows(query, gate, sparse_indices, state, constants)
         _deallocate(sparse_indices)
         output = self._project_output_rows(local_attention, full_hidden, constants)
         _deallocate(full_hidden)

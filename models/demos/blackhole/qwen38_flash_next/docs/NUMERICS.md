@@ -1110,6 +1110,52 @@ captured (the 128-row capture 2.36 s), the acceptance replay 12/12 with `json` 9
 
 
 
+### The lane verify on the verify-rows family's fused programs (2026-10-01)
+
+The 4-lane MTP verify (`ttnn/mtp_lanes.py` -> `ttnn/qsa.py` `forward_verify_lanes`) kept the chain forms where the
+single-stream verify runs the default-on fused `qsa_rows` programs (the family above, "The MTP pass decomposition"):
+the block scores' all-reduce composite and mask add (program 1), the selection's integer chain (program 3), the
+post-attention glue (program 5) and the main tail with its KV stage (program 2).  Per QSA-attention layer the lane
+verify ran 134 programs against the single stream's 35; the pass's one per-lane loop was the KV slab write (a slice
+and a cache write per lane and block).  From this date the lane verify runs the same four programs: the score merge and
+the selection program as they are (their contracts admit the lane rows and the lanes' per-row block offsets), the
+post-attention program fed by the qg linear's shard kept in the gate's slot, and the main tail with its KV stage
+repeated per lane on its one stage core at the lanes' effective positions (the lane's KV region folded in, an
+inactive lane redirected to the scratch block) -- the single-stream verify is the one-lane case of that stage and is
+unchanged.  Bitwise by construction where the chains were exact (the family's own gates), and MEASURED exact below.
+
+A census of the pass first (every program of the verify / draft / commit traces joined to the call that emits it,
+with the program's EXCLUSIVE time -- the gap from the moment it could run to the next program's start -- beside its
+occupancy): the verify's 1,457 data-movement programs carried 13.5 ms of occupancy but 3.3 ms of exclusive time; the
+other 10 ms is small programs waiting behind their predecessor's kernel (the 50 pads after the MoE combine alone read
+3.3 ms of occupancy for 0.07 ms exclusive).  The lever in the glue is the exclusive figure, not the occupancy one.
+
+MEASURED on a 1x4 p150 line, 32k, four lanes at k = 4 (`--lanes 4 --mtp 4`), the four acceptance prompts, 20 warm-up
++ 200 pipelined passes for the wall and 100 blocking passes for the replays, exact against the single-stream referee
+on every pass of every lane (409 / 293 / 275 / 229 passes compared, every committed stream equal) at every step:
+
+| variant | verify programs | pass p50 ms | verify replay ms | aggregate tok/s | exact |
+|---|---:|---:|---:|---:|---|
+| head | 3,033 | 60.36 | 49.62 | 253.3 | 4/4 |
+| + program 1 (score merge) | 2,994 | 60.13 | 49.39 | 254.2 | 4/4 |
+| + program 3 (selection) | 2,903 | 59.25 | 49.22 | 258.4 | 4/4 |
+| + program 5 (post-attention) = the landing | 2,669 | 58.41 | 48.65 | 260.7 | 4/4 |
+| + program 2 (main tail with a SERIAL per-lane KV stage; measured, not landed) | 2,078 | 60.14 | 50.13 | 254.8 | 4/4 |
+
+Host 1-min load 8-20 on the ladder rows (the gates are load-independent, the walls are not).  The pairs of record,
+the landing against the head's code interleaved twice in one hold at load 3.5-11.6 (the quietest window of the
+night): pass p50 58.38 / 58.72 against 59.95 / 59.48 ms (-1.16 on the mean of the pairs), verify replay 48.69 / 48.65
+against 49.65 / 49.64 (-0.97), draft 8.54 against 8.77, aggregate 262.2 / 260.5 against 255.6 / 257.1 tok/s, every
+row exact.  The served startup pin at the landing head (the `--lanes 4 --mtp 4` server's first start, 614 s with the kernels
+compiled): `A3-lanes4-mtp4-32k` 12/12 lane streams equal the single-stream replay of the same process (108 passes, 3
+interleaved, pass p50 57.4 ms in the replay against 59.9 at the 2026-09-29 head), the single-stream gate pass.  The served byte gate at the landing head, the same hold (host load 6): the 4 x chat560 batch at once 139.7 tok/s
+aggregate (2,048 tokens in 14.66 s; 45.0 / 49.4 / 41.4 / 38.3 per request) byte-equal 4/4 to the single-stream server
+of the same head serving the four in turn (59.1 tok/s); the lanes' own repeats 8/8 byte-identical; the natural mixed
+batch 86.5 tok/s (39.2 / 59.6 / 56.0 / 32.1).  The rows of record above (132.2 / 57.6 at host load 0.9) stand as
+written: the single-stream comparator moved too (+2.6 %) between the two evenings, so this row is not a row in
+place but the landing's served figure at its stated load.  The development note of this change (the
+lane glue census and ablation) holds the census by code site, the single-stream comparison and every hold.
+
 ## The device sampler's law (2026-09-25)
 
 The on-device sampler (`sampler_tail`, one program on one core after the top-32 candidate row) is gated on its law, not
