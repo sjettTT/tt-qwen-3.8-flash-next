@@ -159,6 +159,16 @@ token continues at that position plus the larger merged side, and the generated 
 accumulated delta).  The device keeps its caches and masks on the token index and shifts only the rotary rows; text
 requests are unchanged bit for bit (the shift is zero and the rows are the resident table's).
 
+Two additive records for the speculative-decoding benchmarks (2026-09-30).  `qwen38.mtp.accepted_per_pass` is
+the request's passes in order, each entry the drafts that pass accepted (a pass committed one token more), and
+`qwen38.mtp.accepted_histogram` their histogram (index = accepted drafts, k + 1 bins; on `/health.mtp` the
+cumulative one); the single stream's record only (a `--lanes` response keeps `passes` and
+`lanes.committed_tokens`).  `timings` beside `usage` is llama.cpp's object, the fields its SPEED-Bench client
+reads: `prompt_n` / `prompt_ms` / `prompt_per_second` (the prefill), `predicted_n` / `predicted_ms` /
+`predicted_per_second` (the reply's tokens over the decode phase, first to last token, tokens / time as llama.cpp
+forms it; the server's own `qwen38.tokens_per_second` stays (tokens - 1) / decode seconds), `draft_n` (k per
+pass) and `draft_n_accepted`.
+
 ### Several requests at once: `--lanes B` (opt-in, greedy only)
 
 `--lanes B` (B in 2..8 with B x (k + 1) <= 32 rows; needs `--mtp`; off by default) serves up to B requests at once

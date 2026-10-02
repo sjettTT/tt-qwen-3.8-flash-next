@@ -63,6 +63,8 @@ test drives the session with a scripted chain.
 
 from __future__ import annotations
 
+import itertools
+from collections import deque
 import json
 import time
 from dataclasses import dataclass, field, replace
@@ -2137,6 +2139,10 @@ def open_partition_b_mesh(
     }
 
 
+# The per-pass accepted-draft record kept on the chain (the newest passes; a request is far shorter).
+PASS_ACCEPTS_KEPT = 1 << 20
+
+
 @dataclass
 class Qwen38ChainMTP:
     """What an MTP-drafting chain adds (``mtp_v2``): the MTP components, the verify / draft states and their traces
@@ -2163,6 +2169,11 @@ class Qwen38ChainMTP:
     step_written: bool = False
     passes: int = 0
     accepted_drafts: int = 0
+    # Every pass's accepted drafts in order (the newest PASS_ACCEPTS_KEPT; ``pass_accepts_dropped`` counts the
+    # older ones): a request's response carries its own passes' list and their histogram (``summary(since=)``
+    # slices from the snapshot's pass count), ``/health.mtp`` the cumulative histogram.  Additive record, 2026-09-30.
+    pass_accepts: deque[int] = field(default_factory=lambda: deque(maxlen=PASS_ACCEPTS_KEPT))
+    pass_accepts_dropped: int = 0
     capture_ms: dict[str, float] = field(default_factory=dict)
     trace_dram_bytes_per_bank: dict[str, int] = field(default_factory=dict)
     admission: dict[str, Any] = field(default_factory=dict)  # mtp_capacity_admission at the build's context and k
@@ -2212,6 +2223,9 @@ class Qwen38ChainMTP:
     def record(self, pass_record: mtp_v2.Qwen38TTNNMTPPassRecord) -> mtp_v2.Qwen38TTNNMTPPassRecord:
         self.passes += 1
         self.accepted_drafts += pass_record.accepted
+        if len(self.pass_accepts) == self.pass_accepts.maxlen:
+            self.pass_accepts_dropped += 1
+        self.pass_accepts.append(pass_record.accepted)
         statistics = {} if pass_record.decision is None else pass_record.decision.statistics
         self.accept_checks += int(statistics.get("accept_checks", 0))
         if statistics.get("sampled"):
@@ -2259,6 +2273,18 @@ class Qwen38ChainMTP:
         if since is not None:
             counts = {name: value - since[name] for name, value in counts.items()}
         passes, accepted_drafts = counts["passes"], counts["accepted_drafts"]
+        # The per-pass record: a request's passes are the ones after its snapshot's count (None when the snapshot
+        # is older than the kept window); the histogram's index is the accepted drafts (k + 1 bins).
+        per_pass: list[int] | None = None
+        if since is not None:
+            start = since["passes"] - self.pass_accepts_dropped
+            if 0 <= start <= len(self.pass_accepts):
+                per_pass = list(itertools.islice(self.pass_accepts, start, None))
+        histogram = [0] * (self.drafts + 1)
+        for accepted in per_pass if per_pass is not None else self.pass_accepts:
+            histogram[min(accepted, self.drafts)] += 1
+        if per_pass is None and since is None:
+            histogram = None if self.pass_accepts_dropped else histogram  # the cumulative histogram needs every pass
         summary = {
             "k": self.drafts,
             "anchor": self.anchor,
@@ -2266,6 +2292,8 @@ class Qwen38ChainMTP:
             "passes": passes,
             "accepted_drafts": accepted_drafts,
             "tokens_per_pass": None if not passes else round((passes + accepted_drafts) / passes, 4),
+            "accepted_histogram": None if (since is not None and per_pass is None) else histogram,
+            "accepted_per_pass": per_pass,
         }
         if self.sampled:
             sampled_passes, sampled_accepted = counts["sampled_passes"], counts["sampled_accepted_drafts"]

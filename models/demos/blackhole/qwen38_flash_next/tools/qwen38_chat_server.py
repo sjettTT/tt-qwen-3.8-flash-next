@@ -510,6 +510,37 @@ def _usage(prompt_tokens: int, completion_tokens: int, queue_wait: float) -> dic
     }
 
 
+def _timings(usage: Mapping[str, Any], extension: Mapping[str, Any]) -> dict[str, Any]:
+    """llama.cpp's ``timings`` object beside ``usage`` (the fields its SPEED-Bench client reads,
+    ``tools/server/bench/speed-bench``), from the response's own numbers: the prompt's tokens and prefill time, the
+    reply's tokens and decode time (first to last token, as llama.cpp measures its generation), the rates as
+    llama.cpp forms them (tokens / time), the drafts proposed (every pass drafts ``k``) and accepted.  Additive;
+    ``qwen38`` keeps the server's own forms (``tokens_per_second`` is (tokens - 1) / decode seconds)."""
+
+    prompt_n = int(usage.get("prompt_tokens") or 0)
+    predicted_n = int(usage.get("completion_tokens") or 0)
+    prompt_ms = 1000.0 * float(extension.get("prefill_seconds") or 0.0)
+    predicted_ms = 1000.0 * float(extension.get("decode_seconds") or 0.0)
+    mtp = extension.get("mtp") or {}
+    lanes = extension.get("lanes") or {}
+    passes = int(mtp.get("passes") or 0)
+    accepted = mtp.get("accepted_drafts")
+    if accepted is None and passes and lanes.get("committed_tokens") is not None:
+        accepted = int(lanes["committed_tokens"]) - passes  # the lanes record: committed = one per pass + accepted
+    return {
+        "prompt_n": prompt_n,
+        "prompt_ms": round(prompt_ms, 3),
+        "prompt_per_token_ms": None if not prompt_n else round(prompt_ms / prompt_n, 3),
+        "prompt_per_second": None if prompt_ms <= 0 else round(1000.0 * prompt_n / prompt_ms, 3),
+        "predicted_n": predicted_n,
+        "predicted_ms": round(predicted_ms, 3),
+        "predicted_per_token_ms": None if not predicted_n else round(predicted_ms / predicted_n, 3),
+        "predicted_per_second": None if predicted_ms <= 0 else round(1000.0 * predicted_n / predicted_ms, 3),
+        "draft_n": passes * int(mtp.get("k") or 0),
+        "draft_n_accepted": int(accepted or 0),
+    }
+
+
 def _extension(
     completion: Any,
     assembler: protocol.Qwen38ReplyAssembler,
@@ -1409,7 +1440,14 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                 if request["stream"]:
                     for delta in final_deltas:
                         wire.event(chunk({"delta": delta, "finish_reason": None}))
-                    wire.event(chunk({"delta": {}, "finish_reason": finish_reason}, usage=usage, qwen38=extension))
+                    wire.event(
+                        chunk(
+                            {"delta": {}, "finish_reason": finish_reason},
+                            usage=usage,
+                            qwen38=extension,
+                            timings=_timings(usage, extension),
+                        )
+                    )
                     wire.write(b"data: [DONE]\n\n")
                 else:
                     choice: dict[str, Any] = {
@@ -1430,6 +1468,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                             "choices": [choice],
                             "usage": usage,
                             "qwen38": extension,
+                            "timings": _timings(usage, extension),
                         },
                     )
             except OSError as error:
@@ -1699,7 +1738,14 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
             if request["stream"]:
                 for delta in final_deltas:
                     wire.event(chunk({"delta": delta, "finish_reason": None}))
-                wire.event(chunk({"delta": {}, "finish_reason": finish_reason}, usage=usage, qwen38=extension))
+                wire.event(
+                        chunk(
+                            {"delta": {}, "finish_reason": finish_reason},
+                            usage=usage,
+                            qwen38=extension,
+                            timings=_timings(usage, extension),
+                        )
+                    )
                 wire.write(b"data: [DONE]\n\n")
             else:
                 self._send_json(
@@ -1713,6 +1759,7 @@ class Qwen38ChatHandler(http.server.BaseHTTPRequestHandler):
                         "choices": [{"index": 0, "message": assembler.message(), "finish_reason": finish_reason}],
                         "usage": usage,
                         "qwen38": extension,
+                        "timings": _timings(usage, extension),
                     },
                 )
         except OSError as error:

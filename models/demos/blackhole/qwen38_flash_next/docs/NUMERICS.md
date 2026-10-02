@@ -771,6 +771,9 @@ DRAM stays the clause's (k + 1) x 786,432 bytes per GDN layer per device, 141.6 
 
 ## Spec-Bench (`--mtp 4` against plain decode), 2026-09-29
 
+Superseded by SPEED-Bench (its successor; Spec-Bench is one of its 24 sources), reported in the SPEED-Bench
+subsection.
+
 The speculative-decoding benchmark of Xia et al. (Spec-Bench, ACL 2024 Findings): 480 prompts, 80 per category --
 MT-bench (two turns), translation, summarization, question answering, math reasoning, retrieval-augmented generation
 -- decoded greedily to at most 1024 tokens per turn, EOS honoured, thinking off, the second MT-bench turn after our
@@ -802,6 +805,104 @@ length, not the same text.  Sampled requests (a `seed` alone, the card's non-thi
 sampling) on MT-bench and question answering: 2.95 and 2.75 tokens per pass at
 66.1 and 59.7 tok/s (greedy 3.19 / 3.03 at 77.5 / 70.7), the mean acceptance
 probability 0.74, 0.36 % of the candidate draws falling back to the full vocabulary.
+
+## SPEED-Bench (`--mtp 4`), 2026-09-30
+
+NVIDIA's speculative-decoding benchmark (SPEED-Bench, arXiv 2604.09557; the dataset `nvidia/SPEED-Bench`; the authors'
+framework `Model-Optimizer/examples/specdec_bench`) run with the authors' own dataset preparation, turn handling and
+metric code against the chat endpoint through a thin engine wrapper (the speedbench development tooling; the
+development note of the same name holds the protocol as read, every hold and the raw tables).  The qualitative split's metric is the acceptance length AL, "the
+expected number of generated tokens per verification step (including the free verification token)": the framework
+counts the tokens of every decoding step of every turn of a request from the response's per-pass record
+(`qwen38.mtp.accepted_per_pass`, an additive field of `fd654ae52f`) in its own convention (the prefill's token a
+one-token step, the EOS token not counted), then `Request_AL` (the mean over a request's steps), `Category_AL` (the
+mean over the category's requests) and `Average_AL` (the mean over requests); plain decode reads 1.0.  MEASURED
+2026-09-30 19:18Z-22:10Z at `f5dc3c0544` on the fork runtime built at `33b23a205b97`, a 1x4 p150 line at 32k,
+`--mtp 4 --prefill-slab 2048` (k = 4 drafts per pass; the paper's tables use 3), one stream, greedy, thinking off, 4096
+tokens per turn, EOS honoured, one run; 672 prompts, 930 turns, 175,698 decoding steps, 0 errors; host 1-minute load
+1.4-3.0 with the server (median 2.0).
+
+Coverage: the framework's `prepare_data.py` resolves the dataset's placeholders from 24 sources; one of them,
+`cais/hle`, is gated for the account that prepared the data, so 208 of the 880 prompts were left out (listed, not
+substituted): eight categories are complete at 80 of 80, math 18, humanities 8 and stem 6 of 80 are partial.
+
+| category | prompts (of 80) | turns | AL (`Category_AL`) | answer tokens (mean) | `--mtp 4` tok/s (decode phase) |
+|---|---|---|---|---|---|
+| coding | 80 | 89 | 4.20 | 688 | 98.7 |
+| math (partial) | 18 | 36 | 4.18 | 338 | 99.0 |
+| RAG | 80 | 105 | 3.63 | 196 | 84.4 |
+| multilingual | 80 | 80 | 3.49 | 486 | 83.0 |
+| reasoning | 80 | 190 | 3.48 | 682 | 80.0 |
+| STEM (partial) | 6 | 12 | 3.17 | 1210 | 73.2 |
+| summarization | 80 | 80 | 3.02 | 202 | 71.1 |
+| question answering | 80 | 80 | 2.97 | 439 | 71.7 |
+| writing | 80 | 84 | 2.81 | 1844 | 64.5 |
+| humanities (partial) | 8 | 16 | 2.76 | 1303 | 63.2 |
+| roleplay | 80 | 158 | 2.24 | 273 | 53.6 |
+| overall | 672 | 930 | **3.25** (`Average_AL`; 3.11 step-weighted over every step) | 588 | 75.5 |
+
+The framework's histogram of step lengths over every step (1..5 tokens = 0..4 accepted drafts): 41,160 / 33,485 /
+24,887 / 17,494 / 58,672 -- a third of all passes accept all four drafts; its conditional acceptance rates (draft i
+accepted given drafts 1..i-1 were) 0.766 / 0.751 / 0.754 / 0.770, joint 0.766 / 0.575 / 0.434 / 0.334, whose sum plus
+one is the step-weighted 3.11.  15 of the 930 turns hit the 4096-token cap (writing 7, coding 5, QA 2, reasoning 1).
+The tokens per second are the decode phase's ((completion - 1) / (last delta - first delta), the form of the README
+rows), the mean over a category's turns.
+
+For scale, not rank, the paper's Table 1 rows for target models decoding with their own MTP head (batch size 32, draft
+length 3, temperature 0, eight NVIDIA B200): Qwen3-Next-80B-A3B-Instruct on SGLang -- coding 3.34, humanities 2.68,
+math 3.13, multilingual 3.19, QA 2.71, RAG 2.94, reasoning 2.89, roleplay 2.09, STEM 2.85, summarization 2.66, writing
+2.46, mean 2.81 (speedup 1.20x); DeepSeek-R1 on TensorRT-LLM -- 2.76 / 2.53 / 2.77 / 2.68 / 2.52 / 2.61 / 2.62 / 2.14 /
+2.62 / 2.47 / 2.33, mean 2.55 (1.45x).  Ours runs one stream at k = 4 (a higher k raises AL by construction) on the
+same category shape: coding and math highest, roleplay lowest.
+
+### The throughput split: MTP against plain decode
+
+The framework over the prepared throughput buckets, 32 prompts per entropy class on the 1k and 8k buckets and 16 on
+the 16k bucket (the framework's round-robin selection; the same prompts in every arm), 4096-token cap, greedy,
+thinking off.  Arms: `--mtp 4 --prefill-slab 2048` against `--prefill-slab 2048` (plain decode) at one stream; at
+four requests at once the `--lanes 4` server against the one-stream server with four clients queued (its bounded
+queue; each request then decodes alone, the queue wait is what the client sees).  Per-request tokens per second are
+the decode phase's; the speedup is the benchmark's form (the mean over prompts of per-prompt tokens per second, MTP
+over plain, the same prompts); the aggregate is a hold's tokens over its wall clock (prefill, queue and gaps
+included).  MEASURED 2026-09-30 22:14Z - 2026-10-01 06:08Z at `f5dc3c0544` on the fork runtime built at
+`33b23a205b97`, a 1x4 p150 line at 32k; host 1-minute load with the server 1.2-3.0 (median 2.0-2.3).  The 32k bucket
+needs the 64k context profile and was not run; the paper's batch sizes to 256 are out of the server's reach.
+
+| bucket, concurrency | prompts (MTP / plain) | AL (`Average_AL`, MTP) | per-request tok/s MTP / plain | speedup (per prompt, decode; wall) | aggregate tok/s MTP / plain (speedup) | TTFT s MTP / plain |
+|---|---|---|---|---|---|---|
+| 1k, one stream | 96 / 96 | 3.006 (low entropy 3.60, mixed 2.97, high 2.45) | 68.7 / 40.1 | 1.71x (low 2.03x, mixed 1.69x, high 1.42x); 1.55x | 54.5 / 36.4 (1.50x) | 1.54 / 1.49 |
+| 8k, one stream | 96 / 94 | 3.290 (3.72, 3.77, 2.38) | 73.0 / 38.6 | 1.88x (2.11x, 2.15x, 1.38x); 1.66x | 56.8 / 35.1 (1.62x) | 3.75 / 3.32 |
+| 16k, one stream | 48 / 48 | 3.383 (3.61, 4.07, 2.47) | 75.0 / 38.7 | 1.94x (2.06x, 2.32x, 1.43x); 1.70x | 56.6 / 33.8 (1.68x) | 6.85 / 6.04 |
+| 1k, four at once | 96 / 96 | 3.003 (the lanes serve the single stream's texts) | 40.0 / 40.1 (each queued plain request decodes alone) | per request --; wall 3.33x | 116.3 / 36.4 (3.19x) | 2.06 / 59.4 (queue 57.9) |
+| 8k, four at once | 96 / 96 | 3.285 | 39.4 / 38.6 | --; 3.09x | 119.1 / 35.1 (3.39x) | 4.40 / 111.1 |
+
+Low-entropy prompts (sorting, code) accept the most (AL 3.6-3.7, 2.0-2.1x per prompt), creative writing the least
+(2.4-2.5, 1.4x); the acceptance grows with the input length (3.01 / 3.29 / 3.38 over 1k / 8k / 16k).  Four lanes
+give 2.1x the single stream's aggregate and 3.2-3.4x the queued one-stream server's, with the first token in 2-4 s
+instead of a minute or two of queue.  The 8k plain single stream holds 94 of its 96 prompts (two left at a hold's
+end; the speedups are over the 94 both arms hold).
+
+### The cross-check: llama.cpp's stock SPEED-Bench client
+
+llama.cpp's `tools/server/bench/speed-bench/speed_bench.py` (stock, byte-identical) over the prepared parquet through
+a 30-line data shim (the raw dataset holds placeholders for 494 of the 880 qualitative prompts), non-streaming,
+`temperature 0`, `--osl 4096`, thinking off, the first 32 prompts of qa, coding, writing and reasoning (= the
+framework's first 32 of each) against a fresh start of the same server form; MEASURED 2026-10-01 01:00Z-01:50Z.  Its
+`accept_rate` (accepted / proposed drafts from the server's `timings` object, an additive field of `fd654ae52f`)
+equals the framework rows' accepted / (4 x passes) to four decimals on every one of the 128 prompts, and the replies'
+token counts are equal on all 128 (byte-identical greedy texts on two server starts): qa 0.4826, coding 0.7482,
+writing 0.4639, reasoning 0.5890, so 1 + k x `accept_rate` = 2.93 / 3.99 / 2.86 / 3.36 beside the framework's AL on
+the same prompts 2.86 / 4.19 / 2.84 / 3.50 (pooled over passes with the EOS counted against the mean over requests in
+the framework's convention); its `avg_pred_t/s` 70.0 / 99.5 / 65.8 / 82.7 against the rows' client-side decode
+69.4 / 98.6 / 65.1 / 81.8.
+
+### The holds
+
+38 device-broker holds of 1500 s on the second line host between 2026-09-30 18:57Z and 2026-10-01 06:08Z, one chat
+server start per hold (READY 180-221 s from warm caches; 601 s and 491 s for the first start of each server form
+on this head), the clients resumed from their rows; the 1-minute load at launch under 2.0 for 33 holds and 2.1-2.7
+for five (right after the broker's own cluster validation); two holds refused by the launcher's clean-tree check
+(no device time); 0 request errors in the row-of-record arms.  The development note lists every hold.
 
 ## The MTP pass decomposition (2026-09-25)
 

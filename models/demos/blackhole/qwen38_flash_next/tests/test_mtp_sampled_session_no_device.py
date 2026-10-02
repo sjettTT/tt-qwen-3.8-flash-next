@@ -503,7 +503,16 @@ def test_chain_mtp_summary_carries_the_split_counters() -> None:
     mtp = session_module.Qwen38ChainMTP(
         drafts=4, anchor="off", components=None, verify=None, draft=None, step_inputs=None, chunk_extension=None
     )
-    assert set(mtp.summary()) == {"k", "anchor", "sampled", "passes", "accepted_drafts", "tokens_per_pass"}
+    assert set(mtp.summary()) == {
+        "k",
+        "anchor",
+        "sampled",
+        "passes",
+        "accepted_drafts",
+        "tokens_per_pass",
+        "accepted_histogram",
+        "accepted_per_pass",
+    }
     mtp.sampled = True
     # A greedy split pass decided on the host (decide_greedy's record): a diagnostic's, not the served path's, whose
     # greedy requests run the fused traces; the counter still counts it.
@@ -535,6 +544,10 @@ def test_chain_mtp_summary_carries_the_split_counters() -> None:
     assert (since["passes"], since["accepted_drafts"], since["accept_checks"]) == (1, 1, 0)
     assert (since["sampled_passes"], since["sampled_accepted_drafts"], since["sampled_draws"]) == (1, 1, 3)
     assert since["sampled_fallbacks"] == 1 and since["tokens_per_pass"] == since["sampled_tokens_per_pass"] == 2.0
+    # The per-pass record: the request's passes in order with their histogram (index = accepted drafts); the
+    # chain's summary carries the cumulative histogram and no list.
+    assert since["accepted_per_pass"] == [1] and since["accepted_histogram"] == [0, 1, 0, 0, 0]
+    assert summary["accepted_per_pass"] is None and summary["accepted_histogram"] == [0, 1, 1, 0, 0]
     assert set(snapshot) == set(session_module.Qwen38ChainMTP.COUNTERS) and snapshot["passes"] == 1
     assert mtp.captured_trace_ids() == []
     # A device-decided pass (the third form): a sampled pass whose draws are the uniforms the program consumed, the
@@ -699,6 +712,8 @@ MTP_RESPONSE_KEYS = {
     "passes",
     "accepted_drafts",
     "tokens_per_pass",
+    "accepted_histogram",
+    "accepted_per_pass",
     "accept_checks",
     "sampled_passes",
     "sampled_accepted_drafts",
