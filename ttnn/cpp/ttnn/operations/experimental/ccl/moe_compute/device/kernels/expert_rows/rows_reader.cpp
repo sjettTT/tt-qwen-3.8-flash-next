@@ -299,6 +299,13 @@ void kernel_main() {
         }
         noc_async_atomic_barrier();
     };
+    // The row writers read their (token, k) entries from the root's L1 when the root is the only routing core and its
+    // entries region holds the page's entries (`span` of them) at their page offsets; else from DRAM. An acked DRAM
+    // write is not yet visible to a NoC-1 read issued right after the signal that follows it.
+    constexpr uint32_t L1_LISTS = 1u << 31;
+    const uint32_t lists_base = (rt + ENT + 63) & ~63u;
+    static_assert(ENT + 64 < (1u << 16), "the entries offset fits ctl word 3");
+    auto lists_in_l1 = [&](uint32_t span) { return LO && NR == 1 && lists_base + span * 4 <= rt + JBO; };
     uint32_t nj = 0;
     if (root) {
         volatile tt_l1_ptr uint32_t* sa = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(SEM_A));
@@ -472,7 +479,10 @@ void kernel_main() {
         ctl[1] = d;
         ctl[2] = nrow;
         if constexpr (LO) {
-            // the packed lists' header and the per-expert counts (program 2 writes them to output 0)
+            // where the row writers read the lists (ctl word 3: a lone routing core's L1 copy, page entry i at
+            // lists_base + 4 i; 0 = DRAM); the packed lists' header and the per-expert counts (program 2 writes them
+            // to output 0)
+            ctl[3] = lists_in_l1(header[E]) ? L1_LISTS | rx << 22 | ry << 16 | (lists_base - rt) : 0;
             asm volatile("" ::: "memory");
             signal_cores();
             const auto lst = TensorAccessor(tab_args, tab_addr, LIST_PAGE);
@@ -513,17 +523,19 @@ void kernel_main() {
     }
     if constexpr (LO) {
         // A routing core's lists: its write offsets (its row of the root's matrix), its entries placed per expert so
-        // that each list starts at its DRAM address modulo 64 B, one write per expert. The root signals every core
-        // again once all of them landed (the row writers read the lists from DRAM).
+        // that each list starts at its DRAM address modulo 64 B (a lone routing core: at its page offset from
+        // lists_base), one write per expert. The root signals every core again once the row writers can read them: a
+        // lone core's at once from its L1, several cores' once each read its lists back from DRAM.
         if (routes) {
             tt_l1_ptr uint32_t* off = reinterpret_cast<tt_l1_ptr uint32_t*>(rt + OFO);
             tt_l1_ptr uint32_t* place = reinterpret_cast<tt_l1_ptr uint32_t*>(rt + PLC);
             noc_async_read(get_noc_addr(rx, ry, rt + MTX + me * E * 4), rt + OFO, E * 4);
             noc_async_read_barrier();
+            const bool mirrored = lists_in_l1(header[E]);
             uint32_t at = rt + ENT;
             for (uint32_t l = 0; l < E; ++l) {
                 at += (((HW + off[l]) * 4) - at) & 63;
-                place[l] = at;
+                place[l] = mirrored ? lists_base + off[l] * 4 : at;
                 at += own_counts[l] * 4;
             }
             for_each_entry([&](uint32_t l, uint32_t t, uint32_t k) {
@@ -538,7 +550,30 @@ void kernel_main() {
                     noc_async_write(place[l] - bytes, lst.get_noc_addr(0, (HW + off[l]) * 4), bytes);
                 }
             }
-            noc_async_write_barrier();
+            noc_async_writes_flushed();
+            // read the lists back over their L1 copies until DRAM returns every entry (no entry is all ones: k < 32)
+            for (bool missing = !mirrored; missing;) {
+                for (uint32_t l = 0; l < E; ++l) {
+                    const uint32_t bytes = own_counts[l] * 4;
+                    if (bytes) {
+                        place[l] -= bytes;
+                        for (uint32_t w = 0; w < bytes; w += 4) {
+                            *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(place[l] + w) = 0xFFFFFFFFu;
+                        }
+                        noc_async_read(lst.get_noc_addr(0, (HW + off[l]) * 4), place[l], bytes);
+                    }
+                }
+                noc_async_read_barrier();
+                missing = false;
+                for_each_entry([&](uint32_t l, uint32_t t, uint32_t k) {
+                    missing |= *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(place[l]) !=
+                               moe_ring::token_list::pack_entry(t, k);
+                    place[l] += 4;
+                });
+            }
+            if (!mirrored) {
+                noc_async_write_barrier();
+            }
             if (!root) {
                 noc_semaphore_inc(get_noc_addr(rx, ry, get_semaphore(SEM_A)), 1);
                 noc_async_atomic_barrier();

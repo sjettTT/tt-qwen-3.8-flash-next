@@ -131,12 +131,16 @@ void kernel_main() {
     auto entry = [&](uint32_t e, uint32_t p) -> uint32_t {
         return reinterpret_cast<volatile tt_l1_ptr uint32_t*>(lists + (e % LS) * LIST_BYTES)[p];
     };
-    // local output: job e's entries into its list slot (e < D); complete at the next read barrier
+    // local output: job e's entries into its list slot (e < D), from the root's L1 copy of the lists page when ctl
+    // word 3 names it (rows_reader.cpp), else from DRAM; complete at the next read barrier
+    const uint32_t l1_lists = ctl[3];
+    const uint64_t l1_entries =
+        get_noc_addr((l1_lists >> 22) & 0x3F, (l1_lists >> 16) & 0x3F, rt + (l1_lists & 0xFFFF));
     auto fetch_list = [&](uint32_t e) {
         if (LO && e < D) {
-            const uint32_t j = J(e);
-            noc_async_read(
-                lst.get_noc_addr(0, (HW + jobs[3 * j + 1]) * 4), lists + (e % LS) * LIST_BYTES, jobs[3 * j + 2] * 4);
+            const uint32_t j = J(e), first = jobs[3 * j + 1];
+            const uint64_t src = l1_lists ? l1_entries + first * 4 : lst.get_noc_addr(0, (HW + first) * 4);
+            noc_async_read(src, lists + (e % LS) * LIST_BYTES, jobs[3 * j + 2] * 4);
         }
     };
     if constexpr (LO) {
